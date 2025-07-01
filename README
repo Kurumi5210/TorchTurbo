@@ -1,0 +1,24 @@
+# TorchTurbo
+Accelerate torch llm training and inference
+
+## Development
+
+```bash
+# Make symbolic links for third-party (CUTLASS and CuTe) include directories
+python setup.py develop
+
+
+
+```
+
+numa library
+```bash
+yum install numactl-devel.x86_64
+pip install numa
+```
+
+## Installation
+
+```bash
+python setup.py install
+```

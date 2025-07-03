@@ -39,6 +39,10 @@ def setup(rank, args):
 def cleanup():
     dist.destroy_process_group()
 
+def print_model_params(model):
+    for name, param in model.named_parameters():
+        print(f'name {name}, param.shape {param.shape}, param.device {param.device}')
+
 def build_model(path):
     config = AutoConfig.from_pretrained(path)
     with torch.device("meta"):
@@ -46,9 +50,11 @@ def build_model(path):
         moe = MegatronUtils.initialize_moe_layer_from_hf_config(config)
 
     if torch.distributed.get_rank() == 0:
-        print(f'model {model}')
+        print(model.layers[0].mlp)
+        print_model_params(model.layers[0].mlp)
         print('-'*50)
-        print(f'moe {moe}')
+        print(moe)
+        print_model_params(moe)
     return model
 
 def run(rank, args):

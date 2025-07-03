@@ -23,6 +23,7 @@ import torch_npu
 from transformers import AutoConfig, AutoModel
 
 from torch_turbo.moe.megatron_utils import MegatronUtils
+from torch_turbo.moe.moe_utils import MoeUtils
 
 
 def setup(rank, args):
@@ -47,14 +48,19 @@ def build_model(path):
     config = AutoConfig.from_pretrained(path)
     with torch.device("meta"):
         model = AutoModel.from_config(config)
-        moe = MegatronUtils.initialize_moe_layer_from_hf_config(config)
 
-    if torch.distributed.get_rank() == 0:
-        print(model.layers[0].mlp)
-        print_model_params(model.layers[0].mlp)
-        print('-'*50)
-        print(moe)
-        print_model_params(moe)
+        if torch.distributed.get_rank() == 0:
+            print(model.layers[0].mlp)
+            print_model_params(model.layers[0].mlp)
+            print('-'*50)
+
+        MoeUtils.transform_moe_layer(model, config)
+
+        if torch.distributed.get_rank() == 0:
+            print(model.layers[0].mlp)
+            print_model_params(model.layers[0].mlp)
+            print('-'*50)
+
     return model
 
 def run(rank, args):

@@ -40,39 +40,17 @@ def setup(rank, args):
 def cleanup():
     dist.destroy_process_group()
 
-def print_model_params(model):
-    for name, param in model.named_parameters():
-        print(f'name {name}, param.shape {param.shape}, param.device {param.device}')
-
-def build_model(path):
-    config = AutoConfig.from_pretrained(path)
-    with torch.device("meta"):
-        model = AutoModel.from_config(config)
-
-        if torch.distributed.get_rank() == 0:
-            print(model.layers[0].mlp)
-            print_model_params(model.layers[0].mlp)
-            print('-'*50)
-
-        MoeUtils.transform_moe_layer(model, config)
-
-        if torch.distributed.get_rank() == 0:
-            print(model.layers[0].mlp)
-            print_model_params(model.layers[0].mlp)
-            print('-'*50)
-
-    return model
-
 def run(rank, args):
     world_size = args.world_size
     setup(rank, args)
     device = torch.device(f"npu:{rank}")
 
-    world_mesh = init_device_mesh("npu", (world_size,))
-    mesh = init_device_mesh("npu", (world_size // 2, 2), mesh_dim_names=("edp", "ep"))
+    model = MoeUtils.create_fsdp2_moe_model(args, device)
 
-    model = build_model(args.path)
-
+    if rank == 2:
+        print(model)
+        for param_name, param in model.named_parameters():
+            print(f'param_name {param_name}, param.shape {param.shape}')
 
     cleanup()
 
@@ -82,7 +60,7 @@ def main(args):
 
 
 # command:
-#   export PYTHONPATH=/sfs_turbo/xiyun/rl/3d/opensource/Megatron-LM:/sfs_turbo/xiyun/rl/3d/opensource/MindSpeed:/sfs_turbo/xiyun/rl/new/test/torch_turbo:$PYTHONPATH
+#   export PYTHONPATH=/sfs_turbo/xiyun/rl/3d/opensource/Megatron-LM:/sfs_turbo/xiyun/rl/3d/opensource/MindSpeed:/sfs_turbo/xiyun/rl/new/test/tt/torchturbo:$PYTHONPATH
 #   python example/fsdp2/run_qwen3_ep_npu.py  --path /sfs_turbo/pretrained_models/Qwen3-30B-A3B
 if __name__ == "__main__":
     import argparse

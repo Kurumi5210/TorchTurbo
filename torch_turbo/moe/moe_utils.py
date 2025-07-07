@@ -113,11 +113,11 @@ class MoeUtils:
     @staticmethod
     def build_model(config):
         # DEBUG
-        #config.num_hidden_layers = 1
+        config.num_hidden_layers = 1
         with torch.device("meta"):
             model = AutoModel.from_config(config)
             MoeUtils.transform_moe_layer(model, config)
-
+        model = model.to(dtype=torch.bfloat16)
         return model
 
     @staticmethod

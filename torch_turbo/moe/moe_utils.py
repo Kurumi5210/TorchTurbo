@@ -173,7 +173,8 @@ class MoeUtils:
         edp = EXPERT_MESH['edp']
 
         ep_rank = ps.get_expert_model_parallel_rank()
-        ep_world_size = ps.get_expert_model_parallel_world_size()   
+        ep_world_size = ps.get_expert_model_parallel_world_size()
+        
         sharded_sd = {}
         for param_name, param in model.named_parameters():
             if rank == 0:

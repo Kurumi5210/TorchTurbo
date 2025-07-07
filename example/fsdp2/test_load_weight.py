@@ -35,6 +35,7 @@ def verify_weight_loading(path, model, device):
     # Step 1: Load original state dict from safetensors
     sd = load_safetensors_dir(path)
     dist.barrier()
+    flag = True
     
     # Step 2: Verify weights
     for param_name, param in model.named_parameters():
@@ -61,9 +62,7 @@ def verify_weight_loading(path, model, device):
                     down_proj = f"model.{prefix}.{i}.down_proj.weight"
                     w2.append(sd[down_proj].t())
                 full_tensor = torch.stack(w2, dim=0).to(device)
-            # broadcast to ep_group
             full_tensor = full_tensor.reshape(-1, full_tensor.shape[-1])
-
             # each ep slice its part
             full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
             if "weight1" in param_name:
@@ -79,40 +78,39 @@ def verify_weight_loading(path, model, device):
         # Compare
         full_tensor_cpu = full_tensor.cpu().float()
         param_tensor_cpu = param.full_tensor().cpu().float()
-        # 首先检查形状是否匹配
+        # check if the shapes match
         if full_tensor_cpu.shape != param_tensor_cpu.shape:
-            print(f"❌ Shape mismatch for {param_name}:")
-            print(f"  Expected shape: {full_tensor_cpu.shape}")
-            print(f"  Actual shape: {param_tensor_cpu.shape}")
-            dist.barrier()
-            if rank == 0:
-                print("\n❌ Weight loading failed due to shape mismatch!")
-            exit(1)
+            print(f" Rank {rank} - Shape mismatch for {param_name}:")
+            print(f" Rank {rank} - Expected shape: {full_tensor_cpu.shape}")
+            print(f" Rank {rank} - Actual shape: {param_tensor_cpu.shape}")
+            print(f" Rank {rank} - Weight loading failed due to shape mismatch! \n")
+            # exit(1)
+            flag = False
 
-        # 然后检查数值是否匹配
-        if not torch.allclose(full_tensor_cpu, param_tensor_cpu, atol=1e-5) and rank == 0:
-            # 计算最大差异
+        # check if the values match
+        if not torch.allclose(full_tensor_cpu, param_tensor_cpu, atol=0.0):
+            # compute the difference
             diff = torch.abs(full_tensor_cpu - param_tensor_cpu)
             max_diff = torch.max(diff)
             mean_diff = torch.mean(diff)
             
-            print(f"❌ Value mismatch for {param_name}, device={device}:")
-            print(f"  Max difference: {max_diff.item():.6f}, device={device}")
-            print(f"  Mean difference: {mean_diff.item():.6f}, device={device}")
-            print(f"  Expected values sample: {full_tensor_cpu.flatten()[:-1]}, device={device}")
-            print(f"  Actual values sample: {param_tensor_cpu.flatten()[:-1]}, device={device}")
-            print(f"  Actual shape: {param_tensor_cpu.shape}, device={device}")
-            print(f"  Original DTensor values sample: {param.to_local().flatten()[:-1]}, device={device}")
-            print(f"  Original DTensor shape: {param.to_local().shape}, device={device}")
+            print(f"  Value mismatch for {param_name}, device={device}:")
+            # print(f"  Max difference: {max_diff.item():.6f}, device={device}")
+            # print(f"  Mean difference: {mean_diff.item():.6f}, device={device}")
+            # print(f"  Expected values sample: {full_tensor_cpu.flatten()[:-1]}, device={device}")
+            # print(f"  Actual values sample: {param_tensor_cpu.flatten()[:-1]}, device={device}")
+            # print(f"  Actual shape: {param_tensor_cpu.shape}, device={device}")
+            # print(f"  Original DTensor values sample: {param.to_local().flatten()[:-1]}, device={device}")
+            # print(f"  Original DTensor shape: {param.to_local().shape}, device={device}")
             
-            dist.barrier()
-            if rank == 0:
-                print("\n❌ Weight loading failed due to value mismatch!")
-            exit(1)
+            print(f"Rank {rank} - Weight loading failed due to value mismatch! \n")
+            # exit(1)
+            flag = False
+        dist.barrier()
         
     # dist.barrier()
-    if rank == 0:
-        print("\n✅ All weights matched successfully!")
+    if flag == True:
+        print(f"Rank {rank} - weights matched successfully!")
         
 def setup(rank, args):
     os.environ['MASTER_ADDR'] = 'localhost'

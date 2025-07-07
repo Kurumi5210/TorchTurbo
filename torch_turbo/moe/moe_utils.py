@@ -117,7 +117,7 @@ class MoeUtils:
     @staticmethod
     def build_model(config):
         # DEBUG
-        # config.num_hidden_layers = 1
+        config.num_hidden_layers = 1
         with torch.device("meta"):
             model = AutoModel.from_config(config)
             MoeUtils.transform_moe_layer(model, config)
@@ -227,12 +227,10 @@ class MoeUtils:
                         dtype=param.dtype,
                     )
                     # get broadcast tensor
-                    if rank < ep_world_size:
+                    if is_rank_in_mesh(0, ep):
                         dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
-                        # slice tensor
-                        full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
-                    else:
-                        full_tensor = full_tensor[:new_shape[0] // ep_world_size]
+                    # slice tensor
+                    full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
                     if "weight1" in param_name:
                         full_tensor = full_tensor.t()
                     mesh = edp
@@ -243,7 +241,7 @@ class MoeUtils:
                         dtype=param.dtype,
                     )
                     # get broadcast tensor
-                    if rank < ep_world_size:
+                    if is_rank_in_mesh(0, ep):
                         dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
                     mesh = edp
                 else:

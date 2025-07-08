@@ -1,4 +1,5 @@
 from torch_turbo.moe.megatron_utils import MegatronUtils
+from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch.distributed.device_mesh import init_device_mesh
 import torch
 import torch.distributed as dist
@@ -6,7 +7,7 @@ import torch.multiprocessing as mp
 from torch import nn
 import torch.nn.functional as F
 
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 import megatron.core.parallel_state as ps
 
@@ -54,7 +55,7 @@ def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
 
     return tensor[start:end]
 
-class MoeUtils:
+class MoeUtils:    
     @staticmethod
     def transform_moe_layer(model, hf_config):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
@@ -120,6 +121,7 @@ class MoeUtils:
         # config.num_hidden_layers = 1
         with torch.device("meta"):
             model = AutoModel.from_config(config)
+            apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
         model = model.to(dtype=config.torch_dtype)
         return model

@@ -55,7 +55,7 @@ def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
 
     return tensor[start:end]
 
-class MoeUtils:    
+class MoeUtils:
     @staticmethod
     def patch_token_dispatcher(model, hf_config, device):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
@@ -140,8 +140,8 @@ class MoeUtils:
             model = AutoModel.from_config(config)
             apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
-            MoeUtils.patch_token_dispatcher(model, config, device)
             
+        MoeUtils.patch_token_dispatcher(model, config, device)
         model = model.to(dtype=config.torch_dtype)
         return model
 

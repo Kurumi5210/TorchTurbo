@@ -57,11 +57,11 @@ def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
 
 class MoeUtils:    
     @staticmethod
-    def patch_token_dispatcher(model, hf_config):
+    def patch_token_dispatcher(model, hf_config, device):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
         for layer in model.layers:
             token_dispatcher = layer.mlp.token_dispatcher
-            token_dispatcher.permute_idx_device = torch.device("cpu")
+            token_dispatcher.permute_idx_device = device
             input_chunk_idxs = torch.arange(
                 token_dispatcher.num_experts * token_dispatcher.tp_size, device=token_dispatcher.permute_idx_device
             )
@@ -105,7 +105,7 @@ class MoeUtils:
         MoeUtils.init_mesh(args)
 
         config = AutoConfig.from_pretrained(args.path)
-        model = MoeUtils.build_model(config)
+        model = MoeUtils.build_model(config, device)
         model = MoeUtils.fsdp_wrap(model, device)
         MoeUtils.load_weights_from_hf(model, config, device, args.path)
         return model
@@ -133,14 +133,14 @@ class MoeUtils:
         EXPERT_MESH = ep_mesh
 
     @staticmethod
-    def build_model(config):
+    def build_model(config, device):
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
             model = AutoModel.from_config(config)
             apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
-            MoeUtils.patch_token_dispatcher(model, config)
+            MoeUtils.patch_token_dispatcher(model, config, device)
             
         model = model.to(dtype=config.torch_dtype)
         return model

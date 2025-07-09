@@ -38,6 +38,7 @@ def setup(rank, args):
     dist.barrier()
 
 def cleanup():
+    dist.barrier()
     dist.destroy_process_group()
 
 def run(rank, args):

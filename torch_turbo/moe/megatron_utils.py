@@ -7,7 +7,6 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.global_vars import set_args
 
-
 class MegatronUtils:
     @staticmethod
     def initialize_model_parallel(

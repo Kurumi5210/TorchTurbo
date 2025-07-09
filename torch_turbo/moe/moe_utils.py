@@ -57,6 +57,23 @@ def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
 
 class MoeUtils:    
     @staticmethod
+    def patch_token_dispatcher(model, hf_config):
+        assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
+        for layer in model.layers:
+            token_dispatcher = layer.mlp.token_dispatcher
+            token_dispatcher.permute_idx_device = torch.device("cpu")
+            input_chunk_idxs = torch.arange(
+                token_dispatcher.num_experts * token_dispatcher.tp_size, device=token_dispatcher.permute_idx_device
+            )
+            token_dispatcher.sort_input_by_local_experts = input_chunk_idxs.reshape(
+                -1, token_dispatcher.num_local_experts
+            ).T.ravel()
+            # [tp_size * ep_size, num_local_experts]. Restore the output chunks by local experts.
+            token_dispatcher.restore_output_by_local_experts = input_chunk_idxs.reshape(
+                token_dispatcher.num_local_experts, -1
+            ).T.ravel()
+        
+    @staticmethod
     def transform_moe_layer(model, hf_config):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
         for layer in model.layers:
@@ -123,6 +140,8 @@ class MoeUtils:
             model = AutoModel.from_config(config)
             apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
+            MoeUtils.patch_token_dispatcher(model, config)
+            
         model = model.to(dtype=config.torch_dtype)
         return model
 

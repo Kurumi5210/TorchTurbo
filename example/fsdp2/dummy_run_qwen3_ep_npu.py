@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader, Dataset
 import functools
 from torch.utils.data.distributed import DistributedSampler
 from collections.abc import Mapping
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.transformer.moe import grouped_gemm_util as gg
 
 def collate_sentences_lm(samples, input_name, label_name):
     if len(samples) == 0:
@@ -51,6 +53,7 @@ class BenchmarkLMDataset(Dataset):
             return {}
         length = self.max_source_positions
         source = torch.randint(1, self.vocab_size, (length,))
+        # source = torch.full((length,), 12815, dtype=torch.int)  # Use a fixed value for testing
         target = source.clone()
         return {
             "source": source,
@@ -121,6 +124,22 @@ def data_to_device(data, device, non_blocking=False):
 
     return recursively_apply(to_device, data, device, non_blocking=non_blocking)
 
+def compare_outputs(output, output_ref, rank, atol=0.0):
+    """
+    Compare two outputs and print differences if they are not close.
+    """
+    for key in output.keys():
+        if not torch.allclose(output[key][0].float(), output_ref[key][0].float(), atol=atol):
+            diff = torch.abs(output[key][0] - output_ref[key][0])
+            max_diff = torch.max(diff)
+            mean_diff = torch.mean(diff)
+            print(f"Rank {rank} - Key: {key} - Max difference: {max_diff.item():.6f}")
+            print(f"Rank {rank} - Key: {key} - Mean difference: {mean_diff.item():.6f}")
+            print(f"Rank {rank} - Key: {key} - Output shape: {output[key][0].shape}")
+            print(f"Rank {rank} - Key: {key} - Output Ref shape: {output_ref[key][0].shape}")
+            print(f"Rank {rank} - Key: {key} - Output: {output[key][0]}")
+            print(f"Rank {rank} - Key: {key} - Output Ref: {output_ref[key][0]}")
+
 def test_foward(args, model, dataloader, device, rank):
     def check_meta_tensors(module):
         for name, param in module.named_parameters():
@@ -129,47 +148,46 @@ def test_foward(args, model, dataloader, device, rank):
     dist.barrier()
     # build reference model
     config = AutoConfig.from_pretrained(args.path)
-    config.num_hidden_layers = 1
+    config.num_hidden_layers = model.config.num_hidden_layers
     ref_model = AutoModel.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
-    ref_model = ref_model.to(device)
+    ref_model = ref_model.to(device, dtype=config.torch_dtype)
+    model = model.to(dtype=config.torch_dtype)
+    
+    # store intermediate outputs
+    intermediate_outputs = {}
+    intermediate_outputs_ref = {}
+    
+    def get_hook(name, is_ref = False):
+        def generic_hook(module, input, output):
+            if is_ref == False:
+                intermediate_outputs[name] = output
+            else:
+                intermediate_outputs_ref[name] = output
+
+        return generic_hook
+
+    model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed"))
+    for i, layer in enumerate(model.layers):
+        # layer.mlp.router.register_forward_hook(get_hook(f"layer_{i}_router"))
+        layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts"))
+    ref_model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed", True))
+    for i, layer in enumerate(ref_model.layers):
+        # layer.mlp.gate.register_forward_hook(get_hook(f"layer_{i}_router", True))
+        layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts", True)) 
     
     if rank == 0:
         print(f"Reference model: {ref_model}")
-        for param_name, param in ref_model.named_parameters():
-            print(f'param_name {param_name}, param.shape {param.shape}')
         print(f"Model: {model}")
-        for param_name, param in model.named_parameters():
-            print(f'param_name {param_name}, param.shape {param.shape}')
     
-    # store attention outputs
-    attention_outputs = {}
-
-    def get_attention_hook(name):
-        def hook(module, input, output):
-            attention_outputs[name] = output
-        return hook
-
-    # register hook for each attn layer
-    for i, layer in enumerate(model.layers):
-        layer.self_attn.register_forward_hook(get_attention_hook(f"layer_{i}_attn"))
-    # register hook for reference model
-    for i, layer in enumerate(ref_model.layers):
-        layer.self_attn.register_forward_hook(get_attention_hook(f"ref_layer_{i}_attn"))
-            
     for batch in dataloader:
         batch = data_to_device(batch, device)
         output = model(**batch)
-        output = output["last_hidden_state"]
+        # output = output["last_hidden_state"]
+        intermediate_outputs["last_hidden_state"] = output["last_hidden_state"]
         output_ref = ref_model(**batch)
-        output_ref = output_ref["last_hidden_state"]
-        if rank == 0:
-            print(f"batch: {batch}")
-            print(f"attn output: {attention_outputs['layer_0_attn']}")
-            print(f"attn output ref: {attention_outputs['ref_layer_0_attn']}")
-            if not torch.allclose(output.float(), output_ref.float(), atol=0.0):
-                print(f"Rank {rank} - value mismatch! \n")
-                print(f"Rank {rank} - Output: {output}")
-                print(f"Rank {rank} - Output Ref: {output_ref}")
+        # output_ref = output_ref["last_hidden_state"]
+        intermediate_outputs_ref["last_hidden_state"] = output_ref["last_hidden_state"]
+        compare_outputs(intermediate_outputs, intermediate_outputs_ref, rank, atol=0.0)
 
 def setup(rank, args):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -197,7 +215,7 @@ def run(rank, args):
     dp_size = world_size
     total_batch_size = batch_size_per_gpu * dp_size
     total_data_size = max_train_step * total_batch_size
-    seq_len = 1
+    seq_len = 200
     use_distributed_dataloader = True
     
     if use_distributed_dataloader:

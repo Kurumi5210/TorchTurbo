@@ -1,5 +1,6 @@
 from megatron.core import parallel_state, tensor_parallel
 import torch
+import os
 
 def moe_forward(self, hidden_states: torch.Tensor):
     if (
@@ -12,9 +13,12 @@ def moe_forward(self, hidden_states: torch.Tensor):
             "are enabled without also enabling sequence parallelism."
         )
 
+    # debug
+    rank = torch.distributed.get_rank()
     # process MoE
     def custom_forward(hidden_states):
         probs, routing_map, logits = self.router(hidden_states)
+        probs /= probs.sum(dim=-1, keepdim=True)
         logits = logits.view(-1, logits.shape[-1])
         (dispatched_input, tokens_per_expert, permuted_probs) = (
             self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
@@ -22,13 +26,22 @@ def moe_forward(self, hidden_states: torch.Tensor):
         expert_output, mlp_bias = self.experts(
             dispatched_input, tokens_per_expert, permuted_probs
         )
+        expert_output = expert_output * permuted_probs.unsqueeze(-1)
         output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
         if self.use_shared_expert and not self.shared_expert_overlap:
             # if shared_expert_overlap is True, the expert calculation happens in
             # the token_dispatcher to overlap communications and computations
             output = output + self.shared_experts(hidden_states)
+        
+        if rank == 0 and os.environ.get('TORCH_TURBO_DEBUG', False):
+            print(f"hidden_states.shape {hidden_states.shape} hidden_states {hidden_states}")
+            print(f"dispatched_input.shape {dispatched_input.shape} dispatched_input {dispatched_input}")
+            print(f"tokens_per_expert.shape {tokens_per_expert.shape} tokens_per_expert {tokens_per_expert}")
+            print(f"permuted_probs.shape {permuted_probs.shape} permuted_probs {permuted_probs}")
+            print(f"before unpermutation: expert_output.shape {expert_output.shape} expert_output {expert_output}")
+            print(f"after unpermutation: expert_output.shape {output.shape} expert_output {output}")
+            
         return output, mlp_bias, logits
-
     if self.moe_layer_recompute:
         output, mlp_bias, logits = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
     else:

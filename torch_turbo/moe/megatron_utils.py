@@ -6,6 +6,9 @@ import megatron.core.parallel_state as ps
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.global_vars import set_args
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+import torch
 
 class MegatronUtils:
     @staticmethod
@@ -42,6 +45,9 @@ class MegatronUtils:
             use_cpu_initialization=True,
             fp8=None,
             add_bias_linear=False,
+            moe_router_pre_softmax=True,
+            activation_func=F.silu,
+            moe_router_load_balancing_type="none",
         )
         default_config_kwargs.update(**config_kwargs)
         set_args(SimpleNamespace(**default_config_kwargs))
@@ -53,5 +59,20 @@ class MegatronUtils:
             moe_use_legacy_grouped_gemm=True,
         )
         grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
+        
+        def qwen3_moe_transform_w1(model):
+            if tf_config.gated_linear_unit:
+                intermidiate_size = tf_config.moe_ffn_hidden_size * 2
+            else:
+                intermidiate_size = tf_config.moe_ffn_hidden_size
+            model.experts.weight1 = Parameter(
+                torch.empty(
+                    num_local_experts * config.hidden_size,
+                    intermidiate_size,
+                    dtype=config.torch_dtype,
+                )
+            )
+        
+        qwen3_moe_transform_w1(grouped_mlp)
 
         return grouped_mlp

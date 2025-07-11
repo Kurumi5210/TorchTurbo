@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 import megatron.core.parallel_state as ps
+from megatron.core.jit import jit_fuser
 
 # TODO, torch 2.5 and torch 2.6 package name is not the same
 from torch.distributed._tensor import (
@@ -57,9 +58,10 @@ def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
 
 class MoeUtils:
     @staticmethod
-    def patch_token_dispatcher(model, hf_config, device):
+    def patch_moe_layer(model, hf_config, device):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
         for layer in model.layers:
+            # patch token_dispatcher
             token_dispatcher = layer.mlp.token_dispatcher
             token_dispatcher.permute_idx_device = device
             input_chunk_idxs = torch.arange(
@@ -72,6 +74,19 @@ class MoeUtils:
             token_dispatcher.restore_output_by_local_experts = input_chunk_idxs.reshape(
                 token_dispatcher.num_local_experts, -1
             ).T.ravel()
+            
+            # patch grouped mlp
+            @jit_fuser
+            def glu(x, probs):
+                x = torch.chunk(x, 2, dim=-1)
+                return layer.mlp.experts.config.activation_func(x[0]) * x[1]
+            layer.mlp.experts.activation_func_with_probs = glu
+        
+        # patch rotary embedding
+        rotary_emb = model.rotary_emb
+        inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
+        rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+
         
     @staticmethod
     def transform_moe_layer(model, hf_config):
@@ -105,8 +120,9 @@ class MoeUtils:
         MoeUtils.init_mesh(args)
 
         config = AutoConfig.from_pretrained(args.path)
-        model = MoeUtils.build_model(config, device)
+        model = MoeUtils.build_model(config)
         model = MoeUtils.fsdp_wrap(model, device)
+        MoeUtils.patch_moe_layer(model, config, device)
         MoeUtils.load_weights_from_hf(model, config, device, args.path)
         return model
 
@@ -133,7 +149,7 @@ class MoeUtils:
         EXPERT_MESH = ep_mesh
 
     @staticmethod
-    def build_model(config, device):
+    def build_model(config):
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
@@ -141,7 +157,6 @@ class MoeUtils:
             apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
             
-        MoeUtils.patch_token_dispatcher(model, config, device)
         model = model.to(dtype=config.torch_dtype)
         return model
 
@@ -209,6 +224,8 @@ class MoeUtils:
                             fc1 = torch.cat([sd[gate_proj], sd[up_proj]])
                             w1.append(fc1)
                         full_tensor = torch.stack(w1, dim=0).to(device)
+                        # [e, 2 * i, h] -> [e, h, 2 * i]
+                        full_tensor = full_tensor.permute(0, 2, 1)
                     else:
                         # weight2
                         w2 = []
@@ -222,8 +239,6 @@ class MoeUtils:
 
                     # each ep slice its part
                     full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
-                    if "weight1" in param_name:
-                        full_tensor = full_tensor.t()
                     mesh = edp
                 elif "mlp.router" in param_name:
                     new_name = param_name.replace("router", "gate")
@@ -238,10 +253,7 @@ class MoeUtils:
                     mesh = WORLD_MESH
             else:
                 if "mlp.experts" in param_name:
-                    if "weight1" in param_name:
-                        new_shape = (param.shape[1] * ep_world_size, param.shape[0])
-                    else:
-                        new_shape = (param.shape[0] * ep_world_size, param.shape[1])
+                    new_shape = (param.shape[0] * ep_world_size, param.shape[1])
                     full_tensor = torch.empty(
                         new_shape,
                         device=device,
@@ -252,8 +264,6 @@ class MoeUtils:
                         dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
                     # slice tensor
                     full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
-                    if "weight1" in param_name:
-                        full_tensor = full_tensor.t()
                     mesh = edp
                 elif "mlp.router" in param_name:
                     full_tensor = torch.empty(

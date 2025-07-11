@@ -24,6 +24,7 @@ from torch.distributed.fsdp import fully_shard
 
 WORLD_MESH = None
 EXPERT_MESH = None
+FIRST_RANK = 0
 
 def load_safetensors_dir(model_dir: str) -> dict:
     from pathlib import Path
@@ -55,6 +56,18 @@ def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
     end = start + chunk_size
 
     return tensor[start:end]
+
+def all_gather_tensor(local_tensor, ep_name="ep"):
+    """ gather expert tensors
+    """
+    group = EXPERT_MESH[ep_name].get_group(0)
+    ep_world_size = dist.get_world_size(group=group)
+    output_shape = list(local_tensor.shape)
+    output_shape[0] = output_shape[0] * ep_world_size
+    output = torch.empty(output_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+    dist.all_gather_into_tensor(output, local_tensor, group=group)
+
+    return output
 
 class MoeUtils:
     @staticmethod
@@ -161,6 +174,14 @@ class MoeUtils:
         return model
 
     @staticmethod
+    def build_model_from_config(args):
+        # DEBUG
+        config = AutoConfig.from_pretrained(args.path)
+        config.num_hidden_layers = 1
+        model = AutoModel.from_config(config)
+        return model
+
+    @staticmethod
     def fsdp_wrap(model, device):
         for layer in model.layers:
             # wrap moe mlp in edp
@@ -201,7 +222,7 @@ class MoeUtils:
     def load_weights_from_hf(model, config, device, path):
         rank = torch.distributed.get_rank()
         # only load state dict from rank 0, and broadcast to alll other ranks according device mesh
-        if rank == 0:
+        if rank == FIRST_RANK:
             sd = load_safetensors_dir(path)
         torch.distributed.barrier()
 
@@ -213,7 +234,7 @@ class MoeUtils:
         
         sharded_sd = {}
         for param_name, param in model.named_parameters():
-            if rank == 0:
+            if rank == FIRST_RANK:
                 if "mlp.experts" in param_name:
                     prefix = param_name[:-8]
                     if "weight1" in param_name:
@@ -235,7 +256,7 @@ class MoeUtils:
                         full_tensor = torch.stack(w2, dim=0).to(device)
                     # broadcast to ep_group
                     full_tensor = full_tensor.reshape(-1, full_tensor.shape[-1])
-                    dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
+                    dist.broadcast(full_tensor, src=rank, group=ep.get_group(0))
 
                     # each ep slice its part
                     full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
@@ -245,7 +266,7 @@ class MoeUtils:
                     hf_name = f"model.{new_name}"
                     full_tensor = sd[hf_name].to(device)
                     # broadcast to ep_group
-                    dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
+                    dist.broadcast(full_tensor, src=rank, group=ep.get_group(0))
                     mesh = edp
                 else:
                     hf_name = f"model.{param_name}"
@@ -260,8 +281,8 @@ class MoeUtils:
                         dtype=param.dtype,
                     )
                     # get broadcast tensor
-                    if is_rank_in_mesh(0, ep):
-                        dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
+                    if is_rank_in_mesh(FIRST_RANK, ep):
+                        dist.broadcast(full_tensor, src=FIRST_RANK, group=ep.get_group(0))
                     # slice tensor
                     full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
                     mesh = edp
@@ -272,8 +293,8 @@ class MoeUtils:
                         dtype=param.dtype,
                     )
                     # get broadcast tensor
-                    if is_rank_in_mesh(0, ep):
-                        dist.broadcast(full_tensor, src=0, group=ep.get_group(0))
+                    if is_rank_in_mesh(FIRST_RANK, ep):
+                        dist.broadcast(full_tensor, src=FIRST_RANK, group=ep.get_group(0))
                     mesh = edp
                 else:
                     full_tensor = torch.empty(
@@ -288,3 +309,37 @@ class MoeUtils:
         model.load_state_dict(sharded_sd, assign=True)
         for param in model.parameters():
             assert isinstance(param, DTensor), "must be"
+
+    @staticmethod
+    def per_tensor_generate(model):
+        """ per-tensor generator
+        """
+        for name, param in model.named_parameters():
+            if "mlp.experts" in name:
+                prefix = name[:-8]
+                num_experts = model.config.num_experts
+                full_tensor = param.full_tensor()
+                if "weight1" in name:
+                    full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+                    experts = torch.split(full_tensor, model.config.hidden_size)
+                    for i in range(num_experts):
+                        gate_proj = f"model.{prefix}.{i}.gate_proj.weight"
+                        up_proj = f"model.{prefix}.{i}.up_proj.weight"
+                        expert2 = torch.split(experts[i].t(), model.config.moe_intermediate_size)
+                        yield from zip([gate_proj], [expert2[0]])
+                        yield from zip([up_proj], [expert2[1]])
+                else:
+                    # weight2
+                    full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+                    experts = torch.split(full_tensor, model.config.moe_intermediate_size)
+                    for i in range(num_experts):
+                        down_proj = f"model.{prefix}.{i}.down_proj.weight"
+                        yield from zip([down_proj], [experts[i].t()])
+
+            elif "mlp.router" in name:
+                new_name = name.replace("router", "gate")
+                hf_name = f"model.{new_name}"
+                yield from zip([hf_name], [param])
+            else:
+                hf_name = f"model.{name}"
+                yield from zip([hf_name], [param])

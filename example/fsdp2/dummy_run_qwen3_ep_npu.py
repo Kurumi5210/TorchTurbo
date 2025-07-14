@@ -11,13 +11,14 @@ import torch_npu
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from torch_turbo.moe.megatron_utils import MegatronUtils
-from torch_turbo.moe.moe_utils import MoeUtils
+from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
 from torch.utils.data import DataLoader, Dataset
 import functools
 from torch.utils.data.distributed import DistributedSampler
 from collections.abc import Mapping
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.moe import grouped_gemm_util as gg
+import megatron.core.parallel_state as ps
 
 def collate_sentences_lm(samples, input_name, label_name):
     if len(samples) == 0:
@@ -124,22 +125,20 @@ def data_to_device(data, device, non_blocking=False):
 
     return recursively_apply(to_device, data, device, non_blocking=non_blocking)
 
-def compare_outputs(output, output_ref, rank, atol=0.0):
-    """
-    Compare two outputs and print differences if they are not close.
-    """
-    for key in output.keys():
-        if not torch.allclose(output[key][0].float(), output_ref[key][0].float(), atol=atol):
-            diff = torch.abs(output[key][0] - output_ref[key][0])
-            max_diff = torch.max(diff)
-            mean_diff = torch.mean(diff)
-            print(f"Rank {rank} - Key: {key} - Max difference: {max_diff.item():.6f}")
-            print(f"Rank {rank} - Key: {key} - Mean difference: {mean_diff.item():.6f}")
-            print(f"Rank {rank} - Key: {key} - Output shape: {output[key][0].shape}")
-            print(f"Rank {rank} - Key: {key} - Output Ref shape: {output_ref[key][0].shape}")
-            print(f"Rank {rank} - Key: {key} - Output: {output[key][0]}")
-            print(f"Rank {rank} - Key: {key} - Output Ref: {output_ref[key][0]}")
-
+def compare_tensors(key, custom, ref, rank, atol=1e-5):
+    if rank != 0:
+        return
+    if not torch.allclose(custom.float(), ref.float(), atol=atol):
+        diff = torch.abs(custom - ref)
+        max_diff = torch.max(diff)
+        mean_diff = torch.mean(diff)
+        print(f"Rank {rank} - Key: {key} - Max difference: {max_diff.item():.6f}")
+        print(f"Rank {rank} - Key: {key} - Mean difference: {mean_diff.item():.6f}")
+        print(f"Rank {rank} - Key: {key} - Custom shape: {custom.shape}")
+        print(f"Rank {rank} - Key: {key} - Ref shape: {ref.shape}")
+        print(f"Rank {rank} - Key: {key} - Custom value: {custom}")
+        print(f"Rank {rank} - Key: {key} - Ref value: {ref}")
+        
 def test_foward(args, model, dataloader, device, rank):
     def check_meta_tensors(module):
         for name, param in module.named_parameters():
@@ -187,7 +186,176 @@ def test_foward(args, model, dataloader, device, rank):
         output_ref = ref_model(**batch)
         # output_ref = output_ref["last_hidden_state"]
         intermediate_outputs_ref["last_hidden_state"] = output_ref["last_hidden_state"]
-        compare_outputs(intermediate_outputs, intermediate_outputs_ref, rank, atol=0.0)
+        for key in intermediate_outputs.keys():
+            compare_tensors(key, intermediate_outputs[key][0], intermediate_outputs_ref[key][0], rank)
+        
+def test_backward(args, model, dataloader, device, rank, prof=None):
+    from torch.distributed.tensor.experimental import implicit_replication
+    from torch.distributed.fsdp import fully_shard
+    ep_rank = ps.get_expert_model_parallel_rank()
+    ep_world_size = ps.get_expert_model_parallel_world_size()
+    lr = 1e-2
+    betas = (0.9, 0.999)
+    weight_decay = 0.0
+    params = []
+    moe_params = []
+    for param in model.parameters():
+        assert len(param.device_mesh.shape) == 1
+        if param.device_mesh == MoeUtils.get_world_mesh():
+            params.append(param)
+        elif param.device_mesh != MoeUtils.get_world_mesh():
+            moe_params.append(param)
+    
+    # moe_betas = (1 - (1 - betas[0]) / ep_world_size, 1 - (1 - betas[1]) / ep_world_size**2)
+    # optimizer = torch.optim.AdamW([{"params": params, "betas": betas}, {"params": moe_params, "betas": moe_betas}],
+    #     lr=lr,
+    #     weight_decay=weight_decay,
+    # )
+    optimizer = torch.optim.AdamW([{"params": params}, {"params": moe_params}],
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+    )
+    
+    # build reference model
+    config = AutoConfig.from_pretrained(args.path)
+    config.num_hidden_layers = model.config.num_hidden_layers
+    ref_model = AutoModel.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
+    ref_model = ref_model.to(device, dtype=config.torch_dtype)
+    for layer in ref_model.layers:
+        # wrap moe mlp in edp
+        fully_shard(layer.mlp, mesh = MoeUtils.get_world_mesh())
+        # wrap other parts in dp
+        fully_shard(layer, mesh = MoeUtils.get_world_mesh())
+    # wrap remaining parts
+    fully_shard(ref_model, mesh = MoeUtils.get_world_mesh())
+    ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+    
+    model = model.to(dtype=config.torch_dtype)
+    criterion = nn.MSELoss()
+    
+    def get_params_and_grads(model):
+        params = {}
+        grads = {}
+        dist.barrier()
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grads[name] = param.grad.full_tensor().detach().clone()
+                params[name] = param.full_tensor().detach().clone()
+                
+        return params, grads
+    
+    for batch in dataloader:
+        batch = data_to_device(batch, device)
+        output = model(**batch)
+        # generate random tensor in [-1, 1]
+        min_val, max_val = -1.0, 1.0
+        labels = (max_val - min_val) * torch.rand(size=output["last_hidden_state"].shape, device=device, dtype=config.torch_dtype) + min_val
+        loss = criterion(output["last_hidden_state"], labels)
+        optimizer.zero_grad()
+        loss.backward()
+        MoeUtils.scale_moe_gradient(args, moe_params)
+        optimizer.step()
+        params, grads = get_params_and_grads(model)
+        
+        # ref model backward
+        ref_output = ref_model(**batch)
+        ref_loss = criterion(ref_output["last_hidden_state"], labels)
+        ref_optimizer.zero_grad()
+        ref_loss.backward()
+        ref_optimizer.step()
+        ref_params, ref_grads = get_params_and_grads(ref_model)
+        if prof is not None and rank == 0:
+            prof.step()
+        if rank < ep_world_size:
+            for name in params.keys():
+                if "mlp.experts" in name:
+                    prefix = name[:-8]
+                    if "weight1" in name:
+                        w1 = []
+                        grad = []
+                        for i in range(config.num_experts):
+                            gate_proj = f"{prefix}.{i}.gate_proj.weight"
+                            up_proj = f"{prefix}.{i}.up_proj.weight"
+                            fc1 = torch.cat([ref_params[gate_proj], ref_params[up_proj]])
+                            fc1_grad = torch.cat([ref_grads[gate_proj], ref_grads[up_proj]])
+                            w1.append(fc1)
+                            grad.append(fc1_grad)
+                        w1 = torch.stack(w1, dim=0).to(device)
+                        grad = torch.stack(grad, dim=0).to(device)
+                        # [e, 2 * i, h] -> [e, h, 2 * i]
+                        experts = w1.permute(0, 2, 1)
+                        grad = grad.permute(0, 2, 1)
+                    else:
+                        # weight2
+                        w2 = []
+                        grad = []
+                        for i in range(config.num_experts):
+                            down_proj = f"{prefix}.{i}.down_proj.weight"
+                            w2.append(ref_params[down_proj].t())
+                            grad.append(ref_grads[down_proj].t())
+                        experts = torch.stack(w2, dim=0).to(device)
+                        grad = torch.stack(grad, dim=0).to(device)
+                    experts = experts.reshape(-1, experts.shape[-1])
+                    grad = grad.reshape(-1, grad.shape[-1])
+                    experts = slice_tensor_for_ep_rank(experts, ep_rank, ep_world_size)
+                    grad = slice_tensor_for_ep_rank(grad, ep_rank, ep_world_size)
+                    compare_tensors(name, params[name], experts, rank)
+                    compare_tensors(name + "_grad", grads[name], grad, rank)
+                elif "mlp.router" in name:
+                    new_name = name.replace("router", "gate")
+                    compare_tensors(name, params[name], ref_params[new_name], rank)
+                    compare_tensors(name + "_grad", grads[name], ref_grads[new_name], rank)
+                else:
+                    compare_tensors(name, params[name], ref_params[name], rank)
+                    compare_tensors(name + "_grad", grads[name], ref_grads[name], rank)
+
+    if rank == 0:
+        print("-" * 30)
+        print(" " * 10 + "TEST DONE")
+
+def train(args, model, dataloader, device, rank):
+    dist.barrier()
+
+    if rank == 0:
+        print(f"Model: {model}")
+
+    lr = 1e-5
+    betas = (0.9, 0.999)
+    weight_decay = 1e-2
+    params = []
+    moe_params = []
+    for param in model.parameters():
+        if param.device_mesh == MoeUtils.get_world_mesh():
+            params.append(param)
+        elif param.device_mesh != MoeUtils.get_world_mesh():
+            moe_params.append(param)
+
+    optimizer = torch.optim.AdamW([{"params": params}, {"params": moe_params}],
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+    )
+
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+
+    import time
+
+    i = 0
+    for batch in dataloader:
+        start_time = time.time()
+        optimizer.zero_grad()
+        batch = data_to_device(batch, device)
+        output = model(**batch)
+        output = output["last_hidden_state"]
+        output.sum().backward()
+        optimizer.step()
+        cur_time = time.time()
+        print(f'--->step {i}, time {cur_time - start_time}s')
+        i += 1
+        #prof.step()
+    #prof.stop()
+    print(f'train done')    
 
 def setup(rank, args):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -201,6 +369,7 @@ def setup(rank, args):
     dist.barrier()
 
 def cleanup():
+    dist.barrier()
     dist.destroy_process_group()
 
 def run(rank, args):
@@ -224,8 +393,32 @@ def run(rank, args):
         data_size = total_data_size // dp_size
     dataset = get_dataset(seq_length=seq_len, data_size=data_size)
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
-    test_foward(args, model, dataloader, device, rank)
+    # test_foward(args, model, dataloader, device, rank)
+    import torch_npu
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization, profiler_level=torch_npu.profiler.ProfilerLevel.Level1, l2_cache=False
+    )
+    
+    if args.profiling:
+        with torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU
+            ],
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/tmp/profile"),
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True,
+            with_flops=False,
+            with_modules=False,
+            experimental_config=experimental_config
+        ) as prof:
+            test_backward(args, model, dataloader, device, rank, prof)
+    else:
+        test_backward(args, model, dataloader, device, rank)
 
+    # train(args, model, dataloader, device, rank)
     cleanup()
 
 
@@ -243,6 +436,8 @@ if __name__ == "__main__":
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--ep_size", type=int, default=4)
     parser.add_argument("--path", type=str)
+    parser.add_argument("--profiling", default=False, action="store_true")
+    parser.add_argument("--average_in_collective", default=False, action="store_true")
     args = parser.parse_args()
 
     main(args)

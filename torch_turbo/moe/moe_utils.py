@@ -100,6 +100,17 @@ class MoeUtils:
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
         rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
+    @staticmethod
+    def scale_moe_gradient(args, params):
+        ep_world_size = ps.get_expert_model_parallel_world_size()
+        if args.average_in_collective:
+            gradient_scaling_factor = 1 / ep_world_size
+        else:
+            gradient_scaling_factor = 1.0
+            
+        for param in params:
+            assert param.device_mesh == MoeUtils.get_edp_mesh()
+            param.grad.data *= gradient_scaling_factor
         
     @staticmethod
     def transform_moe_layer(model, hf_config):
@@ -185,7 +196,7 @@ class MoeUtils:
     def fsdp_wrap(model, device):
         for layer in model.layers:
             # wrap moe mlp in edp
-            fully_shard(layer.mlp, mesh = MoeUtils.get_edp_mesh())
+            fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh())
             # wrap other parts in dp
             fully_shard(layer, mesh = MoeUtils.get_world_mesh())
         # wrap remaining parts
@@ -265,9 +276,7 @@ class MoeUtils:
                     new_name = param_name.replace("router", "gate")
                     hf_name = f"model.{new_name}"
                     full_tensor = sd[hf_name].to(device)
-                    # broadcast to ep_group
-                    dist.broadcast(full_tensor, src=rank, group=ep.get_group(0))
-                    mesh = edp
+                    mesh = WORLD_MESH
                 else:
                     hf_name = f"model.{param_name}"
                     full_tensor = sd[hf_name].to(device)
@@ -285,16 +294,6 @@ class MoeUtils:
                         dist.broadcast(full_tensor, src=FIRST_RANK, group=ep.get_group(0))
                     # slice tensor
                     full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
-                    mesh = edp
-                elif "mlp.router" in param_name:
-                    full_tensor = torch.empty(
-                        param.size(),
-                        device=device,
-                        dtype=param.dtype,
-                    )
-                    # get broadcast tensor
-                    if is_rank_in_mesh(FIRST_RANK, ep):
-                        dist.broadcast(full_tensor, src=FIRST_RANK, group=ep.get_group(0))
                     mesh = edp
                 else:
                     full_tensor = torch.empty(

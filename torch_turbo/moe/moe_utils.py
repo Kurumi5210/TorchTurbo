@@ -1,3 +1,4 @@
+from typing import Any
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch.distributed.device_mesh import init_device_mesh
@@ -21,6 +22,9 @@ from torch.distributed._tensor import (
     Shard,
 )
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
 
 WORLD_MESH = None
 EXPERT_MESH = None
@@ -68,6 +72,63 @@ def all_gather_tensor(local_tensor, ep_name="ep"):
     dist.all_gather_into_tensor(output, local_tensor, group=group)
 
     return output
+
+# BackwardPrefetchContext is designed to switch prefetch logic between forward & backward.
+#   During forward, prefetch next layer
+#   During backward, prefetch previous layer
+class BackwardPrefetchContext:
+    def __init__(self):
+        self.working = False
+
+        def pre_forward_hook(state, module, args, kwargs):
+            prefetch_list = None
+            if self.working and getattr(module, "expert_forward_prefetch", False):
+                prefetch_list = state._states_to_forward_prefetch
+                backward_prefetch_states = getattr(module, "backward_prefetch_states", [])
+                state._states_to_forward_prefetch = backward_prefetch_states
+
+            res = self.old_pre_forward(state, module, args, kwargs)
+
+            if prefetch_list is not None:
+                state._states_to_forward_prefetch = prefetch_list
+
+            return res
+
+        self.old_pre_forward = FSDPState._pre_forward
+        FSDPState._pre_forward = pre_forward_hook
+
+
+        def post_forward_hook(state, module: nn.Module, input: Any, output: Any):
+            old_mesh_info = None
+            if self.working and (getattr(module, "moe_forward_prefetch", False) or getattr(module, "expert_forward_prefetch", False)):
+                old_mesh_info = state._fsdp_param_group.post_forward_mesh_info
+                state._fsdp_param_group.post_forward_mesh_info = None
+
+            res = self.old_post_forward(state, module, input, output)
+
+            if old_mesh_info != None:
+                state._fsdp_param_group.post_forward_mesh_info = old_mesh_info
+
+            return res
+
+        self.old_post_forward = FSDPState._post_forward
+        FSDPState._post_forward = post_forward_hook
+
+        def backward_prefetch_hook(group):
+            return
+
+        self.old_backward_prefetch = FSDPParamGroup._backward_prefetch
+        FSDPParamGroup._backward_prefetch = backward_prefetch_hook
+
+
+    def __enter__(self):
+        self.working = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.working = False
+
+fsdp2_backward_prefetch_manager = BackwardPrefetchContext()
 
 class MoeUtils:
     @staticmethod
@@ -192,15 +253,79 @@ class MoeUtils:
         model = AutoModel.from_config(config)
         return model
 
+
+    # copied from atorch, may be further optimized
+    @staticmethod
+    def set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, outer_cls, inter_cls, outermost_cls):
+        try:
+            from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+        except (ImportError, ModuleNotFoundError):
+            from torch.distributed.fsdp._fully_shard import FSDPModule
+
+        if not isinstance(fsdp2_model, list):
+            fsdp2_model = [fsdp2_model]
+
+        for single_fsdp2_model in fsdp2_model:
+            outer_modules = []
+            names1 = []
+            inter_modules = []
+            names2 = []
+            outermost_modules = []
+            names3 = []
+
+            for name, named_module in single_fsdp2_model.named_modules():
+                if isinstance(named_module, FSDPModule) and isinstance(named_module, outer_cls):
+                    outer_modules.append(named_module)
+                    names1.append(name)
+
+                if isinstance(named_module, FSDPModule) and isinstance(named_module, inter_cls):
+                    inter_modules.append(named_module)
+                    names2.append(name)
+
+                if isinstance(named_module, FSDPModule) and isinstance(named_module, outermost_cls):
+                    outermost_modules.append(named_module)
+                    names3.append(name)
+
+            assert len(outermost_modules) == 1
+            assert len(inter_modules) == len(outer_modules)
+            prefetch_modules = outermost_modules + inter_modules
+
+            for i in range(len(outer_modules)):
+                module1 = prefetch_modules[i]
+                module2 = outer_modules[i]
+                module1.set_modules_to_forward_prefetch([module2])
+                if i > 1:
+                    backward_prefetch_states = [outer_modules[i - 2]._get_fsdp_state()]
+                    setattr(module1, 'backward_prefetch_states', backward_prefetch_states)
+
+                if i == len(outer_modules) - 1:
+                    # the last stage
+                    module1 = prefetch_modules[i + 1] # ep47
+                    module2 = outer_modules[i - 1] # l46
+                    backward_prefetch_states = [module2._get_fsdp_state()]
+                    setattr(module1, 'backward_prefetch_states', backward_prefetch_states)
+
+            for i in range(len(outer_modules)):
+                module1 = outer_modules[i]
+                module2 = inter_modules[i]
+                module1.set_modules_to_forward_prefetch([module2])
+
     @staticmethod
     def fsdp_wrap(model, device):
+        outer_cls = model.layers[0].__class__
+        inter_cls = model.layers[0].mlp.experts.__class__
+        outermost_cls = model.__class__
         for layer in model.layers:
             # wrap moe mlp in edp
             fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh())
+            setattr(layer.mlp.experts, "expert_forward_prefetch", True)
             # wrap other parts in dp
             fully_shard(layer, mesh = MoeUtils.get_world_mesh())
+            setattr(layer, "moe_forward_prefetch", True)
         # wrap remaining parts
         fully_shard(model, mesh = MoeUtils.get_world_mesh())
+
+        MoeUtils.set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls)
         model.to_empty(device=device)
         return model
 

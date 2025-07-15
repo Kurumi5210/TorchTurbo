@@ -11,7 +11,7 @@ import torch_npu
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from torch_turbo.moe.megatron_utils import MegatronUtils
-from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
+from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank, fsdp2_backward_prefetch_manager
 from torch.utils.data import DataLoader, Dataset
 import functools
 from torch.utils.data.distributed import DistributedSampler
@@ -339,6 +339,11 @@ def train(args, model, dataloader, device, rank):
 
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
 
+    if args.profiling:
+        from torch_turbo.utils.npu_utls import get_profiler
+        prof = get_profiler()
+        prof.start()
+
     import time
 
     i = 0
@@ -348,13 +353,19 @@ def train(args, model, dataloader, device, rank):
         batch = data_to_device(batch, device)
         output = model(**batch)
         output = output["last_hidden_state"]
-        output.sum().backward()
+
+        with fsdp2_backward_prefetch_manager:
+            output.sum().backward()
+
+        MoeUtils.scale_moe_gradient(args, moe_params)
         optimizer.step()
+        if args.profiling:
+            prof.step()
         cur_time = time.time()
         print(f'--->step {i}, time {cur_time - start_time}s')
         i += 1
-        #prof.step()
-    #prof.stop()
+    if args.profiling:
+        prof.stop()
     print(f'train done')    
 
 def setup(rank, args):
@@ -380,11 +391,11 @@ def run(rank, args):
     model = MoeUtils.create_fsdp2_moe_model(args, device)
     dist.barrier()
     batch_size_per_gpu = 1
-    max_train_step = 1
+    max_train_step = 10
     dp_size = world_size
     total_batch_size = batch_size_per_gpu * dp_size
     total_data_size = max_train_step * total_batch_size
-    seq_len = 200
+    seq_len = 2048 * 4
     use_distributed_dataloader = True
     
     if use_distributed_dataloader:
@@ -393,32 +404,8 @@ def run(rank, args):
         data_size = total_data_size // dp_size
     dataset = get_dataset(seq_length=seq_len, data_size=data_size)
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
-    # test_foward(args, model, dataloader, device, rank)
-    import torch_npu
-    experimental_config = torch_npu.profiler._ExperimentalConfig(
-        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization, profiler_level=torch_npu.profiler.ProfilerLevel.Level1, l2_cache=False
-    )
-    
-    if args.profiling:
-        with torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU
-            ],
-            schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("/tmp/profile"),
-            record_shapes=True,
-            profile_memory=False,
-            with_stack=True,
-            with_flops=False,
-            with_modules=False,
-            experimental_config=experimental_config
-        ) as prof:
-            test_backward(args, model, dataloader, device, rank, prof)
-    else:
-        test_backward(args, model, dataloader, device, rank)
 
-    # train(args, model, dataloader, device, rank)
+    train(args, model, dataloader, device, rank)
     cleanup()
 
 
@@ -437,7 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--ep_size", type=int, default=4)
     parser.add_argument("--path", type=str)
     parser.add_argument("--profiling", default=False, action="store_true")
-    parser.add_argument("--average_in_collective", default=False, action="store_true")
+    parser.add_argument("--average_in_collective", default=True, action="store_true")
     args = parser.parse_args()
 
     main(args)

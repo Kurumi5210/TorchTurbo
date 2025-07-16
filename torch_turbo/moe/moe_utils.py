@@ -29,6 +29,7 @@ from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 WORLD_MESH = None
 EXPERT_MESH = None
 FIRST_RANK = 0
+_GRADIENT_SCALING_FACTOR = 1.0
 
 def load_safetensors_dir(model_dir: str) -> dict:
     from pathlib import Path
@@ -161,17 +162,10 @@ class MoeUtils:
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
         rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    @staticmethod
-    def scale_moe_gradient(args, params):
-        ep_world_size = ps.get_expert_model_parallel_world_size()
-        if args.average_in_collective:
-            gradient_scaling_factor = 1 / ep_world_size
-        else:
-            gradient_scaling_factor = 1.0
-            
-        for param in params:
-            assert param.device_mesh == MoeUtils.get_edp_mesh()
-            param.grad.data *= gradient_scaling_factor
+    def scale_moe_gradient(params):
+        assert params[0].device_mesh == MoeUtils.get_edp_mesh()
+        grads = [p.grad for p in params]
+        torch._foreach_mul_(grads, _GRADIENT_SCALING_FACTOR)
         
     @staticmethod
     def transform_moe_layer(model, hf_config):
@@ -217,6 +211,7 @@ class MoeUtils:
         world_size = args.world_size
         world_mesh = init_device_mesh("npu", (world_size,))
         ep_mesh = init_device_mesh("npu", (world_size // args.ep_size, args.ep_size), mesh_dim_names=("edp", "ep"))
+        gradient_scaling_factor = (1 / args.ep_size) if args.average_in_collective else 1.0
 
         def is_same_group(process_group, device_mesh):
             mesh_group = device_mesh.get_group(0)
@@ -232,6 +227,8 @@ class MoeUtils:
         WORLD_MESH = world_mesh
         global EXPERT_MESH
         EXPERT_MESH = ep_mesh
+        global _GRADIENT_SCALING_FACTOR
+        _GRADIENT_SCALING_FACTOR = gradient_scaling_factor
 
     @staticmethod
     def build_model(config):

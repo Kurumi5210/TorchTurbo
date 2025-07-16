@@ -254,7 +254,7 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         loss = criterion(output["last_hidden_state"], labels)
         optimizer.zero_grad()
         loss.backward()
-        MoeUtils.scale_moe_gradient(args, moe_params)
+        MoeUtils.scale_moe_gradient(moe_params)
         optimizer.step()
         params, grads = get_params_and_grads(model)
         
@@ -357,7 +357,7 @@ def train(args, model, dataloader, device, rank):
         with fsdp2_backward_prefetch_manager:
             output.sum().backward()
 
-        MoeUtils.scale_moe_gradient(args, moe_params)
+        MoeUtils.scale_moe_gradient(moe_params)
         optimizer.step()
         if args.profiling:
             prof.step()
@@ -404,7 +404,7 @@ def run(rank, args):
         data_size = total_data_size // dp_size
     dataset = get_dataset(seq_length=seq_len, data_size=data_size)
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
-
+    
     train(args, model, dataloader, device, rank)
     cleanup()
 

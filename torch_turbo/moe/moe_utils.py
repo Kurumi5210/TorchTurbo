@@ -24,6 +24,10 @@ from torch.distributed._tensor import (
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+try:
+    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+except (ImportError, ModuleNotFoundError):
+    from torch.distributed.fsdp._fully_shard import FSDPModule
 
 
 WORLD_MESH = None
@@ -79,19 +83,19 @@ def all_gather_tensor(local_tensor, ep_name="ep"):
 #   During backward, prefetch previous layer
 class BackwardPrefetchContext:
     def __init__(self):
-        self.working = False
+        self.in_backward = False
 
         def pre_forward_hook(state, module, args, kwargs):
-            prefetch_list = None
-            if self.working and getattr(module, "expert_forward_prefetch", False):
-                prefetch_list = state._states_to_forward_prefetch
-                backward_prefetch_states = getattr(module, "backward_prefetch_states", [])
-                state._states_to_forward_prefetch = backward_prefetch_states
+            old_prefetch_list = None
+            cur_prefetch_list = getattr(module, "backward_prefetch_states", [])
+            if self.in_backward and cur_prefetch_list != []:
+                old_prefetch_list = state._states_to_forward_prefetch
+                state._states_to_forward_prefetch = cur_prefetch_list
 
             res = self.old_pre_forward(state, module, args, kwargs)
 
-            if prefetch_list is not None:
-                state._states_to_forward_prefetch = prefetch_list
+            if old_prefetch_list is not None:
+                state._states_to_forward_prefetch = old_prefetch_list
 
             return res
 
@@ -101,7 +105,8 @@ class BackwardPrefetchContext:
 
         def post_forward_hook(state, module: nn.Module, input: Any, output: Any):
             old_mesh_info = None
-            if self.working and (getattr(module, "moe_forward_prefetch", False) or getattr(module, "expert_forward_prefetch", False)):
+            cur_prefetch_list = getattr(module, "backward_prefetch_states", [])
+            if self.in_backward and cur_prefetch_list != []:
                 old_mesh_info = state._fsdp_param_group.post_forward_mesh_info
                 state._fsdp_param_group.post_forward_mesh_info = None
 
@@ -123,11 +128,11 @@ class BackwardPrefetchContext:
 
 
     def __enter__(self):
-        self.working = True
+        self.in_backward = True
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.working = False
+        self.in_backward = False
 
 fsdp2_backward_prefetch_manager = BackwardPrefetchContext()
 
@@ -250,62 +255,46 @@ class MoeUtils:
         model = AutoModel.from_config(config)
         return model
 
-
-    # copied from atorch, may be further optimized
     @staticmethod
-    def set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, outer_cls, inter_cls, outermost_cls):
-        try:
-            from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-        except (ImportError, ModuleNotFoundError):
-            from torch.distributed.fsdp._fully_shard import FSDPModule
+    def set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, layer_cls, expert_cls, model_cls):
+        model_modules = []
+        layer_modules = []
+        expert_modules = []
 
-        if not isinstance(fsdp2_model, list):
-            fsdp2_model = [fsdp2_model]
+        for name, named_module in fsdp2_model.named_modules():
+            if isinstance(named_module, FSDPModule) and isinstance(named_module, model_cls):
+                model_modules.append(named_module)
 
-        for single_fsdp2_model in fsdp2_model:
-            outer_modules = []
-            names1 = []
-            inter_modules = []
-            names2 = []
-            outermost_modules = []
-            names3 = []
+            if isinstance(named_module, FSDPModule) and isinstance(named_module, layer_cls):
+                layer_modules.append(named_module)
 
-            for name, named_module in single_fsdp2_model.named_modules():
-                if isinstance(named_module, FSDPModule) and isinstance(named_module, outer_cls):
-                    outer_modules.append(named_module)
-                    names1.append(name)
+            if isinstance(named_module, FSDPModule) and isinstance(named_module, expert_cls):
+                expert_modules.append(named_module)
 
-                if isinstance(named_module, FSDPModule) and isinstance(named_module, inter_cls):
-                    inter_modules.append(named_module)
-                    names2.append(name)
+        assert len(model_modules) == 1
+        assert len(layer_modules) == len(expert_modules)
 
-                if isinstance(named_module, FSDPModule) and isinstance(named_module, outermost_cls):
-                    outermost_modules.append(named_module)
-                    names3.append(name)
+        for i in range(len(layer_modules)):
+            # layer prefetch layer
+            # expert prefetch expert
+            cur_expert = expert_modules[i]
+            cur_layer = layer_modules[i]
 
-            assert len(outermost_modules) == 1
-            assert len(inter_modules) == len(outer_modules)
-            prefetch_modules = outermost_modules + inter_modules
+            # deal with forward
+            if i == 0:
+               model_modules[0].set_modules_to_forward_prefetch([cur_layer, cur_expert])
+            else:
+                # layer_{i - 1} prefetch layer_i
+                layer_modules[i - 1].set_modules_to_forward_prefetch([cur_layer])
+                expert_modules[i - 1].set_modules_to_forward_prefetch([cur_expert])
 
-            for i in range(len(outer_modules)):
-                module1 = prefetch_modules[i]
-                module2 = outer_modules[i]
-                module1.set_modules_to_forward_prefetch([module2])
-                if i > 1:
-                    backward_prefetch_states = [outer_modules[i - 2]._get_fsdp_state()]
-                    setattr(module1, 'backward_prefetch_states', backward_prefetch_states)
-
-                if i == len(outer_modules) - 1:
-                    # the last stage
-                    module1 = prefetch_modules[i + 1] # ep47
-                    module2 = outer_modules[i - 1] # l46
-                    backward_prefetch_states = [module2._get_fsdp_state()]
-                    setattr(module1, 'backward_prefetch_states', backward_prefetch_states)
-
-            for i in range(len(outer_modules)):
-                module1 = outer_modules[i]
-                module2 = inter_modules[i]
-                module1.set_modules_to_forward_prefetch([module2])
+            # deal with backward
+            if i > 0:
+                # layer_i prefetch layer_{i - 1}
+                layer_backward_prefetch_states = [layer_modules[i - 1]._get_fsdp_state()]
+                setattr(layer_modules[i], 'backward_prefetch_states', layer_backward_prefetch_states)
+                expert_backward_prefetch_states = [expert_modules[i - 1]._get_fsdp_state()]
+                setattr(expert_modules[i], 'backward_prefetch_states', expert_backward_prefetch_states)
 
     @staticmethod
     def fsdp_wrap(model, device):

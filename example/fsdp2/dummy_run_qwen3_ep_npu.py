@@ -148,7 +148,7 @@ def test_foward(args, model, dataloader, device, rank):
     # build reference model
     config = AutoConfig.from_pretrained(args.path)
     config.num_hidden_layers = model.config.num_hidden_layers
-    ref_model = AutoModel.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
+    ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     model = model.to(dtype=config.torch_dtype)
     
@@ -165,12 +165,12 @@ def test_foward(args, model, dataloader, device, rank):
 
         return generic_hook
 
-    model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed"))
-    for i, layer in enumerate(model.layers):
+    model.model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed"))
+    for i, layer in enumerate(model.model.layers):
         # layer.mlp.router.register_forward_hook(get_hook(f"layer_{i}_router"))
         layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts"))
-    ref_model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed", True))
-    for i, layer in enumerate(ref_model.layers):
+    ref_model.model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed", True))
+    for i, layer in enumerate(ref_model.model.layers):
         # layer.mlp.gate.register_forward_hook(get_hook(f"layer_{i}_router", True))
         layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts", True)) 
     
@@ -182,16 +182,19 @@ def test_foward(args, model, dataloader, device, rank):
         batch = data_to_device(batch, device)
         output = model(**batch)
         # output = output["last_hidden_state"]
-        intermediate_outputs["last_hidden_state"] = output["last_hidden_state"]
+        intermediate_outputs["logits"] = output["logits"]
         output_ref = ref_model(**batch)
         # output_ref = output_ref["last_hidden_state"]
-        intermediate_outputs_ref["last_hidden_state"] = output_ref["last_hidden_state"]
+        intermediate_outputs_ref["logits"] = output_ref["logits"]
         for key in intermediate_outputs.keys():
             compare_tensors(key, intermediate_outputs[key][0], intermediate_outputs_ref[key][0], rank)
         
 def test_backward(args, model, dataloader, device, rank, prof=None):
-    from torch.distributed.tensor.experimental import implicit_replication
-    from torch.distributed.fsdp import fully_shard
+    from torch_turbo.utils.torch_utils import torch_version
+    if torch_version() >= (2, 6, 0):
+        from torch.distributed.fsdp import fully_shard
+    else:
+        from torch.distributed._composable.fsdp import fully_shard
     ep_rank = ps.get_expert_model_parallel_rank()
     ep_world_size = ps.get_expert_model_parallel_world_size()
     lr = 1e-2
@@ -220,9 +223,9 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
     # build reference model
     config = AutoConfig.from_pretrained(args.path)
     config.num_hidden_layers = model.config.num_hidden_layers
-    ref_model = AutoModel.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
+    ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
-    for layer in ref_model.layers:
+    for layer in ref_model.model.layers:
         # wrap moe mlp in edp
         fully_shard(layer.mlp, mesh = MoeUtils.get_world_mesh())
         # wrap other parts in dp
@@ -340,7 +343,7 @@ def train(args, model, dataloader, device, rank):
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
 
     if args.profiling:
-        from torch_turbo.utils.npu_utls import get_profiler
+        from torch_turbo.utils.npu_utils import get_profiler
         prof = get_profiler()
         prof.start()
 
@@ -352,7 +355,7 @@ def train(args, model, dataloader, device, rank):
         optimizer.zero_grad()
         batch = data_to_device(batch, device)
         output = model(**batch)
-        output = output["last_hidden_state"]
+        output = output["logits"]
 
         with fsdp2_backward_prefetch_manager:
             output.sum().backward()

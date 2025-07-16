@@ -1,6 +1,7 @@
 from typing import Any
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
+from torch_turbo.utils.torch_utils import torch_version
 from torch.distributed.device_mesh import init_device_mesh
 import torch
 import torch.distributed as dist
@@ -21,13 +22,16 @@ from torch.distributed._tensor import (
     Replicate,
     Shard,
 )
-from torch.distributed.fsdp import fully_shard
-from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
-from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
-try:
-    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-except (ImportError, ModuleNotFoundError):
+if torch_version() >= (2, 6, 0):
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
     from torch.distributed.fsdp._fully_shard import FSDPModule
+else:
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed._composable.fsdp._fsdp_state import FSDPState
+    from torch.distributed._composable.fsdp._fsdp_param_group import FSDPParamGroup
+    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 
 
 WORLD_MESH = None
@@ -140,7 +144,7 @@ class MoeUtils:
     @staticmethod
     def patch_moe_layer(model, hf_config, device):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
-        for layer in model.layers:
+        for layer in model.model.layers:
             # patch token_dispatcher
             token_dispatcher = layer.mlp.token_dispatcher
             token_dispatcher.permute_idx_device = device
@@ -163,7 +167,7 @@ class MoeUtils:
             layer.mlp.experts.activation_func_with_probs = glu
         
         # patch rotary embedding
-        rotary_emb = model.rotary_emb
+        rotary_emb = model.model.rotary_emb
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
         rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -175,7 +179,7 @@ class MoeUtils:
     @staticmethod
     def transform_moe_layer(model, hf_config):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
-        for layer in model.layers:
+        for layer in model.model.layers:
             moe = MegatronUtils.initialize_moe_layer_from_hf_config(hf_config)
             layer.mlp = moe
 
@@ -240,7 +244,7 @@ class MoeUtils:
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
-            model = AutoModel.from_config(config)
+            model = AutoModelForCausalLM.from_config(config)
             apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
             
@@ -298,10 +302,10 @@ class MoeUtils:
 
     @staticmethod
     def fsdp_wrap(model, device):
-        outer_cls = model.layers[0].__class__
-        inter_cls = model.layers[0].mlp.experts.__class__
+        outer_cls = model.model.layers[0].__class__
+        inter_cls = model.model.layers[0].mlp.experts.__class__
         outermost_cls = model.__class__
-        for layer in model.layers:
+        for layer in model.model.layers:
             # wrap moe mlp in edp
             fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh())
             setattr(layer.mlp.experts, "expert_forward_prefetch", True)
@@ -362,8 +366,8 @@ class MoeUtils:
                     if "weight1" in param_name:
                         w1 = []
                         for i in range(config.num_experts):
-                            gate_proj = f"model.{prefix}.{i}.gate_proj.weight"
-                            up_proj = f"model.{prefix}.{i}.up_proj.weight"
+                            gate_proj = f"{prefix}.{i}.gate_proj.weight"
+                            up_proj = f"{prefix}.{i}.up_proj.weight"
                             fc1 = torch.cat([sd[gate_proj], sd[up_proj]])
                             w1.append(fc1)
                         full_tensor = torch.stack(w1, dim=0).to(device)
@@ -373,7 +377,7 @@ class MoeUtils:
                         # weight2
                         w2 = []
                         for i in range(config.num_experts):
-                            down_proj = f"model.{prefix}.{i}.down_proj.weight"
+                            down_proj = f"{prefix}.{i}.down_proj.weight"
                             w2.append(sd[down_proj].t())
                         full_tensor = torch.stack(w2, dim=0).to(device)
                     # broadcast to ep_group
@@ -385,12 +389,10 @@ class MoeUtils:
                     mesh = edp
                 elif "mlp.router" in param_name:
                     new_name = param_name.replace("router", "gate")
-                    hf_name = f"model.{new_name}"
-                    full_tensor = sd[hf_name].to(device)
+                    full_tensor = sd[new_name].to(device)
                     mesh = WORLD_MESH
                 else:
-                    hf_name = f"model.{param_name}"
-                    full_tensor = sd[hf_name].to(device)
+                    full_tensor = sd[param_name].to(device)
                     mesh = WORLD_MESH
             else:
                 if "mlp.experts" in param_name:
@@ -433,8 +435,8 @@ class MoeUtils:
                     full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
                     experts = torch.split(full_tensor, model.config.hidden_size)
                     for i in range(num_experts):
-                        gate_proj = f"model.{prefix}.{i}.gate_proj.weight"
-                        up_proj = f"model.{prefix}.{i}.up_proj.weight"
+                        gate_proj = f"{prefix}.{i}.gate_proj.weight"
+                        up_proj = f"{prefix}.{i}.up_proj.weight"
                         expert2 = torch.split(experts[i].t(), model.config.moe_intermediate_size)
                         yield from zip([gate_proj], [expert2[0]])
                         yield from zip([up_proj], [expert2[1]])
@@ -443,13 +445,11 @@ class MoeUtils:
                     full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
                     experts = torch.split(full_tensor, model.config.moe_intermediate_size)
                     for i in range(num_experts):
-                        down_proj = f"model.{prefix}.{i}.down_proj.weight"
+                        down_proj = f"{prefix}.{i}.down_proj.weight"
                         yield from zip([down_proj], [experts[i].t()])
 
             elif "mlp.router" in name:
                 new_name = name.replace("router", "gate")
-                hf_name = f"model.{new_name}"
-                yield from zip([hf_name], [param])
+                yield from zip([new_name], [param])
             else:
-                hf_name = f"model.{name}"
-                yield from zip([hf_name], [param])
+                yield from zip([name], [param])

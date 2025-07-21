@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
@@ -182,10 +183,36 @@ class MoeUtils:
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
         rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
+    @staticmethod
     def scale_moe_gradient(params):
         assert params[0].device_mesh == MoeUtils.get_edp_mesh()
         grads = [p.grad for p in params]
         torch._foreach_mul_(grads, _GRADIENT_SCALING_FACTOR)
+    
+    @staticmethod
+    def clip_grad_norm(model, max_norm=1.0, norm_type=2.0):
+        params = []
+        grads = []
+        moe_params = []
+        moe_grads = []
+        for param in model.parameters():
+            if param.device_mesh == MoeUtils.get_edp_mesh():
+                moe_params.append(param)
+                moe_grads.append(param.grad)
+            else:
+                params.append(param)
+                grads.append(param.grad)
+
+        dp_total_norm = _get_total_norm(grads, norm_type=norm_type)
+        edp_total_norm = _get_total_norm(moe_grads, norm_type=norm_type)
+        dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
+        edp_total_norm = edp_total_norm.full_tensor().unsqueeze(0)
+        edp_total_norm = all_gather_tensor(edp_total_norm, ep_name="ep")
+        total_norm = torch.linalg.vector_norm(torch.cat([edp_total_norm, dp_total_norm]), norm_type)
+        _clip_grads_with_norm_(params, max_norm, total_norm)
+        _clip_grads_with_norm_(moe_params, max_norm, total_norm)
+
+        return total_norm
         
     @staticmethod
     def transform_moe_layer(model, hf_config):

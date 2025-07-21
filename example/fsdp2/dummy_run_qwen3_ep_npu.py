@@ -253,21 +253,30 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         output = model(**batch)
         # generate random tensor in [-1, 1]
         min_val, max_val = -1.0, 1.0
-        labels = (max_val - min_val) * torch.rand(size=output["last_hidden_state"].shape, device=device, dtype=config.torch_dtype) + min_val
-        loss = criterion(output["last_hidden_state"], labels)
+        labels = (max_val - min_val) * torch.rand(size=output["logits"].shape, device=device, dtype=config.torch_dtype) + min_val
+        loss = criterion(output["logits"], labels)
         optimizer.zero_grad()
         loss.backward()
         MoeUtils.scale_moe_gradient(moe_params)
+        total_norm = MoeUtils.clip_grad_norm(model, max_norm=1.0)
+        total_norm = total_norm.to(device)
         optimizer.step()
         params, grads = get_params_and_grads(model)
         
         # ref model backward
         ref_output = ref_model(**batch)
-        ref_loss = criterion(ref_output["last_hidden_state"], labels)
+        ref_loss = criterion(ref_output["logits"], labels)
         ref_optimizer.zero_grad()
         ref_loss.backward()
+        # the implementation of clip_grad_norm in verl
+        from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+        ref_grads = [p.grad for p in ref_model.parameters() if p.grad is not None]
+        ref_total_norm = _get_total_norm(ref_grads)
+        ref_total_norm = ref_total_norm.to(device)
+        _clip_grads_with_norm_(ref_model.parameters(), max_norm=1.0, total_norm=ref_total_norm)
         ref_optimizer.step()
         ref_params, ref_grads = get_params_and_grads(ref_model)
+        compare_tensors("total_norm", total_norm.detach().clone(), ref_total_norm.full_tensor().detach().clone(), rank)
         if prof is not None and rank == 0:
             prof.step()
         if rank < ep_world_size:
@@ -407,7 +416,7 @@ def run(rank, args):
         data_size = total_data_size // dp_size
     dataset = get_dataset(seq_length=seq_len, data_size=data_size)
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
-    
+
     train(args, model, dataloader, device, rank)
     cleanup()
 

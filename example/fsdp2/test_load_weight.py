@@ -15,6 +15,7 @@ import torch_npu
 
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.moe_utils import MoeUtils, load_safetensors_dir, slice_tensor_for_ep_rank
+from torch_turbo.utils.torch_utils import compare_tensors
 
 import torch
 import torch.distributed as dist
@@ -35,16 +36,9 @@ def verify_weight_loading(path, model, device):
     # Step 1: Load original state dict from safetensors
     sd = load_safetensors_dir(path)
     dist.barrier()
-    flag = True
     
     # Step 2: Verify weights
     for param_name, param in model.named_parameters():
-        # if "embed_tokens" in param_name:
-        #     # print(f"Rank {rank} - {param_name} value: local tensor value: {param.to_local()}")
-        #     print(f"Rank {rank} - {param_name} value: local tensor value: {param.to_local()}")
-        #     # print(f"Rank {rank} - {param_name} value: full tensor value: {param.full_tensor()}")
-        # continue
-        # assert not isinstance(param, DTensor), f"{param_name} must not be DTensor"
         if "mlp.experts" in param_name:
             prefix = param_name[:-8]
             if "weight1" in param_name:
@@ -55,6 +49,7 @@ def verify_weight_loading(path, model, device):
                     fc1 = torch.cat([sd[gate_proj], sd[up_proj]])
                     w1.append(fc1)
                 full_tensor = torch.stack(w1, dim=0).to(device)
+                full_tensor = full_tensor.t()
             else:
                 # weight2
                 w2 = []
@@ -65,8 +60,6 @@ def verify_weight_loading(path, model, device):
             full_tensor = full_tensor.reshape(-1, full_tensor.shape[-1])
             # each ep slice its part
             full_tensor = slice_tensor_for_ep_rank(full_tensor, ep_rank, ep_world_size)
-            if "weight1" in param_name:
-                full_tensor = full_tensor.t()
             
         elif "mlp.router" in param_name:
             new_name = param_name.replace("router", "gate")
@@ -78,39 +71,8 @@ def verify_weight_loading(path, model, device):
         # Compare
         full_tensor_cpu = full_tensor.cpu().float()
         param_tensor_cpu = param.full_tensor().cpu().float()
-        # check if the shapes match
-        if full_tensor_cpu.shape != param_tensor_cpu.shape:
-            print(f" Rank {rank} - Shape mismatch for {param_name}:")
-            print(f" Rank {rank} - Expected shape: {full_tensor_cpu.shape}")
-            print(f" Rank {rank} - Actual shape: {param_tensor_cpu.shape}")
-            print(f" Rank {rank} - Weight loading failed due to shape mismatch! \n")
-            # exit(1)
-            flag = False
-
-        # check if the values match
-        if not torch.allclose(full_tensor_cpu, param_tensor_cpu, atol=0.0):
-            # compute the difference
-            diff = torch.abs(full_tensor_cpu - param_tensor_cpu)
-            max_diff = torch.max(diff)
-            mean_diff = torch.mean(diff)
-            
-            print(f"  Value mismatch for {param_name}, device={device}:")
-            # print(f"  Max difference: {max_diff.item():.6f}, device={device}")
-            # print(f"  Mean difference: {mean_diff.item():.6f}, device={device}")
-            # print(f"  Expected values sample: {full_tensor_cpu.flatten()[:-1]}, device={device}")
-            # print(f"  Actual values sample: {param_tensor_cpu.flatten()[:-1]}, device={device}")
-            # print(f"  Actual shape: {param_tensor_cpu.shape}, device={device}")
-            # print(f"  Original DTensor values sample: {param.to_local().flatten()[:-1]}, device={device}")
-            # print(f"  Original DTensor shape: {param.to_local().shape}, device={device}")
-            
-            print(f"Rank {rank} - Weight loading failed due to value mismatch! \n")
-            # exit(1)
-            flag = False
+        compare_tensors(param_name, full_tensor_cpu, param_tensor_cpu, rank)
         dist.barrier()
-        
-    # dist.barrier()
-    if flag == True:
-        print(f"Rank {rank} - weights matched successfully!")
         
 def setup(rank, args):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -124,6 +86,7 @@ def setup(rank, args):
     dist.barrier()
 
 def cleanup():
+    dist.barrier()
     dist.destroy_process_group()
 
 def run(rank, args):
@@ -152,7 +115,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--ep_size", type=int, default=4)
-    parser.add_argument("--path", type=str)
+    parser.add_argument("--path", type=str, default="/sfs_turbo/qinjue/models/Qwen3-30B-A3B/")
+    parser.add_argument("--golden_path", type=str, default="/sfs_turbo/pretrained_models/Qwen3-30B-A3B")
+    parser.add_argument("--profiling", default=False, action="store_true")
+    parser.add_argument("--average_in_collective", default=True, action="store_true")
     args = parser.parse_args()
 
     main(args)

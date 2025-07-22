@@ -12,6 +12,7 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank, fsdp2_backward_prefetch_manager
+from torch_turbo.utils.torch_utils import compare_tensors
 from torch.utils.data import DataLoader, Dataset
 import functools
 from torch.utils.data.distributed import DistributedSampler
@@ -124,22 +125,8 @@ def data_to_device(data, device, non_blocking=False):
         return data
 
     return recursively_apply(to_device, data, device, non_blocking=non_blocking)
-
-def compare_tensors(key, custom, ref, rank, atol=1e-5):
-    if rank != 0:
-        return
-    if not torch.allclose(custom.float(), ref.float(), atol=atol):
-        diff = torch.abs(custom - ref)
-        max_diff = torch.max(diff)
-        mean_diff = torch.mean(diff)
-        print(f"Rank {rank} - Key: {key} - Max difference: {max_diff.item():.6f}")
-        print(f"Rank {rank} - Key: {key} - Mean difference: {mean_diff.item():.6f}")
-        print(f"Rank {rank} - Key: {key} - Custom shape: {custom.shape}")
-        print(f"Rank {rank} - Key: {key} - Ref shape: {ref.shape}")
-        print(f"Rank {rank} - Key: {key} - Custom value: {custom}")
-        print(f"Rank {rank} - Key: {key} - Ref value: {ref}")
         
-def test_foward(args, model, dataloader, device, rank):
+def test_forward(args, model, dataloader, device, rank):
     def check_meta_tensors(module):
         for name, param in module.named_parameters():
             assert not param.is_meta, f"Parameter {name} is a meta tensor, which is not expected."
@@ -151,6 +138,7 @@ def test_foward(args, model, dataloader, device, rank):
     ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     model = model.to(dtype=config.torch_dtype)
+    # MoeUtils.save_model(model, args.save_path)
     
     # store intermediate outputs
     intermediate_outputs = {}
@@ -435,6 +423,7 @@ if __name__ == "__main__":
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--ep_size", type=int, default=4)
     parser.add_argument("--path", type=str)
+    parser.add_argument("--save_path", type=str, default="/sfs_turbo/qinjue/models/Qwen3-30B-A3B/")
     parser.add_argument("--profiling", default=False, action="store_true")
     parser.add_argument("--average_in_collective", default=True, action="store_true")
     args = parser.parse_args()

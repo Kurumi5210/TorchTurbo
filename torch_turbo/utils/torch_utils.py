@@ -24,3 +24,23 @@ def torch_version(
         return ver, numbering.group(4)
     else:
         return ver
+
+def compare_tensors(key, custom, ref, rank, atol=1e-5):
+    if rank != 0:
+        return
+    # check if the shapes match
+    if custom.shape != ref.shape:
+        print(f" Rank {rank} - Key: {key} - Shape mismatch ")
+        print(f" Rank {rank} - Key: {key} - Expected shape: {custom.shape}")
+        print(f" Rank {rank} - Key: {key} - Actual shape: {ref.shape}")
+        
+    if not torch.allclose(custom.float(), ref.float(), atol=atol):
+        diff = torch.abs(custom - ref)
+        max_diff = torch.max(diff)
+        mean_diff = torch.mean(diff)
+        print(f"Rank {rank} - Key: {key} - Max difference: {max_diff.item():.6f}")
+        print(f"Rank {rank} - Key: {key} - Mean difference: {mean_diff.item():.6f}")
+        print(f"Rank {rank} - Key: {key} - Custom shape: {custom.shape}")
+        print(f"Rank {rank} - Key: {key} - Ref shape: {ref.shape}")
+        print(f"Rank {rank} - Key: {key} - Custom value: {custom}")
+        print(f"Rank {rank} - Key: {key} - Ref value: {ref}")

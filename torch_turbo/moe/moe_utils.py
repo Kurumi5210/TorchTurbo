@@ -1,4 +1,5 @@
 from typing import Any
+import os
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch_turbo.utils.torch_utils import torch_version
@@ -190,13 +191,15 @@ class MoeUtils:
         torch._foreach_mul_(grads, _GRADIENT_SCALING_FACTOR)
     
     @staticmethod
+    @torch.no_grad()
     def clip_grad_norm(model, max_norm=1.0, norm_type=2.0):
         params = []
         grads = []
         moe_params = []
         moe_grads = []
+        edp = MoeUtils.get_edp_mesh()
         for param in model.parameters():
-            if param.device_mesh == MoeUtils.get_edp_mesh():
+            if param.device_mesh == edp:
                 moe_params.append(param)
                 moe_grads.append(param.grad)
             else:
@@ -296,6 +299,23 @@ class MoeUtils:
         config.num_hidden_layers = 1
         model = AutoModel.from_config(config)
         return model
+    
+    @staticmethod
+    def save_model(model, save_path):
+        state_dict = MoeUtils.get_full_hf_state_dict(model)
+
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            with torch.device("meta"):
+                save_model = AutoModelForCausalLM.from_config(model.config)
+            save_model.to_empty(device="cpu")
+            
+            hf_local_path = os.path.join(save_path, "huggingface")
+            os.makedirs(hf_local_path, exist_ok=True)
+            save_model.save_pretrained(hf_local_path, state_dict=state_dict)
+        
+        # wait for rank0 to dump hf_model to local
+        torch.distributed.barrier()
 
     @staticmethod
     def set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, layer_cls, expert_cls, model_cls):
@@ -459,6 +479,51 @@ class MoeUtils:
         model.load_state_dict(sharded_sd, assign=True)
         for param in model.parameters():
             assert isinstance(param, DTensor), "must be"
+    
+    @staticmethod
+    def get_full_hf_state_dict(model):
+        rank = torch.distributed.get_rank()
+        ep = EXPERT_MESH['ep']
+        
+        # Only rank 0 will save hf model and,
+        # offload to cpu to save LLMs which may be too large to fit in one GPU
+        if rank == FIRST_RANK:
+            full_sd = {}
+
+        for name, param in model.named_parameters():
+            assert isinstance(param, DTensor), f"{name} is not DTensor"
+            full_tensor = param.full_tensor()
+            if rank == FIRST_RANK:
+                if "mlp.experts" in name:
+                    prefix = name[:-8]
+                    num_experts = model.config.num_experts
+                    full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+                    if "weight1" in name:
+                        experts = torch.split(full_tensor, model.config.hidden_size)
+                        for i in range(num_experts):
+                            gate_proj = f"{prefix}.{i}.gate_proj.weight"
+                            up_proj = f"{prefix}.{i}.up_proj.weight"
+                            expert2 = torch.split(experts[i].t(), model.config.moe_intermediate_size)
+                            full_sd[gate_proj] = expert2[0].cpu()
+                            full_sd[up_proj] = expert2[1].cpu()
+                    else:
+                        # weight2
+                        experts = torch.split(full_tensor, model.config.moe_intermediate_size)
+                        for i in range(num_experts):
+                            down_proj = f"{prefix}.{i}.down_proj.weight"
+                            full_sd[down_proj] = experts[i].t().cpu()
+                elif "mlp.router" in name:
+                    new_name = name.replace("router", "gate")
+                    full_sd[new_name] = full_tensor.cpu()
+                else:
+                    full_sd[name] = full_tensor.cpu()
+            elif is_rank_in_mesh(FIRST_RANK, ep) and "mlp.experts" in name:
+                full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+                del full_tensor
+            else:
+                del full_tensor
+        
+        return full_sd
 
     @staticmethod
     def per_tensor_generate(model):

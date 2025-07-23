@@ -487,8 +487,7 @@ class MoeUtils:
         
         # Only rank 0 will save hf model and,
         # offload to cpu to save LLMs which may be too large to fit in one GPU
-        if rank == FIRST_RANK:
-            full_sd = {}
+        full_sd = {}
 
         for name, param in model.named_parameters():
             assert isinstance(param, DTensor), f"{name} is not DTensor"

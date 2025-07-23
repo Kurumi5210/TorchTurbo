@@ -524,6 +524,38 @@ class MoeUtils:
                 del full_tensor
         
         return full_sd
+    
+    @staticmethod
+    def load_checkpoint_shard(model, save_path):
+        """
+        Load an FSDP checkpoint for this rank.
+        Every rank will load its own model shard.
+        """
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        model_path = os.path.join(save_path, f"model_world_size_{world_size}_rank_{rank}.pt")
+        model_state_dict = torch.load(model_path, weights_only=False)
+        model.load_state_dict(model_state_dict)
+        print(f"Rank: {rank} - Loaded model from {os.path.abspath(model_path)}")
+        
+        # wait for everyone to load checkpoints
+        torch.distributed.barrier()
+        
+    @staticmethod
+    def save_checkpoint_shard(model, save_path):
+        """
+        Save an FSDP checkpoint for this rank.
+        Every rank will save its own model shard.
+        """
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        model_path = os.path.join(save_path, f"model_world_size_{world_size}_rank_{rank}.pt")
+        model_state_dict = model.state_dict()
+        torch.save(model_state_dict, model_path)
+        print(f"Rank: {rank} - Saved model to {os.path.abspath(model_path)}")
+        
+        # wait for everyone to load checkpoints
+        torch.distributed.barrier()
 
     @staticmethod
     def per_tensor_generate(model):

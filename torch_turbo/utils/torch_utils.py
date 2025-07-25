@@ -44,3 +44,16 @@ def compare_tensors(key, custom, ref, rank, atol=1e-5):
         print(f"Rank {rank} - Key: {key} - Ref shape: {ref.shape}")
         print(f"Rank {rank} - Key: {key} - Custom value: {custom}")
         print(f"Rank {rank} - Key: {key} - Ref value: {ref}")
+
+def load_safetensors_dir(model_dir: str) -> dict:
+    from pathlib import Path
+    from safetensors.torch import load_file
+
+    state_dict = {}
+    model_path = Path(model_dir)
+
+    for safetensor_file in model_path.glob("*.safetensors"):
+        file_path = safetensor_file.as_posix()
+        state_dict.update(load_file(file_path, device="cpu"))
+
+    return state_dict

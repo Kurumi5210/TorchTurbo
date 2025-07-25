@@ -2,7 +2,7 @@ from typing import Any
 import os
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
-from torch_turbo.utils.torch_utils import torch_version
+from torch_turbo.utils.torch_utils import torch_version, load_safetensors_dir
 from torch.distributed.device_mesh import init_device_mesh
 import torch
 import torch.distributed as dist
@@ -26,33 +26,15 @@ from torch.distributed._tensor import (
 )
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp import fully_shard
-    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
-    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
     from torch.distributed.fsdp._fully_shard import FSDPModule
 else:
     from torch.distributed._composable.fsdp import fully_shard
-    from torch.distributed._composable.fsdp._fsdp_state import FSDPState
-    from torch.distributed._composable.fsdp._fsdp_param_group import FSDPParamGroup
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-
 
 WORLD_MESH = None
 EXPERT_MESH = None
 FIRST_RANK = 0
 _GRADIENT_SCALING_FACTOR = 1.0
-
-def load_safetensors_dir(model_dir: str) -> dict:
-    from pathlib import Path
-    from safetensors.torch import load_file
-
-    state_dict = {}
-    model_path = Path(model_dir)
-
-    for safetensor_file in model_path.glob("*.safetensors"):
-        file_path = safetensor_file.as_posix()
-        state_dict.update(load_file(file_path, device="cpu"))
-
-    return state_dict
 
 def is_rank_in_mesh(target_rank, device_mesh):
     return target_rank in device_mesh.mesh.flatten().tolist()
@@ -94,64 +76,6 @@ def convert_param_name(key, reverse_key_mapping):
         if n_replace > 0:
             return key
     return key
-
-# BackwardPrefetchContext is designed to switch prefetch logic between forward & backward.
-#   During forward, prefetch next layer
-#   During backward, prefetch previous layer
-class BackwardPrefetchContext:
-    def __init__(self):
-        self.in_backward = False
-
-        def pre_forward_hook(state, module, args, kwargs):
-            old_prefetch_list = None
-            cur_prefetch_list = getattr(module, "backward_prefetch_states", [])
-            if self.in_backward and cur_prefetch_list != []:
-                old_prefetch_list = state._states_to_forward_prefetch
-                state._states_to_forward_prefetch = cur_prefetch_list
-
-            res = self.old_pre_forward(state, module, args, kwargs)
-
-            if old_prefetch_list is not None:
-                state._states_to_forward_prefetch = old_prefetch_list
-
-            return res
-
-        self.old_pre_forward = FSDPState._pre_forward
-        FSDPState._pre_forward = pre_forward_hook
-
-
-        def post_forward_hook(state, module: nn.Module, input: Any, output: Any):
-            old_mesh_info = None
-            cur_prefetch_list = getattr(module, "backward_prefetch_states", [])
-            if self.in_backward and cur_prefetch_list != []:
-                old_mesh_info = state._fsdp_param_group.post_forward_mesh_info
-                state._fsdp_param_group.post_forward_mesh_info = None
-
-            res = self.old_post_forward(state, module, input, output)
-
-            if old_mesh_info != None:
-                state._fsdp_param_group.post_forward_mesh_info = old_mesh_info
-
-            return res
-
-        self.old_post_forward = FSDPState._post_forward
-        FSDPState._post_forward = post_forward_hook
-
-        def backward_prefetch_hook(group):
-            return
-
-        self.old_backward_prefetch = FSDPParamGroup._backward_prefetch
-        FSDPParamGroup._backward_prefetch = backward_prefetch_hook
-
-
-    def __enter__(self):
-        self.in_backward = True
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.in_backward = False
-
-fsdp2_backward_prefetch_manager = BackwardPrefetchContext()
 
 class MoeUtils:
     @staticmethod

@@ -130,6 +130,8 @@ class MoeUtils:
                 params.append(param)
                 grads.append(param.grad)
 
+        MoeUtils.scale_moe_gradient(moe_params)
+
         dp_total_norm = _get_total_norm(grads, norm_type=norm_type)
         edp_total_norm = _get_total_norm(moe_grads, norm_type=norm_type)
         dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
@@ -283,19 +285,19 @@ class MoeUtils:
                 setattr(expert_modules[i], 'backward_prefetch_states', expert_backward_prefetch_states)
 
     @staticmethod
-    def fsdp_wrap(model, device):
+    def fsdp_wrap(model, device, fsdp_kwargs={}):
         outer_cls = model.model.layers[0].__class__
         inter_cls = model.model.layers[0].mlp.experts.__class__
         outermost_cls = model.__class__
         for layer in model.model.layers:
             # wrap moe mlp in edp
-            fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh())
+            fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh(), **fsdp_kwargs)
             setattr(layer.mlp.experts, "expert_forward_prefetch", True)
             # wrap other parts in dp
-            fully_shard(layer, mesh = MoeUtils.get_world_mesh())
+            fully_shard(layer, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
             setattr(layer, "moe_forward_prefetch", True)
         # wrap remaining parts
-        fully_shard(model, mesh = MoeUtils.get_world_mesh())
+        fully_shard(model, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
 
         MoeUtils.set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls)
         model.to_empty(device=device)

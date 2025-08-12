@@ -180,6 +180,27 @@ class MoeUtils:
         MoeUtils.patch_moe_layer(model, config, device)
         MoeUtils.load_weights_from_hf(model, config, device, args.path)
         return model
+    
+    @staticmethod
+    def create_fsdp2_moe_optimizer(model, optim_config):
+        params = []
+        moe_params = []
+        edp = MoeUtils.get_edp_mesh()
+        for param in model.parameters():
+            if param.device_mesh != edp:
+                params.append(param)
+            else:
+                moe_params.append(param)
+
+        optimizer_params = [{"params": params}, {"params": moe_params}]
+        optimizer = torch.optim.AdamW(
+            optimizer_params,
+            lr=optim_config.get("lr", 1e-4),
+            betas=optim_config.get("betas", (0.9, 0.999)),
+            weight_decay=optim_config.get("weight_decay", 1e-2),
+        )
+        
+        return optimizer
 
     @staticmethod
     def init_mesh(args):
@@ -207,7 +228,7 @@ class MoeUtils:
         _GRADIENT_SCALING_FACTOR = gradient_scaling_factor
 
     @staticmethod
-    def build_model(config):
+    def build_model(config, torch_dtype=torch.bfloat16):
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
@@ -215,7 +236,7 @@ class MoeUtils:
             apply_monkey_patch()
             MoeUtils.transform_moe_layer(model, config)
             
-        model = model.to(dtype=config.torch_dtype)
+        model = model.to(dtype=torch_dtype)
         return model
 
     @staticmethod
@@ -227,19 +248,23 @@ class MoeUtils:
         return model
     
     @staticmethod
-    def save_model(model, save_path):
+    def save_model(model, save_path, processing_class=None):
         state_dict = MoeUtils.get_full_hf_state_dict(model)
 
         rank = torch.distributed.get_rank()
         if rank == 0:
             with torch.device("meta"):
-                save_model = AutoModelForCausalLM.from_config(model.config)
+                save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
             save_model.to_empty(device="cpu")
+            
+            bf16_state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
             
             hf_local_path = os.path.join(save_path, "huggingface")
             os.makedirs(hf_local_path, exist_ok=True)
-            save_model.save_pretrained(hf_local_path, state_dict=state_dict)
-        
+            save_model.save_pretrained(hf_local_path, state_dict=bf16_state_dict)
+            if processing_class is not None:
+                processing_class.save_pretrained(hf_local_path)
+
         # wait for rank0 to dump hf_model to local
         torch.distributed.barrier()
 
@@ -451,7 +476,7 @@ class MoeUtils:
         return full_sd
     
     @staticmethod
-    def load_checkpoint_shard(model, save_path):
+    def load_checkpoint_shard(model, save_path, extra={}):
         """
         Load an FSDP checkpoint for this rank.
         Every rank will load its own model shard.
@@ -463,11 +488,47 @@ class MoeUtils:
         model.load_state_dict(model_state_dict)
         print(f"Rank: {rank} - Loaded model from {os.path.abspath(model_path)}")
         
+        optimizer = extra.get("optimizer", None)
+        if optimizer is not None:
+            # load optimizer state dict
+            optim_path = os.path.join(save_path, f"optim_world_size_{world_size}_rank_{rank}.pt")
+            if os.path.exists(optim_path):
+                optimizer_state_dict = torch.load(optim_path, weights_only=False)
+                optimizer.load_state_dict(optimizer_state_dict)
+                print(f"Rank: {rank} - Loaded optimizer from {os.path.abspath(optim_path)}")
+            else:
+                print(f"Rank: {rank} - Optimizer checkpoint not found at {optim_path}")
+        
+        lr_scheduler = extra.get("lr_scheduler", None)
+        if lr_scheduler is not None:
+            # load lr scheduler state dict
+            scheduler_path = os.path.join(save_path, f"scheduler_world_size_{world_size}_rank_{rank}.pt")
+            if os.path.exists(scheduler_path):
+                lr_scheduler_state_dict = torch.load(scheduler_path, weights_only=False)
+                lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+                print(f"Rank: {rank} - Loaded lr scheduler from {os.path.abspath(scheduler_path)}")
+            else:
+                print(f"Rank: {rank} - Lr scheduler checkpoint not found at {scheduler_path}")
+        
+        # Load RNG state
+        rng_path = os.path.join(save_path, f"rng_world_size_{world_size}_rank_{rank}.pt")
+        if os.path.exists(rng_path):
+            rng_states = torch.load(rng_path, weights_only=False)
+            import random
+            import numpy as np
+            random.setstate(rng_states["python"])
+            np.random.set_state(rng_states["numpy"])
+            torch.random.set_rng_state(rng_states["cpu"])
+            torch.npu.random.set_rng_state(rng_states["npu"])
+            print(f"Rank: {rank} - Loaded RNG state from {os.path.abspath(rng_path)}")
+        else:
+            print(f"Rank: {rank} - RNG checkpoint not found at {rng_path}")
+
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
         
     @staticmethod
-    def save_checkpoint_shard(model, save_path):
+    def save_checkpoint_shard(model, save_path, save_only_model=False, extra={}):
         """
         Save an FSDP checkpoint for this rank.
         Every rank will save its own model shard.
@@ -478,6 +539,36 @@ class MoeUtils:
         model_state_dict = model.state_dict()
         torch.save(model_state_dict, model_path)
         print(f"Rank: {rank} - Saved model to {os.path.abspath(model_path)}")
+        
+        if not save_only_model:
+            optimizer = extra.get("optimizer", None)
+            if optimizer is not None:
+                # save optimizer state dict
+                optim_path = os.path.join(save_path, f"optim_world_size_{world_size}_rank_{rank}.pt")
+                optimizer_state_dict = optimizer.state_dict()
+                torch.save(optimizer_state_dict, optim_path)
+                print(f"Rank: {rank} - Saved optimizer to {os.path.abspath(optim_path)}")
+            
+            lr_scheduler = extra.get("lr_scheduler", None)
+            if lr_scheduler is not None:
+                # save lr scheduler state dict
+                scheduler_path = os.path.join(save_path, f"scheduler_world_size_{world_size}_rank_{rank}.pt")
+                lr_scheduler_state_dict = lr_scheduler.state_dict()
+                torch.save(lr_scheduler_state_dict, scheduler_path)
+                print(f"Rank: {rank} - Saved lr scheduler to {os.path.abspath(scheduler_path)}")
+            
+            # Save RNG state
+            rng_path = os.path.join(save_path, f"rng_world_size_{world_size}_rank_{rank}.pt")
+            import random
+            import numpy as np
+            rng_states = {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "cpu": torch.random.get_rng_state(),
+            }
+            rng_states["npu"] = torch.npu.random.get_rng_state()
+            torch.save(rng_states, rng_path)
+            print(f"Rank: {rank} - Saved rng to {os.path.abspath(rng_path)}")
         
         # wait for everyone to load checkpoints
         torch.distributed.barrier()

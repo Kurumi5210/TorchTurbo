@@ -6,14 +6,13 @@ import torch.multiprocessing as mp
 from torch import nn
 import torch.nn.functional as F
 
-import torch_npu
-
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
 from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch_turbo.utils.torch_utils import compare_tensors
+from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend, is_npu_available
 from torch.utils.data import DataLoader, Dataset
 import functools
 from torch.utils.data.distributed import DistributedSampler
@@ -36,11 +35,11 @@ def test_forward(args, model, dataloader, device, rank):
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     model = model.to(dtype=config.torch_dtype)
     # MoeUtils.save_model(model, args.save_path)
-    
+
     # store intermediate outputs
     intermediate_outputs = {}
     intermediate_outputs_ref = {}
-    
+
     def get_hook(name, is_ref = False):
         def generic_hook(module, input, output):
             if is_ref == False:
@@ -57,12 +56,12 @@ def test_forward(args, model, dataloader, device, rank):
     ref_model.model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed", True))
     for i, layer in enumerate(ref_model.model.layers):
         # layer.mlp.gate.register_forward_hook(get_hook(f"layer_{i}_router", True))
-        layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts", True)) 
-    
+        layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts", True))
+
     if rank == 0:
         print(f"Reference model: {ref_model}")
         print(f"Model: {model}")
-    
+
     for batch in dataloader:
         batch = data_to_device(batch, device)
         output = model(**batch)
@@ -73,7 +72,7 @@ def test_forward(args, model, dataloader, device, rank):
         intermediate_outputs_ref["logits"] = output_ref["logits"]
         for key in intermediate_outputs.keys():
             compare_tensors(key, intermediate_outputs[key][0], intermediate_outputs_ref[key][0], rank)
-        
+
 def test_backward(args, model, dataloader, device, rank, prof=None):
     from torch_turbo.utils.torch_utils import torch_version
     if torch_version() >= (2, 6, 0):
@@ -93,7 +92,7 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
             params.append(param)
         elif param.device_mesh != MoeUtils.get_world_mesh():
             moe_params.append(param)
-    
+
     # moe_betas = (1 - (1 - betas[0]) / ep_world_size, 1 - (1 - betas[1]) / ep_world_size**2)
     # optimizer = torch.optim.AdamW([{"params": params, "betas": betas}, {"params": moe_params, "betas": moe_betas}],
     #     lr=lr,
@@ -104,7 +103,7 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         betas=betas,
         weight_decay=weight_decay,
     )
-    
+
     # build reference model
     config = AutoConfig.from_pretrained(args.path)
     config.num_hidden_layers = model.config.num_hidden_layers
@@ -118,10 +117,10 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
     # wrap remaining parts
     fully_shard(ref_model, mesh = MoeUtils.get_world_mesh())
     ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
-    
+
     model = model.to(dtype=config.torch_dtype)
     criterion = nn.MSELoss()
-    
+
     def get_params_and_grads(model):
         params = {}
         grads = {}
@@ -130,9 +129,9 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
             if param.grad is not None:
                 grads[name] = param.grad.full_tensor().detach().clone()
                 params[name] = param.full_tensor().detach().clone()
-                
+
         return params, grads
-    
+
     for batch in dataloader:
         batch = data_to_device(batch, device)
         output = model(**batch)
@@ -147,7 +146,7 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         total_norm = total_norm.to(device)
         optimizer.step()
         params, grads = get_params_and_grads(model)
-        
+
         # ref model backward
         ref_output = ref_model(**batch)
         ref_loss = criterion(ref_output["logits"], labels)
@@ -263,15 +262,18 @@ def train(args, model, dataloader, device, rank):
         i += 1
     if args.profiling:
         prof.stop()
-    print(f'train done')    
+    print(f'train done')
 
 def setup(rank, args):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12346'
     os.environ['WORLD_SIZE'] = str(args.world_size)
     os.environ['RANK'] = str(rank)
-    dist.init_process_group("hccl", rank=rank, world_size=args.world_size)
-    torch_npu.npu.set_device(rank)
+    dist.init_process_group(backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}", rank=rank, world_size=args.world_size)
+
+    if is_npu_available:
+        import torch_npu
+        torch_npu.npu.set_device(rank)
     MegatronUtils.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
 
     dist.barrier()
@@ -283,7 +285,7 @@ def cleanup():
 def run(rank, args):
     world_size = args.world_size
     setup(rank, args)
-    device = torch.device(f"npu:{rank}")
+    device = get_device_id()
 
     model = MoeUtils.create_fsdp2_moe_model(args, device)
     dist.barrier()
@@ -294,7 +296,7 @@ def run(rank, args):
     total_data_size = max_train_step * total_batch_size
     seq_len = 2048 * 4
     use_distributed_dataloader = True
-    
+
     if use_distributed_dataloader:
         data_size = total_data_size
     else:
@@ -323,6 +325,11 @@ if __name__ == "__main__":
     parser.add_argument("--save_path", type=str, default="/sfs_turbo/qinjue/models/Qwen3-30B-A3B/")
     parser.add_argument("--profiling", default=False, action="store_true")
     parser.add_argument("--average_in_collective", default=True, action="store_true")
+    parser.add_argument("--use_fused_swiglu", default=False, action="store_true")
+    parser.add_argument("--use_fused_rope", default=False, action="store_true")
+    parser.add_argument("--use_fused_rms_norm", default=False, action="store_true")
+    parser.add_argument("--use_fused_permute_unpermute", default=False, action="store_true")
+
     args = parser.parse_args()
 
     main(args)

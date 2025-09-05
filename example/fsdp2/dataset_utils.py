@@ -109,3 +109,38 @@ def data_to_device(data, device, non_blocking=False):
 
     return recursively_apply(to_device, data, device, non_blocking=non_blocking)
 
+def split_into_micro_batches(batch, micro_batch_size):
+    """
+    Split a batch dictionary into multiple micro batches.
+    
+    Args:
+        batch: Input dictionary {key: tensor}, where all tensors must have 
+               the same size in the first dimension (batch_size).
+        micro_batch_size: Number of samples per micro batch.
+    
+    Returns:
+        List[Dict]: List of split micro batches, each being a dictionary 
+                   with the same structure as input.
+    """
+    if not batch:
+        return []
+
+    # Get global batch size (assuming all tensors have same first dim)
+    batch_size = next(iter(batch.values())).size(0)
+    
+    # Calculate number of micro batches needed
+    num_micro_batches = (batch_size + micro_batch_size - 1) // micro_batch_size
+
+    # Split each tensor in the batch dictionary
+    micro_batches = []
+    for i in range(num_micro_batches):
+        start = i * micro_batch_size
+        end = min(start + micro_batch_size, batch_size)
+        
+        micro_batch = {
+            key: tensor[start:end]  # Handles tensors of any dimension
+            for key, tensor in batch.items()
+        }
+        micro_batches.append(micro_batch)
+    
+    return micro_batches

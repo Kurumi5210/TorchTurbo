@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-import mindspeed.megatron_adaptor
+from torch_turbo.utils.device import is_npu_available
+if is_npu_available:
+    import mindspeed.megatron_adaptor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 import megatron.core.parallel_state as ps
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -26,8 +28,8 @@ class MegatronUtils:
             expert_model_parallel_size = expert_model_parallel_size,
             **kwargs,
         )
-        
-    @staticmethod 
+
+    @staticmethod
     def initialize_moe_layer_from_hf_config(config, **config_kwargs):
         num_moe_experts = config.num_experts
         expert_model_parallel_size = ps.get_expert_model_parallel_world_size()
@@ -59,7 +61,7 @@ class MegatronUtils:
             moe_use_legacy_grouped_gemm=True,
         )
         grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
-        
+
         def qwen3_moe_transform_w1(model):
             if tf_config.gated_linear_unit:
                 intermidiate_size = tf_config.moe_ffn_hidden_size * 2
@@ -72,7 +74,7 @@ class MegatronUtils:
                     dtype=config.torch_dtype,
                 )
             )
-        
+
         qwen3_moe_transform_w1(grouped_mlp)
 
         return grouped_mlp

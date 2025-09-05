@@ -3,6 +3,8 @@ import os
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch_turbo.utils.torch_utils import torch_version, load_safetensors_dir
+from torch_turbo.utils.device import get_device_name
+from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch.distributed.device_mesh import init_device_mesh
 import torch
 import torch.distributed as dist
@@ -10,6 +12,8 @@ import torch.multiprocessing as mp
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+
+import torch_npu
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
@@ -30,6 +34,8 @@ if torch_version() >= (2, 6, 0):
 else:
     from torch.distributed._composable.fsdp import fully_shard
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+
+device_name = get_device_name()
 
 WORLD_MESH = None
 EXPERT_MESH = None
@@ -79,7 +85,7 @@ def convert_param_name(key, reverse_key_mapping):
 
 class MoeUtils:
     @staticmethod
-    def patch_moe_layer(model, hf_config, device):
+    def patch_moe_layer(model, hf_config, args, device):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
             # patch token_dispatcher
@@ -95,14 +101,16 @@ class MoeUtils:
             token_dispatcher.restore_output_by_local_experts = input_chunk_idxs.reshape(
                 token_dispatcher.num_local_experts, -1
             ).T.ravel()
-            
+
             # patch grouped mlp
             @jit_fuser
             def glu(x, probs):
+                if args.use_fused_swiglu:
+                    return torch_npu.npu_swiglu(x, dim=-1)
                 x = torch.chunk(x, 2, dim=-1)
                 return layer.mlp.experts.config.activation_func(x[0]) * x[1]
             layer.mlp.experts.activation_func_with_probs = glu
-        
+
         # patch rotary embedding
         rotary_emb = model.model.rotary_emb
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
@@ -113,7 +121,7 @@ class MoeUtils:
         assert params[0].device_mesh == MoeUtils.get_edp_mesh()
         grads = [p.grad for p in params]
         torch._foreach_mul_(grads, _GRADIENT_SCALING_FACTOR)
-    
+
     @staticmethod
     @torch.no_grad()
     def clip_grad_norm(model, max_norm=1.0, norm_type=2.0):
@@ -142,7 +150,7 @@ class MoeUtils:
         _clip_grads_with_norm_(moe_params, max_norm, total_norm)
 
         return total_norm
-        
+
     @staticmethod
     def transform_moe_layer(model, hf_config):
         assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
@@ -175,12 +183,12 @@ class MoeUtils:
         MoeUtils.init_mesh(args)
 
         config = AutoConfig.from_pretrained(args.path)
-        model = MoeUtils.build_model(config)
+        model = MoeUtils.build_model(args, config)
         model = MoeUtils.fsdp_wrap(model, device)
-        MoeUtils.patch_moe_layer(model, config, device)
+        MoeUtils.patch_moe_layer(model, config, args, device)
         MoeUtils.load_weights_from_hf(model, config, device, args.path)
         return model
-    
+
     @staticmethod
     def create_fsdp2_moe_optimizer(model, optim_config):
         params = []
@@ -199,15 +207,15 @@ class MoeUtils:
             betas=optim_config.get("betas", (0.9, 0.999)),
             weight_decay=optim_config.get("weight_decay", 1e-2),
         )
-        
+
         return optimizer
 
     @staticmethod
     def init_mesh(args):
         # TODO: change device name to a global variable to switch between cuda and npu
         world_size = args.world_size
-        world_mesh = init_device_mesh("npu", (world_size,))
-        ep_mesh = init_device_mesh("npu", (world_size // args.ep_size, args.ep_size), mesh_dim_names=("edp", "ep"))
+        world_mesh = init_device_mesh(device_name, (world_size,))
+        ep_mesh = init_device_mesh(device_name, (world_size // args.ep_size, args.ep_size), mesh_dim_names=("edp", "ep"))
         gradient_scaling_factor = (1 / args.ep_size) if args.average_in_collective else 1.0
 
         def is_same_group(process_group, device_mesh):
@@ -228,14 +236,14 @@ class MoeUtils:
         _GRADIENT_SCALING_FACTOR = gradient_scaling_factor
 
     @staticmethod
-    def build_model(config, torch_dtype=torch.bfloat16):
+    def build_model(args, config, torch_dtype=torch.bfloat16):
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(config)
-            apply_monkey_patch()
+            apply_monkey_patch(model, args)
             MoeUtils.transform_moe_layer(model, config)
-            
+
         model = model.to(dtype=torch_dtype)
         return model
 
@@ -246,7 +254,7 @@ class MoeUtils:
         config.num_hidden_layers = 1
         model = AutoModel.from_config(config)
         return model
-    
+
     @staticmethod
     def save_model(model, save_path, processing_class=None):
         state_dict = MoeUtils.get_full_hf_state_dict(model)
@@ -256,9 +264,9 @@ class MoeUtils:
             with torch.device("meta"):
                 save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
             save_model.to_empty(device="cpu")
-            
+
             bf16_state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            
+
             hf_local_path = os.path.join(save_path, "huggingface")
             os.makedirs(hf_local_path, exist_ok=True)
             save_model.save_pretrained(hf_local_path, state_dict=bf16_state_dict)
@@ -366,7 +374,7 @@ class MoeUtils:
 
         ep_rank = ps.get_expert_model_parallel_rank()
         ep_world_size = ps.get_expert_model_parallel_world_size()
-        
+
         sharded_sd = {}
         for param_name, param in model.named_parameters():
             if rank == FIRST_RANK:
@@ -430,12 +438,12 @@ class MoeUtils:
         model.load_state_dict(sharded_sd, assign=True)
         for param in model.parameters():
             assert isinstance(param, DTensor), "must be"
-    
+
     @staticmethod
     def get_full_hf_state_dict(model):
         rank = torch.distributed.get_rank()
         ep = EXPERT_MESH['ep']
-        
+
         # Only rank 0 will save hf model and,
         # offload to cpu to save LLMs which may be too large to fit in one GPU
         full_sd = {}
@@ -472,9 +480,9 @@ class MoeUtils:
                 del full_tensor
             else:
                 del full_tensor
-        
+
         return full_sd
-    
+
     @staticmethod
     def load_checkpoint_shard(model, save_path, extra={}):
         """
@@ -487,7 +495,7 @@ class MoeUtils:
         model_state_dict = torch.load(model_path, weights_only=False)
         model.load_state_dict(model_state_dict)
         print(f"Rank: {rank} - Loaded model from {os.path.abspath(model_path)}")
-        
+
         optimizer = extra.get("optimizer", None)
         if optimizer is not None:
             # load optimizer state dict
@@ -498,7 +506,7 @@ class MoeUtils:
                 print(f"Rank: {rank} - Loaded optimizer from {os.path.abspath(optim_path)}")
             else:
                 print(f"Rank: {rank} - Optimizer checkpoint not found at {optim_path}")
-        
+
         lr_scheduler = extra.get("lr_scheduler", None)
         if lr_scheduler is not None:
             # load lr scheduler state dict
@@ -509,7 +517,7 @@ class MoeUtils:
                 print(f"Rank: {rank} - Loaded lr scheduler from {os.path.abspath(scheduler_path)}")
             else:
                 print(f"Rank: {rank} - Lr scheduler checkpoint not found at {scheduler_path}")
-        
+
         # Load RNG state
         rng_path = os.path.join(save_path, f"rng_world_size_{world_size}_rank_{rank}.pt")
         if os.path.exists(rng_path):
@@ -526,7 +534,7 @@ class MoeUtils:
 
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
-        
+
     @staticmethod
     def save_checkpoint_shard(model, save_path, save_only_model=False, extra={}):
         """
@@ -539,7 +547,7 @@ class MoeUtils:
         model_state_dict = model.state_dict()
         torch.save(model_state_dict, model_path)
         print(f"Rank: {rank} - Saved model to {os.path.abspath(model_path)}")
-        
+
         if not save_only_model:
             optimizer = extra.get("optimizer", None)
             if optimizer is not None:
@@ -548,7 +556,7 @@ class MoeUtils:
                 optimizer_state_dict = optimizer.state_dict()
                 torch.save(optimizer_state_dict, optim_path)
                 print(f"Rank: {rank} - Saved optimizer to {os.path.abspath(optim_path)}")
-            
+
             lr_scheduler = extra.get("lr_scheduler", None)
             if lr_scheduler is not None:
                 # save lr scheduler state dict
@@ -556,7 +564,7 @@ class MoeUtils:
                 lr_scheduler_state_dict = lr_scheduler.state_dict()
                 torch.save(lr_scheduler_state_dict, scheduler_path)
                 print(f"Rank: {rank} - Saved lr scheduler to {os.path.abspath(scheduler_path)}")
-            
+
             # Save RNG state
             rng_path = os.path.join(save_path, f"rng_world_size_{world_size}_rank_{rank}.pt")
             import random
@@ -569,7 +577,7 @@ class MoeUtils:
             rng_states["npu"] = torch.npu.random.get_rng_state()
             torch.save(rng_states, rng_path)
             print(f"Rank: {rank} - Saved rng to {os.path.abspath(rng_path)}")
-        
+
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
@@ -581,7 +589,7 @@ class MoeUtils:
             reverse_key_mapping = {v: k for k, v in model._checkpoint_conversion_mapping.items()}
         else:
             reverse_key_mapping = {}
-            
+
         for name, param in model.named_parameters():
             if "mlp.experts" in name:
                 prefix = name[:-8]

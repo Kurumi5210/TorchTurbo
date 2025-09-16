@@ -114,7 +114,7 @@ def _unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
     return x[slc]
 
 
-def slice_input_tensor(x: Tensor, dim: int, padding: bool = True, group: ProcessGroup = None) -> Tensor:
+def slice_input_tensor(x: Tensor, dim: int, padding: bool = True, group: ProcessGroup = None, sp_mode="ulysses") -> Tensor:
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
     sp_rank = get_ulysses_sequence_parallel_rank()
@@ -124,10 +124,24 @@ def slice_input_tensor(x: Tensor, dim: int, padding: bool = True, group: Process
         padding_size = sp_world_size - (dim_size % sp_world_size)
         x = _pad_tensor(x, dim, padding_size)
     # slice the input tensor
-    parts = x.size(dim) // sp_world_size
-    slc = [slice(None)] * len(x.shape)
-    slc[dim] = slice(sp_rank * parts, (sp_rank + 1) * parts)
-    return x[slc].contiguous()
+    if sp_mode == "ulysses":
+        parts = x.size(dim) // sp_world_size
+        slc = [slice(None)] * len(x.shape)
+        slc[dim] = slice(sp_rank * parts, (sp_rank + 1) * parts)
+        return x[slc].contiguous()
+    else:  # zigzag_ring
+        # zigzag ring attention requires that the chunks of the sequence be concatenated according to zigzag, for example:
+        # s: [0, 1, 2, 3, 4, 5, 6, 7], sp_size=2
+        # g0: [0, 1, 6, 7], g1: [2, 3, 4, 5]
+        parts = x.size(dim) // (sp_world_size * 2)
+        slc = [slice(None)] * len(x.shape)
+        forward_start = sp_rank * parts
+        backward_start = (2 * sp_world_size - sp_rank - 1) * parts
+        slc1 = slc.copy()
+        slc1[dim] = slice(forward_start, forward_start + parts)
+        slc2 = slc.copy()
+        slc2[dim] = slice(backward_start, backward_start + parts)
+        return torch.cat([x[slc1], x[slc2]], dim=dim).contiguous()
 
 
 def all_to_all_tensor(
@@ -241,6 +255,7 @@ def gather_outpus_and_unpad(
     padding_size: int = 0,
     grad_scaler: bool = True,
     group: Optional[dist.ProcessGroup] = None,
+    sp_mode: str = "ulysses",
 ):
     """
     Gather a tensor across a process group and optionally unpad its padded elements.
@@ -261,6 +276,12 @@ def gather_outpus_and_unpad(
     if group is None:
         return x
     x = Gather.apply(group, x, gather_dim, grad_scaler)
+    if sp_mode == "zigzag_ring":
+        sp_world_size = dist.get_world_size(group=group)
+        chunks = torch.chunk(x, 2 * sp_world_size, dim=gather_dim)
+        reordered_chunks = chunks[0::2] + chunks[1::2][::-1]
+        x = torch.cat(reordered_chunks, dim=gather_dim).contiguous()
+
     if unpad_dim is not None:
         assert isinstance(padding_size, int), "padding size is not given or is not an integer"
         if padding_size == 0:
@@ -270,10 +291,11 @@ def gather_outpus_and_unpad(
 
 
 def ulysses_pad(
-    input_ids_rmpad: torch.Tensor, 
-    position_ids_rmpad: Optional[torch.Tensor] = None, 
+    input_ids_rmpad: torch.Tensor,
+    position_ids_rmpad: Optional[torch.Tensor] = None,
     labels: Optional[torch.Tensor] = None,
-    sp_size: int = 1
+    sp_size: int = 1,
+    sp_mode: str = "ulysses",
 ):
     if position_ids_rmpad is not None:
         assert position_ids_rmpad.size(-2) == 1
@@ -281,7 +303,10 @@ def ulysses_pad(
     if sp_size <= 1:
         return input_ids_rmpad, position_ids_rmpad, 0
     _, total_seq_len = input_ids_rmpad.shape
-    pad_size = (sp_size - total_seq_len % sp_size) % sp_size
+    if sp_mode == "ulysses":
+        pad_size = (sp_size - total_seq_len % sp_size) % sp_size
+    else:  # zigzag_ring
+        pad_size = (2 * sp_size - total_seq_len % (2 * sp_size)) % (2 * sp_size)
     if pad_size > 0:
         input_ids_rmpad = torch.nn.functional.pad(input_ids_rmpad, (0, pad_size), value=0)
         if position_ids_rmpad is not None:
@@ -296,10 +321,11 @@ def ulysses_pad(
 
 
 def ulysses_pad_and_slice_inputs(
-    input_ids_rmpad: torch.Tensor, 
-    position_ids_rmpad: Optional[torch.Tensor] = None, 
+    input_ids_rmpad: torch.Tensor,
+    position_ids_rmpad: Optional[torch.Tensor] = None,
     labels: torch.Tensor = None,
-    sp_size: int = 1
+    sp_size: int = 1,
+    sp_mode: str = "ulysses",
 ):
     """
     Pad and slice input_ids to be divisible by sp_size
@@ -319,12 +345,12 @@ def ulysses_pad_and_slice_inputs(
         torch.Tensor: padded and sliced position_ids
         int: pad size
     """
-    input_ids_rmpad, position_ids_rmpad, labels, pad_size = ulysses_pad(input_ids_rmpad, position_ids_rmpad, labels, sp_size)
-    input_ids_rmpad = slice_input_tensor(input_ids_rmpad, dim=1, padding=False)
+    input_ids_rmpad, position_ids_rmpad, labels, pad_size = ulysses_pad(input_ids_rmpad, position_ids_rmpad, labels, sp_size, sp_mode=sp_mode)
+    input_ids_rmpad = slice_input_tensor(input_ids_rmpad, dim=1, padding=False, sp_mode=sp_mode)
     if position_ids_rmpad is not None:
-        position_ids_rmpad = slice_input_tensor(position_ids_rmpad, dim=1, padding=False)
+        position_ids_rmpad = slice_input_tensor(position_ids_rmpad, dim=1, padding=False, sp_mode=sp_mode)
     if labels is not None:
-        labels = slice_input_tensor(labels, dim=1, padding=False)
+        labels = slice_input_tensor(labels, dim=1, padding=False, sp_mode=sp_mode)
 
     return input_ids_rmpad, position_ids_rmpad, labels, pad_size
 
@@ -336,14 +362,14 @@ def validate_ulysses_config(num_heads, ulysses_sequence_size):
 def split_into_micro_batches(batch, micro_batch_size):
     """
     Split a batch dictionary into multiple micro batches.
-    
+
     Args:
-        batch: Input dictionary {key: tensor}, where all tensors must have 
+        batch: Input dictionary {key: tensor}, where all tensors must have
                the same size in the first dimension (batch_size).
         micro_batch_size: Number of samples per micro batch.
-    
+
     Returns:
-        List[Dict]: List of split micro batches, each being a dictionary 
+        List[Dict]: List of split micro batches, each being a dictionary
                    with the same structure as input.
     """
     if not batch:
@@ -351,7 +377,6 @@ def split_into_micro_batches(batch, micro_batch_size):
 
     # Get global batch size (assuming all tensors have same first dim)
     batch_size = next(iter(batch.values())).size(0)
-    
     # Calculate number of micro batches needed
     num_micro_batches = (batch_size + micro_batch_size - 1) // micro_batch_size
 
@@ -360,11 +385,9 @@ def split_into_micro_batches(batch, micro_batch_size):
     for i in range(num_micro_batches):
         start = i * micro_batch_size
         end = min(start + micro_batch_size, batch_size)
-        
         micro_batch = {
             key: tensor[start:end]  # Handles tensors of any dimension
             for key, tensor in batch.items()
         }
         micro_batches.append(micro_batch)
-    
     return micro_batches

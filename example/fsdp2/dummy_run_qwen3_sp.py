@@ -18,6 +18,7 @@ from torch_turbo.sequence_parallel.fsdp_ulysses import FSDPUlyssesShardingManage
 from torch_turbo.sequence_parallel.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 import megatron.core.parallel_state as ps
 from dataset_utils import get_dataloader, get_dataset, data_to_device, split_into_micro_batches
+import time
 
 
 device_name = get_device_name()
@@ -62,10 +63,12 @@ def test_forward(args, model, dataloader, device, rank):
                 input_ids = micro_batch['input_ids']
                 position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
                 if args.sp_size > 1:
-                    input_ids, position_ids, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids, position_ids, _, pad_size = ulysses_pad_and_slice_inputs(
                         input_ids,
                         position_ids_rmpad=position_ids,
+                        labels=None,
                         sp_size=args.sp_size,
+                        sp_mode=args.sp_mode,
                     )
                 output = model(input_ids, position_ids=position_ids)
                 # gather and unpad for the ulysses sp
@@ -75,6 +78,7 @@ def test_forward(args, model, dataloader, device, rank):
                         gather_dim=1,
                         unpad_dim=1,
                         padding_size=pad_size,
+                        sp_mode=args.sp_mode,
                     ).cpu()
                 else:
                     logits = output["logits"].cpu()
@@ -163,6 +167,7 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         min_val, max_val = -1.0, 1.0
         ref_output = ref_model(**batch)
         labels = (max_val - min_val) * torch.rand(size=ref_output["logits"].shape, device=device, dtype=config.torch_dtype) + min_val
+        batch['labels'] = labels
         ref_loss = criterion(ref_output["logits"], labels)
         ref_optimizer.zero_grad()
         ref_loss.backward()
@@ -176,6 +181,7 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         ref_params, ref_grads = get_params_and_grads(ref_model)
 
         seq_len = batch['input_ids'].shape[1]
+        start_time = time.time()
         optimizer.zero_grad()
         with ulysses_sharding_manager:
             batch = ulysses_sharding_manager.preprocess_data(batch)
@@ -185,37 +191,36 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
                 input_ids = micro_batch['input_ids']
                 position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
                 if args.sp_size > 1:
-                    input_ids, position_ids, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids, position_ids, labels, pad_size = ulysses_pad_and_slice_inputs(
                         input_ids,
                         position_ids_rmpad=position_ids,
+                        labels=micro_batch['labels'],
                         sp_size=args.sp_size,
+                        sp_mode=args.sp_mode,
                     )
                 output = model(input_ids, position_ids=position_ids)
                 # gather and unpad for the ulysses sp
                 if args.sp_size > 1:
-                    logits = gather_outpus_and_unpad(
-                        output["logits"],
-                        gather_dim=1,
-                        unpad_dim=1,
-                        padding_size=pad_size,
-                    )
+                    loss_fct = nn.MSELoss(reduction="sum")
+                    loss = loss_fct(output['logits'], labels)
+                    # weighted reduce within sequence_parallel_group
+                    sp_group = ulysses_sharding_manager.device_mesh["sp"].get_group()
+                    loss = torch.distributed.nn.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=sp_group)
+                    label_num = (labels != -100).sum()
+                    label_num = torch.distributed.nn.all_reduce(label_num, op=torch.distributed.ReduceOp.SUM, group=sp_group)
+                    loss /= (label_num * args.sp_size)
                 else:
                     logits = output["logits"]
-
-                loss = criterion(logits, labels)
+                    loss = criterion(logits, micro_batch['labels'])
                 loss.backward()
 
-                if batch_output == {}:
-                    batch_output["logits"] = logits.cpu()
-                else:
-                    batch_output["logits"] = torch.cat([batch_output["logits"], logits.cpu()], dim=0)
-
-            output = ulysses_sharding_manager.postprocess_data(data=batch_output)
 
         MoeUtils.scale_moe_gradient(moe_params)
         total_norm = MoeUtils.clip_grad_norm(model, max_norm=1.0)
         total_norm = total_norm.to(device)
         optimizer.step()
+        end_time = time.time()
+        print(f'---> time {end_time - start_time}s')
         params, grads = get_params_and_grads(model)
 
         compare_tensors("total_norm", total_norm.detach().clone(), ref_total_norm.full_tensor().detach().clone(), rank)
@@ -364,7 +369,7 @@ def run(rank, args):
     dataset = get_dataset(seq_length=seq_len, data_size=data_size)
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
 
-    test_forward(args, model, dataloader, device, rank)
+    test_backward(args, model, dataloader, device, rank)
     cleanup()
 
 
@@ -382,10 +387,15 @@ if __name__ == "__main__":
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--ep_size", type=int, default=4)
     parser.add_argument("--sp_size", type=int, default=2)
+    parser.add_argument("--sp_mode", type=str, default="zigzag_ring", choices=["zigzag_ring", "ulysses"])
     parser.add_argument("--path", type=str, default="/sfs_turbo/pretrained_models/Qwen3-30B-A3B/")
     parser.add_argument("--save_path", type=str, default="/sfs_turbo/qinjue/models/Qwen3-30B-A3B/")
     parser.add_argument("--profiling", default=False, action="store_true")
     parser.add_argument("--average_in_collective", default=True, action="store_true")
+    parser.add_argument("--use_fused_swiglu", default=False, action="store_true")
+    parser.add_argument("--use_fused_rope", default=False, action="store_true")
+    parser.add_argument("--use_fused_rms_norm", default=False, action="store_true")
+    parser.add_argument("--use_fused_permute_unpermute", default=False, action="store_true")
     args = parser.parse_args()
 
     main(args)

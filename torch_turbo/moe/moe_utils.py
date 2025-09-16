@@ -3,7 +3,7 @@ import os
 from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch_turbo.utils.torch_utils import torch_version, load_safetensors_dir
-from torch_turbo.utils.device import get_device_name
+from torch_turbo.utils.device import get_device_name, get_device_id
 from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch.distributed.device_mesh import init_device_mesh
 import torch
@@ -272,6 +272,7 @@ class MoeUtils:
             save_model.save_pretrained(hf_local_path, state_dict=bf16_state_dict)
             if processing_class is not None:
                 processing_class.save_pretrained(hf_local_path)
+            print(f"Rank: {rank} - Saved hf model to {os.path.abspath(hf_local_path)}")
 
         # wait for rank0 to dump hf_model to local
         torch.distributed.barrier()
@@ -449,8 +450,10 @@ class MoeUtils:
         full_sd = {}
 
         for name, param in model.named_parameters():
-            assert isinstance(param, DTensor), f"{name} is not DTensor"
-            full_tensor = param.full_tensor()
+            if isinstance(param, DTensor):
+                full_tensor = param.full_tensor()
+            else:
+                full_tensor = param
             if rank == FIRST_RANK:
                 if "mlp.experts" in name:
                     prefix = name[:-8]
@@ -580,6 +583,16 @@ class MoeUtils:
 
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
+
+    @staticmethod
+    def pt2hf(args, save_path, hf_save_path, config_path):
+        MoeUtils.init_mesh(args)
+        config = AutoConfig.from_pretrained(config_path)
+        model = MoeUtils.build_model(args, config)
+        model = MoeUtils.fsdp_wrap(model, get_device_id())
+        MoeUtils.patch_moe_layer(model, config, args, get_device_id())
+        MoeUtils.load_checkpoint_shard(model, save_path)
+        MoeUtils.save_model(model, hf_save_path)
 
     @staticmethod
     def per_tensor_generate(model):

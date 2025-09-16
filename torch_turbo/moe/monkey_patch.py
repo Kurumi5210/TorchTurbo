@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from ring_attn_ascend import zigzag_ring_flash_attn_func
 import sys
 from torch_turbo.sequence_parallel.ulysses import (
     gather_heads_scatter_seq,
@@ -83,6 +84,23 @@ def _ulysses_flash_attention_forward(
         # (bsz, seq_len, n_head/n, head_dim) -> (bsz, seq_len/n, n_head, head_dim)
         attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2)
 
+    return attn_output
+
+def _zigzag_ring_flash_attn_forward(
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    query_length,
+    dropout=0,
+    deterministic=False,
+    sliding_window=None,
+    is_causal=True,
+    **kwargs,
+):
+    attn_output, _, _ = zigzag_ring_flash_attn_func(
+        query_states, key_states, value_states, dropout, causal=is_causal, group=get_ulysses_sequence_parallel_group()
+    )
     return attn_output
 
 def moe_forward(self, hidden_states: torch.Tensor):
@@ -171,20 +189,26 @@ def apply_monkey_patch(model, args):
     except AttributeError:
         num_attention_heads, num_key_value_heads = model.config.text_config.num_attention_heads, model.config.text_config.num_key_value_heads
     ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
-    assert num_attention_heads % ulysses_sp_size == 0, f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
-    assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (
-        f"num_key_value_heads {num_key_value_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}or vise versa. Upon ulysses_sp_size % num_key_value_heads == 0,kv heads are repeated to ensure correctness."
-    )
-    # transformers<=4.47.1
-    if hasattr(module, "_flash_attention_forward"):
-        module._flash_attention_forward = _ulysses_flash_attention_forward
-        print(f"Monkey patch _flash_attention_forward in {model.__module__}")
+    if args.sp_mode == "ulysses":
+        assert num_attention_heads % ulysses_sp_size == 0, f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
+        assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (
+            f"num_key_value_heads {num_key_value_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}or vise versa. Upon ulysses_sp_size % num_key_value_heads == 0,kv heads are repeated to ensure correctness."
+        )
+        new_attention_forward = _ulysses_flash_attention_forward
     else:
-        # transformers>=4.48.0
-        from transformers.integrations import flash_attention
+        new_attention_forward = _zigzag_ring_flash_attn_forward
 
-        flash_attention._flash_attention_forward = _ulysses_flash_attention_forward
-        print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
+    if ulysses_sp_size > 1:
+        # transformers<=4.47.1
+        if hasattr(module, "_flash_attention_forward"):
+            module._flash_attention_forward = new_attention_forward
+            print(f"Monkey patch _flash_attention_forward in {model.__module__}")
+        else:
+            # transformers>=4.48.0
+            from transformers.integrations import flash_attention
+
+            flash_attention._flash_attention_forward = new_attention_forward
+            print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
 
     if args.use_fused_rope:
         import transformers.models.qwen3_moe.modeling_qwen3_moe as modeling_qwen3_moe

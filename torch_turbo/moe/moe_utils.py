@@ -86,7 +86,7 @@ def convert_param_name(key, reverse_key_mapping):
 class MoeUtils:
     @staticmethod
     def patch_moe_layer(model, hf_config, args, device):
-        assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
+        assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
             # patch token_dispatcher
             token_dispatcher = layer.mlp.token_dispatcher
@@ -153,10 +153,14 @@ class MoeUtils:
 
     @staticmethod
     def transform_moe_layer(model, hf_config):
-        assert "moe" in hf_config.model_type, f'{hf_config.model_type} must be moe model'
+        assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
             moe = MegatronUtils.initialize_moe_layer_from_hf_config(hf_config)
             layer.mlp = moe
+            if "next" in hf_config.model_type:
+                from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextMLP
+                layer.mlp.shared_expert = Qwen3NextMLP(model.config, intermediate_size=model.config.shared_expert_intermediate_size)
+                layer.mlp.shared_expert_gate = torch.nn.Linear(model.config.hidden_size, 1, bias=False)
 
     @staticmethod
     def get_world_mesh():

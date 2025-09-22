@@ -1,5 +1,6 @@
 from megatron.core import parallel_state, tensor_parallel
 import torch
+import torch.nn.functional as F
 import os
 from typing import Optional
 
@@ -98,9 +99,24 @@ def _zigzag_ring_flash_attn_forward(
     is_causal=True,
     **kwargs,
 ):
-    attn_output, _, _ = zigzag_ring_flash_attn_func(
-        query_states, key_states, value_states, dropout, causal=is_causal, group=get_ulysses_sequence_parallel_group()
-    )
+    ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+    if ulysses_sp_size > 1:
+        attn_output, _, _ = zigzag_ring_flash_attn_func(
+            query_states, key_states, value_states, dropout, causal=is_causal, group=get_ulysses_sequence_parallel_group()
+        )
+    else:
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            query_length,
+            is_causal=is_causal,
+            dropout=dropout,
+            deterministic=deterministic,
+            sliding_window=sliding_window,
+            **kwargs
+        )
     return attn_output
 
 def moe_forward(self, hidden_states: torch.Tensor):
@@ -135,10 +151,10 @@ def moe_forward(self, hidden_states: torch.Tensor):
             expert_output = expert_output * permuted_probs.unsqueeze(-1)
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
 
-        if self.use_shared_expert and not self.shared_expert_overlap:
-            # if shared_expert_overlap is True, the expert calculation happens in
-            # the token_dispatcher to overlap communications and computations
-            output = output + self.shared_experts(hidden_states)
+        if hasattr(self, 'shared_expert') and self.shared_expert is not None:
+            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+            output = output + shared_expert_output
 
         if rank == 0 and os.environ.get('TORCH_TURBO_DEBUG', False):
             print(f"hidden_states.shape {hidden_states.shape} hidden_states {hidden_states}")
@@ -188,7 +204,7 @@ def apply_monkey_patch(model, args):
         num_attention_heads, num_key_value_heads = model.config.num_attention_heads, model.config.num_key_value_heads
     except AttributeError:
         num_attention_heads, num_key_value_heads = model.config.text_config.num_attention_heads, model.config.text_config.num_key_value_heads
-    ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+    ulysses_sp_size = args.sp_size
     if args.sp_mode == "ulysses":
         assert num_attention_heads % ulysses_sp_size == 0, f"num_attention_heads {num_attention_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
         assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (

@@ -5,6 +5,10 @@ import os
 from typing import Optional
 
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
+try:
+    from transformers.models.qwen3_next.modeling_qwen3_next import apply_mask_to_padding_states
+except ImportError:
+    pass  # Qwen3Next is only available in transformers>=4.57.0.dev0
 from ring_attn_ascend import zigzag_ring_flash_attn_func
 import sys
 from torch_turbo.sequence_parallel.ulysses import (
@@ -12,6 +16,7 @@ from torch_turbo.sequence_parallel.ulysses import (
     gather_seq_scatter_heads,
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
+    SequenceParallelCausalConv1dComm,
 )
 
 _FUSED_PERMUTE_UNPERMUTE = False
@@ -119,6 +124,156 @@ def _zigzag_ring_flash_attn_forward(
         )
     return attn_output
 
+def _ulysses_gated_delta_net_forward(
+    self,
+    hidden_states,
+    cache_params,
+    cache_position,
+    attention_mask,
+):
+    ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+
+    hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+
+    # Set up dimensions for reshapes later
+    batch_size, seq_len, _ = hidden_states.shape
+
+    use_precomputed_states = (
+        cache_params is not None
+        and cache_params.has_previous_state
+        and seq_len == 1
+        and cache_position is not None
+    )
+
+    # getting projected states from cache if it exists
+    if cache_params is not None:
+        conv_state = cache_params.conv_states[self.layer_idx]
+        recurrent_state = cache_params.recurrent_states[self.layer_idx]
+
+    projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+    projected_states_ba = self.in_proj_ba(hidden_states)
+    query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+    query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
+
+    mixed_qkv = torch.cat((query, key, value), dim=-1)
+    mixed_qkv = mixed_qkv.transpose(1, 2)
+
+    if ulysses_sp_size > 1:
+        comm = SequenceParallelCausalConv1dComm(self.conv_kernel_size, group=get_ulysses_sequence_parallel_group())
+
+        recv_left = comm.exchange_left_border(mixed_qkv)
+        if recv_left is not None:
+            mixed_qkv = torch.cat((recv_left, mixed_qkv), dim=2)
+        else:
+            mixed_qkv = F.pad(mixed_qkv, (comm.left_padding_size, 0))
+
+    if use_precomputed_states:
+        # 2. Convolution sequence transformation
+        # NOTE: the conv state is updated in `causal_conv1d_update`
+        mixed_qkv = self.causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            self.conv1d.weight.squeeze(1),
+            self.conv1d.bias,
+            self.activation,
+        )
+    else:
+        if cache_params is not None:
+            conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+            cache_params.conv_states[self.layer_idx] = conv_state
+        if self.causal_conv1d_fn is not None:
+            mixed_qkv = self.causal_conv1d_fn(
+                x=mixed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                seq_idx=None,
+            )
+        else:
+            if ulysses_sp_size > 1:
+                mixed_qkv = self.conv1d(mixed_qkv)
+            else:
+                mixed_qkv = self.conv1d(mixed_qkv)[:, :, :seq_len]
+            mixed_qkv = F.silu(mixed_qkv)
+
+    if ulysses_sp_size > 1:
+        # Remove the extra border added for convolution
+        mixed_qkv = mixed_qkv[:, :, comm.left_padding_size : comm.left_padding_size + seq_len]
+
+    mixed_qkv = mixed_qkv.transpose(1, 2)
+    query, key, value = torch.split(
+        mixed_qkv,
+        [
+            self.key_dim,
+            self.key_dim,
+            self.value_dim,
+        ],
+        dim=-1,
+    )
+    query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
+    key = key.reshape(key.shape[0], key.shape[1], -1, self.head_k_dim)
+    value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
+
+    beta = b.sigmoid()
+    # If the model is loaded in fp16, without the .float() here, A might be -inf
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+    if self.num_v_heads // self.num_k_heads > 1:
+        query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+    if ulysses_sp_size > 1:
+        # (bsz, seq_len/n, n_head, head_dim) -> (bsz, seq_len, n_head/n, head_dim)
+        query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2)
+        key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2)
+        value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2)
+        # (bsz, seq_len/n, n_head) -> (bsz, seq_len, n_head/n)
+        beta = gather_seq_scatter_heads(beta, seq_dim=1, head_dim=2)
+        g = gather_seq_scatter_heads(g, seq_dim=1, head_dim=2)
+
+    if not use_precomputed_states:
+        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    else:
+        core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    if ulysses_sp_size > 1:
+        # (bsz, seq_len, n_head/n, head_dim) -> (bsz, seq_len/n, n_head, head_dim)
+        core_attn_out = gather_heads_scatter_seq(core_attn_out, seq_dim=1, head_dim=2)
+
+    # Update cache
+    if cache_params is not None:
+        cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+
+    z_shape_og = z.shape
+    # reshape input data into 2D tensor
+    core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+    z = z.reshape(-1, z.shape[-1])
+    core_attn_out = self.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(z_shape_og)
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+
+    output = self.out_proj(core_attn_out)
+    return output
+
 def moe_forward(self, hidden_states: torch.Tensor):
     if (
         self.training
@@ -210,6 +365,10 @@ def apply_monkey_patch(model, args):
         assert num_key_value_heads % ulysses_sp_size == 0 or ulysses_sp_size % num_key_value_heads == 0, (
             f"num_key_value_heads {num_key_value_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}or vise versa. Upon ulysses_sp_size % num_key_value_heads == 0,kv heads are repeated to ensure correctness."
         )
+        if "next" in model.config.model_type:
+            linear_num_value_heads = model.config.linear_num_value_heads
+            assert linear_num_value_heads % ulysses_sp_size == 0, f"linear_num_value_heads {linear_num_value_heads} must be divisible by ulysses_sp_size {ulysses_sp_size}"
+
         new_attention_forward = _ulysses_flash_attention_forward
     else:
         new_attention_forward = _zigzag_ring_flash_attn_forward
@@ -225,6 +384,11 @@ def apply_monkey_patch(model, args):
 
             flash_attention._flash_attention_forward = new_attention_forward
             print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
+
+        if "next" in model.config.model_type:
+            from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
+            Qwen3NextGatedDeltaNet.forward = _ulysses_gated_delta_net_forward
+            print(f"Monkey patch Qwen3NextGatedDeltaNet.forward")
 
     if args.use_fused_rope:
         import transformers.models.qwen3_moe.modeling_qwen3_moe as modeling_qwen3_moe

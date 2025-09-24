@@ -391,3 +391,41 @@ def split_into_micro_batches(batch, micro_batch_size):
         }
         micro_batches.append(micro_batch)
     return micro_batches
+
+class SequenceParallelCausalConv1dComm:
+    def __init__(self, conv_kernel_size, group):
+        super().__init__()
+        self.conv_kernel_size = conv_kernel_size
+
+        self.left_padding_size = conv_kernel_size - 1
+
+        self.group = group
+        self.sp_size = dist.get_world_size(group)
+        self.sp_rank = dist.get_rank(group)
+
+        self.left_rank = self.sp_rank - 1 if self.sp_rank > 0 else None
+        self.right_rank = self.sp_rank + 1 if self.sp_rank < self.sp_size - 1 else None
+
+        if group is not None:
+            self.left_rank = dist.get_global_rank(group, self.left_rank) if self.left_rank is not None else None
+            self.right_rank = dist.get_global_rank(group, self.right_rank) if self.right_rank is not None else None
+
+    def exchange_left_border(self, x):
+        """
+        Exchange border information with left rank and right rank
+        """
+        send_right = x[:, :, -self.left_padding_size:].contiguous()
+        recv_left = torch.zeros(x.size(0), x.size(1), self.left_padding_size, device=x.device, dtype=x.dtype)
+
+        reqs = []
+
+        # Communicate with right neighbor and left neighbor
+        if self.left_rank is not None:
+            reqs.append(dist.irecv(recv_left, src=self.left_rank, group=self.group))
+        if self.right_rank is not None:
+            reqs.append(dist.isend(send_right, dst=self.right_rank, group=self.group))
+        # Wait for all communications to complete
+        for req in reqs:
+            req.wait()
+
+        return recv_left

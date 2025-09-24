@@ -33,6 +33,8 @@ def test_forward(args, model, dataloader, device, rank):
     config.num_hidden_layers = model.config.num_hidden_layers
     ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
+    if hasattr(config, "layer_types"):
+        ref_model.config.layer_types = ref_model.config.layer_types[:config.num_hidden_layers]
     model = model.to(dtype=config.torch_dtype)
     # MoeUtils.save_model(model, args.save_path)
 
@@ -321,6 +323,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--world_size", type=int, default=16)
     parser.add_argument("--ep_size", type=int, default=4)
+    parser.add_argument("--sp_size", type=int, default=2)
+    parser.add_argument("--sp_mode", type=str, default="zigzag_ring", choices=["zigzag_ring", "ulysses"])
     parser.add_argument("--path", type=str, default="/sfs_turbo/pretrained_models/Qwen3-30B-A3B/")
     parser.add_argument("--save_path", type=str, default="/sfs_turbo/qinjue/models/Qwen3-30B-A3B/")
     parser.add_argument("--profiling", default=False, action="store_true")

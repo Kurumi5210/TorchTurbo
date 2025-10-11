@@ -1,39 +1,36 @@
 from typing import Any
 import os
-from torch_turbo.moe.megatron_utils import MegatronUtils
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+from torch.distributed._tensor import distribute_tensor, DTensor
+from torch.distributed.device_mesh import init_device_mesh
+from torch import nn
+from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch_turbo.utils.torch_utils import torch_version, load_safetensors_dir
 from torch_turbo.utils.device import get_device_name, get_device_id
-from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
-from torch.distributed.device_mesh import init_device_mesh
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch import nn
-import torch.nn.functional as F
-from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
-
-import torch_npu
-
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
-
-import megatron.core.parallel_state as ps
-from megatron.core.jit import jit_fuser
-
-# TODO, torch 2.5 and torch 2.6 package name is not the same
-from torch.distributed._tensor import (
-    DeviceMesh,
-    distribute_tensor,
-    DTensor,
-    Replicate,
-    Shard,
+from torch_turbo.transformer.transformer_config import TransformerConfig
+from torch_turbo.transformer.module import ModuleSpec
+from torch_turbo.moe.moe_layer import MoESubmodules, MoELayer
+from torch_turbo.moe.experts import GroupedMLP
+from torch_turbo.distributed.parallel import (
+    get_expert_model_parallel_group,
+    get_expert_model_parallel_rank,
+    get_expert_model_parallel_world_size
 )
+
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp import fully_shard
     from torch.distributed.fsdp._fully_shard import FSDPModule
 else:
     from torch.distributed._composable.fsdp import fully_shard
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+
 
 device_name = get_device_name()
 
@@ -85,6 +82,36 @@ def convert_param_name(key, reverse_key_mapping):
 
 class MoeUtils:
     @staticmethod
+    def initialize_moe_layer_from_hf_config(config, args, **config_kwargs):
+        num_moe_experts = config.num_experts
+        expert_model_parallel_size = get_expert_model_parallel_world_size()
+        default_config_kwargs = dict(
+            num_layers=1,
+            expert_model_parallel_size=expert_model_parallel_size,
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            moe_token_dispatcher_type="alltoall",
+            gated_linear_unit=True,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_moe_experts=num_moe_experts,
+            moe_router_topk=config.num_experts_per_tok,
+            use_cpu_initialization=True,
+            fp8=None,
+            add_bias_linear=False,
+            moe_router_pre_softmax=True,
+            activation_func=F.silu,
+            moe_router_load_balancing_type="none",
+        )
+        default_config_kwargs.update(**config_kwargs)
+        tf_config = TransformerConfig(**default_config_kwargs)
+        experts = ModuleSpec(module=GroupedMLP, submodules=None)
+        moe_submodules = MoESubmodules(experts=experts, shared_experts=None)
+
+        grouped_mlp = MoELayer(tf_config, moe_submodules, args.use_fused_swiglu, args.use_fused_permute_unpermute)
+
+        return grouped_mlp
+
+    @staticmethod
     def patch_moe_layer(model, hf_config, args, device):
         assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
@@ -101,15 +128,6 @@ class MoeUtils:
             token_dispatcher.restore_output_by_local_experts = input_chunk_idxs.reshape(
                 token_dispatcher.num_local_experts, -1
             ).T.ravel()
-
-            # patch grouped mlp
-            @jit_fuser
-            def glu(x, probs):
-                if args.use_fused_swiglu:
-                    return torch_npu.npu_swiglu(x, dim=-1)
-                x = torch.chunk(x, 2, dim=-1)
-                return layer.mlp.experts.config.activation_func(x[0]) * x[1]
-            layer.mlp.experts.activation_func_with_probs = glu
 
         # patch rotary embedding
         rotary_emb = model.model.rotary_emb
@@ -155,7 +173,7 @@ class MoeUtils:
     def transform_moe_layer(model, hf_config):
         assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
-            moe = MegatronUtils.initialize_moe_layer_from_hf_config(hf_config)
+            moe = MoeUtils.initialize_moe_layer_from_hf_config(hf_config, args)
             layer.mlp = moe
             if "next" in hf_config.model_type:
                 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextMLP
@@ -229,7 +247,7 @@ class MoeUtils:
             return mesh_ranks == given_ranks
 
         # verify ep group is the same with ep_mesh
-        megatron_ep_group = ps.get_expert_model_parallel_group()
+        megatron_ep_group = get_expert_model_parallel_group()
         assert is_same_group(megatron_ep_group, ep_mesh['ep'])
 
         global WORLD_MESH
@@ -246,7 +264,7 @@ class MoeUtils:
         with torch.device("meta"):
             model = AutoModelForCausalLM.from_config(config)
             apply_monkey_patch(model, args)
-            MoeUtils.transform_moe_layer(model, config)
+            MoeUtils.transform_moe_layer(model, config, args)
 
         model = model.to(dtype=torch_dtype)
         return model
@@ -377,8 +395,8 @@ class MoeUtils:
         ep = EXPERT_MESH['ep']
         edp = EXPERT_MESH['edp']
 
-        ep_rank = ps.get_expert_model_parallel_rank()
-        ep_world_size = ps.get_expert_model_parallel_world_size()
+        ep_rank = get_expert_model_parallel_rank()
+        ep_world_size = get_expert_model_parallel_world_size()
 
         sharded_sd = {}
         for param_name, param in model.named_parameters():

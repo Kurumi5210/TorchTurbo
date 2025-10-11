@@ -4,22 +4,18 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
-import torch.nn.functional as F
 
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
-from torch_turbo.moe.megatron_utils import MegatronUtils
 from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
 from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch_turbo.utils.torch_utils import compare_tensors
 from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend, is_npu_available
-from torch.utils.data import DataLoader, Dataset
-import functools
-from torch.utils.data.distributed import DistributedSampler
-from collections.abc import Mapping
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.transformer.moe import grouped_gemm_util as gg
-import megatron.core.parallel_state as ps
+from torch_turbo.distributed.parallel import (
+    initialize_model_parallel,
+    get_expert_model_parallel_rank,
+    get_expert_model_parallel_world_size
+)
 from dataset_utils import get_dataloader, get_dataset, data_to_device
 
 def test_forward(args, model, dataloader, device, rank):
@@ -81,8 +77,8 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         from torch.distributed.fsdp import fully_shard
     else:
         from torch.distributed._composable.fsdp import fully_shard
-    ep_rank = ps.get_expert_model_parallel_rank()
-    ep_world_size = ps.get_expert_model_parallel_world_size()
+    ep_rank = get_expert_model_parallel_rank()
+    ep_world_size = get_expert_model_parallel_world_size()
     lr = 1e-2
     betas = (0.9, 0.999)
     weight_decay = 0.0
@@ -95,11 +91,6 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         elif param.device_mesh != MoeUtils.get_world_mesh():
             moe_params.append(param)
 
-    # moe_betas = (1 - (1 - betas[0]) / ep_world_size, 1 - (1 - betas[1]) / ep_world_size**2)
-    # optimizer = torch.optim.AdamW([{"params": params, "betas": betas}, {"params": moe_params, "betas": moe_betas}],
-    #     lr=lr,
-    #     weight_decay=weight_decay,
-    # )
     optimizer = torch.optim.AdamW([{"params": params}, {"params": moe_params}],
         lr=lr,
         betas=betas,
@@ -275,8 +266,11 @@ def setup(rank, args):
 
     if is_npu_available:
         import torch_npu
+        from torch_npu.contrib import transfer_to_npu
         torch_npu.npu.set_device(rank)
-    MegatronUtils.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
+    else:
+        torch.cuda.set_device(rank)
+    initialize_model_parallel(expert_model_parallel_size=args.ep_size)
 
     dist.barrier()
 
@@ -307,6 +301,8 @@ def run(rank, args):
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
 
     train(args, model, dataloader, device, rank)
+    # test_forward(args, model, dataloader, device, rank)
+    # test_backward(args, model, dataloader, device, rank)
     cleanup()
 
 
@@ -321,7 +317,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--world_size", type=int, default=16)
+    parser.add_argument("--world_size", type=int, default=8)
     parser.add_argument("--ep_size", type=int, default=4)
     parser.add_argument("--sp_size", type=int, default=2)
     parser.add_argument("--sp_mode", type=str, default="zigzag_ring", choices=["zigzag_ring", "ulysses"])

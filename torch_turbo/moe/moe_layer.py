@@ -1,0 +1,157 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
+import os
+
+import torch
+import torch.nn.functional as F
+
+from torch_turbo.distributed.parallel import (
+    get_expert_model_parallel_world_size,
+    get_expert_model_parallel_rank
+)
+from torch_turbo.transformer.transformer_config import TransformerConfig
+from torch_turbo.transformer.module import ModuleSpec, build_module
+from torch_turbo.moe.router import TopKRouter
+from torch_turbo.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
+
+
+@dataclass
+class MoESubmodules:
+    """MoE Layer Submodule spec"""
+
+    experts: Union[ModuleSpec, type] = None
+    shared_experts: Union[ModuleSpec, type] = None
+
+                
+class BaseMoELayer(torch.nn.Module, ABC):
+    """Base class for a mixture of experts layer.
+
+    Args:
+        config (TransformerConfig): Configuration object for the transformer model.
+    """
+
+    def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.expert_parallel_size = get_expert_model_parallel_world_size()
+        assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
+
+        assert self.config.num_moe_experts % self.expert_parallel_size == 0
+        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+        local_expert_indices_offset = (
+            get_expert_model_parallel_rank() * self.num_local_experts
+        )
+
+        self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
+        self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+
+        self.local_expert_indices = [
+            local_expert_indices_offset + i for i in range(self.num_local_experts)
+        ]
+        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+        self.router: TopKRouter = None
+        self.experts = None
+        self.shared_experts = None
+        self.token_dispatcher: Optional[MoETokenDispatcher] = None
+        self.layer_number = layer_number
+
+    @abstractmethod
+    def forward(self, hidden_states):
+        """Forward method for the MoE layer."""
+        pass
+
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number for the MoE layer."""
+        self.layer_number = layer_number
+        self.router.set_layer_number(layer_number)
+
+class MoELayer(BaseMoELayer):
+    """
+    Mixture of experts Layer **currently only supports no token dropping**.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: Optional[MoESubmodules] = None,
+        use_fused_swiglu: Optional[bool] = False,
+        use_fused_permute_unpermute: Optional[bool] = False,
+        layer_number: Optional[int] = None,
+    ):
+        self.use_fused_swiglu = use_fused_swiglu
+        self.use_fused_permute_unpermute = use_fused_permute_unpermute
+        self.submodules = submodules
+        super(MoELayer, self).__init__(config=config, layer_number=layer_number)
+
+        # Initialize router
+        self.router = TopKRouter(config=self.config)
+
+        # Initialize token dispatcher
+        if config.moe_token_dispatcher_type == "alltoall":
+            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        else:
+            raise ValueError(
+                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+            )
+
+        # Initialize experts
+        self.experts = build_module(self.submodules.experts, self.num_local_experts, self.use_fused_swiglu, self.config)
+
+        # Initialize shared experts
+        if self.use_shared_expert:
+            self.shared_experts = build_module(self.submodules.shared_experts, config=self.config)
+            if self.shared_expert_overlap:
+                self.token_dispatcher.set_shared_experts(self.shared_experts)
+
+    def forward(self, hidden_states: torch.Tensor):
+        if (
+            self.training
+            and self.config.tensor_model_parallel_size > 1
+            and not self.config.sequence_parallel
+        ):
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                "are enabled without also enabling sequence parallelism."
+            )
+
+        # debug
+        rank = torch.distributed.get_rank()
+        # process MoE
+        def custom_forward(hidden_states):
+            probs, routing_map, logits = self.router(hidden_states)
+            probs /= probs.sum(dim=-1, keepdim=True)
+            logits = logits.view(-1, logits.shape[-1])
+            (dispatched_input, tokens_per_expert, permuted_probs) = (
+                self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
+            )
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
+            if self.use_fused_permute_unpermute:
+                # apply shape transform for npu fused kernel
+                num_tokens, _ = probs.shape
+                probs = probs.masked_select(routing_map).view(num_tokens, -1)
+                output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias, probs)
+            else:
+                expert_output = expert_output * permuted_probs.unsqueeze(-1)
+                output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+
+            if hasattr(self, 'shared_expert') and self.shared_expert is not None:
+                shared_expert_output = self.shared_expert(hidden_states)
+                shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+                output = output + shared_expert_output
+
+            if rank == 0 and os.environ.get('TORCH_TURBO_DEBUG', False):
+                print(f"hidden_states.shape {hidden_states.shape} hidden_states {hidden_states}")
+                print(f"dispatched_input.shape {dispatched_input.shape} dispatched_input {dispatched_input}")
+                print(f"tokens_per_expert.shape {tokens_per_expert.shape} tokens_per_expert {tokens_per_expert}")
+                print(f"permuted_probs.shape {permuted_probs.shape} permuted_probs {permuted_probs}")
+                print(f"before unpermutation: expert_output.shape {expert_output.shape} expert_output {expert_output}")
+                print(f"after unpermutation: expert_output.shape {output.shape} expert_output {output}")
+
+            return output, mlp_bias, logits
+        output, mlp_bias, logits = custom_forward(hidden_states)
+        return output, logits

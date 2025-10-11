@@ -1,12 +1,12 @@
 from torch_turbo.moe.moe_utils import MoeUtils
-from torch_turbo.moe.megatron_utils import MegatronUtils
+from torch_turbo.distributed.parallel import initialize_model_parallel
 import torch.distributed as dist
 import torch_npu
 
 def setup(args, backend="nccl"):
     """初始化进程组，必须在所有分布式操作前调用"""
     dist.init_process_group(backend=backend)
-    MegatronUtils.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
+    initialize_model_parallel(expert_model_parallel_size=args.ep_size)
     torch_npu.npu.set_device(dist.get_rank() % torch_npu.npu.device_count())
     print(f"Rank {dist.get_rank()} initialized")
 

@@ -12,8 +12,11 @@ import torch.nn.functional as F
 
 import torch_npu
 
-
-from torch_turbo.moe.megatron_utils import MegatronUtils
+from torch_turbo.distributed.parallel import (
+    initialize_model_parallel,
+    get_expert_model_parallel_rank,
+    get_expert_model_parallel_world_size
+)
 from torch_turbo.moe.moe_utils import MoeUtils, load_safetensors_dir, slice_tensor_for_ep_rank
 from torch_turbo.utils.torch_utils import compare_tensors
 
@@ -22,12 +25,11 @@ import torch.distributed as dist
 from torch.distributed._tensor import DTensor
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoConfig
-import megatron.core.parallel_state as ps
 
 def verify_weight_loading(path, model, device):
     rank = dist.get_rank()
-    ep_rank = ps.get_expert_model_parallel_rank()
-    ep_world_size = ps.get_expert_model_parallel_world_size()
+    ep_rank = get_expert_model_parallel_rank()
+    ep_world_size = get_expert_model_parallel_world_size()
     
     # Step 1: Load original state dict from safetensors
     sd = load_safetensors_dir(path)
@@ -75,7 +77,7 @@ def setup(rank, args):
     os.environ['RANK'] = str(rank)
     dist.init_process_group("hccl", rank=rank, world_size=args.world_size)
     torch_npu.npu.set_device(rank)
-    MegatronUtils.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
+    initialize_model_parallel(expert_model_parallel_size=args.ep_size)
 
     dist.barrier()
 

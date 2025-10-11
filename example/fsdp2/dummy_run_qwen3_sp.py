@@ -9,14 +9,17 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
-from torch_turbo.moe.megatron_utils import MegatronUtils
+from torch_turbo.distributed.parallel import (
+    initialize_model_parallel,
+    get_expert_model_parallel_rank,
+    get_expert_model_parallel_world_size
+)
 from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
 from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch_turbo.utils.torch_utils import compare_tensors
 from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend, is_npu_available
 from torch_turbo.sequence_parallel.fsdp_ulysses import FSDPUlyssesShardingManager
 from torch_turbo.sequence_parallel.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
-import megatron.core.parallel_state as ps
 from dataset_utils import get_dataloader, get_dataset, data_to_device, split_into_micro_batches
 import time
 
@@ -101,8 +104,8 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         from torch.distributed.fsdp import fully_shard
     else:
         from torch.distributed._composable.fsdp import fully_shard
-    ep_rank = ps.get_expert_model_parallel_rank()
-    ep_world_size = ps.get_expert_model_parallel_world_size()
+    ep_rank = get_expert_model_parallel_rank()
+    ep_world_size = get_expert_model_parallel_world_size()
     lr = 1e-2
     betas = (0.9, 0.999)
     weight_decay = 0.0
@@ -339,7 +342,7 @@ def setup(rank, args):
         torch_npu.npu.set_device(rank)
     else:
         torch.cuda.set_device(rank)
-    MegatronUtils.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
+    initialize_model_parallel(expert_model_parallel_size=args.ep_size)
 
     dist.barrier()
 

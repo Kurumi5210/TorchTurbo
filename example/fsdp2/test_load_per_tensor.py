@@ -22,7 +22,7 @@ import torch_npu
 
 from transformers import AutoConfig, AutoModel
 
-from torch_turbo.moe.megatron_utils import MegatronUtils
+from torch_turbo.distributed.parallel import initialize_model_parallel
 from torch_turbo.moe.moe_utils import MoeUtils, load_safetensors_dir, FIRST_RANK
 
 
@@ -33,7 +33,7 @@ def setup(rank, args):
     os.environ['RANK'] = str(rank)
     dist.init_process_group("hccl", rank=rank, world_size=args.world_size)
     torch_npu.npu.set_device(rank)
-    MegatronUtils.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
+    initialize_model_parallel(expert_model_parallel_size=args.ep_size)
 
     dist.barrier()
 

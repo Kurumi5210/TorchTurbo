@@ -1,4 +1,3 @@
-from megatron.core import parallel_state, tensor_parallel
 import torch
 import torch.nn.functional as F
 import os
@@ -9,7 +8,12 @@ try:
     from transformers.models.qwen3_next.modeling_qwen3_next import apply_mask_to_padding_states
 except ImportError:
     pass  # Qwen3Next is only available in transformers>=4.57.0.dev0
-from ring_attn_ascend import zigzag_ring_flash_attn_func
+
+try:
+    from ring_attn_ascend import zigzag_ring_flash_attn_func
+except ImportError:
+    pass
+    
 import sys
 from torch_turbo.sequence_parallel.ulysses import (
     gather_heads_scatter_seq,
@@ -19,7 +23,6 @@ from torch_turbo.sequence_parallel.ulysses import (
     SequenceParallelCausalConv1dComm,
 )
 
-_FUSED_PERMUTE_UNPERMUTE = False
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -348,12 +351,6 @@ def apply_monkey_patch(model, args):
     """
     Apply monkey patch to the MoE layer for expert parallel and attention for ulysses sequence parallel.
     """
-    from megatron.core.transformer.moe.moe_layer import MoELayer
-    from megatron.core.transformer.moe.router import TopKRouter
-
-    TopKRouter.forward = router_forward
-    MoELayer.forward = moe_forward
-
     module = sys.modules[model.__module__]
     try:
         num_attention_heads, num_key_value_heads = model.config.num_attention_heads, model.config.num_key_value_heads
@@ -407,19 +404,12 @@ def apply_monkey_patch(model, args):
         Qwen3MoeRMSNorm.forward = fused_forward
 
     if args.use_fused_permute_unpermute:
-        global _FUSED_PERMUTE_UNPERMUTE
-        _FUSED_PERMUTE_UNPERMUTE = True
-        import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
         from mindspeed.ops.npu_moe_token_permute import npu_moe_token_permute
         from mindspeed.ops.npu_moe_token_unpermute import npu_moe_token_unpermute
         from typing import List, Optional, Tuple
-        from megatron.core.tensor_parallel import (
-            all_to_all,
-            gather_from_sequence_parallel_region,
-            reduce_scatter_to_sequence_parallel_region,
-        )
-        from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
-        from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+        from torch_turbo.distributed.mappings import all_to_all
+        from torch_turbo.transformer.utils  import sort_chunks_by_idxs
+        from torch_turbo.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 
         def permute(
             tokens,
@@ -482,9 +472,6 @@ def apply_monkey_patch(model, args):
             hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
             tokens_per_expert = self.preprocess(self.routing_map)
 
-            if self.shared_experts is not None:
-                self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
-
             # Permutation 1: input to AlltoAll input
             tokens_per_expert = self._maybe_dtoh_and_synchronize(
                 "before_permutation_1", tokens_per_expert
@@ -509,9 +496,6 @@ def apply_monkey_patch(model, args):
             global_input_tokens = all_to_all(
                 self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
             )
-
-            if self.shared_experts is not None:
-                self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
 
             # Permutation 2: Sort tokens by local expert.
             tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -587,26 +571,11 @@ def apply_monkey_patch(model, args):
                         fused=self.config.moe_permute_fusion,
                     )
 
-            if self.tp_size > 1:
-                if self.output_splits_tp is None:
-                    input_split_sizes = None
-                else:
-                    input_split_sizes = self.output_splits_tp.tolist()
-                # The precision of TP reduce_scatter should be the same as the router_dtype
-                hidden_states = reduce_scatter_to_sequence_parallel_region(
-                    hidden_states.to(self.probs.dtype),
-                    group=self.tp_group,
-                    input_split_sizes=input_split_sizes,
-                ).to(hidden_states.dtype)
-
             # Perform expert parallel AlltoAll communication
             # hidden_states: [SEQL, H] -> [SEQL, H/TP]
             permutated_local_input_tokens = all_to_all(
                 self.ep_group, hidden_states, self.input_splits, self.output_splits
             )
-            if self.shared_experts is not None:
-                self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
-                self.shared_experts.post_forward_comm()
 
             # Unpermutation 1: AlltoAll output to output
             output = unpermute(
@@ -622,11 +591,6 @@ def apply_monkey_patch(model, args):
             # Reshape the output tensor
             output = output.view(self.hidden_shape)
 
-            # Add shared experts output
-            if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts.get_output()
-                output += shared_expert_output
             return output, None
-
         MoEAlltoAllTokenDispatcher.token_permutation = token_permutation
         MoEAlltoAllTokenDispatcher.token_unpermutation = token_unpermutation

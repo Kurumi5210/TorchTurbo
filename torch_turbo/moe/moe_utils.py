@@ -170,7 +170,7 @@ class MoeUtils:
         return total_norm
 
     @staticmethod
-    def transform_moe_layer(model, hf_config):
+    def transform_moe_layer(model, hf_config, args):
         assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
             moe = MoeUtils.initialize_moe_layer_from_hf_config(hf_config, args)

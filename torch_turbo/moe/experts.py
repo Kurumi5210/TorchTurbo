@@ -66,7 +66,6 @@ class GroupedMLP(torch.nn.Module):
             def glu(x, probs):
                 if use_fused_swiglu:
                     # use npu fused kernel for glu
-                    print("fused swiglu activated...")
                     import torch_npu
                     return torch_npu.npu_swiglu(x, dim=-1)
                 x = torch.chunk(x, 2, dim=-1)

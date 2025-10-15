@@ -13,7 +13,7 @@ from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
 
 from torch_turbo.moe.monkey_patch import apply_monkey_patch
 from torch_turbo.utils.torch_utils import torch_version, load_safetensors_dir
-from torch_turbo.utils.device import get_device_name, get_device_id
+from torch_turbo.utils.device import get_device_name, get_device_id, is_npu_available
 from torch_turbo.transformer.transformer_config import TransformerConfig
 from torch_turbo.transformer.module import ModuleSpec
 from torch_turbo.moe.moe_layer import MoESubmodules, MoELayer
@@ -23,6 +23,9 @@ from torch_turbo.distributed.parallel import (
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
 )
+if is_npu_available:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
 
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp import fully_shard
@@ -116,6 +119,8 @@ class MoeUtils:
         assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
             # patch token_dispatcher
+            if not hasattr(layer.mlp, "token_dispatcher"):
+                continue
             token_dispatcher = layer.mlp.token_dispatcher
             token_dispatcher.permute_idx_device = device
             input_chunk_idxs = torch.arange(
@@ -172,7 +177,13 @@ class MoeUtils:
     @staticmethod
     def transform_moe_layer(model, hf_config, args):
         assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
-        for layer in model.model.layers:
+        if hasattr(hf_config, "first_k_dense_replace"):
+            first_moe_layer = hf_config.first_k_dense_replace
+        else:
+            first_moe_layer = 0
+        for i, layer in enumerate(model.model.layers):
+            if i < first_moe_layer:
+                continue
             moe = MoeUtils.initialize_moe_layer_from_hf_config(hf_config, args)
             layer.mlp = moe
             if "next" in hf_config.model_type:
@@ -300,10 +311,14 @@ class MoeUtils:
         torch.distributed.barrier()
 
     @staticmethod
-    def set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, layer_cls, expert_cls, model_cls):
+    def set_moe_forward_prefetch_for_fsdp2_ep(fsdp2_model, layer_cls, expert_cls, model_cls, config=None):
         model_modules = []
         layer_modules = []
         expert_modules = []
+        if hasattr(config, "first_k_dense_replace"):
+            first_k_dense_replace = config.first_k_dense_replace
+        else:
+            first_k_dense_replace = 0
 
         for name, named_module in fsdp2_model.named_modules():
             if isinstance(named_module, FSDPModule) and isinstance(named_module, model_cls):
@@ -316,46 +331,66 @@ class MoeUtils:
                 expert_modules.append(named_module)
 
         assert len(model_modules) == 1
-        assert len(layer_modules) == len(expert_modules)
+        assert len(layer_modules) == len(expert_modules + first_k_dense_replace)
 
         for i in range(len(layer_modules)):
             # layer prefetch layer
             # expert prefetch expert
-            cur_expert = expert_modules[i]
             cur_layer = layer_modules[i]
+            j = i - first_k_dense_replace
+            if j >= 0:
+                cur_expert = expert_modules[j]
 
             # deal with forward
             if i == 0:
-               model_modules[0].set_modules_to_forward_prefetch([cur_layer, cur_expert])
+                if j == 0:
+                    model_modules[0].set_modules_to_forward_prefetch([cur_layer, cur_expert])
+                else:
+                    model_modules[0].set_modules_to_forward_prefetch([cur_layer])
             else:
                 # layer_{i - 1} prefetch layer_i
-                layer_modules[i - 1].set_modules_to_forward_prefetch([cur_layer])
-                expert_modules[i - 1].set_modules_to_forward_prefetch([cur_expert])
+                if j == 0:
+                    layer_modules[i - 1].set_modules_to_forward_prefetch([cur_expert, cur_layer])
+                else:
+                    layer_modules[i - 1].set_modules_to_forward_prefetch([cur_layer])
+                
+                if j > 0:
+                    expert_modules[j - 1].set_modules_to_forward_prefetch([cur_expert])
+            
 
             # deal with backward
             if i > 0:
                 # layer_i prefetch layer_{i - 1}
                 layer_backward_prefetch_states = [layer_modules[i - 1]._get_fsdp_state()]
                 setattr(layer_modules[i], 'backward_prefetch_states', layer_backward_prefetch_states)
-                expert_backward_prefetch_states = [expert_modules[i - 1]._get_fsdp_state()]
-                setattr(expert_modules[i], 'backward_prefetch_states', expert_backward_prefetch_states)
+
+            if j > 0:
+                # layer_i prefetch layer_{i - 1}
+                expert_backward_prefetch_states = [expert_modules[j - 1]._get_fsdp_state()]
+                setattr(expert_modules[j], 'backward_prefetch_states', expert_backward_prefetch_states)
 
     @staticmethod
-    def fsdp_wrap(model, device, fsdp_kwargs={}):
+    def fsdp_wrap(model, device, fsdp_kwargs={}, config=None):
         outer_cls = model.model.layers[0].__class__
-        inter_cls = model.model.layers[0].mlp.experts.__class__
+        if hasattr(config, "first_k_dense_replace"):
+            first_k_dense_replace = config.first_k_dense_replace
+            inter_cls = model.model.layers[config.first_k_dense_replace].mlp.experts.__class__
+        else:
+            first_k_dense_replace = 0
+            inter_cls = model.model.layers[0].mlp.experts.__class__
         outermost_cls = model.__class__
-        for layer in model.model.layers:
+        for i, layer in enumerate(model.model.layers):
             # wrap moe mlp in edp
-            fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh(), **fsdp_kwargs)
-            setattr(layer.mlp.experts, "expert_forward_prefetch", True)
+            if i >= first_k_dense_replace:
+                fully_shard(layer.mlp.experts, mesh = MoeUtils.get_edp_mesh(), **fsdp_kwargs)
+                setattr(layer.mlp.experts, "expert_forward_prefetch", True)
             # wrap other parts in dp
             fully_shard(layer, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
             setattr(layer, "moe_forward_prefetch", True)
         # wrap remaining parts
         fully_shard(model, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
 
-        MoeUtils.set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls)
+        MoeUtils.set_moe_forward_prefetch_for_fsdp2_ep(model, config, outer_cls, inter_cls, outermost_cls)
         model.to_empty(device=device)
         return model
 
@@ -408,9 +443,10 @@ class MoeUtils:
                         for i in range(config.num_experts):
                             gate_proj = f"{prefix}.{i}.gate_proj.weight"
                             up_proj = f"{prefix}.{i}.up_proj.weight"
-                            fc1 = torch.cat([sd[gate_proj], sd[up_proj]])
+                            fc1 = torch.cat([sd[gate_proj].to(device), sd[up_proj].to(device)])
                             w1.append(fc1)
-                        full_tensor = torch.stack(w1, dim=0).to(device)
+                        full_tensor = torch.stack(w1, dim=0)
+                        del w1
                         # [e, 2 * i, h] -> [e, h, 2 * i]
                         full_tensor = full_tensor.permute(0, 2, 1)
                     else:
@@ -418,8 +454,9 @@ class MoeUtils:
                         w2 = []
                         for i in range(config.num_experts):
                             down_proj = f"{prefix}.{i}.down_proj.weight"
-                            w2.append(sd[down_proj].t())
-                        full_tensor = torch.stack(w2, dim=0).to(device)
+                            w2.append(sd[down_proj].to(device).t())
+                        full_tensor = torch.stack(w2, dim=0)
+                        del w2
                     # broadcast to ep_group
                     full_tensor = full_tensor.reshape(-1, full_tensor.shape[-1])
                     dist.broadcast(full_tensor, src=rank, group=ep.get_group(0))

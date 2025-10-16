@@ -46,14 +46,76 @@ def compare_tensors(key, custom, ref, rank, atol=1e-5):
         print(f"Rank {rank} - Key: {key} - Ref value: {ref}")
 
 def load_safetensors_dir(model_dir: str) -> dict:
-    from pathlib import Path
-    from safetensors.torch import load_file
+    import os
+    from safetensors.torch import load_file as safetensors_load
 
     state_dict = {}
-    model_path = Path(model_dir)
 
-    for safetensor_file in model_path.glob("*.safetensors"):
-        file_path = safetensor_file.as_posix()
-        state_dict.update(load_file(file_path, device="cpu"))
+    # Step 1: Identify if the input is a Hugging Face repo ID or local path
+    try:
+        from huggingface_hub.utils import HFValidationError, validate_repo_id
 
+        try:
+            validate_repo_id(model_dir)
+            is_hf_repo = True
+        except HFValidationError:
+            is_hf_repo = False
+    except ImportError:
+        is_hf_repo = False
+
+    if is_hf_repo:
+        from huggingface_hub import snapshot_download
+
+        # Step 2: Download the repo if it's a Hugging Face repo ID
+        local_path = snapshot_download(
+            repo_id=model_dir,
+        )
+    else:
+        # Assume it's a local path
+        local_path = model_dir
+
+    # Step 3: Load all .safetensors and .bin files
+    file_paths_to_load = []
+    if os.path.isdir(local_path):
+        for filename in os.listdir(local_path):
+            filepath = os.path.join(local_path, filename)
+            if filename.endswith(".safetensors") or filename.endswith(".bin"):
+                file_paths_to_load.append(filepath)
+    elif os.path.isfile(local_path):
+        file_paths_to_load.append(local_path)
+    else:
+        raise ValueError(
+            f"Local path {local_path} does not exist or is not a valid path, "
+            f"or {local_path} is a huggingface repo id but huggingface_hub is not installed."
+        )
+
+    def _load(filepath: str):
+        if filepath.endswith(".safetensors"):
+            state_dict = safetensors_load(filepath)
+            for k in list(state_dict.keys()):
+                state_dict[k] = state_dict[k].clone()
+        elif filepath.endswith(".bin"):
+            state_dict = torch.load(filepath, map_location="cpu")
+        else:
+            raise ValueError(f"{filepath} is not a torch bin or safetensor file.")
+        return state_dict
+
+    state_dict = {}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(
+        max_workers=max(1, os.cpu_count() // 8)
+    ) as executor:
+        future_to_checkpoint = {
+            executor.submit(_load, path): path for path in file_paths_to_load
+        }
+
+        for future in as_completed(future_to_checkpoint):
+            path = future_to_checkpoint[future]
+            try:
+                sd = future.result()
+                state_dict.update(sd)
+            except Exception as e:
+                raise RuntimeError(f"Error loading checkpoint from {path}: {e}")
     return state_dict

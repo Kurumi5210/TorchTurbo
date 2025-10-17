@@ -144,6 +144,10 @@ class MoELayer(BaseMoELayer):
                 shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
                 output = output + shared_expert_output
 
+            if hasattr(self, 'shared_experts') and self.shared_experts is not None:
+                shared_expert_output = self.shared_experts(hidden_states)
+                output = output + shared_expert_output
+
             if rank == 0 and os.environ.get('TORCH_TURBO_DEBUG', False):
                 print(f"hidden_states.shape {hidden_states.shape} hidden_states {hidden_states}")
                 print(f"dispatched_input.shape {dispatched_input.shape} dispatched_input {dispatched_input}")

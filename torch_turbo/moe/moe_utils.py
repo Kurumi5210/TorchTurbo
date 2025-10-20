@@ -146,7 +146,8 @@ class MoeUtils:
         # patch rotary embedding
         rotary_emb = model.model.rotary_emb
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
-        rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+        # HACK align to deepspeed
+        rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)
 
     @staticmethod
     def scale_moe_gradient(params):
@@ -228,7 +229,7 @@ class MoeUtils:
     def create_fsdp2_moe_model(args, device):
         MoeUtils.init_mesh(args)
 
-        config = AutoConfig.from_pretrained(args.path)
+        config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
         model = MoeUtils.build_model(args, config)
         model = MoeUtils.fsdp_wrap(model, device)
         MoeUtils.patch_moe_layer(model, config, args, device)
@@ -286,7 +287,11 @@ class MoeUtils:
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+            if config.architectures[0] == "BailingMoeV2ForCausalLM":
+                from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                model = BailingMoeV2ForCausalLM(config)
+            else:
+                model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
             apply_monkey_patch(model, args)
             MoeUtils.transform_moe_layer(model, config, args)
 
@@ -296,9 +301,13 @@ class MoeUtils:
     @staticmethod
     def build_model_from_config(args):
         # DEBUG
-        config = AutoConfig.from_pretrained(args.path)
+        config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
         config.num_hidden_layers = 1
-        model = AutoModel.from_config(config)
+        if config.architectures[0] == "BailingMoeV2ForCausalLM":
+            from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+            model = BailingMoeV2ForCausalLM(config)
+        else:
+            model = AutoModel.from_config(config, trust_remote_code=True)
         return model
 
     @staticmethod
@@ -308,7 +317,12 @@ class MoeUtils:
         rank = torch.distributed.get_rank()
         if rank == 0:
             with torch.device("meta"):
-                save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
+                if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
+                    from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                    save_model = BailingMoeV2ForCausalLM(model.config)
+                else:    
+                    save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
+                
             save_model.to_empty(device="cpu")
 
             bf16_state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}

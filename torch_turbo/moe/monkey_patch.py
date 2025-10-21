@@ -311,7 +311,9 @@ def apply_monkey_patch(model, args):
 
             flash_attention._flash_attention_forward = new_attention_forward
             print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
-
+        if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
+            for layer in model.model.layers:
+                layer.attention._flash_attention_forward = new_attention_forward
         if "next" in model.config.model_type:
             from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextGatedDeltaNet
             Qwen3NextGatedDeltaNet.forward = _ulysses_gated_delta_net_forward

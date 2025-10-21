@@ -105,6 +105,15 @@ class MoeUtils:
             activation_func=F.silu,
             moe_router_load_balancing_type="none",
         )
+        if config.architectures[0] == "BailingMoeV2ForCausalLM":
+            default_config_kwargs.update(
+                moe_router_score_function=config.score_function,
+                moe_router_group_topk=config.topk_group,
+                moe_router_num_groups=config.n_group,
+                moe_router_dtype=config.router_dtype, 
+                moe_router_enable_expert_bias=config.moe_router_enable_expert_bias,
+                moe_router_topk_scaling_factor=config.routed_scaling_factor,
+            )
         default_config_kwargs.update(**config_kwargs)
         tf_config = TransformerConfig(**default_config_kwargs)
         experts = ModuleSpec(module=GroupedMLP, submodules=None)
@@ -137,7 +146,8 @@ class MoeUtils:
         # patch rotary embedding
         rotary_emb = model.model.rotary_emb
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
-        rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+        # HACK align to deepspeed
+        rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)
 
     @staticmethod
     def scale_moe_gradient(params):
@@ -185,11 +195,15 @@ class MoeUtils:
             if i < first_moe_layer:
                 continue
             moe = MoeUtils.initialize_moe_layer_from_hf_config(hf_config, args)
+            if "bailing_moe" in hf_config.model_type:
+                bailing_shared_experts = layer.mlp.shared_experts.__class__(model.config, intermediate_size=model.config.moe_intermediate_size * model.config.num_shared_experts)
             layer.mlp = moe
             if "next" in hf_config.model_type:
                 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextMLP
                 layer.mlp.shared_expert = Qwen3NextMLP(model.config, intermediate_size=model.config.shared_expert_intermediate_size)
                 layer.mlp.shared_expert_gate = torch.nn.Linear(model.config.hidden_size, 1, bias=False)
+            if "bailing_moe" in hf_config.model_type:
+                layer.mlp.shared_experts = bailing_shared_experts
 
     @staticmethod
     def get_world_mesh():
@@ -215,7 +229,7 @@ class MoeUtils:
     def create_fsdp2_moe_model(args, device):
         MoeUtils.init_mesh(args)
 
-        config = AutoConfig.from_pretrained(args.path)
+        config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
         model = MoeUtils.build_model(args, config)
         model = MoeUtils.fsdp_wrap(model, device)
         MoeUtils.patch_moe_layer(model, config, args, device)
@@ -273,19 +287,15 @@ class MoeUtils:
         # DEBUG
         # config.num_hidden_layers = 1
         with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(config)
+            if config.architectures[0] == "BailingMoeV2ForCausalLM":
+                from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                model = BailingMoeV2ForCausalLM(config)
+            else:
+                model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
             apply_monkey_patch(model, args)
             MoeUtils.transform_moe_layer(model, config, args)
 
         model = model.to(dtype=torch_dtype)
-        return model
-
-    @staticmethod
-    def build_model_from_config(args):
-        # DEBUG
-        config = AutoConfig.from_pretrained(args.path)
-        config.num_hidden_layers = 1
-        model = AutoModel.from_config(config)
         return model
 
     @staticmethod
@@ -295,7 +305,12 @@ class MoeUtils:
         rank = torch.distributed.get_rank()
         if rank == 0:
             with torch.device("meta"):
-                save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
+                if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
+                    from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                    save_model = BailingMoeV2ForCausalLM(model.config)
+                else:    
+                    save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
+                
             save_model.to_empty(device="cpu")
 
             bf16_state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
@@ -331,7 +346,7 @@ class MoeUtils:
                 expert_modules.append(named_module)
 
         assert len(model_modules) == 1
-        assert len(layer_modules) == len(expert_modules + first_k_dense_replace)
+        assert len(layer_modules) == len(expert_modules) + first_k_dense_replace
 
         for i in range(len(layer_modules)):
             # layer prefetch layer
@@ -390,7 +405,7 @@ class MoeUtils:
         # wrap remaining parts
         fully_shard(model, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
 
-        MoeUtils.set_moe_forward_prefetch_for_fsdp2_ep(model, config, outer_cls, inter_cls, outermost_cls)
+        MoeUtils.set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, config)
         model.to_empty(device=device)
         return model
 
@@ -424,6 +439,7 @@ class MoeUtils:
         rank = torch.distributed.get_rank()
         # only load state dict from rank 0, and broadcast to alll other ranks according device mesh
         if rank == FIRST_RANK:
+            print("Start loading param to memory...", flush=True)
             sd = load_safetensors_dir(path)
         torch.distributed.barrier()
 
@@ -434,6 +450,18 @@ class MoeUtils:
         ep_world_size = get_expert_model_parallel_world_size()
 
         sharded_sd = {}
+        for buffer_name, buffer in model.named_buffers():
+            if "router.expert_bias" in buffer_name:
+                if rank == FIRST_RANK:          
+                    new_name = buffer_name.replace("router", "gate")
+                    full_tensor = sd[new_name].to(device)
+                else:
+                    full_tensor = torch.empty(
+                        buffer.shape,
+                        device=device,
+                    )
+                dist.broadcast(full_tensor, src=FIRST_RANK)
+                sharded_sd[buffer_name] = full_tensor
         for param_name, param in model.named_parameters():
             if rank == FIRST_RANK:
                 if "mlp.experts" in param_name:

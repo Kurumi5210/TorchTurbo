@@ -121,8 +121,10 @@ class MoELayer(BaseMoELayer):
         rank = torch.distributed.get_rank()
         # process MoE
         def custom_forward(hidden_states):
+            hidden_states_dtype = hidden_states.dtype
             probs, routing_map, logits = self.router(hidden_states)
-            probs /= probs.sum(dim=-1, keepdim=True)
+            if self.config.moe_router_score_function != "sigmoid":
+                probs /= probs.sum(dim=-1, keepdim=True)
             logits = logits.view(-1, logits.shape[-1])
             (dispatched_input, tokens_per_expert, permuted_probs) = (
                 self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
@@ -138,10 +140,14 @@ class MoELayer(BaseMoELayer):
             else:
                 expert_output = expert_output * permuted_probs.unsqueeze(-1)
                 output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
-
+            output = output.to(hidden_states_dtype)
             if hasattr(self, 'shared_expert') and self.shared_expert is not None:
                 shared_expert_output = self.shared_expert(hidden_states)
                 shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+                output = output + shared_expert_output
+
+            if hasattr(self, 'shared_experts') and self.shared_experts is not None:
+                shared_expert_output = self.shared_experts(hidden_states)
                 output = output + shared_expert_output
 
             if rank == 0 and os.environ.get('TORCH_TURBO_DEBUG', False):

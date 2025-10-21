@@ -525,6 +525,8 @@ def apply_monkey_patch(model, args):
             )
 
             # Unpermutation 1: AlltoAll output to output
+            # HACK
+            probs = probs.to(torch.bfloat16)
             output = unpermute(
                 permutated_local_input_tokens,
                 self.reversed_local_input_permutation_mapping,

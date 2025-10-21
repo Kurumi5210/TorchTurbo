@@ -299,18 +299,6 @@ class MoeUtils:
         return model
 
     @staticmethod
-    def build_model_from_config(args):
-        # DEBUG
-        config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
-        config.num_hidden_layers = 1
-        if config.architectures[0] == "BailingMoeV2ForCausalLM":
-            from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
-            model = BailingMoeV2ForCausalLM(config)
-        else:
-            model = AutoModel.from_config(config, trust_remote_code=True)
-        return model
-
-    @staticmethod
     def save_model(model, save_path, processing_class=None):
         state_dict = MoeUtils.get_full_hf_state_dict(model)
 

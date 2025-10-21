@@ -54,7 +54,8 @@ class Router(ABC, torch.nn.Module):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype))
+        # HACK: avoid unexpected dtype conversion
+        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype)).to(router_dtype)
         return logits
     
 class TopKRouter(Router):

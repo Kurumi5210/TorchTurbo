@@ -717,3 +717,18 @@ class MoeUtils:
                 yield from zip([convert_param_name(new_name, reverse_key_mapping)], [param.full_tensor()])
             else:
                 yield from zip([convert_param_name(name, reverse_key_mapping)], [param.full_tensor()])
+
+    @staticmethod
+    def load_safetensors_dir_base(model_dir):
+        # quick start for 1 layer hack when model is very large
+        from pathlib import Path
+        from safetensors.torch import load_file
+
+        state_dict = {}
+        model_path = Path(model_dir)
+
+        for safetensor_file in model_path.glob("*.safetensors"):
+            file_path = safetensor_file.as_posix()
+            state_dict.update(load_file(file_path, device="cpu"))
+
+        return state_dict

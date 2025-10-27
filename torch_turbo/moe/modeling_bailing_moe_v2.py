@@ -29,6 +29,7 @@ from torch import nn
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_attention_mask,
@@ -406,15 +407,35 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
         tokens_per_expert = tokens_per_expert.cpu().numpy()
         outputs = []
         start_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            end_idx = start_idx + num_tokens
-            if num_tokens == 0:
-                continue
-            expert = self.experts[i]
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = expert(tokens_for_this_expert)
-            outputs.append(expert_out.to(x.device))
-            start_idx = end_idx
+        if is_deepspeed_zero3_enabled():
+            # cover the original modeling_bailing_moe_v2.py for deepspeed zero3
+            # experts balance
+            for i, num_tokens in enumerate(tokens_per_expert):
+                expert = self.experts[i]
+                if num_tokens == 0:
+                    dummy_input = torch.zeros(
+                        1, x.shape[-1],
+                        dtype=x.dtype,
+                        device=x.device
+                    )
+                    expert_out = expert(dummy_input)
+                    expert_out = expert_out[:0]  # shape: [0, hidden_dim]
+                else:
+                    end_idx = start_idx + num_tokens
+                    tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+                    expert_out = expert(tokens_for_this_expert)
+                    start_idx = end_idx
+                outputs.append(expert_out.to(x.device))
+        else:
+            for i, num_tokens in enumerate(tokens_per_expert):
+                end_idx = start_idx + num_tokens
+                if num_tokens == 0:
+                    continue
+                expert = self.experts[i]
+                tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+                expert_out = expert(tokens_for_this_expert)
+                outputs.append(expert_out.to(x.device))
+                start_idx = end_idx
 
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
         new_x = torch.empty_like(outs)

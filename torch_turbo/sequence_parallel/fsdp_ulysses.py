@@ -49,7 +49,7 @@ class FSDPUlyssesShardingManager:
 
         return data
 
-    def preprocess_data_with_pad(self, data: Dict[str, torch.Tensor]):
+    def preprocess_data_with_pad(self, data: Dict[str, torch.Tensor], pad_value: int = 0):
         """
         Synchronizes variable-length sequences across ranks in a sequence parallel group by padding
         to the maximum sequence length found in the group. Handles multiple data types in input dictionary.
@@ -89,6 +89,12 @@ class FSDPUlyssesShardingManager:
                         data[key],
                         (0, padding_needed),  # Pad right side of sequence dimension
                         value=-100  # Use -100 for label padding (common in loss ignore)
+                    )
+                elif key == 'input_ids':
+                    padded_data = torch.nn.functional.pad(
+                        data[key],
+                        (0, padding_needed),
+                        value=pad_value
                     )
                 else:
                     padded_data = torch.nn.functional.pad(

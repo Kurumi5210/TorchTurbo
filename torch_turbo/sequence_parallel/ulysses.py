@@ -296,6 +296,7 @@ def ulysses_pad(
     labels: Optional[torch.Tensor] = None,
     sp_size: int = 1,
     sp_mode: str = "ulysses",
+    pad_value: int = 0,
 ):
     if position_ids_rmpad is not None:
         assert position_ids_rmpad.size(-2) == 1
@@ -308,7 +309,7 @@ def ulysses_pad(
     else:  # zigzag_ring
         pad_size = (2 * sp_size - total_seq_len % (2 * sp_size)) % (2 * sp_size)
     if pad_size > 0:
-        input_ids_rmpad = torch.nn.functional.pad(input_ids_rmpad, (0, pad_size), value=0)
+        input_ids_rmpad = torch.nn.functional.pad(input_ids_rmpad, (0, pad_size), value=pad_value)
         if position_ids_rmpad is not None:
             pad_pos_ids = torch.arange(pad_size, device=position_ids_rmpad.device).unsqueeze(0)
             if position_ids_rmpad.dim() == 3:
@@ -326,6 +327,7 @@ def ulysses_pad_and_slice_inputs(
     labels: torch.Tensor = None,
     sp_size: int = 1,
     sp_mode: str = "ulysses",
+    pad_value: int = 0,
 ):
     """
     Pad and slice input_ids to be divisible by sp_size
@@ -345,7 +347,8 @@ def ulysses_pad_and_slice_inputs(
         torch.Tensor: padded and sliced position_ids
         int: pad size
     """
-    input_ids_rmpad, position_ids_rmpad, labels, pad_size = ulysses_pad(input_ids_rmpad, position_ids_rmpad, labels, sp_size, sp_mode=sp_mode)
+    input_ids_rmpad, position_ids_rmpad, labels, pad_size = ulysses_pad(
+        input_ids_rmpad, position_ids_rmpad, labels, sp_size, sp_mode=sp_mode, pad_value=pad_value)
     input_ids_rmpad = slice_input_tensor(input_ids_rmpad, dim=1, padding=False, sp_mode=sp_mode)
     if position_ids_rmpad is not None:
         position_ids_rmpad = slice_input_tensor(position_ids_rmpad, dim=1, padding=False, sp_mode=sp_mode)

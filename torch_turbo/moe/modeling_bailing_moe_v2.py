@@ -463,6 +463,19 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def apply_mask_to_padding_states_helper(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    if attention_mask is not None and attention_mask.dim() == 2:
+        bsz, seq_len = attention_mask.shape
+        attention_mask = attention_mask.view(bsz, seq_len, 1).expand([bsz, seq_len, hidden_states.shape[-1]])
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask).to(dtype)
+
+    return hidden_states
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaAttention with Llama->BailingMoeV2
 class BailingMoeV2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -683,6 +696,8 @@ class BailingMoeV2FlashAttention2(BailingMoeV2Attention):
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = apply_mask_to_padding_states_helper(attn_output, kwargs.get("attn_out_mask", None))
+
         attn_output = self.dense(attn_output)
 
         if not output_attentions:
@@ -1017,6 +1032,9 @@ class BailingMoeV2DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        attention_kwargs = {}
+        if hasattr(self, "attn_out_mask") and self.attn_out_mask is not None:
+            attention_kwargs = {"attn_out_mask": self.attn_out_mask}
         hidden_states, self_attn_weights, present_key_value = self.attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -1025,6 +1043,7 @@ class BailingMoeV2DecoderLayer(nn.Module):
             output_attentions=output_attentions,
             position_embeddings=position_embeddings,
             use_cache=use_cache,
+            **attention_kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -1298,6 +1317,9 @@ class BailingMoeV2Model(BailingMoeV2PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # Add attn_out_mask to decoder layer's kwargs will cause error in checkpointing when use reentrant,
+            # so we set it as an attribute of decoder_layer.
+            decoder_layer.attn_out_mask=kwargs.get("attn_out_mask", None)
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,

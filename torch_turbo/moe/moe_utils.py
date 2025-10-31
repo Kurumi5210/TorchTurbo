@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, cast
 import os
 
 import torch
@@ -23,6 +23,7 @@ from torch_turbo.distributed.parallel import (
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
 )
+from torch.distributed.tensor.placement_types import Shard
 if is_npu_available:
     import torch_npu
     from torch_npu.contrib import transfer_to_npu
@@ -41,6 +42,11 @@ WORLD_MESH = None
 EXPERT_MESH = None
 FIRST_RANK = 0
 _GRADIENT_SCALING_FACTOR = 1.0
+
+import torch.distributed.checkpoint as dcp
+from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend
+
+ckpt_group = dist.new_group(list(range(dist.get_world_size())), backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}")
 
 def is_rank_in_mesh(target_rank, device_mesh):
     return target_rank in device_mesh.mesh.flatten().tolist()
@@ -441,6 +447,7 @@ class MoeUtils:
         if rank == FIRST_RANK:
             print("Start loading param to memory...", flush=True)
             sd = load_safetensors_dir(path)
+            print("Finish loading param to memory", flush=True)
         torch.distributed.barrier()
 
         ep = EXPERT_MESH['ep']
@@ -574,6 +581,62 @@ class MoeUtils:
         return full_sd
 
     @staticmethod
+    def load_checkpoint_shard_async(model, save_path, extra={}):
+        """
+        Load an FSDP checkpoint for this rank.
+        Every rank will load its own model shard.
+        """
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        checkpoint_id = save_path
+        optimizer = extra.get("optimizer", None)
+        lr_scheduler = extra.get("lr_scheduler", None)
+        state_dict = dict()
+        model_sd = model.state_dict()
+        # HACK: change device mesh to use dcp
+        for name in list(model_sd.keys()):
+            if "mlp.experts.weight" in name:
+                local_tensor = model_sd[name].to_local()
+                model_sd[name] = DTensor.from_local(local_tensor, device_mesh=WORLD_MESH, placements=[Shard(0)])
+        state_dict["model"] = model_sd
+        if optimizer is not None:
+            state_dict["optimizer"] = optimizer.state_dict()
+        if lr_scheduler is not None:
+            state_dict["lr_scheduler"] = lr_scheduler.state_dict()
+        
+        dcp.state_dict_loader.load(state_dict, checkpoint_id=checkpoint_id, process_group=ckpt_group)
+        # HACK: resume device mesh
+        for name in list(state_dict["model"].keys()):
+            if "expert_bias" in name:
+                model_sd[name] = model.state_dict()[name]
+            if "mlp.experts.weight" in name:
+                local_tensor = state_dict["model"][name].to_local()
+                old_mesh = model.state_dict()[name].device_mesh
+                state_dict["model"][name] = DTensor.from_local(local_tensor, device_mesh=old_mesh, placements=[Shard(0)])
+        model.load_state_dict(state_dict["model"])
+        if optimizer is not None:
+            optimizer.load_state_dict(state_dict["optimizer"])
+        if lr_scheduler is not None:
+            lr_scheduler.load_state_dict(state_dict["lr_scheduler"])
+
+        # Load RNG state
+        rng_path = os.path.join(save_path, f"rng_world_size_{world_size}_rank_{rank}.pt")
+        if os.path.exists(rng_path):
+            rng_states = torch.load(rng_path, weights_only=False)
+            import random
+            import numpy as np
+            random.setstate(rng_states["python"])
+            np.random.set_state(rng_states["numpy"])
+            torch.random.set_rng_state(rng_states["cpu"])
+            torch.npu.random.set_rng_state(rng_states["npu"])
+            print(f"Rank: {rank} - Loaded RNG state from {os.path.abspath(rng_path)}")
+        else:
+            print(f"Rank: {rank} - RNG checkpoint not found at {rng_path}")
+
+        # wait for everyone to load checkpoints
+        torch.distributed.barrier()
+
+    @staticmethod
     def load_checkpoint_shard(model, save_path, extra={}):
         """
         Load an FSDP checkpoint for this rank.
@@ -626,6 +689,48 @@ class MoeUtils:
         torch.distributed.barrier()
 
     @staticmethod
+    def save_checkpoint_shard_async(model, save_path, save_only_model=False, extra={}):
+        """
+        Save an FSDP checkpoint for this rank.
+        Every rank will save its own model shard.
+        """
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        optimizer = extra.get("optimizer", None)
+        lr_scheduler = extra.get("lr_scheduler", None)
+        state_dict = dict()
+        model_sd = model.state_dict()
+        # HACK: change device mesh to use dcp
+        for name in list(model_sd.keys()):
+            if "mlp.experts.weight" in name:
+                local_tensor = model_sd[name].to_local()
+                model_sd[name] = DTensor.from_local(local_tensor, device_mesh=WORLD_MESH, placements=[Shard(0)])
+        state_dict["model"] =  model_sd
+        if not save_only_model:
+            if optimizer is not None:
+                state_dict["optimizer"] = optimizer.state_dict()
+            if lr_scheduler is not None:
+                state_dict["lr_scheduler"] = lr_scheduler.state_dict()
+        future = dcp.state_dict_saver.async_save(state_dict, checkpoint_id=save_path, process_group=ckpt_group)
+        # Save RNG state
+        rng_path = os.path.join(save_path, f"rng_world_size_{world_size}_rank_{rank}.pt")
+        import random
+        import numpy as np
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cpu": torch.random.get_rng_state(),
+        }
+        rng_states["npu"] = torch.npu.random.get_rng_state()
+        torch.save(rng_states, rng_path)
+        print(f"Rank: {rank} - Saved rng to {os.path.abspath(rng_path)}")
+
+        # wait for everyone to save checkpoints
+        torch.distributed.barrier()
+        
+        return future
+
+    @staticmethod
     def save_checkpoint_shard(model, save_path, save_only_model=False, extra={}):
         """
         Save an FSDP checkpoint for this rank.
@@ -668,7 +773,7 @@ class MoeUtils:
             torch.save(rng_states, rng_path)
             print(f"Rank: {rank} - Saved rng to {os.path.abspath(rng_path)}")
 
-        # wait for everyone to load checkpoints
+        # wait for everyone to save checkpoints
         torch.distributed.barrier()
 
     @staticmethod

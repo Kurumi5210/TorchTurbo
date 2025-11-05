@@ -8,10 +8,13 @@ jobs:
     stage: test
     component: shell-with-clone
     inputs:
-      image: aci/utf-8_jdk-1.8.0_172_b245_mvn-3.2.5:20201225
+      image: hcs-base/npu_test_pipeline:20251105203859 # aci/utf-8_jdk-1.8.0_172_b245_mvn-3.2.5:20201225
       script: |
         echo hello
         ls
+        python --version
+        cd ./test_pipeline && python run_torchturbo_test.py
+        echo "请自己进入实验链接检查结果"
       cloneDepth: 1     # 指定 clone 深度, 默认是10
       cloneFetchCommitId: true # 是否开启 fetch 模式下载代码(默认是 true，下载速度快)，当值为 false 时，cloneSingleBranch 不生效
       cloneSingleBranch: false # git clone 是否开启 --single-branch，默认 false

@@ -39,6 +39,8 @@ def _ulysses_flash_attention_forward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
+    attention_mask,
+    query_length,
     *args,
     position_ids: Optional[torch.Tensor] = None,
     **kwargs,
@@ -84,9 +86,12 @@ def _ulysses_flash_attention_forward(
         position_ids_list = [torch.empty_like(position_ids) for _ in range(ulysses_sp_size)]
         torch.distributed.all_gather(position_ids_list, position_ids, group=get_ulysses_sequence_parallel_group())
         position_ids = torch.concat(position_ids_list, dim=-1)
+        if query_length != query_states.size(1):
+            assert query_length * ulysses_sp_size == query_states.size(1), "ulysses fa only pass 1/sp query here"
+            query_length = query_states.size(1)
 
     # (bsz, seq_len, n_head/n, head_dim)
-    attn_output = _flash_attention_forward(query_states, key_states, value_states, *args, position_ids=position_ids, **kwargs)
+    attn_output = _flash_attention_forward(query_states, key_states, value_states, attention_mask, query_length, *args, position_ids=position_ids, **kwargs)
 
     ########## AlltoAll for Ulysses ##########
     if ulysses_sp_size > 1:
@@ -539,6 +544,10 @@ def apply_monkey_patch(model, args):
 
             # Reshape the output tensor
             output = output.view(self.hidden_shape)
+
+            # release cached tensors
+            self.probs = None
+            self.routing_map = None
 
             return output, None
         MoEAlltoAllTokenDispatcher.token_permutation = token_permutation

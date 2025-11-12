@@ -90,6 +90,8 @@ def load_safetensors_dir(model_dir: str) -> dict:
         )
 
     def _load(filepath: str):
+        import time
+        t0 = time.perf_counter()
         if filepath.endswith(".safetensors"):
             state_dict = safetensors_load(filepath)
             for k in list(state_dict.keys()):
@@ -98,6 +100,8 @@ def load_safetensors_dir(model_dir: str) -> dict:
             state_dict = torch.load(filepath, map_location="cpu")
         else:
             raise ValueError(f"{filepath} is not a torch bin or safetensor file.")
+        t1 = time.perf_counter()
+        print(f"[Loading] load {filepath} done in {t1 - t0:.2f} s", flush=True)
         return state_dict
 
     state_dict = {}

@@ -1,5 +1,6 @@
 from typing import Any, cast
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -400,6 +401,9 @@ class MoeUtils:
             first_k_dense_replace = 0
             inter_cls = model.model.layers[0].mlp.experts.__class__
         outermost_cls = model.__class__
+        if config.architectures[0] == "BailingMoeV2ForCausalLM":
+            fully_shard(model.model.word_embeddings, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
+            fully_shard(model.lm_head, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
         for i, layer in enumerate(model.model.layers):
             # wrap moe mlp in edp
             if i >= first_k_dense_replace:
@@ -446,8 +450,10 @@ class MoeUtils:
         # only load state dict from rank 0, and broadcast to alll other ranks according device mesh
         if rank == FIRST_RANK:
             print("Start loading param to memory...", flush=True)
+            t0 = time.perf_counter()
             sd = load_safetensors_dir(path)
-            print("Finish loading param to memory", flush=True)
+            t1 = time.perf_counter()
+            print("Finish loading param to memory in {t1 - t0:.2f} s", flush=True)
         torch.distributed.barrier()
 
         ep = EXPERT_MESH['ep']
@@ -456,6 +462,7 @@ class MoeUtils:
         ep_rank = get_expert_model_parallel_rank()
         ep_world_size = get_expert_model_parallel_world_size()
 
+        bcast_start = time.perf_counter()
         sharded_sd = {}
         for buffer_name, buffer in model.named_buffers():
             if "router.expert_bias" in buffer_name:
@@ -530,6 +537,10 @@ class MoeUtils:
             sharded_tensor = distribute_tensor(full_tensor, mesh, param.placements)
             sharded_sd[param_name] = nn.Parameter(sharded_tensor)
 
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        bcast_elapsed = time.perf_counter() - bcast_start
+        print(f"[Rank {rank}] broadcast done in {bcast_elapsed:.2f} s", flush=True)
         model.load_state_dict(sharded_sd, assign=True)
         for param in model.parameters():
             assert isinstance(param, DTensor), "must be"

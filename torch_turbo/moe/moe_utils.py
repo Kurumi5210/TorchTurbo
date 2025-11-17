@@ -2,6 +2,11 @@ from typing import Any, cast
 import os
 import time
 
+from pathlib import Path
+from typing import Dict
+from safetensors.torch import load_file
+import json
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -89,6 +94,230 @@ def convert_param_name(key, reverse_key_mapping):
         if n_replace > 0:
             return key
     return key
+
+
+class DistParamLoad:
+    def __init__(self, model, config, device, path, ep_mesh, world_mesh):
+        self.model = model
+        self.config = config
+        self.device = device
+        self.path = Path(path)
+        self.ep_mesh = ep_mesh
+        self.world_mesh = world_mesh
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.ep_rank = get_expert_model_parallel_rank()
+        self.ep_world_size = get_expert_model_parallel_world_size()
+        # log related
+        self.start_time = time.perf_counter()
+        self.prev_time = self.start_time
+        # build meta
+        self.param_to_filename = self._load_index_json()
+        self.param_to_rank, self.layer_to_rank = self._build_param_to_rank()
+        self.local_sd = self._load_local_shards()
+
+    def _load_index_json(self):
+        index_path = self.path / "model.safetensors.index.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Index file not found: {index_path}")
+        with open(index_path) as f:
+            index = json.load(f)
+        return index["weight_map"]
+
+    def _get_layer_id(self, param_name):
+        parts = param_name.split('.')
+        if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
+            return int(parts[2])
+        return None
+
+    def _sync_log_rank0(self, content, update_prev = True):
+        torch.cuda.synchronize()
+        dist.barrier()
+        cur = time.perf_counter()
+        if self.rank == 0:
+            print(f"{content} in {cur - self.prev_time:.2f}s (total {cur - self.start_time:.2f}s)", flush=True)
+        if update_prev:
+            self.prev_time = cur
+
+    def _build_param_to_rank(self):
+        param_to_rank = {}
+        layer_rank_map = {}
+
+        for param_name in self.param_to_filename.keys():
+            layer_id = self._get_layer_id(param_name)
+            if layer_id is not None:
+                rank = (layer_id + 1) % self.world_size
+                param_to_rank[param_name] = rank
+                layer_rank_map[layer_id] = rank
+            else:
+                param_to_rank[param_name] = 0
+
+        self._sync_log_rank0(f"Distributed {len(layer_rank_map)} layers across {self.world_size} ranks")
+        return param_to_rank, layer_rank_map
+
+    def _load_local_shards(self):
+        self.local_params = {
+            name: filename
+            for name, filename in self.param_to_filename.items()
+            if self.param_to_rank[name] == self.rank
+        }
+
+        local_sd = {}
+        if self.local_params:
+            files_needed = set(self.local_params.values())
+            files = [self.path / f for f in sorted(files_needed)]
+            print(f"[Rank {self.rank}] Loading {len(files)} files with {len(self.local_params)} parameters...", flush=True)
+            t0 = time.perf_counter()
+            for f in files:
+                file_params = load_file(f.as_posix(), device="cpu")
+                for param_name, tensor in file_params.items():
+                    if param_name in self.local_params:
+                        local_sd[param_name] = tensor
+            print(f"[Rank {self.rank}] Loaded {len(local_sd)} params in {time.perf_counter() - t0:.2f}s", flush=True)
+        else:
+            print(f"[Rank {self.rank}] No parameters to load")
+
+        self._sync_log_rank0(f"[Load File] Load finished")
+        return local_sd
+
+    def _broadcast_tensor(self, name, shape=None, dtype=None):
+        owner = self.param_to_rank[name]
+        if self.rank == owner:
+            tensor = self.local_sd[name].to(self.device, dtype=dtype)
+        else:
+            tensor = torch.empty(shape, device=self.device, dtype=dtype)
+        dist.broadcast(tensor, src=owner)
+        return tensor
+
+    def _get_owner_rank(self, name):
+        layer_id = self._get_layer_id(name)
+        if layer_id is not None:
+            return self.layer_to_rank[layer_id]
+        else:
+            return self.param_to_rank[name]
+
+    def _load_experts_to_device(self):
+        def get_expert_keys(prefix, is_weight1):
+            keys = []
+            for i in range(self.config.num_experts):
+                if is_weight1:
+                    keys.extend([f"{prefix}.{i}.gate_proj.weight", f"{prefix}.{i}.up_proj.weight"])
+                else:
+                    keys.append(f"{prefix}.{i}.down_proj.weight")
+            return keys
+
+        for name, param in self.model.named_parameters():
+            if "mlp.experts" not in name or self._get_owner_rank(name) != self.rank:
+                continue
+
+            prefix = name[:-8]
+            is_weight1 = "weight1" in name
+            for key in get_expert_keys(prefix, is_weight1):
+                assert key in self.local_sd, f"{key} must be in rank {self.rank} local sd"
+                self.local_sd[key] = self.local_sd[key].to(self.device)
+
+    def _broadcast_to_ep_ranks(self, name, param, prefix, is_weight1):
+        owner = self._get_owner_rank(name)
+        ep_size = self.ep_world_size
+        result = None
+        if owner == self.rank:
+            for i in range(ep_size):
+                num_local_experts = self.config.num_experts // ep_size
+                weights = []
+                for j in range(num_local_experts):
+                    index = i * num_local_experts + j
+                    if is_weight1:
+                        gate = self.local_sd.pop(f"{prefix}.{index}.gate_proj.weight")
+                        up = self.local_sd.pop(f"{prefix}.{index}.up_proj.weight")
+                        weights.append(torch.cat([gate, up]))
+                    else:
+                        down = self.local_sd.pop(f"{prefix}.{index}.down_proj.weight")
+                        weights.append(down.t())
+                tensor = torch.stack(weights, dim=0)
+                tensor = tensor.permute(0, 2, 1) if is_weight1 else tensor
+                tensor = tensor.reshape(-1, tensor.shape[-1])
+                if self.rank % ep_size == i:
+                    result = tensor
+                dist.broadcast(tensor, src=owner)
+                torch.cuda.synchronize()
+        else:
+            new_shape = (param.shape[0], param.shape[1])
+            tensor = torch.empty(
+                new_shape,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            for i in range(ep_size):
+                dist.broadcast(tensor, src=owner)
+                torch.cuda.synchronize()
+                if self.rank % ep_size == i:
+                    result = tensor.clone()
+
+        return result
+
+    def _broadcast_buffers(self):
+         # Load buffers (e.g., bailing expert bias)
+        for name, buf in self.model.named_buffers():
+            if "router.expert_bias" in name:
+                full = self._broadcast_tensor(name.replace("router", "gate"), buf.shape, buf.dtype)
+                buf.copy_(full)
+
+    def _broadcast_params(self):
+        num_param_tensors = len(list(self.model.parameters()))
+        i = 0
+        for name, param in self.model.named_parameters():
+            if "mlp.experts" in name:
+                owner = self._get_owner_rank(name)
+                prefix = name[:-8]
+                is_weight1 = "weight1" in name
+                full = self._broadcast_to_ep_ranks(name, param, prefix, is_weight1)
+                mesh = self.ep_mesh['edp']
+            elif "mlp.router" in name:
+                full = self._broadcast_tensor(name.replace("router", "gate"), param.shape, param.dtype)
+                mesh = self.world_mesh
+            else:
+                full = self._broadcast_tensor(name, param.shape, param.dtype)
+                mesh = self.world_mesh
+
+            sharded_tensor = distribute_tensor(full, mesh, param.placements, src_data_rank=None)
+
+            with torch.no_grad():
+                param.copy_(nn.Parameter(sharded_tensor))
+            del sharded_tensor, full
+            i += 1
+            mem_free, mem_total = torch.cuda.mem_get_info()
+            mem_used = mem_total - mem_free
+            utilization = mem_used / mem_total
+            self._sync_log_rank0(f"[Rank {self.rank}, mem {utilization:.1%}] Broadcast {i}/{num_param_tensors} params", False)
+            if utilization > 0.8:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                new_free, _ = torch.cuda.mem_get_info()
+                freed_gb = (new_free - mem_free) / 1024**3
+                print(f"Rank {self.rank} Cleaned {freed_gb:.2f} GB ({new_free} - {mem_free}) GPU memory (utilization: {utilization:.1%} -> {(mem_total - new_free)/mem_total:.1%})", flush=True)
+
+    def _validation(self):
+        # Validation
+        for p in self.model.parameters():
+            assert isinstance(p, DTensor), f"Parameter {p} is not DTensor"
+
+    def load(self):
+        # move experts from cpu to npu
+        self._load_experts_to_device()
+        self._sync_log_rank0(f"[Rank {self.rank}] load experts to gpu")
+
+        # buffers
+        self._broadcast_buffers()
+        self._sync_log_rank0(f"[Rank {self.rank}] broadcast buffers")
+
+        # parameters
+        self._broadcast_params()
+        self._sync_log_rank0(f"[Rank {self.rank}] Broadcast/sharding done")
+
+        self._validation()
+
 
 class MoeUtils:
     @staticmethod
@@ -446,6 +675,11 @@ class MoeUtils:
     # name experts.weight2, param.shape torch.Size([24576, 2048]), param.device meta
     @staticmethod
     def load_weights_from_hf(model, config, device, path):
+        legacy = os.environ.get("TT_LEGACY_MODEL_LOAD", None)
+        if legacy is None:
+            dpl = DistParamLoad(model, config, device, path, EXPERT_MESH, WORLD_MESH)
+            dpl.load()
+            return
         rank = torch.distributed.get_rank()
         # only load state dict from rank 0, and broadcast to alll other ranks according device mesh
         if rank == FIRST_RANK:
@@ -453,7 +687,7 @@ class MoeUtils:
             t0 = time.perf_counter()
             sd = load_safetensors_dir(path)
             t1 = time.perf_counter()
-            print("Finish loading param to memory in {t1 - t0:.2f} s", flush=True)
+            print(f"Finish loading param to memory in {t1 - t0:.2f} s", flush=True)
         torch.distributed.barrier()
 
         ep = EXPERT_MESH['ep']

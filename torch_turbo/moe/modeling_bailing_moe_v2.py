@@ -62,7 +62,7 @@ if is_flash_attn_2_available():
 
 if is_torch_npu_available():
     print("Using npu_fusion_attention", flush=True)
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, unpad_input
+    from torch_turbo.utils.flash_attn_utils import index_first_axis, pad_input, unpad_input
     from transformers.integrations.npu_flash_attention import npu_flash_attn_varlen_func as flash_attn_varlen_func, npu_flash_attn_func as flash_attn_func
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict
 from safetensors.torch import load_file
 import json
-
+import gc
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -95,6 +95,16 @@ def convert_param_name(key, reverse_key_mapping):
             return key
     return key
 
+def fix_rope_config_for_bailing(config):
+    rotary_dim = getattr(config, "rotary_dim", None)
+    head_dim = getattr(config, "head_dim", None)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    assert head_dim != None, "must be"
+    assert rotary_dim != None or partial_rotary_factor != None, "must be"
+    if partial_rotary_factor == None:
+        # Ring-1T does not set partial_rotary_factor
+        partial_rotary_factor = rotary_dim / head_dim
+        config.partial_rotary_factor = partial_rotary_factor
 
 class DistParamLoad:
     def __init__(self, model, config, device, path, ep_mesh, world_mesh):
@@ -290,9 +300,7 @@ class DistParamLoad:
             utilization = mem_used / mem_total
             self._sync_log_rank0(f"[Rank {self.rank}, mem {utilization:.1%}] Broadcast {i}/{num_param_tensors} params", False)
             if utilization > 0.8:
-                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                import gc
                 gc.collect()
                 new_free, _ = torch.cuda.mem_get_info()
                 freed_gb = (new_free - mem_free) / 1024**3
@@ -302,6 +310,13 @@ class DistParamLoad:
         # Validation
         for p in self.model.parameters():
             assert isinstance(p, DTensor), f"Parameter {p} is not DTensor"
+
+    def _cleanup(self):
+        self.local_sd = None
+        gc.collect()
+        torch.cuda.synchronize()
+        dist.barrier()
+        torch.cuda.empty_cache()
 
     def load(self):
         # move experts from cpu to npu
@@ -315,6 +330,8 @@ class DistParamLoad:
         # parameters
         self._broadcast_params()
         self._sync_log_rank0(f"[Rank {self.rank}] Broadcast/sharding done")
+
+        self._cleanup()
 
         self._validation()
 
@@ -381,6 +398,8 @@ class MoeUtils:
 
         # patch rotary embedding
         rotary_emb = model.model.rotary_emb
+        if rotary_emb.config.architectures[0] == "BailingMoeV2ForCausalLM":
+            fix_rope_config_for_bailing(rotary_emb.config)
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
         # HACK align to deepspeed
         rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)

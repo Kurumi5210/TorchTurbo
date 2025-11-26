@@ -12,8 +12,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
-from torch.distributed._tensor import distribute_tensor, DTensor
+import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed._tensor import distribute_tensor, DTensor
 from torch import nn
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
 
@@ -49,10 +50,6 @@ EXPERT_MESH = None
 FIRST_RANK = 0
 _GRADIENT_SCALING_FACTOR = 1.0
 
-import torch.distributed.checkpoint as dcp
-from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend
-
-ckpt_group = dist.new_group(list(range(dist.get_world_size())), backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}")
 
 def is_rank_in_mesh(target_rank, device_mesh):
     return target_rank in device_mesh.mesh.flatten().tolist()
@@ -486,7 +483,7 @@ class MoeUtils:
 
         config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
         model = MoeUtils.build_model(args, config)
-        model = MoeUtils.fsdp_wrap(model, device)
+        model = MoeUtils.fsdp_wrap(model, device, {}, config)
         MoeUtils.patch_moe_layer(model, config, args, device)
         MoeUtils.load_weights_from_hf(model, config, device, args.path)
         return model
@@ -845,7 +842,7 @@ class MoeUtils:
         return full_sd
 
     @staticmethod
-    def load_checkpoint_shard_async(model, save_path, extra={}):
+    def load_checkpoint_shard_async(model, save_path, ckpt_group, extra={}):
         """
         Load an FSDP checkpoint for this rank.
         Every rank will load its own model shard.
@@ -892,7 +889,12 @@ class MoeUtils:
             random.setstate(rng_states["python"])
             np.random.set_state(rng_states["numpy"])
             torch.random.set_rng_state(rng_states["cpu"])
-            torch.npu.random.set_rng_state(rng_states["npu"])
+            # Load device-specific RNG state based on device type
+            device_name = get_device_name()
+            if device_name == "npu":
+                torch.npu.random.set_rng_state(rng_states["npu"])
+            elif device_name == "cuda":
+                torch.cuda.random.set_rng_state(rng_states["cuda"])
             print(f"Rank: {rank} - Loaded RNG state from {os.path.abspath(rng_path)}")
         else:
             print(f"Rank: {rank} - RNG checkpoint not found at {rng_path}")
@@ -944,7 +946,12 @@ class MoeUtils:
             random.setstate(rng_states["python"])
             np.random.set_state(rng_states["numpy"])
             torch.random.set_rng_state(rng_states["cpu"])
-            torch.npu.random.set_rng_state(rng_states["npu"])
+            # Load device-specific RNG state based on device type
+            device_name = get_device_name()
+            if device_name == "npu":
+                torch.npu.random.set_rng_state(rng_states["npu"])
+            elif device_name == "cuda":
+                torch.cuda.random.set_rng_state(rng_states["cuda"])
             print(f"Rank: {rank} - Loaded RNG state from {os.path.abspath(rng_path)}")
         else:
             print(f"Rank: {rank} - RNG checkpoint not found at {rng_path}")
@@ -953,7 +960,7 @@ class MoeUtils:
         torch.distributed.barrier()
 
     @staticmethod
-    def save_checkpoint_shard_async(model, save_path, save_only_model=False, extra={}):
+    def save_checkpoint_shard_async(model, save_path, ckpt_group, save_only_model=False, extra={}):
         """
         Save an FSDP checkpoint for this rank.
         Every rank will save its own model shard.
@@ -985,7 +992,12 @@ class MoeUtils:
             "numpy": np.random.get_state(),
             "cpu": torch.random.get_rng_state(),
         }
-        rng_states["npu"] = torch.npu.random.get_rng_state()
+        # Save device-specific RNG state based on device type
+        device_name = get_device_name()
+        if device_name == "npu":
+            rng_states["npu"] = torch.npu.random.get_rng_state()
+        elif device_name == "cuda":
+            rng_states["cuda"] = torch.cuda.random.get_rng_state()
         torch.save(rng_states, rng_path)
         print(f"Rank: {rank} - Saved rng to {os.path.abspath(rng_path)}")
 
@@ -1033,7 +1045,12 @@ class MoeUtils:
                 "numpy": np.random.get_state(),
                 "cpu": torch.random.get_rng_state(),
             }
-            rng_states["npu"] = torch.npu.random.get_rng_state()
+            # Save device-specific RNG state based on device type
+            device_name = get_device_name()
+            if device_name == "npu":
+                rng_states["npu"] = torch.npu.random.get_rng_state()
+            elif device_name == "cuda":
+                rng_states["cuda"] = torch.cuda.random.get_rng_state()
             torch.save(rng_states, rng_path)
             print(f"Rank: {rank} - Saved rng to {os.path.abspath(rng_path)}")
 

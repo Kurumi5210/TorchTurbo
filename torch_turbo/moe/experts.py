@@ -33,14 +33,17 @@ else:
     assert_grouped_gemm_is_available()
     gg_ops = grouped_gemm.ops
 
-def conditional_jit_fuser(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
-    if not is_npu_available:
-        jit_fuser = torch.compile
-        wrapper = jit_fuser(wrapper)
-    return wrapper
+def conditional_jit_fuser(use_fused_swiglu=False):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        if not is_npu_available and use_fused_swiglu:
+            print("Using JIT fuser for fused swiglu.")
+            jit_fuser = torch.compile
+            wrapper = jit_fuser(wrapper)
+        return wrapper
+    return decorator
 
 
 class GroupedMLP(torch.nn.Module):
@@ -62,7 +65,7 @@ class GroupedMLP(torch.nn.Module):
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
 
-            @conditional_jit_fuser
+            @conditional_jit_fuser(use_fused_swiglu)
             def glu(x, probs):
                 if use_fused_swiglu:
                     # use npu fused kernel for glu
@@ -89,7 +92,6 @@ class GroupedMLP(torch.nn.Module):
         fc2_input_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
 
-        self.num_local_experts = config.num_moe_experts // config.expert_model_parallel_size
         # Note: The current kernel implementations of grouped_gemm
         # does not support transposition with CUTLASS grouped GEMM
         # (https://github.com/fanshiqing/grouped_gemm/blob/main/csrc/grouped_gemm.cu#L355-L358)

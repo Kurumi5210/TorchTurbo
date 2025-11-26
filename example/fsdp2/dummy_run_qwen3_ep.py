@@ -25,14 +25,13 @@ def test_forward(args, model, dataloader, device, rank):
     check_meta_tensors(model)
     dist.barrier()
     # build reference model
-    config = AutoConfig.from_pretrained(args.path)
+    config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
     config.num_hidden_layers = model.config.num_hidden_layers
-    ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
+    ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config, trust_remote_code=True)
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     if hasattr(config, "layer_types"):
         ref_model.config.layer_types = ref_model.config.layer_types[:config.num_hidden_layers]
     model = model.to(dtype=config.torch_dtype)
-    # MoeUtils.save_model(model, args.save_path)
 
     # store intermediate outputs
     intermediate_outputs = {}
@@ -49,11 +48,9 @@ def test_forward(args, model, dataloader, device, rank):
 
     model.model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed"))
     for i, layer in enumerate(model.model.layers):
-        # layer.mlp.router.register_forward_hook(get_hook(f"layer_{i}_router"))
         layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts"))
     ref_model.model.rotary_emb.register_forward_hook(get_hook(f"rotary_embed", True))
     for i, layer in enumerate(ref_model.model.layers):
-        # layer.mlp.gate.register_forward_hook(get_hook(f"layer_{i}_router", True))
         layer.mlp.register_forward_hook(get_hook(f"layer_{i}_experts", True))
 
     if rank == 0:
@@ -63,10 +60,8 @@ def test_forward(args, model, dataloader, device, rank):
     for batch in dataloader:
         batch = data_to_device(batch, device)
         output = model(**batch)
-        # output = output["last_hidden_state"]
         intermediate_outputs["logits"] = output["logits"]
         output_ref = ref_model(**batch)
-        # output_ref = output_ref["last_hidden_state"]
         intermediate_outputs_ref["logits"] = output_ref["logits"]
         for key in intermediate_outputs.keys():
             compare_tensors(key, intermediate_outputs[key][0], intermediate_outputs_ref[key][0], rank)
@@ -98,9 +93,9 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
     )
 
     # build reference model
-    config = AutoConfig.from_pretrained(args.path)
+    config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
     config.num_hidden_layers = model.config.num_hidden_layers
-    ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config)
+    ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config, trust_remote_code=True)
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     for layer in ref_model.model.layers:
         # wrap moe mlp in edp
@@ -300,8 +295,8 @@ def run(rank, args):
     dataset = get_dataset(seq_length=seq_len, data_size=data_size)
     dataloader = get_dataloader(dataset, batch_size_per_gpu, rank, dp_size, use_distributed_dataloader)
 
-    train(args, model, dataloader, device, rank)
-    # test_forward(args, model, dataloader, device, rank)
+    # train(args, model, dataloader, device, rank)
+    test_forward(args, model, dataloader, device, rank)
     # test_backward(args, model, dataloader, device, rank)
     cleanup()
 
@@ -311,7 +306,7 @@ def main(args):
 
 
 # command:
-#   export PYTHONPATH=/sfs_turbo/xiyun/rl/3d/opensource/Megatron-LM:/sfs_turbo/xiyun/rl/3d/opensource/MindSpeed:/sfs_turbo/xiyun/rl/new/test/tt/torchturbo:$PYTHONPATH
+#   export PYTHONPATH=/sfs_turbo/xiyun/rl/3d/opensource/MindSpeed:/sfs_turbo/xiyun/rl/new/test/tt/torchturbo:$PYTHONPATH
 #   python example/fsdp2/dummy_run_qwen3_ep_npu.py  --path /sfs_turbo/pretrained_models/Qwen3-30B-A3B
 if __name__ == "__main__":
     import argparse

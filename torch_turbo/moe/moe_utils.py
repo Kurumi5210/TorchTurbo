@@ -1,9 +1,8 @@
-from typing import Any, cast
 import os
+import re
 import time
 
 from pathlib import Path
-from typing import Dict
 from safetensors.torch import load_file
 import json
 import gc
@@ -11,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed._tensor import distribute_tensor, DTensor
@@ -82,7 +81,6 @@ def all_gather_tensor(local_tensor, ep_name="ep"):
     return output
 
 def convert_param_name(key, reverse_key_mapping):
-    import re
     for pattern, replacement in reverse_key_mapping.items():
         replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
         replacement = re.sub(r"\(.*\)", "", replacement)
@@ -104,11 +102,11 @@ def fix_rope_config_for_bailing(config):
         config.partial_rotary_factor = partial_rotary_factor
 
 class DistParamLoad:
-    def __init__(self, model, config, device, path, ep_mesh, world_mesh):
+    def __init__(self, model, config, device, args, ep_mesh, world_mesh):
         self.model = model
         self.config = config
         self.device = device
-        self.path = Path(path)
+        self.path = Path(args.path)
         self.ep_mesh = ep_mesh
         self.world_mesh = world_mesh
         self.rank = dist.get_rank()
@@ -122,6 +120,7 @@ class DistParamLoad:
         self.param_to_filename = self._load_index_json()
         self.param_to_rank, self.layer_to_rank = self._build_param_to_rank()
         self.local_sd = self._load_local_shards()
+        self.use_te = args.use_transformer_engine
 
     def _load_index_json(self):
         index_path = self.path / "model.safetensors.index.json"
@@ -213,7 +212,7 @@ class DistParamLoad:
                     keys.append(f"{prefix}.{i}.down_proj.weight")
             return keys
 
-        for name, param in self.model.named_parameters():
+        for name, _ in self.model.named_parameters():
             if "mlp.experts" not in name or self._get_owner_rank(name) != self.rank:
                 continue
 
@@ -222,6 +221,59 @@ class DistParamLoad:
             for key in get_expert_keys(prefix, is_weight1):
                 assert key in self.local_sd, f"{key} must be in rank {self.rank} local sd"
                 self.local_sd[key] = self.local_sd[key].to(self.device)
+
+    def _te_load_experts_to_device(self):
+        def get_expert_keys(prefix, is_fc1):
+            keys = []
+            for i in range(self.config.num_experts):
+                if is_fc1:
+                    keys.extend([f"{prefix}.{i}.gate_proj.weight", f"{prefix}.{i}.up_proj.weight"])
+                else:
+                    keys.append(f"{prefix}.{i}.down_proj.weight")
+            return keys
+
+        for name, _ in self.model.named_parameters():
+            if "mlp.experts" not in name or "weight0" not in name or self._get_owner_rank(name) != self.rank:
+                continue
+            prefix = ".".join(name.split(".")[:5])
+            is_fc1 = "fc1_linear" in name
+            for key in get_expert_keys(prefix, is_fc1):
+                assert key in self.local_sd, f"{key} must be in rank {self.rank} local sd"
+                self.local_sd[key] = self.local_sd[key].to(self.device)
+
+    def _te_broadcast_to_ep_ranks(self, name, param, prefix_lst):
+        prefix = ".".join(prefix_lst[:5])
+        owner = self._get_owner_rank(name)
+        ep_size = self.ep_world_size
+        num_local_experts = self.config.num_experts // ep_size
+        result = None
+        if owner == self.rank:
+            for i in range(ep_size):
+                expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
+                if "fc1_linear" in name:
+                    gate = self.local_sd.pop(f"{prefix}.{expert_idx}.gate_proj.weight")
+                    up = self.local_sd.pop(f"{prefix}.{expert_idx}.up_proj.weight")
+                    tensor = torch.cat([gate, up])
+                elif "fc2_linear" in name:
+                    down = self.local_sd.pop(f"{prefix}.{expert_idx}.down_proj.weight")
+                    tensor = down
+                if self.rank % ep_size == i:
+                    result = tensor
+                dist.broadcast(tensor, src=owner)
+                torch.cuda.synchronize()
+        else:
+            new_shape = (param.shape[0], param.shape[1])
+            tensor = torch.empty(
+                new_shape,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            for i in range(ep_size):
+                dist.broadcast(tensor, src=owner)
+                torch.cuda.synchronize()
+                if self.rank % ep_size == i:
+                    result = tensor.clone()
+        return result
 
     def _broadcast_to_ep_ranks(self, name, param, prefix, is_weight1):
         owner = self._get_owner_rank(name)
@@ -245,6 +297,7 @@ class DistParamLoad:
                 tensor = tensor.reshape(-1, tensor.shape[-1])
                 if self.rank % ep_size == i:
                     result = tensor
+                 # broadcast to ep_group
                 dist.broadcast(tensor, src=owner)
                 torch.cuda.synchronize()
         else:
@@ -255,6 +308,7 @@ class DistParamLoad:
                 dtype=param.dtype,
             )
             for i in range(ep_size):
+                # get broadcast tensor
                 dist.broadcast(tensor, src=owner)
                 torch.cuda.synchronize()
                 if self.rank % ep_size == i:
@@ -274,10 +328,13 @@ class DistParamLoad:
         i = 0
         for name, param in self.model.named_parameters():
             if "mlp.experts" in name:
-                owner = self._get_owner_rank(name)
-                prefix = name[:-8]
-                is_weight1 = "weight1" in name
-                full = self._broadcast_to_ep_ranks(name, param, prefix, is_weight1)
+                if self.use_te:
+                    prefix = name.split(".")
+                    full = self._te_broadcast_to_ep_ranks(name, param, prefix)
+                else:
+                    is_weight1 = "weight1" in name
+                    prefix = name[:-8]
+                    full = self._broadcast_to_ep_ranks(name, param, prefix, is_weight1)
                 mesh = self.ep_mesh['edp']
             elif "mlp.router" in name:
                 full = self._broadcast_tensor(name.replace("router", "gate"), param.shape, param.dtype)
@@ -317,7 +374,10 @@ class DistParamLoad:
 
     def load(self):
         # move experts from cpu to npu
-        self._load_experts_to_device()
+        if self.use_te:
+            self._te_load_experts_to_device()
+        else:
+            self._load_experts_to_device()
         self._sync_log_rank0(f"[Rank {self.rank}] load experts to gpu")
 
         # buffers
@@ -369,7 +429,7 @@ class MoeUtils:
         experts = ModuleSpec(module=GroupedMLP, submodules=None)
         moe_submodules = MoESubmodules(experts=experts, shared_experts=None)
 
-        grouped_mlp = MoELayer(tf_config, moe_submodules, args.use_fused_swiglu, args.use_fused_permute_unpermute)
+        grouped_mlp = MoELayer(tf_config, moe_submodules, args.use_fused_swiglu, args.use_fused_permute_unpermute, args.use_transformer_engine)
 
         return grouped_mlp
 
@@ -485,7 +545,7 @@ class MoeUtils:
         model = MoeUtils.build_model(args, config)
         model = MoeUtils.fsdp_wrap(model, device, {}, config)
         MoeUtils.patch_moe_layer(model, config, args, device)
-        MoeUtils.load_weights_from_hf(model, config, device, args.path)
+        MoeUtils.load_weights_from_hf(model, config, device, args)
         return model
 
     @staticmethod
@@ -551,8 +611,12 @@ class MoeUtils:
         return model
 
     @staticmethod
-    def save_model(model, save_path, processing_class=None):
-        state_dict = MoeUtils.get_full_hf_state_dict(model)
+    def save_model(model, save_path, args, processing_class=None):
+        use_te = args.use_transformer_engine
+        if use_te:
+            state_dict = MoeUtils.get_te_full_hf_state_dict(model)
+        else:
+            state_dict = MoeUtils.get_full_hf_state_dict(model)
 
         rank = torch.distributed.get_rank()
         if rank == 0:
@@ -690,10 +754,10 @@ class MoeUtils:
     # name experts.weight1, param.shape torch.Size([2048, 49152]), param.device meta
     # name experts.weight2, param.shape torch.Size([24576, 2048]), param.device meta
     @staticmethod
-    def load_weights_from_hf(model, config, device, path):
+    def load_weights_from_hf(model, config, device, args):
         legacy = os.environ.get("TT_LEGACY_MODEL_LOAD", None)
         if legacy is None:
-            dpl = DistParamLoad(model, config, device, path, EXPERT_MESH, WORLD_MESH)
+            dpl = DistParamLoad(model, config, device, args, EXPERT_MESH, WORLD_MESH)
             dpl.load()
             return
         rank = torch.distributed.get_rank()
@@ -701,7 +765,7 @@ class MoeUtils:
         if rank == FIRST_RANK:
             print("Start loading param to memory...", flush=True)
             t0 = time.perf_counter()
-            sd = load_safetensors_dir(path)
+            sd = load_safetensors_dir(args.path)
             t1 = time.perf_counter()
             print(f"Finish loading param to memory in {t1 - t0:.2f} s", flush=True)
         torch.distributed.barrier()
@@ -828,6 +892,57 @@ class MoeUtils:
                         for i in range(num_experts):
                             down_proj = f"{prefix}.{i}.down_proj.weight"
                             full_sd[down_proj] = experts[i].t().cpu()
+                elif "mlp.router" in name:
+                    new_name = name.replace("router", "gate")
+                    full_sd[new_name] = full_tensor.cpu()
+                else:
+                    full_sd[name] = full_tensor.cpu()
+            elif is_rank_in_mesh(FIRST_RANK, ep) and "mlp.experts" in name:
+                full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+                del full_tensor
+            else:
+                del full_tensor
+
+        return full_sd
+    
+    @staticmethod
+    def get_te_full_hf_state_dict(model):
+        rank = torch.distributed.get_rank()
+        ep = EXPERT_MESH['ep']
+
+        # Only rank 0 will save hf model and,
+        # offload to cpu to save LLMs which may be too large to fit in one GPU
+        full_sd = {}
+
+        for name, param in model.named_parameters():
+            if isinstance(param, DTensor):
+                full_tensor = param.full_tensor()
+            else:
+                full_tensor = param
+            if rank == FIRST_RANK:
+                if "mlp.experts" in name:
+                    full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+                    prefix_lst = name.split(".")
+                    prefix = ".".join(name.split(".")[:5])
+                    group = EXPERT_MESH["ep"].get_group(0)
+                    ep_size = dist.get_world_size(group=group)
+                    num_local_experts = model.config.num_experts // ep_size
+                        
+                    if "fc1_linear" in name:
+                        experts = torch.split(full_tensor, model.config.moe_intermediate_size * 2)
+                        for i in range(ep_size):
+                            expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
+                            gate_proj = f"{prefix}.{expert_idx}.gate_proj.weight"
+                            up_proj = f"{prefix}.{expert_idx}.up_proj.weight"
+                            expert2 = torch.split(experts[i], model.config.moe_intermediate_size)
+                            full_sd[gate_proj] = expert2[0].cpu()
+                            full_sd[up_proj] = expert2[1].cpu()
+                    elif "fc2_linear" in name:
+                        experts = torch.split(full_tensor, model.config.hidden_size)
+                        for i in range(ep_size):
+                            expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
+                            down_proj = f"{prefix}.{expert_idx}.down_proj.weight"
+                            full_sd[down_proj] = experts[i].cpu()
                 elif "mlp.router" in name:
                     new_name = name.replace("router", "gate")
                     full_sd[new_name] = full_tensor.cpu()

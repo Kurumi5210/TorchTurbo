@@ -1,3 +1,4 @@
+import os
 from copy import deepcopy
 from functools import wraps
 
@@ -15,9 +16,19 @@ try:
 except ImportError:
     grouped_gemm = None
 
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch import GroupedLinear
+except ImportError:
+    GroupedLinear = None
+
 def grouped_gemm_is_available():
     """Check if grouped_gemm is available."""
     return grouped_gemm is not None
+
+def transformer_engine_is_available():
+    """Check if transformer_engine is available."""
+    return GroupedLinear is not None
 
 def assert_grouped_gemm_is_available():
     """Assert that grouped_gemm is available."""
@@ -52,7 +63,11 @@ class GroupedMLP(torch.nn.Module):
     Executes multiple experts in parallel to maximize computational efficiency.
     """
 
-    def __init__(self, num_local_experts: int, use_fused_swiglu: bool, config: TransformerConfig):
+    def __init__(self,
+                 num_local_experts: int,
+                 use_fused_swiglu: bool,
+                 use_te: bool,
+                 config: TransformerConfig):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts
@@ -60,7 +75,6 @@ class GroupedMLP(torch.nn.Module):
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
-        self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
@@ -97,7 +111,30 @@ class GroupedMLP(torch.nn.Module):
         # (https://github.com/fanshiqing/grouped_gemm/blob/main/csrc/grouped_gemm.cu#L355-L358)
         # and as a result we avoid allocate the transpose of weights.
         # Initialize weight.
-        if config.use_cpu_initialization:
+        self.use_te = use_te
+        if transformer_engine_is_available() and self.use_te:
+            if torch.distributed.get_rank() == 0:
+                print("Using TE GroupedLinear.")
+            self.fc1_linear = GroupedLinear(
+                num_gemms=self.num_local_experts,
+                in_features=self.config.hidden_size,
+                out_features=fc1_output_size_per_partition,
+                bias=False,  # bias not supported in original implementation
+                params_dtype=config.params_dtype,
+                device="cuda"
+            )
+
+            self.fc2_linear = GroupedLinear(
+                num_gemms=self.num_local_experts,
+                in_features=fc2_input_size_per_partition // self.num_local_experts,
+                out_features=self.config.hidden_size,
+                bias=False,  # bias not supported in original implementation
+                params_dtype=config.params_dtype,
+                device="cuda"
+            )
+        else:
+            if torch.distributed.get_rank() == 0:
+                print("Using fused op grouped_matmul.")
             self.weight1 = Parameter(
                 torch.empty(
                     self.config.hidden_size * self.num_local_experts,
@@ -112,8 +149,6 @@ class GroupedMLP(torch.nn.Module):
                     dtype=config.params_dtype
                 )
             )
-        setattr(self.weight1, 'allreduce', not self.expert_parallel)
-        setattr(self.weight2, 'allreduce', not self.expert_parallel)
 
     def forward(
         self,
@@ -135,17 +170,33 @@ class GroupedMLP(torch.nn.Module):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if permuted_local_hidden_states.nelement() != 0:
-            # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
-            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+            
+            if transformer_engine_is_available() and self.use_te:
+                # Use TransformerEngine GroupedLinear if available, otherwise fall back to grouped_gemm
+                m_splits = tokens_per_expert.tolist()
+                # First grouped linear: hidden_size -> fc1_output_size
+                fc1_output = self.fc1_linear(permuted_local_hidden_states, m_splits)
+                
+                # Apply activation function
+                intermediate_parallel = self.activation_func_with_probs(
+                    fc1_output, permuted_probs.unsqueeze(-1)
+                )
 
-            fc1_output = gg_ops.gmm(
-                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
-            )
-            intermediate_parallel = self.activation_func_with_probs(
-                fc1_output, permuted_probs.unsqueeze(-1)
-            )
-            fc2_output = gg_ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+                # Second grouped linear: fc2_input_size -> hidden_size
+                fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
+            else:
+                # Fall back to original grouped_gemm implementation
+                # Reshape the weights for the grouped GEMMs.
+                w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+                w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+
+                fc1_output = gg_ops.gmm(
+                    permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
+                )
+                intermediate_parallel = self.activation_func_with_probs(
+                    fc1_output, permuted_probs.unsqueeze(-1)
+                )
+                fc2_output = gg_ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         else:
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0

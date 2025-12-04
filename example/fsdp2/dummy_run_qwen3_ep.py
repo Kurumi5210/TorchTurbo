@@ -96,6 +96,9 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
     config = AutoConfig.from_pretrained(args.path, trust_remote_code=True)
     config.num_hidden_layers = model.config.num_hidden_layers
     ref_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=args.path, config=config, trust_remote_code=True)
+    if rank == 0:
+        print(f"ref model: {ref_model}")
+        print(f"fsdp model: {model}")
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     for layer in ref_model.model.layers:
         # wrap moe mlp in edp
@@ -324,6 +327,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_fused_rope", default=False, action="store_true")
     parser.add_argument("--use_fused_rms_norm", default=False, action="store_true")
     parser.add_argument("--use_fused_permute_unpermute", default=False, action="store_true")
+    parser.add_argument("--use_transformer_engine", default=False, action="store_true")
 
     args = parser.parse_args()
 

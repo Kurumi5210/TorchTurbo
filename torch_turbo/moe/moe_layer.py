@@ -77,10 +77,12 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         use_fused_swiglu: Optional[bool] = False,
         use_fused_permute_unpermute: Optional[bool] = False,
+        use_te: Optional[bool] = False,
         layer_number: Optional[int] = None,
     ):
         self.use_fused_swiglu = use_fused_swiglu
         self.use_fused_permute_unpermute = use_fused_permute_unpermute
+        self.use_te = use_te
         self.submodules = submodules
         super(MoELayer, self).__init__(config=config, layer_number=layer_number)
 
@@ -98,7 +100,7 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = build_module(self.submodules.experts, self.num_local_experts, self.use_fused_swiglu, self.config)
+        self.experts = build_module(self.submodules.experts, self.num_local_experts, self.use_fused_swiglu, self.use_te, self.config)
 
         # Initialize shared experts
         if self.use_shared_expert:

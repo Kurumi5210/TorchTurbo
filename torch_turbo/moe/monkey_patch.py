@@ -332,7 +332,7 @@ def apply_monkey_patch(model, args):
             sin = sin.unsqueeze(unsqueeze_dim)
             return npu_rotary_position_embedding(q, cos, sin, 0), npu_rotary_position_embedding(k, cos, sin, 0)
         modeling_qwen3_moe.apply_rotary_pos_emb = apply_rotary_pos_emb
-        import torch_turbo.moe.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
+        import torch_turbo.models.bailing.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
         def apply_rotary_pos_emb_bailing(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
             cos = cos.unsqueeze(unsqueeze_dim)
             sin = sin.unsqueeze(unsqueeze_dim)
@@ -352,7 +352,7 @@ def apply_monkey_patch(model, args):
         def fused_forward(self, hidden_states: torch.Tensor):
             return npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
         Qwen3MoeRMSNorm.forward = fused_forward
-        from .modeling_bailing_moe_v2 import BailingMoeV2RMSNorm
+        from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2RMSNorm
         BailingMoeV2RMSNorm.forward = fused_forward
 
     if args.use_fused_permute_unpermute:

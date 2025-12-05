@@ -600,7 +600,7 @@ class MoeUtils:
         # config.num_hidden_layers = 1
         with torch.device("meta"):
             if config.architectures[0] == "BailingMoeV2ForCausalLM":
-                from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                 model = BailingMoeV2ForCausalLM(config)
             else:
                 model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
@@ -622,7 +622,7 @@ class MoeUtils:
         if rank == 0:
             with torch.device("meta"):
                 if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
-                    from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                    from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                     save_model = BailingMoeV2ForCausalLM(model.config)
                 else:    
                     save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)

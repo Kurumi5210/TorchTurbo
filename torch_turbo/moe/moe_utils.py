@@ -29,6 +29,9 @@ from torch_turbo.distributed.parallel import (
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
 )
+from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+from torch_turbo.models.deepseek.modeling_deepseek_v32 import create_deepseek_v32_model
+
 from torch.distributed.tensor.placement_types import Shard
 if is_npu_available:
     import torch_npu
@@ -316,11 +319,17 @@ class DistParamLoad:
 
         return result
 
+    def _expert_bias_hf_name(self, name):
+        name = name.replace("router", "gate")
+        if "deepseek" in self.config.model_type:
+            name = name.replace("expert_bias", "e_score_correction_bias")
+        return name
+
     def _broadcast_buffers(self):
          # Load buffers (e.g., bailing expert bias)
         for name, buf in self.model.named_buffers():
             if "router.expert_bias" in name:
-                full = self._broadcast_tensor(name.replace("router", "gate"), buf.shape, buf.dtype)
+                full = self._broadcast_tensor(self._expert_bias_hf_name(name), buf.shape, buf.dtype)
                 buf.copy_(full)
 
     def _broadcast_params(self):
@@ -396,7 +405,6 @@ class DistParamLoad:
 class MoeUtils:
     @staticmethod
     def initialize_moe_layer_from_hf_config(config, args, **config_kwargs):
-        num_moe_experts = config.num_experts
         expert_model_parallel_size = get_expert_model_parallel_world_size()
         default_config_kwargs = dict(
             num_layers=1,
@@ -406,17 +414,27 @@ class MoeUtils:
             gated_linear_unit=True,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
-            num_moe_experts=num_moe_experts,
             moe_router_topk=config.num_experts_per_tok,
-            use_cpu_initialization=True,
+            init_model_with_meta_device=True,
             fp8=None,
             add_bias_linear=False,
             moe_router_pre_softmax=True,
             activation_func=F.silu,
             moe_router_load_balancing_type="none",
         )
-        if config.architectures[0] == "BailingMoeV2ForCausalLM":
+        if config.model_type == "deepseek_v32" or config.model_type == "deepseek_v3":
             default_config_kwargs.update(
+                num_moe_experts = config.n_routed_experts,
+                moe_router_score_function=config.scoring_func,
+                moe_router_group_topk=config.topk_group,
+                moe_router_num_groups=config.n_group,
+                moe_router_dtype='f32',
+                moe_router_enable_expert_bias=True,
+                moe_router_topk_scaling_factor=config.routed_scaling_factor,
+            )
+        elif config.architectures[0] == "BailingMoeV2ForCausalLM":
+            default_config_kwargs.update(
+                num_moe_experts = config.num_experts,
                 moe_router_score_function=config.score_function,
                 moe_router_group_topk=config.topk_group,
                 moe_router_num_groups=config.n_group,
@@ -424,18 +442,29 @@ class MoeUtils:
                 moe_router_enable_expert_bias=config.moe_router_enable_expert_bias,
                 moe_router_topk_scaling_factor=config.routed_scaling_factor,
             )
+        else:
+            default_config_kwargs.update(
+                num_moe_experts = config.num_experts,
+            )
+
         default_config_kwargs.update(**config_kwargs)
         tf_config = TransformerConfig(**default_config_kwargs)
         experts = ModuleSpec(module=GroupedMLP, submodules=None)
         moe_submodules = MoESubmodules(experts=experts, shared_experts=None)
 
-        grouped_mlp = MoELayer(tf_config, moe_submodules, args.use_fused_swiglu, args.use_fused_permute_unpermute, args.use_transformer_engine)
+        use_fused_swiglu = getattr(args, "use_fused_swiglu", False)
+        use_fused_permute_unpermute = getattr(args, "use_fused_permute_unpermute", False)
+        use_transformer_engine = getattr(args, "use_transformer_engine", False)
+        grouped_mlp = MoELayer(tf_config, moe_submodules, use_fused_swiglu, use_fused_permute_unpermute, use_transformer_engine)
+        grouped_mlp.config.model_type = config.model_type
 
         return grouped_mlp
 
     @staticmethod
     def patch_moe_layer(model, hf_config, args, device):
-        assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
+        assert ("moe" in hf_config.model_type) \
+            or ("next" in hf_config.model_type) \
+            or ("deepseek" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         for layer in model.model.layers:
             # patch token_dispatcher
             if not hasattr(layer.mlp, "token_dispatcher"):
@@ -498,7 +527,9 @@ class MoeUtils:
 
     @staticmethod
     def transform_moe_layer(model, hf_config, args):
-        assert ("moe" in hf_config.model_type) or ("next" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
+        assert ("moe" in hf_config.model_type) or \
+            ("next" in hf_config.model_type) or \
+            ("deepseek" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
         if hasattr(hf_config, "first_k_dense_replace"):
             first_moe_layer = hf_config.first_k_dense_replace
         else:
@@ -507,15 +538,13 @@ class MoeUtils:
             if i < first_moe_layer:
                 continue
             moe = MoeUtils.initialize_moe_layer_from_hf_config(hf_config, args)
-            if "bailing_moe" in hf_config.model_type:
-                bailing_shared_experts = layer.mlp.shared_experts.__class__(model.config, intermediate_size=model.config.moe_intermediate_size * model.config.num_shared_experts)
+            if hasattr(layer.mlp, "shared_experts"):
+                moe.shared_experts = layer.mlp.shared_experts
             layer.mlp = moe
             if "next" in hf_config.model_type:
                 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextMLP
                 layer.mlp.shared_expert = Qwen3NextMLP(model.config, intermediate_size=model.config.shared_expert_intermediate_size)
                 layer.mlp.shared_expert_gate = torch.nn.Linear(model.config.hidden_size, 1, bias=False)
-            if "bailing_moe" in hf_config.model_type:
-                layer.mlp.shared_experts = bailing_shared_experts
 
     @staticmethod
     def get_world_mesh():
@@ -600,8 +629,10 @@ class MoeUtils:
         # config.num_hidden_layers = 1
         with torch.device("meta"):
             if config.architectures[0] == "BailingMoeV2ForCausalLM":
-                from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                 model = BailingMoeV2ForCausalLM(config)
+            elif "deepseek_v3" in config.model_type:
+                model = create_deepseek_v32_model(config)
+                config.num_experts = config.n_routed_experts
             else:
                 model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
             apply_monkey_patch(model, args)

@@ -162,4 +162,6 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias, logits
         output, mlp_bias, logits = custom_forward(hidden_states)
+        if "deepseek" in self.config.model_type:
+            return output
         return output, logits

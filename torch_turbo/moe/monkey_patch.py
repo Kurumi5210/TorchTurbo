@@ -316,7 +316,7 @@ def apply_monkey_patch(model, args):
 
             flash_attention._flash_attention_forward = new_attention_forward
             print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
-        if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
+        if model.config.architectures[0] in ["BailingMoeV2ForCausalLM", "BailingMoeV2_5ForCausalLM"]:
             for layer in model.model.layers:
                 layer.attention._flash_attention_forward = new_attention_forward
         if "next" in model.config.model_type:

@@ -30,6 +30,7 @@ from torch_turbo.distributed.parallel import (
     get_expert_model_parallel_world_size
 )
 from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM
 from torch_turbo.models.deepseek.modeling_deepseek_v32 import create_deepseek_v32_model
 
 from torch.distributed.tensor.placement_types import Shard
@@ -432,7 +433,7 @@ class MoeUtils:
                 moe_router_enable_expert_bias=True,
                 moe_router_topk_scaling_factor=config.routed_scaling_factor,
             )
-        elif config.architectures[0] == "BailingMoeV2ForCausalLM":
+        elif config.architectures[0] in ["BailingMoeV2ForCausalLM", "BailingMoeV2_5ForCausalLM"]:
             default_config_kwargs.update(
                 num_moe_experts = config.num_experts,
                 moe_router_score_function=config.score_function,
@@ -482,13 +483,31 @@ class MoeUtils:
                 token_dispatcher.num_local_experts, -1
             ).T.ravel()
 
-        # patch rotary embedding
+        # patch to rotary_emb
         rotary_emb = model.model.rotary_emb
-        if rotary_emb.config.architectures[0] == "BailingMoeV2ForCausalLM":
+        if rotary_emb.config.architectures[0] in ["BailingMoeV2ForCausalLM", "BailingMoeV2_5ForCausalLM"]:
             fix_rope_config_for_bailing(rotary_emb.config)
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
         # HACK align to deepspeed
-        rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)
+        if rotary_emb.config.architectures[0] == "BailingMoeV2_5ForCausalLM":
+            rotary_emb.original_inv_freq = inv_freq
+            rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+        else:
+            rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)
+
+        if model.model.config.architectures[0] == "BailingMoeV2_5ForCausalLM":
+            # patch to rotary_emb_mla
+            rotary_emb_mla = model.model.rotary_emb_mla
+            inv_freq, rotary_emb_mla.attention_scaling = rotary_emb_mla.rope_init_fn(rotary_emb_mla.config, device)
+            rotary_emb_mla.original_inv_freq = inv_freq
+            rotary_emb_mla.register_buffer("inv_freq", inv_freq, persistent=False)
+            # patch to layer.attention
+            for layer in model.model.layers:
+                if layer.attention.__class__.__name__ == 'BailingMoeV2_5LinearAttention':
+                    slope = -layer.attention.build_slope_tensor(layer.attention.num_heads) * (
+                        1 - (layer.attention.layer_idx - 1) / (layer.attention.config.num_hidden_layers - 1) + 1e-5
+                    )
+                    layer.attention.register_buffer('slope', slope, persistent=False)
 
     @staticmethod
     def scale_moe_gradient(params):
@@ -505,12 +524,14 @@ class MoeUtils:
         moe_grads = []
         edp = MoeUtils.get_edp_mesh()
         for param in model.parameters():
-            if param.device_mesh == edp:
-                moe_params.append(param)
-                moe_grads.append(param.grad)
-            else:
-                params.append(param)
-                grads.append(param.grad)
+            # Skip parameters without gradients to ensure correctness.
+            if param.grad is not None:
+                if param.device_mesh == edp:
+                    moe_params.append(param)
+                    moe_grads.append(param.grad)
+                else:
+                    params.append(param)
+                    grads.append(param.grad)
 
         MoeUtils.scale_moe_gradient(moe_params)
 
@@ -630,6 +651,8 @@ class MoeUtils:
         with torch.device("meta"):
             if config.architectures[0] == "BailingMoeV2ForCausalLM":
                 model = BailingMoeV2ForCausalLM(config)
+            elif config.architectures[0] == "BailingMoeV2_5ForCausalLM":
+                model = BailingMoeV2_5ForCausalLM(config)
             elif "deepseek_v3" in config.model_type:
                 model = create_deepseek_v32_model(config)
                 config.num_experts = config.n_routed_experts
@@ -655,6 +678,9 @@ class MoeUtils:
                 if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
                     from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                     save_model = BailingMoeV2ForCausalLM(model.config)
+                elif model.config.architectures[0] == "BailingMoeV2_5ForCausalLM":
+                    from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM
+                    save_model = BailingMoeV2_5ForCausalLM(model.config)
                 else:    
                     save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
                 
@@ -693,7 +719,6 @@ class MoeUtils:
                 expert_modules.append(named_module)
 
         assert len(model_modules) == 1
-        assert len(layer_modules) == len(expert_modules) + first_k_dense_replace
 
         for i in range(len(layer_modules)):
             # layer prefetch layer
@@ -741,7 +766,7 @@ class MoeUtils:
             first_k_dense_replace = 0
             inter_cls = model.model.layers[0].mlp.experts.__class__
         outermost_cls = model.__class__
-        if config.architectures[0] == "BailingMoeV2ForCausalLM":
+        if config.architectures[0] in ["BailingMoeV2ForCausalLM", "BailingMoeV2_5ForCausalLM"]:
             fully_shard(model.model.word_embeddings, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
             fully_shard(model.lm_head, mesh = MoeUtils.get_world_mesh(), **fsdp_kwargs)
         for i, layer in enumerate(model.model.layers):

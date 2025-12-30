@@ -681,7 +681,7 @@ class MoeUtils:
                 elif model.config.architectures[0] == "BailingMoeV2_5ForCausalLM":
                     from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM
                     save_model = BailingMoeV2_5ForCausalLM(model.config)
-                else:    
+                else:
                     save_model = AutoModelForCausalLM.from_config(model.config, torch_dtype=torch.bfloat16)
                 
             save_model.to_empty(device="cpu")

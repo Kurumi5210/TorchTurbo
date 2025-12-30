@@ -5,7 +5,7 @@ import torch.multiprocessing as mp
 from transformers import AutoConfig
 from torch_turbo.moe.moe_utils import MoeUtils
 from torch_turbo.distributed.parallel import initialize_model_parallel
-from io_hooker import InputOutputHooker, io_hook_wrapper
+from tests.tools.io_hooker import InputOutputHooker, io_hook_wrapper
 import gc
 import sys
 

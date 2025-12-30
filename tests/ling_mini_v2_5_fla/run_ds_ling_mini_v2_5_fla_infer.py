@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoConfig, AutoModelForCausalLM
-from io_hooker import InputOutputHooker, io_hook_wrapper
+from tests.tools.io_hooker import InputOutputHooker, io_hook_wrapper
 import gc
 import sys
 

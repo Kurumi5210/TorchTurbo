@@ -703,10 +703,7 @@ class MoeUtils:
         model_modules = []
         layer_modules = []
         expert_modules = []
-        if hasattr(config, "first_k_dense_replace"):
-            first_k_dense_replace = config.first_k_dense_replace
-        else:
-            first_k_dense_replace = 0
+        first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
 
         for name, named_module in fsdp2_model.named_modules():
             if isinstance(named_module, FSDPModule) and isinstance(named_module, model_cls):
@@ -719,6 +716,9 @@ class MoeUtils:
                 expert_modules.append(named_module)
 
         assert len(model_modules) == 1
+        num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0)
+        # Validate MTP layers in assertion
+        assert len(layer_modules) + num_nextn_predict_layers == len(expert_modules) + first_k_dense_replace
 
         for i in range(len(layer_modules)):
             # layer prefetch layer

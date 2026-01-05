@@ -90,6 +90,15 @@ def run(rank, args):
             hooked_fn = io_hook_wrapper(hooker, f'decoder_layer{idx}_att_op_{mode}', orig_fn)
             attn.lightning_attn_ops[mode] = hooked_fn
 
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'token_dispatcher'):
+            disp = layer.mlp.token_dispatcher # MoEAlltoAllTokenDispatcher
+            # token_permutation
+            orig_perm = disp.token_permutation
+            disp.token_permutation = io_hook_wrapper(hooker, f'decoder_layer{idx}_mlp_dispatch', orig_perm)
+            # token_unpermutation
+            orig_unperm = disp.token_unpermutation
+            disp.token_unpermutation = io_hook_wrapper(hooker, f'decoder_layer{idx}_mlp_undispatch', orig_unperm)
+
     for _ in range(hooker.num_record_forward):
         with hooker:
             batch = get_rand_batch(config.vocab_size, device)
@@ -100,7 +109,8 @@ def run(rank, args):
             loss = ForCausalLMLoss(output['logits'], batch["input_ids"], config.vocab_size)
             print(f'loss {loss}')
             hooker.model_inputs_outputs.append({"loss": (loss,)})
-        print(output)
+        if torch.distributed.get_rank() == 0:
+            print(output)
 
     cleanup()
 
@@ -127,6 +137,7 @@ if __name__ == "__main__":
         use_fused_rms_norm=False,
         use_fused_permute_unpermute=False,
         use_transformer_engine=False,
+        torch_turbo_use_deterministic_algo=True,
         path=args.path,
     )
 

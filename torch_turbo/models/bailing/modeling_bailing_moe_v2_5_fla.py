@@ -43,6 +43,9 @@ from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
+    is_flash_attn_2_available,
+    is_torch_npu_available,
+    is_flash_attn_greater_or_equal_2_10,
     logging,
     replace_return_docstrings,
 )
@@ -60,6 +63,21 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 from fla.ops.simple_gla.chunk import chunk_simple_gla
 
+from torch_turbo.sequence_parallel.ulysses import (
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
+    SequenceParallelCausalConv1dComm,
+)
+from torch_turbo.utils.flash_attn_utils import index_first_axis, pad_input, unpad_input, get_unpad_data
+
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+
+if is_torch_npu_available():
+    print("Using npu_fusion_attention", flush=True)
+    from transformers.integrations.npu_flash_attention import npu_flash_attn_varlen_func as flash_attn_varlen_func, npu_flash_attn_func as flash_attn_func
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -507,8 +525,12 @@ def eager_attention_forward(
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+        if attention_mask.dim() == 2:
+            pad_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [bsz, 1, 1, seq_len]
+            attn_weights = attn_weights.masked_fill(pad_mask == 0, float("-inf"))
+        else:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
@@ -603,6 +625,7 @@ class BailingMoeV2_5MultiLatentAttention(nn.Module):
 
     def __init__(self, config: BailingMoeV2_5Config, layer_idx: int):
         super().__init__()
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
         self.config = config
         self.layer_idx = layer_idx
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
@@ -650,6 +673,98 @@ class BailingMoeV2_5MultiLatentAttention(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.scaling = self.scaling * mscale * mscale
 
+    def _upad_input(
+        self, query_layer, key_layer, value_layer, attention_mask, query_length
+    ):
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = get_unpad_data(attention_mask)
+        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+        key_layer = index_first_axis(
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+            indices_k,
+        )
+        value_layer = index_first_axis(
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+            indices_k,
+        )
+        if query_length == kv_seq_len:
+            query_layer = index_first_axis(
+                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim),
+                indices_k,
+            )
+            cu_seqlens_q = cu_seqlens_k
+            max_seqlen_in_batch_q = max_seqlen_in_batch_k
+            indices_q = indices_k
+        elif query_length == 1:
+            max_seqlen_in_batch_q = 1
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=query_layer.device
+            )  # There is a memcpy here, that is very bad.
+            indices_q = cu_seqlens_q[:-1]
+            query_layer = query_layer.squeeze(1)
+        else:
+            # The -q_len: slice assumes left padding.
+            attention_mask = attention_mask[:, -query_length:]
+            # flash-attn 2.7.2
+            # https://github.com/Dao-AILab/flash-attention/blob/v2.7.2/flash_attn/bert_padding.py
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, _ = unpad_input(
+                query_layer, attention_mask
+            )
+
+        return (
+            query_layer,
+            key_layer,
+            value_layer,
+            indices_q,
+            (cu_seqlens_q, cu_seqlens_k),
+            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+        )
+
+    def _flash_attention_forward(self, query_states, key_states, value_states, attention_mask, seq_length, is_causal, dropout, position_ids):
+        if attention_mask is not None:
+            assert query_states.dim() == 4, "dim of query_states must be 4"
+            assert attention_mask.ndim == 2, "must be packing attention mask"
+            assert query_states.size(1) == key_states.size(1), "seq_len must be equal during training for q & k"
+            assert query_states.size(0) == 1, "batch_size must be 1 to simplify topk indices in packing mode"
+
+            batch_size = query_states.shape[0]
+            (
+                query_states,
+                key_states,
+                value_states,
+                indices_q,
+                cu_seq_lens,
+                max_seq_lens,
+            ) = self._upad_input(query_states, key_states, value_states, attention_mask, seq_length)
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+            assert query_states.dim() == 3, "dim must be 3"
+
+            attn_output_unpad = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_in_batch_q,
+                max_seqlen_k=max_seqlen_in_batch_k,
+                dropout_p=dropout,
+                softmax_scale=self.scaling,
+                causal=is_causal,
+            )
+            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, seq_length)
+        else:
+            attn_output = flash_attn_func(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=dropout,
+                softmax_scale=self.scaling,
+                causal=is_causal,
+            )
+        return attn_output
+
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
@@ -658,6 +773,7 @@ class BailingMoeV2_5MultiLatentAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
 
@@ -684,7 +800,6 @@ class BailingMoeV2_5MultiLatentAttention(nn.Module):
         if self.config.rope_interleave:  # support using interleaved weights for efficiency
             q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
         else:
-            x = 1 / 0
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -699,26 +814,44 @@ class BailingMoeV2_5MultiLatentAttention(nn.Module):
         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
 
-        attention_interface: Callable = eager_attention_forward
+        dropout_rate = self.attention_dropout if self.training else 0.0
+        if not self._flash_attn_uses_top_left_mask:
+            causal = self.is_causal
+        else:
+            causal = self.is_causal and seq_length != 1
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        if self.config._attn_implementation == "flash_attention_2":
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            attn_output = self._flash_attention_forward(query_states,
+                                                        key_states,
+                                                        value_states,
+                                                        attention_mask,
+                                                        seq_length,
+                                                        is_causal=causal,
+                                                        dropout=dropout_rate,
+                                                        position_ids=position_ids)
+            attn_weights = None
+        else:
+            # eager attention
+            attn_output, attn_weights = eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
-
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.dense(attn_output)
-        return attn_output, attn_weights, past_key_values
 
+        return attn_output, attn_weights, past_key_values
 
 class BailingMoeV2_5LinearAttention(nn.Module):
     """
@@ -838,6 +971,7 @@ class BailingMoeV2_5LinearAttention(nn.Module):
                 "for padding purposes (0 indicating padding). "
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
+        ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
 
         # launching the triton kernel for just one token will actually be slower
         mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
@@ -886,20 +1020,36 @@ class BailingMoeV2_5LinearAttention(nn.Module):
                 # value_states = value_states.mul_(attention_mask[:, -q_len:, None, None])
                 value_states = value_states * attention_mask[:, -q_len:, None, None]
 
+        g = self.slope[None, None, :].expand(bsz, q_len, self.num_heads).to(query_states.device)
+
+        if ulysses_sp_size > 1:
+            query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2)
+            key_states = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2)
+            value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2)
+            g = gather_seq_scatter_heads(g, seq_dim=1, head_dim=2)
+
+            if recurrent_state is not None:
+                raise ValueError("recurrent_state must be None")
+
+            if use_cache is not False:
+                raise ValueError("use_cache must be False")
+
         o, recurrent_state = self.lightning_attn_ops[mode](
             q=query_states,
             k=key_states,
             v=value_states,
-            # to avoid Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
-            g=self.slope[None, None, :].expand(bsz, q_len, self.num_heads).to(query_states.device),
+            g=g,
             initial_state=recurrent_state,
             output_final_state=use_cache,
         )
 
+        if ulysses_sp_size > 1:
+            o = gather_heads_scatter_seq(o, seq_dim=1, head_dim=2)
+
         o = o.reshape(bsz, q_len, -1)
         o = self.g_norm(o)
         g_proj = self.g_proj(hidden_states)
-        o = o * torch.sigmoid_(g_proj)
+        o = o * torch.sigmoid(g_proj)
         o = self.dense(o)
 
         if use_cache and past_key_value is not None and isinstance(past_key_value, Cache):
@@ -1313,9 +1463,6 @@ class BailingMoeV2_5Model(BailingMoeV2_5PreTrainedModel):
             cache_position: torch.Tensor = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
 
         softmax_attention_layer_id = self.config.layer_group_size - 1
         past_seen_tokens = (

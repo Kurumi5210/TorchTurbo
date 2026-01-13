@@ -1,17 +1,108 @@
 
 import os
-
 import torch
 import torch.nn.functional as F
-
 from torch_turbo.utils.device import is_torch_npu_available
-
+from einops import rearrange, repeat
 
 if is_torch_npu_available():
     import math
-
     import torch_npu
-    from einops import rearrange, repeat
+
+def get_seqlens_in_batch(attention_mask: "torch.Tensor") -> "torch.Tensor":
+    r"""Get the sequnce lengths in the current batch.
+
+    e.g.
+    ```python
+    # input
+    [
+        [1, 1, 2, 2, 2, 0],
+        [1, 2, 2, 3, 3, 3],
+    ]
+    # output
+    [2, 3, 1, 2, 3]
+    ```
+    """
+    bsz = attention_mask.size(0)
+    dtype, device = attention_mask.dtype, attention_mask.device
+    max_num = torch.max(attention_mask).item()
+    counts: torch.Tensor = torch.zeros((bsz, max_num), dtype=dtype, device=device)
+    for i in range(max_num):
+        counts[:, i] = torch.sum(attention_mask == (i + 1), dim=-1)
+
+    counts = counts.flatten()
+    seqlens = counts[counts.nonzero().squeeze(dim=-1)]
+    return seqlens
+
+# packing attention mask copied from llamma-factory
+def get_unpad_data_lf(attention_mask: "torch.Tensor") -> tuple["torch.Tensor", "torch.Tensor", int]:
+    r"""Prepare the indices and seqlens for flash attn varlen function.
+
+    Returns:
+        indices: indices of non-masked tokens from the flattened sequence.
+        cu_seqlens: the cumulative sequence lengths in the current batch, always starts from 0.
+        max_seqlen_in_batch: the largest seqlen in the current batch.
+
+    e.g.
+    ```python
+    # input
+    [
+        [1, 1, 2, 2, 2, 0],
+        [1, 2, 2, 3, 3, 3],
+    ]
+    # output
+    [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]
+    [0, 2, 5, 6, 8, 11]
+    3
+    ```
+
+    """
+    seqlens_in_batch = get_seqlens_in_batch(attention_mask)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    return indices, cu_seqlens, max_seqlen_in_batch
+
+# non-packing attention mask
+def get_unpad_data_normal(attention_mask):
+    r"""Prepare the indices and seqlens for flash attn varlen function.
+
+    Returns:
+        indices: indices of non-masked tokens from the flattened sequence.
+        cu_seqlens: the cumulative sequence lengths in the current batch, always starts from 0.
+        max_seqlen_in_batch: the largest seqlen in the current batch.
+
+    e.g.
+    ```python
+    # input
+    [
+        [1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1],
+    ]
+    # output
+    [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]
+    [0, 5, 11]
+    6
+    ```
+
+    """
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(
+        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
+    )
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+def get_unpad_data(attention_mask):
+    if torch.max(attention_mask) > 1:
+        return get_unpad_data_lf(attention_mask)
+    else:
+        return get_unpad_data_normal(attention_mask)
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 class IndexFirstAxis(torch.autograd.Function):
@@ -89,6 +180,8 @@ def pad_input(hidden_states, indices, batch, seqlen):
     output = index_put_first_axis(hidden_states, indices, batch * seqlen)
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
+def _unpad_input_core(input, indices):
+    return index_first_axis(rearrange(input, "b s ... -> (b s) ..."), indices)
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 def unpad_input(hidden_states, attention_mask, unused_mask=None):
@@ -116,7 +209,7 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     # index with integer indices. Moreover, torch's index is a bit slower than it needs to be,
     # so we write custom forward and backward to make it a bit faster.
     return (
-        index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
+        _unpad_input_core(hidden_states, indices),
         indices,
         cu_seqlens,
         max_seqlen_in_batch,

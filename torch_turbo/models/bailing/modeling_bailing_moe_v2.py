@@ -62,7 +62,7 @@ if is_flash_attn_2_available():
 
 if is_torch_npu_available():
     print("Using npu_fusion_attention", flush=True)
-    from torch_turbo.utils.flash_attn_utils import index_first_axis, pad_input, unpad_input
+    from torch_turbo.utils.flash_attn_utils import index_first_axis, pad_input, unpad_input, get_unpad_data
     from transformers.integrations.npu_flash_attention import npu_flash_attn_varlen_func as flash_attn_varlen_func, npu_flash_attn_func as flash_attn_func
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
@@ -769,7 +769,7 @@ class BailingMoeV2FlashAttention2(BailingMoeV2Attention):
         return attn_output
 
     def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = get_unpad_data(attention_mask)
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(

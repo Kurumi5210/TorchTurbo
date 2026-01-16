@@ -332,7 +332,6 @@ def apply_monkey_patch(model, args):
             sin = sin.unsqueeze(unsqueeze_dim)
             return npu_rotary_position_embedding(q, cos, sin, 0), npu_rotary_position_embedding(k, cos, sin, 0)
         modeling_qwen3_moe.apply_rotary_pos_emb = apply_rotary_pos_emb
-        import torch_turbo.models.bailing.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
         def apply_rotary_pos_emb_bailing(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
             cos = cos.unsqueeze(unsqueeze_dim)
             sin = sin.unsqueeze(unsqueeze_dim)
@@ -344,7 +343,10 @@ def apply_monkey_patch(model, args):
             q_embed = torch.cat([q_embed, q_pass], dim=-1)
             k_embed = torch.cat([k_embed, k_pass], dim=-1)
             return q_embed, k_embed
+        import torch_turbo.models.bailing.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
         modeling_bailing_moe_v2.apply_rotary_pos_emb = apply_rotary_pos_emb_bailing
+        import torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla as modeling_bailing_moe_v2_5
+        modeling_bailing_moe_v2_5.apply_rotary_pos_emb = apply_rotary_pos_emb_bailing
 
     if args.use_fused_rms_norm:
         from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
@@ -354,6 +356,8 @@ def apply_monkey_patch(model, args):
         Qwen3MoeRMSNorm.forward = fused_forward
         from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2RMSNorm
         BailingMoeV2RMSNorm.forward = fused_forward
+        from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5RMSNorm
+        BailingMoeV2_5RMSNorm.forward = fused_forward
 
     if args.use_fused_permute_unpermute:
         from mindspeed.ops.npu_moe_token_permute import npu_moe_token_permute

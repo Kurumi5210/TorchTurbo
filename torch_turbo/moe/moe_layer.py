@@ -126,7 +126,7 @@ class MoELayer(BaseMoELayer):
             hidden_states_dtype = hidden_states.dtype
             probs, routing_map, logits = self.router(hidden_states)
             if self.config.moe_router_score_function != "sigmoid":
-                probs /= probs.sum(dim=-1, keepdim=True)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
             logits = logits.view(-1, logits.shape[-1])
             (dispatched_input, tokens_per_expert, permuted_probs) = (
                 self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)

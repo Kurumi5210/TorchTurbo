@@ -13,7 +13,7 @@ try:
     from ring_attn_ascend import zigzag_ring_flash_attn_func
 except ImportError:
     pass
-    
+
 import sys
 from torch_turbo.sequence_parallel.ulysses import (
     gather_heads_scatter_seq,
@@ -34,6 +34,19 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
     return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
+
+# Copied from transformers 4.52.4 and only support flash_attention_2
+def create_causal_mask(config, input_embeds, attention_mask, cache_position, past_key_values, position_ids):
+    if attention_mask is not None and past_key_values is not None:
+        is_padding_right = attention_mask[:, -1].sum().item() != input_embeds.size()[0]
+        if is_padding_right:
+            raise ValueError(
+                "You are attempting to perform batched generation with padding_side='right'"
+                " this may lead to unexpected behaviour for Flash Attention version of Qwen3Moe. Make sure to "
+                " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
+            )
+
+    return attention_mask
 
 def _ulysses_flash_attention_forward(
     query_states: torch.Tensor,
@@ -306,6 +319,15 @@ def apply_monkey_patch(model, args):
         new_attention_forward = _zigzag_ring_flash_attn_forward
 
     if ulysses_sp_size > 1:
+        if model.config.architectures[0] == "Qwen3MoeForCausalLM":
+            # Apply create_causal_mask patch for Qwen3Moe when Ulysses sequence parallel is enabled.
+            # Note: Higher transformers versions (e.g., 4.57.3) trim attention_mask in create_causal_mask,
+            # which needs to be disabled for Ulysses SP to work correctly.
+            import transformers.models.qwen3_moe.modeling_qwen3_moe as qwen3_moe_module
+            if hasattr(qwen3_moe_module, 'create_causal_mask'):
+                qwen3_moe_module.create_causal_mask = create_causal_mask
+                print(f"Monkey patch create_causal_mask in Qwen3MoeModel")
+
         # transformers<=4.47.1
         if hasattr(module, "_flash_attention_forward"):
             module._flash_attention_forward = new_attention_forward
@@ -345,8 +367,11 @@ def apply_monkey_patch(model, args):
             return q_embed, k_embed
         import torch_turbo.models.bailing.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
         modeling_bailing_moe_v2.apply_rotary_pos_emb = apply_rotary_pos_emb_bailing
-        import torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla as modeling_bailing_moe_v2_5
-        modeling_bailing_moe_v2_5.apply_rotary_pos_emb = apply_rotary_pos_emb_bailing
+        try:
+            import torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla as modeling_bailing_moe_v2_5
+            modeling_bailing_moe_v2_5.apply_rotary_pos_emb = apply_rotary_pos_emb_bailing
+        except ImportError:
+            pass
 
     if args.use_fused_rms_norm:
         from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRMSNorm
@@ -356,8 +381,11 @@ def apply_monkey_patch(model, args):
         Qwen3MoeRMSNorm.forward = fused_forward
         from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2RMSNorm
         BailingMoeV2RMSNorm.forward = fused_forward
-        from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5RMSNorm
-        BailingMoeV2_5RMSNorm.forward = fused_forward
+        try:
+            from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5RMSNorm
+            BailingMoeV2_5RMSNorm.forward = fused_forward
+        except ImportError as e:
+            print(f"Import BailingMoeV2_5RMSNorm Error: {e}")
 
     if args.use_fused_permute_unpermute:
         from mindspeed.ops.npu_moe_token_permute import npu_moe_token_permute

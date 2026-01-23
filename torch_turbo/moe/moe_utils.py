@@ -29,9 +29,7 @@ from torch_turbo.distributed.parallel import (
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
 )
-from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
-from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM
-from torch_turbo.models.deepseek.modeling_deepseek_v32 import create_deepseek_v32_model
+
 
 from torch.distributed.tensor.placement_types import Shard
 if is_npu_available:
@@ -650,10 +648,13 @@ class MoeUtils:
         # config.num_hidden_layers = 1
         with torch.device("meta"):
             if config.architectures[0] == "BailingMoeV2ForCausalLM":
+                from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                 model = BailingMoeV2ForCausalLM(config)
             elif config.architectures[0] == "BailingMoeV2_5ForCausalLM":
+                from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM
                 model = BailingMoeV2_5ForCausalLM(config)
             elif "deepseek_v3" in config.model_type:
+                from torch_turbo.models.deepseek.modeling_deepseek_v32 import create_deepseek_v32_model
                 model = create_deepseek_v32_model(config)
                 config.num_experts = config.n_routed_experts
             else:

@@ -1,7 +1,5 @@
 import torch
 
-from torch_turbo.distributed.parallel import get_tensor_model_parallel_group
-
 
 def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_global_buffer=False):
     """Gather tensors and concatenate along the first dimension.
@@ -16,9 +14,6 @@ def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_glo
     Returns:
         torch.Tensor: Gathered tensor.
     """
-
-    if group is None:
-        group = get_tensor_model_parallel_group()
     world_size = torch.distributed.get_world_size(group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
@@ -48,8 +43,6 @@ def _reduce_scatter_along_first_dim(
             the input splits along the first dimension for each rank. If None,
             equal splitting is assumed. Default: None.
     """
-    if group is None:
-        group = get_tensor_model_parallel_group()
     world_size = torch.distributed.get_world_size(group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
@@ -74,8 +67,6 @@ def _reduce_scatter_along_first_dim(
 def _split_along_first_dim(input_, group=None):
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
-    if group is None:
-        group = get_tensor_model_parallel_group()
     world_size = torch.distributed.get_world_size(group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:

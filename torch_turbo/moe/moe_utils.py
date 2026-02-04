@@ -645,7 +645,7 @@ class MoeUtils:
     @staticmethod
     def build_model(args, config, torch_dtype=torch.bfloat16):
         # DEBUG
-        # config.num_hidden_layers = 1
+        config.num_hidden_layers = 1
         with torch.device("meta"):
             if config.architectures[0] == "BailingMoeV2ForCausalLM":
                 from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM

@@ -4,12 +4,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from torch_turbo.transformer.transformer_config import TransformerConfig
-from torch_turbo.distributed.parallel import (
-    get_expert_model_parallel_group,
-    get_expert_tensor_parallel_group,
-    get_expert_tensor_parallel_rank,
-    get_expert_tensor_and_model_parallel_group
-)
+from torch_turbo.distributed.parallel import get_expert_model_parallel_group
 from torch_turbo.distributed.mappings import (
     all_to_all,
     gather_from_sequence_parallel_region
@@ -41,21 +36,6 @@ class MoETokenDispatcher:
     def ep_group(self):
         """Get expert model parallel group."""
         return get_expert_model_parallel_group()
-
-    @property
-    def tp_group(self):
-        """Get expert tensor parallel group."""
-        return get_expert_tensor_parallel_group()
-
-    @property
-    def tp_rank(self):
-        """Get expert tensor parallel rank."""
-        return get_expert_tensor_parallel_rank()
-
-    @property
-    def tp_ep_group(self):
-        """Get expert tensor and model parallel group."""
-        return get_expert_tensor_and_model_parallel_group()
 
     @abstractmethod
     def token_permutation(
@@ -242,7 +222,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # [tp_size, ep_size, num_experts]
             num_global_tokens_per_expert = (
                 gather_from_sequence_parallel_region(
-                    num_local_tokens_per_expert, group=self.tp_ep_group
+                    num_local_tokens_per_expert, group=self.ep_group
                 )
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
@@ -256,7 +236,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # [tp_size, ep_size] -> [ep_size]
             # self.output_splits represents the number of tokens received by the current rank
             # from other EP rank.
-            self.output_splits = num_global_tokens_per_rank[self.tp_rank]
+            # HACK: tp_rank always 0
+            self.output_splits = num_global_tokens_per_rank[0]
             # [tp_size, ep_size] -> [tp_size]
             # self.output_splits_tp represents the number of tokens received by the current
             # rank from other TP rank.

@@ -7,8 +7,6 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from torch_turbo.transformer.transformer_config import TransformerConfig
-from torch_turbo.transformer.utils import divide
-from torch_turbo.distributed.parallel import get_expert_tensor_parallel_world_size
 from torch_turbo.utils.device import is_npu_available
 
 try:
@@ -95,16 +93,14 @@ class GroupedMLP(torch.nn.Module):
         self.activation_func_with_probs = self.activation_func
 
         # How many feature each rank holds for fc1 and fc2, respectively.
-        tp_size = get_expert_tensor_parallel_world_size()
-
         if config.gated_linear_unit:
             fc1_output_size = self.config.moe_ffn_hidden_size * 2
         else:
             fc1_output_size = self.config.moe_ffn_hidden_size
-        fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
+        fc1_output_size_per_partition = fc1_output_size
 
         fc2_input_size = self.config.moe_ffn_hidden_size * self.num_local_experts
-        fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
+        fc2_input_size_per_partition = fc2_input_size
 
         # Note: The current kernel implementations of grouped_gemm
         # does not support transposition with CUTLASS grouped GEMM

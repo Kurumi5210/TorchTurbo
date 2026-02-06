@@ -31,6 +31,10 @@ class Router(ABC, torch.nn.Module):
         if config.perform_initialization:
             config.init_method(self.weight)
         self.weight.data = self.weight.data.to(dtype=config.params_dtype)
+        setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
+        # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
+        # So we need to know if the model is configured to calculate per token loss.
+        self.calculate_per_token_loss = self.config.calculate_per_token_loss
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -94,6 +98,27 @@ class TopKRouter(Router):
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
 
+    def apply_input_jitter(self, input: torch.Tensor):
+        """Add noise to the input tensor.
+        Refer to https://arxiv.org/abs/2101.03961.
+
+        Args:
+            input (Tensor): Input tensor.
+
+        Returns:
+            Tensor: Jittered input.
+        """
+        if self.config.moe_input_jitter_eps is not None:
+            eps = self.config.moe_input_jitter_eps
+            if self.input_jitter is None:
+                self.input_jitter = torch.distributions.uniform.Uniform(
+                    torch.tensor(1.0 - eps, device=input.device),
+                    torch.tensor(1.0 + eps, device=input.device),
+                ).rsample
+            return input * self.input_jitter(input.shape)
+        else:
+            return input
+
     def routing(self, logits: torch.Tensor):
         """Top-k routing function
 
@@ -141,7 +166,9 @@ class TopKRouter(Router):
             input (torch.Tensor): Input tensor.
         """
         self._maintain_float32_expert_bias()
-        
+
+        # Apply input jitter
+        input = self.apply_input_jitter(input)
         logits = self.gating(input)
 
         scores, routing_map = self.routing(logits)

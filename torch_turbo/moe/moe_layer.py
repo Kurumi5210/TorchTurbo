@@ -44,6 +44,7 @@ class BaseMoELayer(torch.nn.Module, ABC):
         )
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
+        self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
@@ -104,8 +105,20 @@ class MoELayer(BaseMoELayer):
         # Initialize shared experts
         if self.use_shared_expert:
             self.shared_experts = build_module(self.submodules.shared_experts, config=self.config)
+            if self.shared_expert_overlap:
+                self.token_dispatcher.set_shared_experts(self.shared_experts)
 
     def forward(self, hidden_states: torch.Tensor):
+        if (
+            self.training
+            and self.config.tensor_model_parallel_size > 1
+            and not self.config.sequence_parallel
+        ):
+            raise ValueError(
+                "During training, performance may degrade if MoE and tensor parallelism"
+                "are enabled without also enabling sequence parallelism."
+            )
+
         # debug
         rank = torch.distributed.get_rank()
         # process MoE

@@ -10,31 +10,11 @@ from typing import Callable, ContextManager, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
-    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
-    std = sigma / math.sqrt(multiplier * num_layers)
-
-    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
-class AttnBackend(enum.Enum):
-    """Attention Backend"""
-
-    flash = 1
-    fused = 2
-    unfused = 3
-    local = 4
-    auto = 5
-
-class Fp8Recipe(str, enum.Enum):
-    """FP8 recipe names: delayed, tensorwise, mxfp8."""
-
-    delayed = "delayed"
-    tensorwise = "tensorwise"
-    mxfp8 = "mxfp8"
 
 @dataclass
 class ModelParallelConfig:
@@ -46,52 +26,8 @@ class ModelParallelConfig:
     ###################
     # Model parallelism
     ###################
-    tensor_model_parallel_size: int = 1
-    """Intra-layer model parallelism. Splits tensors across GPU ranks."""
-
-    pipeline_model_parallel_comm_backend: Optional[str] = None
-    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
-       If None, the default backend will be used.
-    """
-
-    pipeline_model_parallel_size: int = 1
-    """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
-
-    virtual_pipeline_model_parallel_size: Optional[int] = None
-    """Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
-       bubble.  Considers a transformer block as a list of smaller transformer (virtual) blocks.
-       The number of virtual blocks per pipeline model parallel rank is the virtual model parallel
-       size.  See Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM:
-       arxiv.org/pdf/2104.04473.pdf for more details.
-    """
-
-    sequence_parallel: bool = False
-    """Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms
-       and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer Models
-       (https://arxiv.org/abs/2205.05198) for more details.
-    """
-
-    context_parallel_size: int = 1
-    """Splits network input along sequence dimension across GPU ranks."""
-
-    hierarchical_context_parallel_sizes: Optional[list[int]] = None
-    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
-       the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
-       groups of two levels, so the first value of the list indicates the group size of the a2a
-       communication type, and the second value indicates the group size of the p2p communication
-       type.
-    """
-
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
-
-    expert_tensor_parallel_size: Optional[int] = None
-    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks."""
-
-    moe_extended_tp: bool = False
-    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
-      Its functionality is replaced by expert_tensor_parallel_size.
-    """
 
     ###################
     # Initialization
@@ -101,330 +37,16 @@ class ModelParallelConfig:
        load values from a checkpoint.
     """
 
-    use_cpu_initialization: bool = False
-    """When set to False, we initialize the weights directly on the GPU. CPU initialization is the
-       same regardless of tensor model parallelism, but GPU initialization is not. Transferring
-       weights from CPU to GPU can take a significant amount of time for large models.
-    """
-
     ###################
     # Training
     ###################
-    fp16: bool = False
-    """If true, train with fp16 mixed precision training."""
-
-    bf16: bool = False
-    """If true, train with bf16 mixed precision training."""
-
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights."""
-
-    timers: Optional[Callable] = None
-    """Timers object to call for various timing functions. See megatron.core.timers.Timers"""
-
-    finalize_model_grads_func: Optional[Callable] = None
-    """Function that finalizes gradients on all workers. Could include ensuring that grads are
-       all-reduced across data parallelism, pipeline parallelism, and sequence parallelism
-       dimensions.
-    """
-
-    grad_scale_func: Optional[Callable] = None
-    """If using loss scaling, this function should take the loss and return the scaled loss. If
-       None, no function is called on the loss.
-    """
-
-    no_sync_func: Optional[Callable] = None
-    """Function that creates a context that suppresses asynchronous data-parallel communication. If
-       the model is an instance of core.distributed.DistributedDataParallel, the default is to use
-       core.distributed.DistributedDataParallel.no_sync.
-    """
-
-    grad_sync_func: Optional[Callable] = None
-    """Function that launches asynchronous gradient reductions (e.g. distributed optimizer gradient
-       reduce-scatters). The function should take one argument: an iterable of parameters whose
-       gradients are to be synchronized.
-    """
-
-    param_sync_func: Optional[Callable] = None
-    """Function that launches asynchronous parameter synchronizations (e.g. distributed optimizer
-       parameter all-gathers). The function should take one argument: an iterable of parameters to
-       be synchronized.
-    """
 
     deterministic_mode: bool = False
     """If true, code that has deterministic execution will be chosen. This usually
        means slower execution, but is good for debugging and testing. Defaults to False."""
 
-    enable_autocast: bool = False
-    """If true runs the forward step function inside torch.autocast context."""
-
-    autocast_dtype: Optional[torch.dtype] = None
-    """dtype to pass to torch.amp.autocast when enabled. If None, is set to pipeline_dtype."""
-
-    num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
-    """If int, set the number of microbatches where not all of the layers will be checkpointed and
-       recomputed. The rest of the microbatches within the window of maximum outstanding
-       microbatches will recompute all layers (either full recompute or selective recompute). If
-       None, the checkpoint and recompute will be left up to the forward_step function.
-
-    """
-
-    ###################
-    # Optimizations
-    ###################
-    gradient_accumulation_fusion: bool = False
-    """If true, fuses weight gradient accumulation to GEMMs. Requires the custom CUDA extension
-       fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
-       APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
-       --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
-       must turn off gradient accumulation fusion.
-    """
-
-    async_tensor_model_parallel_allreduce: bool = False
-    """NOTE: Deprecated. This flag is ignored."""
-
-    use_te_rng_tracker: bool = False
-    """If true, uses RNG state tracker in TransformerEngine if exists.
-    """
-
-    tp_comm_overlap: bool = False
-    """If true, allows overlapping of Linear layer execution with tensor parallel communication
-       collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever
-       possible during the forward and the backward pass.
-    """
-
-    tp_comm_bulk_wgrad: bool = True
-    """If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't care if
-       tp_comm_overlap is False.
-    """
-
-    tp_comm_bulk_dgrad: bool = True
-    """If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
-       tp_comm_overlap is False.
-    """
-
-    tp_comm_overlap_ag: bool = True
-    """If true, allows All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
-       Don't care if tp_comm_overlap is False.
-    """
-
-    tp_comm_overlap_rs: bool = True
-    """If true, allows Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
-       Don't care if tp_comm_overlap is False.
-    """
-
-    tp_comm_overlap_rs_dgrad: bool = False
-    """If true, allows Reduce-Scatter overlap with DGRAD GEMM by pipelining the
-       GEMM and Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
-    """
-
-    tp_comm_split_ag: bool = True
-    """Deprecated from TransformerEngine v1.6.0.
-       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
-       splits. Don't care if tp_comm_overlap is False.
-    """
-
-    tp_comm_atomic_ag: bool = False
-    """Deprecated from TransformerEngine v1.6.0.
-       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
-       both done atomically. Don't care if tp_comm_overlap is False.
-    """
-
-    tp_comm_split_rs: bool = True
-    """Deprecated from TransformerEngine v1.6.0.
-       If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
-       Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
-    """
-
-    tp_comm_atomic_rs: bool = False
-    """Deprecated from TransformerEngine v1.6.0.
-       If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
-       Reduce-Scatter both done atomically. Don't care if tp_comm_overlap is False.
-    """
-
-    cross_entropy_loss_fusion: bool = False
-    """If this is enabled, the fused cross entropy implementation would be used.
-       Defaults to False.
-    """
-
-    cross_entropy_fusion_impl: str = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
-    """
-
-    tp_comm_overlap_disable_qkv: bool = False
-    """
-       If true, the AllGather -> Gemm overlap for QKV gets disabled
-    """
-
-    tp_comm_overlap_disable_fc1: bool = False
-    """
-       If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
-    """
-
-    tp_comm_bootstrap_backend: str = 'nccl'
-    """
-       Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
-    """
-
-    ###################
-    # Pipeline Parallel
-    ###################
-    pipeline_dtype: torch.dtype = None
-    """dtype used in p2p communication, usually params_dtype"""
-
-    variable_seq_lengths: bool = False
-    """Support for variable sequence lengths across microbatches. Setting this communicates the size
-        of tensors during pipeline parallelism communication, because of this extra overhead it
-        should only be set if the sequence length varies by microbatch within a global batch.
-    """
-
-    overlap_p2p_comm: bool = False
-    """When True some of the peer to peer communication for pipeline parallelism will overlap with
-       computation. Must be False if batch_p2p_comm is true.
-    """
-
-    batch_p2p_comm: bool = True
-    """Use batch_isend_irecv instead of individual isend/irecv calls. Must be False if
-       overlap_p2p_comm is True.
-    """
-
-    batch_p2p_sync: bool = True
-    """When using batch_isend_irecv, do a cuda.device.synchronize afterward to work around a bug in
-       older version of PyTorch.
-    """
-
-    use_ring_exchange_p2p: bool = False
-    """Use custom ring_exchange kernel instead of torch.distributed.batch_isend_irecv(). Requires
-       custom built torch with torch.distributed.ring_exchange.
-    """
-
-    deallocate_pipeline_outputs: bool = False
-    """If True, output data is deallocated after the tensor is sent to the next pipeline stage.
-       Helps with saving memory, does nothing when pipeline parallel is not used.
-    """
-
-    defer_embedding_wgrad_compute: bool = False
-    """If true, defers the embedding WGRAD GEMMs while pipeline flush is
-       taking place enabling us to hide pipeline flush latency. Defaults to False.
-    """
-
-    wgrad_deferral_limit: int = 0
-    """This value tunes the number of micro-batches for which the embedding weight gradient compute
-       needs to be deferred to pipeline flush, this argument is invalid if
-       `defer_embedding_wgrad_compute` is False.
-       Defaults to 0, which means all micro-batches are deferred.
-    """
-
-    pipeline_model_parallel_split_rank: Optional[int] = None
-    """If int, rank where encoder and decoder should be split in cases where the model has both an
-       encoder and decoder (e.g., T5). Ignored if None.
-    """
-
-    overlap_p2p_comm_warmup_flush: bool = False
-    """If true, overlap communication and computation in warm up and flush phase.
-       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
-       Defaults to False.
-    """
-
-    microbatch_group_size_per_vp_stage: Optional[int] = None
-    """This value specifies the number of micro-batches that are executed 
-       at a time for a given virtual stage (both forward and backward).
-       Default (in __post_init__() method below) to pipeline_parallel_size 
-       which specifies a depth-first schedule.
-       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
-       num_microbatches = 4, we have 
-       rank 0 | 0 1 0 1 2 3 2 3
-       rank 1 |   0 1 0 1 2 3 2 3
-       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
-       we have
-       rank 0 | 0 1 2 0 1 2 3 4 3 4 
-       rank 1 |   0 1 2 0 1 2 3 4 3 4
-    """
-
-    ###################
-    # CPU Offloading
-    ###################
-    cpu_offloading: bool = False
-    """When set to True, all the activations are offloaded to the CPU asynchronously."""
-
-    cpu_offloading_num_layers: int = 0
-    """Tells the number of transformer layers for which activations has to be offloaded."""
-
-    _cpu_offloading_context: Optional[ContextManager] = (
-        None
-        # Used for internal use only, not to be set by a user.
-        # TODO: Need to move to the 'right' place when possible.
-    )
-    """For internal use only, do not set."""
-
-    cpu_offloading_activations: bool = True
-    """If True, offloads the activations to CPU."""
-
-    cpu_offloading_weights: bool = True
-    """If True, offloads the weights to CPU."""
-
-    ###################
-    # Timing
-    ###################
-    barrier_with_L1_time: bool = True
-    """If true, use barrier with level 1 time measurements. It is up to the user to make sure
-       calling barrier with their timers will not result in hangs. This can happen if for example
-       the user adds a level 1 timer that is not called by all ranks.
-    """
-
-    def __post_init__(self):
-        """Python dataclass method that is used to modify attributes after initialization.
-        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
-        details.
-        """
-        if self.sequence_parallel:
-            if self.tensor_model_parallel_size <= 1:
-                raise ValueError("Can not use sequence paralllelism without tensor parallelism")
-
-        if self.expert_tensor_parallel_size is None:
-            self.expert_tensor_parallel_size = self.tensor_model_parallel_size
-
-        if self.pipeline_model_parallel_size > 1:
-            if self.pipeline_dtype is None:
-                raise ValueError(
-                    "When using pipeline parallelism, pipeline_dtype must be specified"
-                )
-
-        if self.autocast_dtype is None:
-            self.autocast_dtype = self.params_dtype
-
-        if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
-            raise ValueError(
-                "Cannot defer embedding wgrad compute when pipeline model parallel is not used"
-            )
-
-        if self.defer_embedding_wgrad_compute and not self.gradient_accumulation_fusion:
-            raise ValueError(
-                "Cannot defer embedding wgrad compute when gradient accumulation fusion is not used"
-            )
-
-        if self.defer_embedding_wgrad_compute and self.wgrad_deferral_limit < 0:
-            raise ValueError(
-                "Wgrad deferral limit should be greater than or equal to 0 when it is enabled!"
-            )
-
-        if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
-            if self.sequence_parallel is False:
-                raise ValueError(
-                    "When using expert parallelism and tensor parallelism, "
-                    "sequence parallelism must be used"
-                )
-
-        if self.microbatch_group_size_per_vp_stage is None:
-            self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
-
-        if self.overlap_p2p_comm_warmup_flush:
-            if not self.overlap_p2p_comm or self.batch_p2p_comm:
-                raise ValueError(
-                    "Pipeline parallel communication overlapping in warmup and flush is only "
-                    "compatible with overlap_p2p_comm but not batch_p2p_comm."
-                )
 
 @dataclass
 class TransformerConfig(ModelParallelConfig):
@@ -441,80 +63,22 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
-    mtp_num_layers: Optional[int] = None
-    """Number of Multi-Token Prediction (MTP) Layers."""
-
-    mtp_loss_scaling_factor: Optional[float] = None
-    """Weighting factor of Multi-Token Prediction (MTP) loss."""
-
-    num_layers_in_first_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on first pipeline stage.
-    None implies equal layer division across PP ranks."""
-
-    num_layers_in_last_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on last pipeline stage.
-    None implies equal layer division across PP ranks."""
-
-    account_for_embedding_in_pipeline_split: bool = False
-    """If set, the embedding layer will be treated as a standard transformer
-    layer in the context of partition and placement for pipeline parallelism."""
-
-    account_for_loss_in_pipeline_split: bool = False
-    """If set, the loss layer will be treated as a standard transformer
-    layer in the context of partition and placement for pipeline parallelism."""
-
     hidden_size: int = 0
     """Transformer hidden size."""
 
     num_attention_heads: int = 0
     """Number of transformer attention heads."""
 
-    attention_backend: AttnBackend = AttnBackend.auto
-    """Attention backend to run. By default we let transformer engine
-    decide the best backend to run (except in the case of local).
-    If attention backend is local we use the local pytorch implementation in mcore.
-    Users can specify exact backend by changing this config. """
-
-    softmax_scale: Optional[float] = None
-    """Softmax scale for attention scaling."""
-
-    num_query_groups: Optional[int] = None
-    """Number of query groups for group query attention. If None, normal attention is used."""
-
     ffn_hidden_size: Optional[int] = None
     """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
     if not provided."""
 
-    kv_channels: Optional[int] = None
-    """Projection weights dimension in multi-head attention. This is set to hidden_size //
-    num_attention_heads if not provided."""
-
-    hidden_dropout: float = 0.1
-    """Dropout probability for transformer hidden state."""
-
     attention_dropout: float = 0.1
     """Post attention dropout probability."""
-
-    fp32_residual_connection: bool = False
-    """If true, move residual connections to fp32."""
-
-    # @jcasper should we keep this option?
-    apply_residual_connection_post_layernorm: bool = False
-    """If True, uses the original BERT residule connection ordering."""
-
-    layernorm_epsilon: float = 1e-5
-    """Epsilon value for any LayerNorm operations."""
-
-    layernorm_zero_centered_gamma: bool = False
-    """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
-    numerical stability."""
 
     add_bias_linear: bool = True
     """Include a bias term in all linear layers (QKV projections, after core attention, and two in
     MLP layer)."""
-
-    add_qkv_bias: bool = False
-    """Add a bias term only for QKV projections."""
 
     gated_linear_unit: bool = False
     """Use a gated linear unit for the first linear layer in the MLP."""
@@ -522,37 +86,9 @@ class TransformerConfig(ModelParallelConfig):
     activation_func: Callable = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
-    activation_func_fp8_input_store: bool = False
-    """Store the input of MLP activation function in FP8 for backprop to save memory.
-    The stored input is casted back to the original precision before backprop compuatation."""
-
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
-
-    rotary_interleaved: bool = False
-    """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
-    first half and second half (LLaMa style). Default to False."""
-
-    window_size: Optional[Tuple[int, int]] = None
-    """If not None, then will use sliding window attention. The size of the window is specified by
-    the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
-
-    normalization: str = "LayerNorm"
-    """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
-
-    qk_layernorm: bool = False
-    """Whether to apply `normalization` type of normalization to the query and key embeddings."""
-
-    test_mode: bool = False
-    """Whether to run real-time tests."""
-
-    calculate_per_token_loss: bool = False
-    """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
-    global batch, versus the default behavior of assuming all tokens are non-padded."""
-
-    multi_latent_attention: bool = False
-    """Whether to use multi-latent attention."""
 
     ####################
     # initialization
@@ -563,165 +99,9 @@ class TransformerConfig(ModelParallelConfig):
     megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with
     mean=0.0 and std=init_method_std."""
 
-    output_layer_init_method: Optional[Callable] = None
-    """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
-    will be set to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn
-    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
-
     init_method_std: float = 0.02
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
-
-    init_model_with_meta_device: bool = False
-    """
-    If True, initializes the model with the meta device. This is helpful for
-    training of very large models. This feature is only works when custom fsdp is turned on.
-    """
-
-    ####################
-    # mixed-precision
-    ####################
-    apply_query_key_layer_scaling: bool = False
-    """If true, scale Q * K^T by 1 / layer-number. This improve numeric stability when training with
-    fp16."""
-
-    attention_softmax_in_fp32: bool = True
-    """If True, run attention masking and softmax in fp32. This should be True if
-    apply_query_key_layer_scaling is True."""
-
-    disable_bf16_reduced_precision_matmul: bool = False
-    """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to 
-    prevent matmul from using reduced precision accumulation when using BF16."""
-
-    ####################
-    # fusion
-    ####################
-    bias_activation_fusion: bool = False
-    """If True, fuses bias addition and the activation function when possible."""
-
-    masked_softmax_fusion: bool = False
-    """If True, uses softmax fusion."""
-
-    persist_layer_norm: bool = False
-    """If True, uses the persistent fused layer norm kernel. This kernel only supports a fixed set
-    of hidden sizes."""
-
-    memory_efficient_layer_norm: bool = False
-    """If True, and using local layers (not from TransformerEngine), tells Apex to use the memory
-    efficient fused LayerNorm kernel. Ignored if not using LayerNorm."""
-
-    bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
-    """If True, uses bias dropout fusion."""
-
-    apply_rope_fusion: bool = False
-    """If True, use fused RoPE kernel."""
-
-    ####################
-    # activation recomputation
-    ####################
-    recompute_granularity: Optional[str] = None
-    """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
-    activation checkpointing where the submodules set in --recompute-modules is checkpointed.
-    The default is "core_attn" which is the memory intensive part of attention.
-    These memory intensive activations are also less compute intensive which makes activation
-    checkpointing more efficient for LLMs (20B+).  See Reducing Activation Recomputation in Large
-    Transformer Models (https://arxiv.org/abs/2205.05198) for more details.  'full' will checkpoint
-    the entire transformer layer.  If None, no recompute is performed and all activations are saved.
-    If set, must be 'selective' or 'full'. 'selective' always uses all layers.
-    """
-
-    recompute_method: Optional[str] = None
-    """Determines which transformer layers will be recomputed. uniform will uniformly divide the
-    total number of transformer layers in a transformer block and recompute the input activation of
-    each divided chunk at the specified granularity.  block will recompute the input activations for
-    only a set number of transformer layers per pipeline stage.  The rest of the layers in the
-    pipeline stage will not have any activations recomputed.  If None, and recompute is enabled, all
-    layers will do recomputation. If set, must be 'uniform' or 'block'."""
-
-    recompute_num_layers: Optional[int] = None
-    """When recompute_method is uniform, recompute_num_layers is the number of transformer layers in
-    each uniformly divided recompute unit.  When recompute_method is block, recompute_num_layers is
-    the number of transformer layers to recompute within each pipeline stage.  Must be None for
-    'selective' activation checkpointing."""
-
-    distribute_saved_activations: Optional[bool] = None
-    """If True, distribute recomputed activations across the model parallel group."""
-
-    recompute_modules: Optional[List[str]] = None
-    """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe".
-    default: ["core_attn"].
-    "core_attn": recompute the core attention part of the transformer layer.
-    "moe_act": recompute the MoE MLP activation function.
-    "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
-    "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
-    "mlp": recompute the dense MLP submodule. 
-    "moe": recompute the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
-    "core_attn", "mlp", and "moe" uses normal checkpointing.
-    """
-
-    ####################
-    # fp8 related
-    ####################
-    fp8: Optional[str] = None
-    """If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined
-    choices (1) 'e4m3' uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8
-    activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
-
-    fp8_recipe: Optional[str] = "delayed"
-    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
-    choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
-    uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only"""
-
-    fp8_param: bool = False
-    """If set, keep the parameters in fp8 precision to save memory. This option must be used
-    together with fp8 mode (i.e., TransformerConfig.fp8 is not None). Note that not all parameters
-    will be converted to fp8; for example, biases will remain unchanged. The parameters affected are
-    primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
-    determined by TE."""
-
-    fp8_margin: int = 0
-    """Margin for the scaling factor computation."""
-
-    fp8_interval: int = 1
-    """DEPRECATED from TransformerEngine v1.8.0. This flag is ignored.
-    Controls how often the scaling factor is recomputed.
-    """
-
-    fp8_amax_history_len: int = 1
-    """The length of the amax history window used for scaling factor computation."""
-
-    fp8_amax_compute_algo: str = "most_recent"
-    """Algorithm used for choosing the `amax` value for the scaling factor computation. There are 2
-    predefined choices: `max` chooses the largest `amax` in the history window, while `most_recent`
-    always chooses the most recently seen value.
-
-    """
-
-    fp8_wgrad: bool = True
-    """When set to False, override FP8 config options and do the wgrad computation
-    in higher precision."""
-
-    fp8_dot_product_attention: bool = False
-    """When set to True, use the FP8 implementation of Dot Product Attention."""
-
-    fp8_multi_head_attention: bool = False
-    """When set to True, use the FP8 implementation of Multi Head Attention."""
-
-    tp_only_amax_red: bool = False
-    """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
-
-    first_last_layers_bf16: bool = False
-    """If True, retains first and last N TransformerBlocks in BF16 as opposed to FP8."""
-
-    num_layers_at_start_in_bf16: int = 1
-    """Number of layers at the start of the model to keep in BF16 precision when
-    first_last_layers_bf16 is True."""
-
-    num_layers_at_end_in_bf16: int = 1
-    """Number of layers at the end of the model to keep in BF16 precision when
-    first_last_layers_bf16 is True."""
 
     ####################
     # MoE related
@@ -731,10 +111,6 @@ class TransformerConfig(ModelParallelConfig):
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
     there are multiple shared experts.
     None means no shared expert."""
-
-    moe_shared_expert_overlap: bool = False
-    """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared epxerts execute after the routed experts."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -753,11 +129,6 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
-
-    moe_router_topk_limited_devices: Optional[int] = None
-    """Number of EP ranks to consider for each token in group-limited routing,
-    DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
-    """
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
@@ -816,29 +187,9 @@ class TransformerConfig(ModelParallelConfig):
     """Use legacy GroupedMLP rather than TEGroupedMLP.
     Note: The legacy one will be deprecated soon."""
 
-    moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
-    """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
-
-    moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
-    """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
-
-    moe_input_jitter_eps: Optional[float] = None
-    """Add noise to the input tensor by applying jitter with a specified epsilon value."""
-
-    moe_token_dropping: bool = False
-    """This feature involves selectively dropping and padding tokens for each expert to achieve a
-    specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
-    currently unsupported so should remain False."""
-
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
-
-    moe_enable_deepep: bool = False
-    """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
-
-    moe_per_layer_logging: bool = False
-    """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
@@ -855,179 +206,19 @@ class TransformerConfig(ModelParallelConfig):
     be dropped.
     """
 
-    moe_layer_recompute: bool = False
-    """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
-
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
-    ##################
-    # Context Parallel
-    ##################
-    cp_comm_type: Optional[Union[str, List[str]]] = None
-    """Inter-gpu communication type for context parallelism.
-    str: all layers share same communication type.
-    List[str]: each layer has its separate communication type.
-    cp_comm_type of each layer can be "p2p" or "all_gather" or "a2a" or "a2a+p2p".
-    "p2p": Exchange KV chunks with P2P communications in ring topology. P2P is async and can be
-    overlapped with attention compute.
-    "all_gather": All-gather to get full sequence of KV before attention. The all-gather is not
-    async, and cannot be overlapped.
-    "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP group, and gather to get
-    full sequence of QKV.
-    "a2a+p2p": A hierarchical implementation of context parallelism to attention.
-    It uses A2A communications in low-level CP groups (e.g., via NVLink),
-    and P2P communications in high-level CP groups (e.g., via IBLink).
-    """
-
-    ##################
-    # Cuda Graphs
-    ##################
-    enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
-
-    cuda_graph_use_single_mempool: bool = False
-    """When set to true, cudagraphs will be captured inside a single mempool, in which all
-    cudagraphs may only be used once per step. If false, cudagraphs may be reused across
-    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation,
-    however may greatly increase the number of cudagraphs created when the number of microbatches
-    is high."""
-
-    cuda_graph_retain_backward_graph: bool = False
-    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
-    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For
-    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
-
-    cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
-
-    external_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
-
-    cuda_graph_scope: str = "full"
-    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
-    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
-    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
-
-    ####################
-    # miscellaneous
-    ####################
-    clone_scatter_output_in_embedding: bool = True
-    """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
-    to facilitate garbage collection of input."""
-
-    disable_parameter_transpose_cache: bool = False
-    """When set to true, the parameter transposes are not cached for subsequent iterations."""
-
-    config_logger_dir: str = ""
-    """When non-empty, dumps entry-point configs to config_logger_dir"""
-
-    flash_decode: bool = False
-    """ Use the optimized flash decoding kernel during inference. """
-
-    use_te_rng_tracker: bool = False
-    """ Whether to use the TE or MCore version of the RNG tracker. """
-
-    inference_rng_tracker: bool = False
-    """ Whether we should instantiate a separate RNG tracker for inference. """
-
-    mrope_section: Optional[List[int]] = None
-    """ Multimodal rope section is for channel dimension of temporal, height and width 
-    in rope calculation. """
-
-    is_hybrid_model: bool = False
-    """ Indicates whether this is a hybrid model. """
-
-    mamba_state_dim: int = 128
-    """The dimensionality of the state representation in Mamba layers."""
-
-    mamba_head_dim: int = 64
-    """The dimensionality of the heads in the Mamba layers."""
-
-    mamba_num_groups: int = 8
-    """The number of groups used in Mamba layers."""
-
-    heterogeneous_block_specs: bool = False
-    """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
-
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
-        super().__post_init__()
-        if self.fp16 and self.bf16:
-            raise ValueError(
-                f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
-            )
-
-        # Apply BF16 matmul precision setting if needed
-        if self.bf16 and self.disable_bf16_reduced_precision_matmul:
-            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-
-        if self.num_attention_heads % self.tensor_model_parallel_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
-                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
-            )
-
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
-
-        if self.kv_channels is None:
-            self.kv_channels = self.hidden_size // self.num_attention_heads
-
-        if self.num_query_groups is None:
-            self.num_query_groups = self.num_attention_heads
-
-        if self.num_query_groups % self.tensor_model_parallel_size != 0:
-            raise ValueError(
-                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
-                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
-            )
-
-        if self.fp8:
-            # cannot support first last layer bf16 with delayed scaling
-            if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
-                raise ValueError("Delayed scaling does not support first / last layer in BF16.")
-
-            # max bf16 layers per pipeline stage
-            max_bf16_layers_per_pipeline_stage = (
-                self.num_layers // self.pipeline_model_parallel_size
-            )
-
-            # check start/end bf16 layer counts are valid
-            if self.first_last_layers_bf16:
-                if (
-                    self.num_layers_at_start_in_bf16 < 0
-                    or self.num_layers_at_start_in_bf16 > max_bf16_layers_per_pipeline_stage
-                ):
-                    raise ValueError(
-                        f"num_layers_at_start_in_bf16 ({self.num_layers_at_start_in_bf16}) must be "
-                        f"between 0 and number of layers per pipeline stage "
-                        f"({max_bf16_layers_per_pipeline_stage})."
-                    )
-                if (
-                    self.num_layers_at_end_in_bf16 < 0
-                    or self.num_layers_at_end_in_bf16 > max_bf16_layers_per_pipeline_stage
-                ):
-                    raise ValueError(
-                        f"num_layers_at_end_in_bf16 ({self.num_layers_at_end_in_bf16}) must be "
-                        f"between 0 and number of layers per pipeline stage "
-                        f"({max_bf16_layers_per_pipeline_stage})."
-                    )
-
-            if self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param:
-                raise ValueError("MXFP8 currently does not support fp8_param.")
-
-        if self.fp8_param and not self.fp8:
-            raise ValueError("fp8_param must be used together with fp8 mode.")
-
-        if self.apply_query_key_layer_scaling:
-            self.attention_softmax_in_fp32 = True
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError('num_moe_experts must be non None to use expert-parallel.')
@@ -1038,28 +229,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
 
-        if self.moe_enable_deepep:
-            if self.moe_token_dispatcher_type != "flex":
-                raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-
-        if self.moe_token_dispatcher_type == "flex":
-            if self.moe_pad_expert_input_to_capacity:
-                raise ValueError(
-                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
-                )
-
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
                     f'moe_shared_expert_intermediate_size must be '
                     f'num_shared_experts * ffn_size_of_each_shared_expert, '
                     f'but got {self.moe_shared_expert_intermediate_size}'
-                )
-            if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
-                "alltoall"
-            ]:
-                raise ValueError(
-                    f'moe_shared_expert_overlap only works with alltoall token dispatcher.'
                 )
 
         if self.moe_expert_capacity_factor is not None:
@@ -1076,293 +251,17 @@ class TransformerConfig(ModelParallelConfig):
                     'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
                 )
 
-        if self.cpu_offloading and (
-            self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
-        ):
-            raise ValueError(
-                f'CPU offloading can be done only for layers less than {self.num_layers}'
-            )
-
-        if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
-            raise ValueError(
-                'Currently there is no support for Pipeline parallelism with CPU offloading'
-            )
-
-        if self.cpu_offloading and self.recompute_granularity is not None:
-            raise ValueError(
-                'CPU offloading does not work when activation recomputation is enabled'
-            )
-
-        if self.recompute_granularity is not None:
-            if self.recompute_granularity not in ['full', 'selective']:
-                raise ValueError(
-                    f'When using recompute_granuarlity: {self.recompute_granularity} must be "full"'
-                    'or "selective".'
-                )
-
-            if self.recompute_method is not None:
-                if self.recompute_method not in ['block', 'uniform']:
-                    raise ValueError(
-                        f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
-                    )
-            elif self.recompute_granularity != 'selective':
-                raise ValueError(
-                    f'Using recompute_granularity: {self.recompute_granularity} so '
-                    'recompute_method must be "block" or "uniform"'
-                )
-
-            if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
-                raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} '
-                    'recompute_num_layers must be between '
-                    '1 and num_layers_per_pipeline_rank: '
-                    f'{self.num_layers // self.pipeline_model_parallel_size}'
-                )
-            elif (
-                self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
-            ):
-                raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} '
-                    'recompute_num_layers must be None.'
-                )
-
-            if self.distribute_saved_activations and self.sequence_parallel:
-                raise ValueError(
-                    f'distribute_saved_activations: {self.distribute_saved_activations} must be '
-                    f'false when sequence parallel is enabled: {self.sequence_parallel}'
-                )
-
-        if self.recompute_modules is None:
-            self.recompute_modules = ['core_attn']
-
-        if self.recompute_granularity == 'selective':
-            if len(self.recompute_modules) > 0:
-                allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe"}
-                invalid_modules = set(self.recompute_modules) - allowed_modules
-                assert not invalid_modules, (
-                    f'Invalid choices for recompute_modules: {invalid_modules}. '
-                    f'Allowed modules are: {allowed_modules}'
-                )
-
-            if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
-                raise ValueError(
-                    "moe_act in recompute_modules is only supported with moe_grouped_gemm."
-                )
-
-            if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
-                raise ValueError(
-                    "mla_up_proj in recompute_modules is only supported with "
-                    "multi_latent_attention."
-                )
-
-            if "core_attn" in self.recompute_modules:
-                warnings.warn(
-                    "If you are using transformer_engine as the transformer implementation, "
-                    "the core_attn is from transformer_engine and may be the fused version. "
-                    "For fused attention, you have no need to set 'core_attn' to recompute. "
-                    "Please check that the core_attn recompute is really needed."
-                )
-
-        if self.moe_layer_recompute:
-            warnings.warn(
-                "--moe-layer-recompute is deprecated. "
-                "Use --recompute-granularity selective --recompute-modules moe_layer instead."
-            )
-            if self.recompute_granularity == 'full':
-                raise ValueError(
-                    "Do not set --moe-layer-recompute with full recompute granularity. "
-                )
-            self.recompute_granularity = 'selective'
-            if "moe" not in self.recompute_modules:
-                self.recompute_modules.append("moe")
-
-        if (
-            self.num_layers_in_first_pipeline_stage is not None
-            or self.num_layers_in_last_pipeline_stage is not None
-        ) and (
-            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
-        ):
-            raise ValueError(
-                'num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be'
-                'set at the same time with account_for_embedding_in_pipeline_split'
-                'and account_for_loss_in_pipeline_split'
-            )
-
-        if (
-            self.num_layers_in_first_pipeline_stage is not None
-            or self.num_layers_in_last_pipeline_stage is not None
-        ):
-            pipeline_parallel_size = self.pipeline_model_parallel_size
-            num_layers = self.num_layers
-
-            if self.num_layers_in_first_pipeline_stage is not None:
-                if self.num_layers_in_first_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
-
-                if self.virtual_pipeline_model_parallel_size is not None:
-                    if (
-                        self.num_layers_in_first_pipeline_stage
-                        % self.virtual_pipeline_model_parallel_size
-                        != 0
-                    ):
-                        raise ValueError(
-                            f'number of layers at first stage: '
-                            f'{self.num_layers_in_first_pipeline_stage}'
-                            f'must be divisible by virtual pipeline'
-                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
-                        )
-                num_layers -= self.num_layers_in_first_pipeline_stage
-                pipeline_parallel_size -= 1
-
-            if self.num_layers_in_last_pipeline_stage is not None:
-                if self.num_layers_in_last_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_last_pipeline_stage must be larger than 0')
-
-                if self.virtual_pipeline_model_parallel_size is not None:
-                    if (
-                        self.num_layers_in_last_pipeline_stage
-                        % self.virtual_pipeline_model_parallel_size
-                        != 0
-                    ):
-                        raise ValueError(
-                            f'number of layers at last stage: '
-                            f'{self.num_layers_in_last_pipeline_stage}'
-                            f'must be divisible by virtual pipeline'
-                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
-                        )
-                num_layers -= self.num_layers_in_last_pipeline_stage
-                pipeline_parallel_size -= 1
-
-            if not num_layers % pipeline_parallel_size == 0:
-                raise ValueError(
-                    f'number of layers at middle stage: {num_layers} must be divisible by'
-                    f'the middle pipeline model parallel size {pipeline_parallel_size}'
-                )
-
-            if self.virtual_pipeline_model_parallel_size is not None:
-                num_layers_per_middle_pipeline_rank = num_layers // pipeline_parallel_size
-                if (
-                    not num_layers_per_middle_pipeline_rank
-                    % self.virtual_pipeline_model_parallel_size
-                    == 0
-                ):
-                    raise ValueError(
-                        f'number of layers on each middle pipeline rank:'
-                        f'{num_layers_per_middle_pipeline_rank} must be divisible by virtual'
-                        f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
-                    )
-
-        if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
-            if self.virtual_pipeline_model_parallel_size is None:
-                num_layers = self.num_layers
-
-                if self.account_for_embedding_in_pipeline_split:
-                    num_layers += 1
-
-                if self.account_for_loss_in_pipeline_split:
-                    num_layers += 1
-
-                if not num_layers % self.pipeline_model_parallel_size == 0:
-                    raise ValueError(
-                        f'number of middle layers: {num_layers} must be divisible by '
-                        f'middle pipeline_model_parallel_size {self.pipeline_model_parallel_size}'
-                    )
-            else:
-                num_layers = self.num_layers
-                if self.account_for_embedding_in_pipeline_split:
-                    num_layers += 1
-
-                if self.account_for_loss_in_pipeline_split:
-                    num_layers += 1
-
-                if not num_layers % self.pipeline_model_parallel_size == 0:
-                    raise ValueError(
-                        f'num_layers: {num_layers} after enable'
-                        f'account_for_embedding_in_pipeline_split or '
-                        f'account_for_loss_in_pipeline_split must be divisible'
-                        f'by pipeline_model_parallel_size '
-                        f'{self.pipeline_model_parallel_size}'
-                    )
-
-                num_layers_per_pipeline_rank = num_layers // self.pipeline_model_parallel_size
-                if (
-                    not num_layers_per_pipeline_rank % self.virtual_pipeline_model_parallel_size
-                    == 0
-                ):
-                    raise ValueError(
-                        f'number of layers on each pipeline rank: {num_layers_per_pipeline_rank}'
-                        f'(after enable account_for_embedding_in_pipeline_split or '
-                        f'account_for_loss_in_pipeline_split) must be divisible by'
-                        f'virtual_pipeline_model_parallel_size'
-                        f'{self.virtual_pipeline_model_parallel_size}'
-                    )
-
-        if self.apply_query_key_layer_scaling:
-            self.attention_softmax_in_fp32 = True
-
-        if self.bias_activation_fusion:
-            if self.activation_func not in [F.gelu, F.silu]:
-                raise ValueError(
-                    "When bias_activation_fusion is True, activation function should be either "
-                    "gelu or swiglu"
-                )
-            if (
-                self.activation_func == F.gelu
-                and not self.gated_linear_unit
-                and not self.add_bias_linear
-            ):
-                raise ValueError(
-                    "When bias_activation_fusion is True, gated_linear_unit is False, "
-                    "and activation function is gelu, add_bias_linear must also be True."
-                )
-
-        if self.activation_func_fp8_input_store:
-            if self.activation_func != F.silu or not self.gated_linear_unit:
-                raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
-
-        if self.multi_latent_attention and self.rotary_interleaved:
-            raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
-
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
 
-        if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std,
-                self.num_layers,
-                multiplier=2.0 if not self.is_hybrid_model else 1.0,
-            )
-
         if self.num_moe_experts is not None:
             assert not self.add_bias_linear, "Bias is not supported for MoE"
-
-        if self.moe_token_dispatcher_type == "alltoall_seq":
-            if self.tensor_model_parallel_size != self.expert_tensor_parallel_size:
-                raise ValueError(
-                    "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
-                )
-            if self.moe_permute_fusion:
-                raise ValueError("alltoall_seq dispatcher does not support permute fusion.")
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
                 "Expert bias for aux-loss-free routing only supports sigmoid score function."
                 "Please set --moe-router-score-function sigmoid for sigmoid score function."
             )
-
-        # if self.num_moe_experts and self.fp8:
-        #     # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
-        #     if not is_te_min_version("1.7.0.dev0"):
-        #         raise ValueError(
-        #             "Only transformer-engine>=1.7.0 supports MoE FP8 training, "
-        #             f"but your version is {get_te_version()}."
-        #         )
-
-        #     if self.moe_grouped_gemm and not is_te_min_version("1.11.0"):
-        #         raise ValueError(
-        #             "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
-        #             f"but your version is {get_te_version()}."
-        #         )
 
         if (
             self.moe_router_topk == 1
@@ -1375,11 +274,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
 
         if self.moe_router_group_topk:
-            if self.moe_router_topk_limited_devices:
-                raise ValueError(
-                    "moe_router_topk_limited_devices is deprecated and replaced by "
-                    "moe_router_group_topk and moe_router_num_groups."
-                )
             if not self.moe_router_num_groups:
                 raise ValueError(
                     "When using group limited routing, moe_router_num_groups must be specified."
@@ -1393,42 +287,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
                     f"moe_router_num_groups ({self.moe_router_num_groups})."
                 )
-        elif self.moe_router_topk_limited_devices:
-            warnings.warn(
-                "moe_router_topk_limited_devices is deprecated. Use moe_router_group_topk and "
-                "moe_router_num_groups instead."
-            )
-            self.moe_router_group_topk = self.moe_router_topk_limited_devices
-            self.moe_router_num_groups = self.expert_model_parallel_size
-
-        if self.enable_cuda_graph:
-            if self.cpu_offloading:
-                raise ValueError("CUDA graphs not supported with CPU offloading.")
-            if self.recompute_granularity:
-                raise ValueError("CUDA graphs not supported with activation recomputation.")
-
-        if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
-            if self.variable_seq_lengths is True:
-                raise ValueError(
-                    f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
-                    f"variable sequence length, please use alltoall dispatcher instead."
-                )
-
-        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
-            if isinstance(self.cp_comm_type, list):
-                assert len(self.cp_comm_type) == self.num_layers, (
-                    f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
-                    f"the total number of transformer layers ({self.num_layers})!"
-                )
-            else:
-                assert isinstance(
-                    self.cp_comm_type, str
-                ), "Unsupported communication type for context parallelism!"
-
-        assert (
-            self.pipeline_model_parallel_size > 0
-        ), f"Pipeline model parallel size must be larger than 0 \
-            when enable --standalone-embedding-stage and --standalone-loss-stage"
 
         if (
             self.num_moe_experts is not None

@@ -414,8 +414,6 @@ class MoeUtils:
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             moe_router_topk=config.num_experts_per_tok,
-            init_model_with_meta_device=True,
-            fp8=None,
             add_bias_linear=False,
             moe_router_pre_softmax=True,
             activation_func=F.silu,

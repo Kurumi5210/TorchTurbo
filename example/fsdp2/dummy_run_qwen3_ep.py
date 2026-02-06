@@ -315,10 +315,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--world_size", type=int, default=8)
-    parser.add_argument("--ep_size", type=int, default=4)
-    parser.add_argument("--sp_size", type=int, default=2)
-    parser.add_argument("--sp_mode", type=str, default="zigzag_ring", choices=["zigzag_ring", "ulysses"])
+    parser.add_argument("--world_size", type=int, default=16)
+    parser.add_argument("--ep_size", type=int, default=8)
+    parser.add_argument("--sp_size", type=int, default=1)
+    parser.add_argument("--sp_mode", type=str, default="ulysses", choices=["zigzag_ring", "ulysses"])
     parser.add_argument("--path", type=str, default="/sfs_turbo/pretrained_models/Qwen3-30B-A3B/")
     parser.add_argument("--save_path", type=str, default="/sfs_turbo/qinjue/models/Qwen3-30B-A3B/")
     parser.add_argument("--profiling", default=False, action="store_true")

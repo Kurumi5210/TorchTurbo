@@ -4,13 +4,12 @@ from typing import List, Optional, Tuple
 import torch
 
 from torch_turbo.transformer.transformer_config import TransformerConfig
-from torch_turbo.distributed.parallel import get_expert_model_parallel_group
-from torch_turbo.distributed.mappings import (
+from torchturbo.torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
+from torchturbo.torch_turbo.distributed.comm import (
     all_to_all,
     gather_from_sequence_parallel_region
 )
 from torch_turbo.transformer.utils import (
-    get_capacity,
     permute,
     unpermute,
     sort_chunks_by_idxs,
@@ -115,7 +114,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [tp_size]. Represents the number of tokens received by the current rank from
         # other TP ranks.
         self.output_splits_tp = None
-        self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else None
+        # TODO: can also be set to cpu
+        self.permute_idx_device = torch.device("cuda")
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
         )
@@ -130,10 +130,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Token drop and padding.
         # Drop and pad the input to capacity.
-        self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
-        if self.drop_and_pad:
-            assert self.config.moe_expert_capacity_factor is not None
-            self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
         self.capacity = None
 
         # A cuda stream synchronization is needed in self.token_permutation() in some cases,
@@ -169,44 +165,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
-        if self.drop_and_pad:
-            # Drop and pad the input to capacity.
-            num_tokens = routing_map.size(0) * self.config.moe_router_topk
-            self.capacity = get_capacity(
-                num_tokens=num_tokens,
-                num_experts=self.num_experts,
-                capacity_factor=self.moe_expert_capacity_factor,
-            )
-            self.num_out_tokens = self.capacity * self.num_experts
-            # [num_local_experts], number of tokens processed by each expert.
-            num_tokens_per_local_expert = torch.full(
-                (self.num_local_experts,),
-                self.capacity * self.tp_size * self.ep_size,
-                dtype=torch.long,
-            )
-            # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
-            # to each local expert by all ranks.
-            self.num_global_tokens_per_local_expert = torch.full(
-                (self.num_experts * self.tp_size,),
-                self.capacity,
-                dtype=torch.long,
-                device=self.permute_idx_device,
-            )
-            return num_tokens_per_local_expert
 
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
 
-        if self.config.moe_expert_capacity_factor is not None:
-            # Drop tokens to capacity, no padding.
-            self.num_out_tokens = num_local_tokens_per_expert.sum()
-
-            # A synchronization is needed before the first permutation
-            # to get the `num_out_tokens` CPU value.
-            self._maybe_update_cuda_sync_point("before_permutation_1")
-        else:
-            # Dropless
-            self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
+        self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
 
         if self.ep_size > 1 or self.tp_size > 1:
             # ===================================================
@@ -324,7 +287,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             probs=probs,
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
-            drop_and_pad=self.drop_and_pad,
         )
 
         # Perform expert parallel AlltoAll communication
@@ -343,37 +305,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_2", tokens_per_expert
         )
         if self.num_local_experts > 1:
-            if self.drop_and_pad:
-                global_input_tokens = (
-                    global_input_tokens.view(
-                        self.tp_size * self.ep_size,
-                        self.num_local_experts,
-                        self.capacity,
-                        *global_input_tokens.size()[1:],
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                    .flatten(start_dim=0, end_dim=2)
-                )
-                global_probs = (
-                    global_probs.view(
-                        self.tp_size * self.ep_size,
-                        self.num_local_experts,
-                        self.capacity,
-                        *global_probs.size()[1:],
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                    .flatten(start_dim=0, end_dim=2)
-                )
-            else:
-                global_input_tokens, global_probs = sort_chunks_by_idxs(
-                    global_input_tokens,
-                    self.num_global_tokens_per_local_expert.ravel(),
-                    self.sort_input_by_local_experts,
-                    probs=global_probs,
-                    fused=self.config.moe_permute_fusion,
-                )
+            global_input_tokens, global_probs = sort_chunks_by_idxs(
+                global_input_tokens,
+                self.num_global_tokens_per_local_expert.ravel(),
+                self.sort_input_by_local_experts,
+                probs=global_probs,
+                fused=self.config.moe_permute_fusion,
+            )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize("before_finish", tokens_per_expert)
 
@@ -403,25 +341,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Unpermutation 2: Unsort tokens by local expert.
         if self.num_local_experts > 1:
-            if self.drop_and_pad:
-                hidden_states = (
-                    hidden_states.view(
-                        self.num_local_experts,
-                        self.tp_size * self.ep_size,
-                        self.capacity,
-                        *hidden_states.size()[1:],
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                    .flatten(start_dim=0, end_dim=2)
-                )
-            else:
-                hidden_states, _ = sort_chunks_by_idxs(
-                    hidden_states,
-                    self.num_global_tokens_per_local_expert.T.ravel(),
-                    self.restore_output_by_local_experts,
-                    fused=self.config.moe_permute_fusion,
-                )
+            hidden_states, _ = sort_chunks_by_idxs(
+                hidden_states,
+                self.num_global_tokens_per_local_expert.T.ravel(),
+                self.restore_output_by_local_experts,
+                fused=self.config.moe_permute_fusion,
+            )
 
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
@@ -436,7 +361,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
-            drop_and_pad=self.drop_and_pad,
         )
 
         # Reshape the output tensor
@@ -461,36 +385,35 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
         """
-        if not self.drop_and_pad:
-            if point == self.cuda_dtoh_point:
-                # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
-                on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
-                if on_side_stream:
-                    self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.cuda_dtoh_stream):
-                    # TODO: use MemcpyBatchAsync instead.
-                    tokens_per_expert = maybe_move_tensor_to_cpu(
-                        tokens_per_expert, record_stream=on_side_stream
+        if point == self.cuda_dtoh_point:
+            # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
+            on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
+            if on_side_stream:
+                self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.cuda_dtoh_stream):
+                # TODO: use MemcpyBatchAsync instead.
+                tokens_per_expert = maybe_move_tensor_to_cpu(
+                    tokens_per_expert, record_stream=on_side_stream
+                )
+                self.input_splits = maybe_move_tensor_to_cpu(
+                    self.input_splits, as_numpy=True, record_stream=on_side_stream
+                )
+                self.output_splits = maybe_move_tensor_to_cpu(
+                    self.output_splits, as_numpy=True, record_stream=on_side_stream
+                )
+                self.output_splits_tp = maybe_move_tensor_to_cpu(
+                    self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
+                )
+                self.num_out_tokens = maybe_move_tensor_to_cpu(
+                    self.num_out_tokens, record_stream=on_side_stream
+                )
+                if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
+                    self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
+                        self.num_global_tokens_per_local_expert, record_stream=on_side_stream
                     )
-                    self.input_splits = maybe_move_tensor_to_cpu(
-                        self.input_splits, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.output_splits = maybe_move_tensor_to_cpu(
-                        self.output_splits, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.output_splits_tp = maybe_move_tensor_to_cpu(
-                        self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.num_out_tokens = maybe_move_tensor_to_cpu(
-                        self.num_out_tokens, record_stream=on_side_stream
-                    )
-                    if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
-                        self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
-                            self.num_global_tokens_per_local_expert, record_stream=on_side_stream
-                        )
 
-            if point == self.cuda_sync_point:
-                # Synchronize with the dtoh stream at self.cuda_sync_point.
-                self.cuda_dtoh_stream.synchronize()
+        if point == self.cuda_sync_point:
+            # Synchronize with the dtoh stream at self.cuda_sync_point.
+            self.cuda_dtoh_stream.synchronize()
 
         return tokens_per_expert

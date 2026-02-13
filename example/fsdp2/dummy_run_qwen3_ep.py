@@ -11,7 +11,7 @@ from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
 from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch_turbo.utils.torch_utils import compare_tensors
 from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend, is_npu_available
-from torch_turbo.distributed.parallel import (
+from torchturbo.torch_turbo.distributed.parallel_state import (
     initialize_model_parallel,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size

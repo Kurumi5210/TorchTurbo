@@ -11,7 +11,7 @@ from torch_turbo.utils.device import is_npu_available
 if is_npu_available:
     import torch_npu.contrib.transfer_to_npu as _
 
-from torch_turbo.distributed.parallel import initialize_model_parallel
+from torchturbo.torch_turbo.distributed.parallel_state import initialize_model_parallel
 from torch_turbo.moe.moe_utils import MoeUtils
 
 from transformers import AutoConfig

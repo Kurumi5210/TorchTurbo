@@ -22,9 +22,9 @@ from torch_turbo.utils.torch_utils import torch_version, load_safetensors_dir
 from torch_turbo.utils.device import get_device_name, get_device_id, is_npu_available
 from torch_turbo.transformer.transformer_config import TransformerConfig
 from torch_turbo.transformer.module import ModuleSpec
-from torch_turbo.moe.moe_layer import MoESubmodules, MoELayer
-from torch_turbo.moe.experts import GroupedMLP
-from torch_turbo.distributed.parallel import (
+from torch_turbo.distributed.moe.moe_layer import MoESubmodules, MoELayer
+from torch_turbo.distributed.moe.experts import GroupedMLP
+from torch_turbo.distributed.parallel_state import (
     get_expert_model_parallel_group,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
@@ -406,15 +406,12 @@ class MoeUtils:
     def initialize_moe_layer_from_hf_config(config, args, **config_kwargs):
         expert_model_parallel_size = get_expert_model_parallel_world_size()
         default_config_kwargs = dict(
-            num_layers=1,
             expert_model_parallel_size=expert_model_parallel_size,
             moe_ffn_hidden_size=config.moe_intermediate_size,
             moe_token_dispatcher_type="alltoall",
             gated_linear_unit=True,
             hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
             moe_router_topk=config.num_experts_per_tok,
-            add_bias_linear=False,
             moe_router_pre_softmax=True,
             activation_func=F.silu,
             moe_router_load_balancing_type="none",
@@ -462,22 +459,6 @@ class MoeUtils:
         assert ("moe" in hf_config.model_type) \
             or ("next" in hf_config.model_type) \
             or ("deepseek" in hf_config.model_type), f'{hf_config.model_type} must be moe model'
-        for layer in model.model.layers:
-            # patch token_dispatcher
-            if not hasattr(layer.mlp, "token_dispatcher"):
-                continue
-            token_dispatcher = layer.mlp.token_dispatcher
-            token_dispatcher.permute_idx_device = device
-            input_chunk_idxs = torch.arange(
-                token_dispatcher.num_experts * token_dispatcher.tp_size, device=token_dispatcher.permute_idx_device
-            )
-            token_dispatcher.sort_input_by_local_experts = input_chunk_idxs.reshape(
-                -1, token_dispatcher.num_local_experts
-            ).T.ravel()
-            # [tp_size * ep_size, num_local_experts]. Restore the output chunks by local experts.
-            token_dispatcher.restore_output_by_local_experts = input_chunk_idxs.reshape(
-                token_dispatcher.num_local_experts, -1
-            ).T.ravel()
 
         # patch to rotary_emb
         rotary_emb = model.model.rotary_emb
@@ -616,37 +597,12 @@ class MoeUtils:
         return optimizer
 
     @staticmethod
-    def init_mesh(args):
-        # TODO: change device name to a global variable to switch between cuda and npu
-        world_size = args.world_size
-        world_mesh = init_device_mesh(device_name, (world_size,))
-        ep_mesh = init_device_mesh(device_name, (world_size // args.ep_size, args.ep_size), mesh_dim_names=("edp", "ep"))
-        gradient_scaling_factor = (1 / args.ep_size) if args.average_in_collective else 1.0
-
-        def is_same_group(process_group, device_mesh):
-            mesh_group = device_mesh.get_group(0)
-            mesh_ranks = dist.get_process_group_ranks(mesh_group)
-            given_ranks = dist.get_process_group_ranks(process_group)
-            return mesh_ranks == given_ranks
-
-        # verify ep group is the same with ep_mesh
-        megatron_ep_group = get_expert_model_parallel_group()
-        assert is_same_group(megatron_ep_group, ep_mesh['ep'])
-
-        global WORLD_MESH
-        WORLD_MESH = world_mesh
-        global EXPERT_MESH
-        EXPERT_MESH = ep_mesh
-        global _GRADIENT_SCALING_FACTOR
-        _GRADIENT_SCALING_FACTOR = gradient_scaling_factor
-
-    @staticmethod
     def build_model(args, config, torch_dtype=torch.bfloat16):
         # DEBUG
         config.num_hidden_layers = 1
         with torch.device("meta"):
             if config.architectures[0] == "BailingMoeV2ForCausalLM":
-                from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                from torchturbo.torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                 model = BailingMoeV2ForCausalLM(config)
             elif config.architectures[0] == "BailingMoeV2_5ForCausalLM":
                 from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM
@@ -675,7 +631,7 @@ class MoeUtils:
         if rank == 0:
             with torch.device("meta"):
                 if model.config.architectures[0] == "BailingMoeV2ForCausalLM":
-                    from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
+                    from torchturbo.torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
                     save_model = BailingMoeV2ForCausalLM(model.config)
                 elif model.config.architectures[0] == "BailingMoeV2_5ForCausalLM":
                     from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5ForCausalLM

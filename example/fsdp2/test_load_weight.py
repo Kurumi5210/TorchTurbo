@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 import torch_npu
 
-from torch_turbo.distributed.parallel import (
+from torchturbo.torch_turbo.distributed.parallel_state import (
     initialize_model_parallel,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size

@@ -79,7 +79,6 @@ def permute(
     probs: Optional[torch.Tensor] = None,
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
-    drop_and_pad: bool = False,
 ):
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
@@ -102,29 +101,14 @@ def permute(
     """
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
-    if drop_and_pad and not (num_out_tokens is None):
-        capacity = num_out_tokens // num_experts
-        assert not routing_map.requires_grad
-        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
-        # use argsort to put indices of all non-zeros in the beginning of list
-        # and keep the first `capacity` number of indices
-        sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
-            :, :capacity
-        ].contiguous()
-        # flatten from [num_experts, capacity] to 1D
-        sorted_indices = sorted_indices.view(-1)
-        if probs is not None:
-            routing_map = routing_map.bool()
-    else:
-        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-        routing_map = routing_map.bool().T.contiguous()
+    # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+    routing_map = routing_map.bool().T.contiguous()
 
-        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-        token_indices = (
-            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-        )
-        sorted_indices = token_indices.masked_select(routing_map)
+    # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
+    token_indices = (
+        torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+    )
+    sorted_indices = token_indices.masked_select(routing_map)
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
@@ -160,7 +144,6 @@ def unpermute(
     probs: torch.Tensor = None,
     routing_map: torch.Tensor = None,
     fused: bool = False,
-    drop_and_pad: bool = False,
 ):
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -191,24 +174,7 @@ def unpermute(
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
-        if drop_and_pad:
-            num_experts = routing_map.size(1)
-            num_permuted_tokens = sorted_indices.size(0)
-            capacity = num_permuted_tokens // num_experts
-            num_unpermuted_tokens = probs.size(0)
-
-            # [num_unpermuted_tokens, num_experts] -> num_experts * num_unpermuted_tokens
-            probs_T_1D = probs.T.contiguous().view(-1)
-
-            # get 1D indices of the probs selected by routing_map
-            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
-            indices_dim1 = sorted_indices.view(num_experts, capacity)
-            indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
-
-            # get probs from indices
-            permuted_probs = probs_T_1D.index_select(0, indices_1D)
-        else:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+        permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
         # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
         # higher precision due to moe_router_dtype being enabled. This can lead to
         # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
@@ -256,14 +222,10 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
     topk: int,
-    capacity_factor: Optional[float] = None,
-    pad_to_capacity: bool = False,
-    drop_policy: str = "probs",
     use_pre_softmax: bool = False,
     num_groups: Optional[int] = None,
     group_topk: Optional[int] = None,
     scaling_factor: Optional[float] = None,
-    deterministic_mode: bool = False,
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
 ):
@@ -282,7 +244,6 @@ def topk_softmax_with_capacity(
         num_groups (int): Number of groups for routed experts.
         group_topk (int): Number of selected groups for each token.
         scaling_factor (float): Scaling factor of routing score in top-k selection.
-        deterministic_mode (bool): Deprecated.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
 
@@ -339,35 +300,7 @@ def topk_softmax_with_capacity(
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
     tokens_per_expert = topk_map.sum(dim=0)
 
-    if capacity_factor is None:
-        # TopK without capacity
-        return topk_masked_gates, topk_map, tokens_per_expert
-    else:
-        # TopK with capacity
-        expert_capacity = get_capacity(
-            num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
-        )
-
-        # Maskout exceeded tokens
-        if drop_policy == "probs":
-            _, capacity_indices = torch.topk(
-                topk_masked_gates, k=expert_capacity, dim=0, sorted=False
-            )
-            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
-        elif drop_policy == "position":
-            _, capacity_indices = torch.topk(topk_map.int(), k=expert_capacity, dim=0, sorted=False)
-            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
-        else:
-            raise ValueError(f"Invalid drop_policy: {drop_policy}")
-
-        if pad_to_capacity:
-            final_map = capacity_mask
-            final_probs = topk_masked_gates * final_map
-        else:
-            # Get exceed mask and maskout exceeded probs and indices
-            final_map = torch.logical_and(topk_map, capacity_mask)
-            final_probs = topk_masked_gates * final_map
-        return final_probs, final_map, tokens_per_expert
+    return topk_masked_gates, topk_map, tokens_per_expert
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""

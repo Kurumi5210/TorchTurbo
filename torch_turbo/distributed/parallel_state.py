@@ -1,11 +1,15 @@
-from datetime import timedelta
-from typing import Optional
-
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+
+from torch_turbo.utils.device import get_device_name
 
 
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
+_WORLD_MESH = None
+_EXPERT_MESH = None
+_GRADIENT_SCALING_FACTOR = 1.0
 
 
 def create_group(
@@ -30,8 +34,6 @@ def create_group(
 
 def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
-    distributed_timeout_minutes: int = 30,
-    nccl_communicator_config_path: Optional[str] = None,
 ) -> None:
     """Initialize expert model parallel groups.
 
@@ -39,13 +41,6 @@ def initialize_model_parallel(
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
-
-        distributed_timeout_minutes (int, default = 30): Timeout, in
-            minutes, for operations executed against distributed
-            process groups.
-
-        nccl_communicator_config_path (str, default = None):
-            Path to the yaml file of NCCL communicator configurations.
     """
     # Get world size and rank.
     assert torch.distributed.is_initialized()
@@ -89,3 +84,63 @@ def get_expert_model_parallel_rank():
         return torch.distributed.get_rank(group=get_expert_model_parallel_group())
     else:
         return 0
+
+
+_PARALLEL_STATE = None
+
+
+class ParallelState:
+    sp_size: int = 1
+    ep_size: int = 1
+
+    def sp_enabled(self) -> bool:
+        return self.sp_size > 1
+    
+    def ep_enabled(self) -> bool:
+        return self.ep_size > 1
+
+
+def init_parallel_state(sp_size, ep_size):
+    global _PARALLEL_STATE
+    _PARALLEL_STATE = ParallelState(sp_size, ep_size)
+
+def get_parallel_state():
+    return _PARALLEL_STATE
+
+# DeviceMesh related funcitons
+def init_mesh(args):
+    # TODO: change device name to a global variable to switch between cuda and npu
+    world_size = args.world_size
+    device_name = get_device_name()
+    world_mesh = init_device_mesh(device_name, (world_size,))
+    ep_mesh = init_device_mesh(device_name, (world_size // args.ep_size, args.ep_size), mesh_dim_names=("edp", "ep"))
+    gradient_scaling_factor = (1 / args.ep_size) if args.average_in_collective else 1.0
+
+    def is_same_group(process_group, device_mesh):
+        mesh_group = device_mesh.get_group(0)
+        mesh_ranks = dist.get_process_group_ranks(mesh_group)
+        given_ranks = dist.get_process_group_ranks(process_group)
+        return mesh_ranks == given_ranks
+
+    # verify ep group is the same with ep_mesh
+    megatron_ep_group = get_expert_model_parallel_group()
+    assert is_same_group(megatron_ep_group, ep_mesh['ep'])
+
+    global _WORLD_MESH
+    global _EXPERT_MESH
+    global _GRADIENT_SCALING_FACTOR
+    _WORLD_MESH = world_mesh
+    _WORLD_MESH = ep_mesh
+    _GRADIENT_SCALING_FACTOR = gradient_scaling_factor
+
+def get_world_mesh():
+    return _WORLD_MESH
+
+def get_expert_mesh():
+    return _EXPERT_MESH
+
+def get_edp_mesh():
+    return _EXPERT_MESH['edp']
+
+def get_sharded_gradient_scaling_factor():
+    return _GRADIENT_SCALING_FACTOR

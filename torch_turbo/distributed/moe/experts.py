@@ -69,9 +69,6 @@ class GroupedMLP(torch.nn.Module):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts
-        assert (
-            config.add_bias_linear == False
-        ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):

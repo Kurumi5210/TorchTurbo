@@ -22,7 +22,7 @@ import torch_npu
 
 from transformers import AutoConfig, AutoModel
 
-from torch_turbo.distributed.parallel import initialize_model_parallel
+from torchturbo.torch_turbo.distributed.parallel_state import initialize_model_parallel
 from torch_turbo.moe.moe_utils import MoeUtils
 
 

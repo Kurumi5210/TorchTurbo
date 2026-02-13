@@ -365,7 +365,7 @@ def apply_monkey_patch(model, args):
             q_embed = torch.cat([q_embed, q_pass], dim=-1)
             k_embed = torch.cat([k_embed, k_pass], dim=-1)
             return q_embed, k_embed
-        import torch_turbo.models.bailing.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
+        import torchturbo.torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 as modeling_bailing_moe_v2
         modeling_bailing_moe_v2.apply_rotary_pos_emb = apply_rotary_pos_emb_bailing
         try:
             import torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla as modeling_bailing_moe_v2_5
@@ -379,7 +379,7 @@ def apply_monkey_patch(model, args):
         def fused_forward(self, hidden_states: torch.Tensor):
             return npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
         Qwen3MoeRMSNorm.forward = fused_forward
-        from torch_turbo.models.bailing.modeling_bailing_moe_v2 import BailingMoeV2RMSNorm
+        from torchturbo.torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 import BailingMoeV2RMSNorm
         BailingMoeV2RMSNorm.forward = fused_forward
         try:
             from torch_turbo.models.bailing.modeling_bailing_moe_v2_5_fla import BailingMoeV2_5RMSNorm
@@ -391,9 +391,9 @@ def apply_monkey_patch(model, args):
         from mindspeed.ops.npu_moe_token_permute import npu_moe_token_permute
         from mindspeed.ops.npu_moe_token_unpermute import npu_moe_token_unpermute
         from typing import List, Optional, Tuple
-        from torch_turbo.distributed.mappings import all_to_all
+        from torchturbo.torch_turbo.distributed.comm import all_to_all
         from torch_turbo.transformer.utils  import sort_chunks_by_idxs
-        from torch_turbo.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+        from torchturbo.torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 
         def permute(
             tokens,

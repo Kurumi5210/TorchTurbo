@@ -1,5 +1,5 @@
 from torch_turbo.moe.moe_utils import MoeUtils
-from torch_turbo.distributed.parallel import initialize_model_parallel
+from torchturbo.torch_turbo.distributed.parallel_state import initialize_model_parallel
 import torch.distributed as dist
 import torch_npu
 

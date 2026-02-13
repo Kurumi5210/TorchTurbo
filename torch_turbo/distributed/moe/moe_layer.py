@@ -6,14 +6,14 @@ import os
 import torch
 import torch.nn.functional as F
 
-from torch_turbo.distributed.parallel import (
+from torchturbo.torch_turbo.distributed.parallel_state import (
     get_expert_model_parallel_world_size,
     get_expert_model_parallel_rank
 )
 from torch_turbo.transformer.transformer_config import TransformerConfig
 from torch_turbo.transformer.module import ModuleSpec, build_module
-from torch_turbo.moe.router import TopKRouter
-from torch_turbo.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
+from torchturbo.torch_turbo.distributed.moe.router import TopKRouter
+from torchturbo.torch_turbo.distributed.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 
 
 @dataclass

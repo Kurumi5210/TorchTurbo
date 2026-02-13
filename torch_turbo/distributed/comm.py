@@ -1,4 +1,21 @@
 import torch
+import torch.distributed as dist
+from torch_turbo.distributed.parallel_state import get_expert_mesh
+
+
+
+def all_gather_tensor(local_tensor, ep_name="ep"):
+    """ gather expert tensors
+    """
+    expert_mesh = get_expert_mesh()
+    group = expert_mesh[ep_name].get_group(0)
+    ep_world_size = dist.get_world_size(group=group)
+    output_shape = list(local_tensor.shape)
+    output_shape[0] = output_shape[0] * ep_world_size
+    output = torch.empty(output_shape, dtype=local_tensor.dtype, device=local_tensor.device)
+    dist.all_gather_into_tensor(output, local_tensor, group=group)
+
+    return output
 
 
 def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_global_buffer=False):

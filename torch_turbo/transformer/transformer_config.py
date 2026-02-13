@@ -43,10 +43,6 @@ class ModelParallelConfig:
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights."""
 
-    deterministic_mode: bool = False
-    """If true, code that has deterministic execution will be chosen. This usually
-       means slower execution, but is good for debugging and testing. Defaults to False."""
-
 
 @dataclass
 class TransformerConfig(ModelParallelConfig):
@@ -60,9 +56,6 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
-    num_layers: int = 0
-    """Number of transformer layers in a transformer block."""
-
     hidden_size: int = 0
     """Transformer hidden size."""
 
@@ -72,13 +65,6 @@ class TransformerConfig(ModelParallelConfig):
     ffn_hidden_size: Optional[int] = None
     """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
     if not provided."""
-
-    attention_dropout: float = 0.1
-    """Post attention dropout probability."""
-
-    add_bias_linear: bool = True
-    """Include a bias term in all linear layers (QKV projections, after core attention, and two in
-    MLP layer)."""
 
     gated_linear_unit: bool = False
     """Use a gated linear unit for the first linear layer in the MLP."""
@@ -111,11 +97,6 @@ class TransformerConfig(ModelParallelConfig):
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
     there are multiple shared experts.
     None means no shared expert."""
-
-    moe_layer_freq: Union[int, List[int]] = 1
-    """Frequency between MoE layers and Dense layers. Accepts either:
-    - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
-    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
     moe_ffn_hidden_size: Optional[int] = None
     """MoE Feed-Forward Network hidden size"""
@@ -171,12 +152,6 @@ class TransformerConfig(ModelParallelConfig):
     The routing decision is based on the sum of the routing scores and the expert bias.
     See https://arxiv.org/abs/2408.15664 for details."""
 
-    moe_router_bias_update_rate: float = 1e-3
-    """The expert bias is updated based on the number of assigned tokens to each expert
-    in a global batch, where the bias is increased for the experts with less assigned tokens
-    and decreased for the experts with more assigned tokens.
-    The default value 1e-3 is same as that used in DeepSeekV3."""
-
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -190,21 +165,6 @@ class TransformerConfig(ModelParallelConfig):
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
-
-    moe_expert_capacity_factor: Optional[float] = None
-    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
-    will be dropped. The default is None."""
-
-    moe_pad_expert_input_to_capacity: bool = False
-    """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
-    the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
-    default setting is False."""
-
-    moe_token_drop_policy: str = 'probs'
-    """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
-    the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
-    be dropped.
-    """
 
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
@@ -237,25 +197,8 @@ class TransformerConfig(ModelParallelConfig):
                     f'but got {self.moe_shared_expert_intermediate_size}'
                 )
 
-        if self.moe_expert_capacity_factor is not None:
-            if self.moe_expert_capacity_factor < 0:
-                self.moe_expert_capacity_factor = None
-            if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
-                raise ValueError(
-                    'moe_expert_capacity_factor only works with aux_loss or none load balancing'
-                )
-
-        if self.moe_pad_expert_input_to_capacity:
-            if self.moe_expert_capacity_factor is None:
-                raise ValueError(
-                    'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
-                )
-
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
-
-        if self.num_moe_experts is not None:
-            assert not self.add_bias_linear, "Bias is not supported for MoE"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(

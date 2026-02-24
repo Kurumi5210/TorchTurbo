@@ -6,9 +6,10 @@ if torch_version() >= (2, 6, 0):
 else:
     from torch.distributed._composable.fsdp import fully_shard
 
+from torch_turbo.distributed.fsdp.moe_fwd_bwd_prefetch import set_moe_forward_prefetch_for_fsdp2_ep
 from torch_turbo.distributed.moe.moe_layer import MoESubmodules, MoELayer
 from torch_turbo.distributed.moe.experts import GroupedMLP
-from torch_turbo.distributed.sequence_parallel.ulysess import ulysses_flash_attention_forward
+from torch_turbo.distributed.sequence_parallel.ulysses import ulysses_flash_attention_forward
 from torch_turbo.distributed.parallel_state import (
     init_mesh,
     init_parallel_state,
@@ -25,6 +26,7 @@ from torch_turbo.models.registry import (
 from torch_turbo.models.weight_loader import DistParamLoader
 from torch_turbo.transformer.module import ModuleSpec
 from torch_turbo.utils.device import is_npu_available
+
 if is_npu_available:
     from torch_npu.contrib import transfer_to_npu as _
 
@@ -38,8 +40,16 @@ def get_apply_modules(model, apply_modules):
                 parallel_modules.append(module)
     return parallel_modules
 
+
 def get_fully_shard_plan(model, apply_modules):
-    pass
+    shard_modules = dict()
+    layers = model.model.layers
+    for target_module, shard_strategy in apply_modules:
+        for name, module in layers.named_modules():
+            if target_module == name:
+                shard_modules[module] = shard_strategy
+    return shard_modules
+
 
 def apply_sp(model, sp_config):
     # qwen: self_attn
@@ -47,6 +57,7 @@ def apply_sp(model, sp_config):
     sp_modules = get_apply_modules(model, sp_config.apply_modules)
     for module in sp_modules:
         module._flash_attention_forward = ulysses_flash_attention_forward
+
 
 def apply_ep(model, moe_config, ep_config):
     # initilize moe_layer
@@ -64,6 +75,7 @@ def apply_ep(model, moe_config, ep_config):
             moe_layer.shared_experts = ep_module.shared_experts
         ep_module = moe_layer
 
+
 def apply_fsdp(model, fsdp_config, fsdp_kwargs):
     fsdp_plan = get_fully_shard_plan(model, fsdp_config.apply_modules)
     for module, shard_strategy in fsdp_plan.items():
@@ -71,6 +83,19 @@ def apply_fsdp(model, fsdp_config, fsdp_kwargs):
             fully_shard(module, mesh=get_edp_mesh(), **fsdp_kwargs)
         elif shard_strategy == 'dp':
             fully_shard(module, mesh=get_world_mesh(), **fsdp_kwargs)
+
+    for layer in model.model.layers:
+        fully_shard(layer, mesh = get_world_mesh(), **fsdp_kwargs)
+        setattr(layer, "moe_forward_prefetch", True)
+
+    fully_shard(model, mesh = get_world_mesh(), **fsdp_kwargs)
+    outer_cls = model.model.layers[0].__class__
+    if hasattr(model.config, "first_k_dense_replace"):
+        inter_cls = model.model.layers[model.config.first_k_dense_replace].mlp.experts.__class__
+    else:
+        inter_cls = model.model.layers[0].mlp.experts.__class__
+    outermost_cls = model.__class__
+    set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, model.config)
 
 
 def build_fsdp_turbo_model(args, fsdp_kwargs, device):
@@ -87,10 +112,10 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
         # get parallel config
         parallel_plan = get_parallel_plan(config)
         # apply sp modules
-        if parallel_state.sp_enabled:
+        if parallel_state.sp_enabled():
             apply_sp(model, parallel_plan.sp_config)
         # apply ep modules
-        if parallel_state.ep_enabled:
+        if parallel_state.ep_enabled():
             apply_ep(model, parallel_plan.moe_config, parallel_plan.ep_config)
     # TODO: why to bf16?
     model = model.to(dtype=torch.bfloat16)

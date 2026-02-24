@@ -1,15 +1,22 @@
+from typing import Optional
+
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import init_device_mesh
 
 from torch_turbo.utils.device import get_device_name
 
 
-# Expert model parallel group that current rank belongs to.
-_EXPERT_MODEL_PARALLEL_GROUP = None
 _WORLD_MESH = None
+
+# EP global params
+_EXPERT_MODEL_PARALLEL_GROUP = None
 _EXPERT_MESH = None
 _GRADIENT_SCALING_FACTOR = 1.0
+
+# SP global params
+_ULYSSES_SEQUENCE_PARALLEL_GROUP = None
 
 
 def create_group(
@@ -84,6 +91,38 @@ def get_expert_model_parallel_rank():
         return torch.distributed.get_rank(group=get_expert_model_parallel_group())
     else:
         return 0
+
+
+def set_ulysses_sequence_parallel_group(group: dist.ProcessGroup):
+    """
+    Set ulysses sequence parallel process group.
+    """
+    global _ULYSSES_SEQUENCE_PARALLEL_GROUP
+    _ULYSSES_SEQUENCE_PARALLEL_GROUP = group
+
+
+def get_ulysses_sequence_parallel_group() -> Optional[dist.ProcessGroup]:
+    """
+    Get ulysses sequence parallel process group.
+    """
+    global _ULYSSES_SEQUENCE_PARALLEL_GROUP
+    return _ULYSSES_SEQUENCE_PARALLEL_GROUP
+
+
+def get_ulysses_sequence_parallel_world_size(group: ProcessGroup = None) -> int:
+    """
+    Get ulysses sequence parallel world size.
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    return dist.get_world_size(group) if group else 1
+
+
+def get_ulysses_sequence_parallel_rank(group: ProcessGroup = None) -> int:
+    """
+    Get ulysses sequence parallel rank.
+    """
+    group = get_ulysses_sequence_parallel_group() if group is None else group
+    return dist.get_rank(group) if group else 0
 
 
 _PARALLEL_STATE = None

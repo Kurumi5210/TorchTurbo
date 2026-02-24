@@ -63,12 +63,10 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 from fla.ops.simple_gla.chunk import chunk_simple_gla
 
-from torch_turbo.sequence_parallel.ulysses import (
+from torch_turbo.distributed.sequence_parallel.ulysses import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
-    get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_world_size,
-    SequenceParallelCausalConv1dComm,
 )
 from torch_turbo.utils.flash_attn_utils import index_first_axis, pad_input, unpad_input, get_unpad_data
 

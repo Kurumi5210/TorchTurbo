@@ -2,9 +2,10 @@ import os
 
 import torch
 import torch.distributed.checkpoint as dcp
+from torch.distributed.tensor.placement_types import Shard
 from torch.distributed._tensor import DTensor
 
-from torch_turbo
+from torch_turbo.distributed.parallel_state import get_world_mesh
 from torch_turbo.utils.device import get_device_name
 
 
@@ -22,11 +23,12 @@ class CheckpointingManager:
         lr_scheduler = extra.get("lr_scheduler", None)
         state_dict = dict()
         model_sd = model.state_dict()
+        world_mesh = get_world_mesh()
         # HACK: change device mesh to use dcp
         for name in list(model_sd.keys()):
             if "mlp.experts.weight" in name:
                 local_tensor = model_sd[name].to_local()
-                model_sd[name] = DTensor.from_local(local_tensor, device_mesh=WORLD_MESH, placements=[Shard(0)])
+                model_sd[name] = DTensor.from_local(local_tensor, device_mesh=world_mesh, placements=[Shard(0)])
         state_dict["model"] = model_sd
         if optimizer is not None:
             state_dict["optimizer"] = optimizer.state_dict()

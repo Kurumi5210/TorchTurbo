@@ -9,7 +9,7 @@ from torchturbo.torch_turbo.distributed.comm import (
     all_to_all,
     gather_from_sequence_parallel_region
 )
-from torch_turbo.transformer.utils import (
+from torch_turbo.distributed.moe.utils import (
     permute,
     unpermute,
     sort_chunks_by_idxs,

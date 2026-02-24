@@ -2,7 +2,8 @@ from typing import Dict
 from torch.distributed.device_mesh import DeviceMesh
 import torch
 
-from torch_turbo.sequence_parallel.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
+from torch_turbo.distributed.parallel_state import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
+
 
 class FSDPUlyssesShardingManager:
     """

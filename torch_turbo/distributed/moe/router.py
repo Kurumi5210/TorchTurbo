@@ -4,7 +4,7 @@ from typing import Callable
 import torch
 
 from torch_turbo.transformer.transformer_config import TransformerConfig
-from torch_turbo.transformer.utils import topk_softmax_with_capacity
+from torch_turbo.distributed.moe.utils import topk_softmax_with_capacity
 
 
 class Router(ABC, torch.nn.Module):

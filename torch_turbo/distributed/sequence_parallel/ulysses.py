@@ -8,9 +8,10 @@ from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 from .utils import (
     repeat_kv,
-    _unpad_tensor,
-    _pad_tensor,
+    unpad_tensor,
+    pad_tensor,
 )
+from torch_turbo.distributed.parallel_state import get_ulysses_sequence_parallel_group, get_ulysses_sequence_parallel_world_size
 
 
 def all_to_all_tensor(
@@ -84,7 +85,7 @@ def gather_seq_scatter_heads(
     x = SeqAllToAll.apply(group, x, head_dim, seq_dim)
     if unpadded_dim_size and unpadded_dim_size % sp_world != 0:
         padding_size = x.size(seq_dim) - unpadded_dim_size
-        x = _unpad_tensor(x, seq_dim, padding_size)
+        x = unpad_tensor(x, seq_dim, padding_size)
     return x
 
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:
@@ -101,7 +102,7 @@ def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: Proc
     sp_world = get_ulysses_sequence_parallel_world_size(group)
     if dim_size % sp_world != 0:
         padding_size = sp_world - (dim_size % sp_world)
-        x = _pad_tensor(x, seq_dim, padding_size)
+        x = pad_tensor(x, seq_dim, padding_size)
     return SeqAllToAll.apply(group, x, seq_dim, head_dim, False)
 
 

@@ -3,20 +3,15 @@ from typing import Callable
 
 import torch
 
-from torch_turbo.transformer.transformer_config import TransformerConfig
+from torch_turbo.distributed.parallel_config import MoEConfig
 from torch_turbo.distributed.moe.utils import topk_softmax_with_capacity
 
 
 class Router(ABC, torch.nn.Module):
     """Base Router class"""
 
-    def __init__(self, config: TransformerConfig) -> None:
-        """
-        Initialize the Router module.
-
-        Args:
-            config (TransformerConfig): Configuration object for the Transformer model.
-        """
+    def __init__(self, config: MoEConfig) -> None:
+        """Initialize the Router module."""
         super().__init__()
         self.config = config
         self.num_experts = self.config.num_moe_experts
@@ -57,12 +52,8 @@ class Router(ABC, torch.nn.Module):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(self, config: TransformerConfig) -> None:
-        """Initialize the zero token dropping router.
-
-        Args:
-            config (TransformerConfig): The configuration for the transformer model.
-        """
+    def __init__(self, config: MoEConfig) -> None:
+        """Initialize the zero token dropping router."""
         super().__init__(config=config)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type

@@ -7,7 +7,7 @@ from torch_turbo.distributed.parallel_state import get_expert_model_parallel_wor
 
 def _get_base_moe_config(hf_config: PretrainedConfig, **override_config_kwargs) -> dict:
     ep_size = get_expert_model_parallel_world_size()
-    base_config = dict(
+    base_config_kwargs = dict(
         # model arch
         hidden_size=hf_config.moe_intermediate_size,
         gated_linear_unit=True,
@@ -21,15 +21,15 @@ def _get_base_moe_config(hf_config: PretrainedConfig, **override_config_kwargs) 
         moe_router_pre_softmax=True,
         moe_token_dispatcher_type="alltoall",
     )
-    base_config.update(override_config_kwargs)
-    return base_config
+    base_config_kwargs.update(**override_config_kwargs)
+    return base_config_kwargs
 
 def hf_to_moe_config_qwen3(hf_config: PretrainedConfig) -> MoEConfig:
-    args = _get_base_moe_config(
+    qwen3_config_kwargs = _get_base_moe_config(
         hf_config = hf_config,
         num_moe_experts = hf_config.num_experts,
     )
-    return MoEConfig(args)
+    return MoEConfig(**qwen3_config_kwargs)
 
 def hf_to_moe_config_bailing(hf_config: PretrainedConfig) -> MoEConfig:
     args = _get_base_moe_config(

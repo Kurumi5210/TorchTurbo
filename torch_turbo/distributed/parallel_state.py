@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -127,7 +128,7 @@ def get_ulysses_sequence_parallel_rank(group: ProcessGroup = None) -> int:
 
 _PARALLEL_STATE = None
 
-
+@dataclass(frozen=True)
 class ParallelState:
     sp_size: int = 1
     ep_size: int = 1

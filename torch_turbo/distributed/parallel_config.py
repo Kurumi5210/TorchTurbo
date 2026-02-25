@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
 
 
+@dataclass
 class MoEConfig:
     # model architecture
     hidden_size: int = 0
@@ -49,23 +51,27 @@ class MoEConfig:
     moe_apply_probs_on_input: bool = False
 
 
+@dataclass
 class SPConfig:
     # sp module list
     """Can be chosen from [_flash_attention_forward, create_causal_mask, rotary]"""
     apply_modules: List[str] = None
 
 
+@dataclass
 class EPConfig:
     # ep module list
     """Can be chosen from [mlp.experts, mlp.shared_epxerts, token_dispatcher]"""
     apply_modules: List[str] = None
 
 
+@dataclass
 class FullyShardConfig:
     # fully shard module list
     apply_modules: List[str] = None
 
 
+@dataclass
 class ParallelPlanConfig:
     moe_config: MoEConfig = None
     sp_config: SPConfig = None

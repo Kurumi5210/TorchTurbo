@@ -79,16 +79,20 @@ def get_model_config(args):
 
 def get_model_cls(model_config):
     model_type = model_config.model_type
+    print(f"model_type>>>>>>>>{model_type}")
     module_name = _SUPPORT_MODELS[model_type]
     importlib.import_module(f'torch_turbo.models.{module_name}')
-    if model_type not in MODELING_REGISTRY.valid_keys():
-        return AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
-    return MODELING_REGISTRY[model_type]
+    print(f"get_model_cls>>>>>>>>>{MODELING_REGISTRY[model_type]()}")
+    # if model_type not in MODELING_REGISTRY.valid_keys():
+    #     return AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
+    return MODELING_REGISTRY[model_type]()
 
 def get_parallel_plan(model_config):
     model_type = model_config.model_type
-    moe_config = _CONFIG_CONVERTER_REGISTRY[model_type]
-    sp_config, ep_config, fsdp_config = PARALLEL_CONFIG_REGISTRY[model_type]
+    moe_config = _CONFIG_CONVERTER_REGISTRY[model_type](model_config)
+    print(f"moe_config>>>>>>>>>>>{moe_config}")
+    print(f"get_parallel_plan>>>>>>>>>{PARALLEL_CONFIG_REGISTRY[model_type]()}")
+    sp_config, ep_config, fsdp_config = PARALLEL_CONFIG_REGISTRY[model_type]()
     parallel_plan = ParallelPlanConfig(moe_config, sp_config, ep_config, fsdp_config)
     return parallel_plan
 

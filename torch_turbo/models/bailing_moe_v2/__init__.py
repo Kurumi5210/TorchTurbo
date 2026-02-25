@@ -1,5 +1,5 @@
 import torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 as bailing_moe_v2_model
-from torchturbo.torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torch_turbo.models.registry import MODELING_REGISTRY, PARALLEL_CONFIG_REGISTRY
 from torch_turbo.ops import npu_fused_ops
 from torch_turbo.utils.device import is_npu_available

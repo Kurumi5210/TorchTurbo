@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from torch_turbo.transformer.transformer_config import TransformerConfig
+from torch_turbo.distributed.parallel_config import MoEConfig
 from torch_turbo.utils.device import is_npu_available
 
 try:
@@ -65,7 +65,7 @@ class GroupedMLP(torch.nn.Module):
                  num_local_experts: int,
                  use_fused_swiglu: bool,
                  use_te: bool,
-                 config: TransformerConfig):
+                 config: MoEConfig):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts

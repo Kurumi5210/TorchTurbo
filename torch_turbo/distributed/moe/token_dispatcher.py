@@ -3,9 +3,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from torch_turbo.transformer.transformer_config import TransformerConfig
-from torchturbo.torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
-from torchturbo.torch_turbo.distributed.comm import (
+from torch_turbo.distributed.parallel_config import MoEConfig
+from torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
+from torch_turbo.distributed.comm import (
     all_to_all,
     gather_from_sequence_parallel_region
 )
@@ -18,11 +18,9 @@ from torch_turbo.distributed.moe.utils import (
 
 
 class MoETokenDispatcher:
-    """
-    MoE Token Dispatcher
-    """
+    """MoE Token Dispatcher"""
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(self, config: MoEConfig) -> None:
         """
         Initialize the MoE Token Dispatcher.
         """
@@ -81,7 +79,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self, num_local_experts: int, local_expert_indices: List[int], config: MoEConfig
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
@@ -89,7 +87,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Args:
             num_local_experts (int): Number of local experts on the current device.
             local_expert_indices (List[int]): Indices of local experts on the current device.
-            config (TransformerConfig): Configuration for the transformer model.
+            config (MoEConfig): Configuration for the transformer model.
         """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts

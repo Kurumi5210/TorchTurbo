@@ -1,4 +1,7 @@
-import transformers.models.qwen3.modeling_qwen3 as qewn3_moe_model
+import logging
+
+import transformers.models.qwen3_moe.modeling_qwen3_moe as qewn3_moe_model
+
 from torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torch_turbo.distributed.parallel_state import get_parallel_state
 from torch_turbo.distributed.sequence_parallel.utils import create_causal_mask
@@ -20,9 +23,18 @@ def apply_qwen3_moe_patch():
 
 
 @MODELING_REGISTRY.register("qwen3_moe")
-def register_bailing_moe_v2_modeling():
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3MoeForCausalLM
+def register_qwen3_moe_modeling():
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
     apply_qwen3_moe_patch()
 
+    print("Qwen3 MoE modeling registered!")
     return Qwen3MoeForCausalLM
+
+
+@PARALLEL_CONFIG_REGISTRY.register("qwen3_moe")
+def register_qwen3_moe_parallel_config():
+    from .parallel_config import get_parallel_config
+
+    print("Qwen3 MoE parallel config registered!")
+    return get_parallel_config()

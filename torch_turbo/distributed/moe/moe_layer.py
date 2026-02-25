@@ -6,14 +6,14 @@ import os
 import torch
 import torch.nn.functional as F
 
-from torchturbo.torch_turbo.distributed.parallel_state import (
+from torch_turbo.distributed.parallel_config import MoEConfig
+from torch_turbo.distributed.parallel_state import (
     get_expert_model_parallel_world_size,
     get_expert_model_parallel_rank
 )
-from torch_turbo.transformer.transformer_config import TransformerConfig
+from torch_turbo.distributed.moe.router import TopKRouter
+from torch_turbo.distributed.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from torch_turbo.transformer.module import ModuleSpec, build_module
-from torchturbo.torch_turbo.distributed.moe.router import TopKRouter
-from torchturbo.torch_turbo.distributed.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 
 
 @dataclass
@@ -25,13 +25,9 @@ class MoESubmodules:
 
                 
 class BaseMoELayer(torch.nn.Module, ABC):
-    """Base class for a mixture of experts layer.
+    """Base class for a mixture of experts layer."""
 
-    Args:
-        config (TransformerConfig): Configuration object for the transformer model.
-    """
-
-    def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
+    def __init__(self, config: MoEConfig, layer_number: Optional[int] = None):
         super().__init__()
         self.config = config
         self.expert_parallel_size = get_expert_model_parallel_world_size()
@@ -72,7 +68,7 @@ class MoELayer(BaseMoELayer):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: MoEConfig,
         submodules: Optional[MoESubmodules] = None,
         use_fused_swiglu: Optional[bool] = False,
         use_fused_permute_unpermute: Optional[bool] = False,

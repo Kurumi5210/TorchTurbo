@@ -8,7 +8,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import torch_turbo.distributed.parallel_state as ps
-from .dataset_utils import get_dataloader, get_dataset, data_to_device
+from dataset_utils import get_dataloader, get_dataset, data_to_device
 from torch_turbo.distributed.parallize_model import build_fsdp_turbo_model
 from torch_turbo.distributed.fsdp.clip_grad_norm import clip_grad_norm, scale_moe_gradient
 from torch_turbo.distributed.fsdp.moe_fwd_bwd_prefetch import fsdp2_backward_prefetch_manager

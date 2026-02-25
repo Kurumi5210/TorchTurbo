@@ -51,9 +51,9 @@ def match_module(fqn_pattern: str, fqn: str, prefix: str = None):
 def get_apply_modules(model, apply_modules):
     parallel_modules = []
     layers = model.model.layers
-    for target_module in apply_modules:
+    for target_name in apply_modules:
         for name, module in layers.named_modules():
-            if match_module(target_module, name):
+            if match_module(target_name, name):
                 parallel_modules.append(module)
     return parallel_modules
 
@@ -61,9 +61,9 @@ def get_apply_modules(model, apply_modules):
 def get_fully_shard_plan(model, apply_modules):
     shard_modules = dict()
     layers = model.model.layers
-    for target_module, shard_strategy in apply_modules:
+    for target_name, shard_strategy in apply_modules:
         for name, module in layers.named_modules():
-            if target_module == name:
+            if match_module(target_name, name):
                 shard_modules[module] = shard_strategy
     return shard_modules
 
@@ -121,9 +121,9 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
     parallel_state = get_parallel_state()
 
     config = get_model_config(args)
-    # DEBUG
-    # config.num_hidden_layers = 1
-    # TODO: is device meta necessary?
+    # used for DEBUG
+    config.num_hidden_layers = 1
+    # create parallel model on meta device
     with torch.device("meta"):
         model = get_model_cls(config)
         # get parallel config
@@ -139,7 +139,7 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
 
     # apply fully shard modules
     apply_fsdp(model, parallel_plan.fsdp_config, fsdp_kwargs)
-    # TODO: why to empty? need to register buffer after empty
+    # create empty tensor for model params on target device
     model.to_empty(device=device)
 
     # patch model buffer

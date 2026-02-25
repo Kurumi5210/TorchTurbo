@@ -3,6 +3,19 @@ from typing import Optional
 
 import torch
 
+
+def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
+    assert ep_world_size > 0, "must be"
+
+    total_dim = tensor.shape[0]
+    chunk_size = total_dim // ep_world_size
+
+    start = ep_rank * chunk_size
+    end = start + chunk_size
+
+    return tensor[start:end]
+
+
 def group_limited_topk(
     scores: torch.Tensor,
     topk: int,
@@ -55,6 +68,7 @@ def group_limited_topk(
 
     return probs, top_indices
 
+
 def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_capacity=None):
     """
     Calculate the capacity of each expert.
@@ -72,6 +86,7 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
     if min_capacity is not None and capacity < min_capacity:
         capacity = min_capacity
     return capacity
+
 
 def permute(
     tokens,
@@ -120,6 +135,7 @@ def permute(
 
     return permuted_input, permuted_probs, sorted_indices
 
+
 def sort_chunks_by_idxs(
     input: torch.Tensor,
     split_sizes: torch.Tensor,
@@ -136,6 +152,7 @@ def sort_chunks_by_idxs(
     else:
         permuted_probs = None
     return output, permuted_probs
+
 
 def unpermute(
     permuted_tokens: torch.Tensor,
@@ -202,6 +219,7 @@ def unpermute(
     
     return output_tokens.to(dtype=input_dtype)
 
+
 def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
     """Move a tensor to CPU if it is on GPU.
     Args:
@@ -218,6 +236,7 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
             tensor.record_stream(torch.cuda.current_stream())
         tensor = cpu_tensor
     return tensor
+
 
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
@@ -302,9 +321,11 @@ def topk_softmax_with_capacity(
 
     return topk_masked_gates, topk_map, tokens_per_expert
 
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
+
 
 def divide(numerator, denominator):
     """Ensure that numerator is divisible by the denominator and return

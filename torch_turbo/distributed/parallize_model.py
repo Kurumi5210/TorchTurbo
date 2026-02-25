@@ -1,3 +1,4 @@
+import re
 import torch
 
 from torch_turbo.utils.torch_utils import torch_version
@@ -31,12 +32,28 @@ if is_npu_available:
     from torch_npu.contrib import transfer_to_npu as _
 
 
+def match_module(fqn_pattern: str, fqn: str, prefix: str = None):
+    assert isinstance(fqn_pattern, str), f"fqn_pattern must be a str, got {type(fqn_pattern)}"
+    assert isinstance(fqn, str), f"fqn must be a str, got {type(fqn)}"
+
+    if prefix:
+        fqn_pattern = [".".join([prefix, pattern]) for pattern in fqn_pattern]
+
+    regex_str = re.escape(fqn_pattern).replace(r"\*", r".*")
+    regex_str = f"^{regex_str}$"
+    regex = re.compile(regex_str)
+
+    match = regex.match(fqn)
+
+    return match
+
+
 def get_apply_modules(model, apply_modules):
     parallel_modules = []
     layers = model.model.layers
     for target_module in apply_modules:
         for name, module in layers.named_modules():
-            if target_module == name:
+            if match_module(target_module, name):
                 parallel_modules.append(module)
     return parallel_modules
 

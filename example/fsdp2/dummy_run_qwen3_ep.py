@@ -7,16 +7,15 @@ from torch import nn
 
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
-from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
+import torch_turbo.distributed.parallel_state as ps
+from .dataset_utils import get_dataloader, get_dataset, data_to_device
+from torch_turbo.distributed.parallize_model import build_fsdp_turbo_model
+from torch_turbo.distributed.fsdp.clip_grad_norm import clip_grad_norm, scale_moe_gradient
+from torch_turbo.distributed.fsdp.moe_fwd_bwd_prefetch import fsdp2_backward_prefetch_manager
+from torch_turbo.distributed.moe.utils import slice_tensor_for_ep_rank
 from torch_turbo.utils.torch_utils import compare_tensors
 from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend, is_npu_available
-from torchturbo.torch_turbo.distributed.parallel_state import (
-    initialize_model_parallel,
-    get_expert_model_parallel_rank,
-    get_expert_model_parallel_world_size
-)
-from dataset_utils import get_dataloader, get_dataset, data_to_device
+
 
 def test_forward(args, model, dataloader, device, rank):
     def check_meta_tensors(module):
@@ -72,8 +71,8 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         from torch.distributed.fsdp import fully_shard
     else:
         from torch.distributed._composable.fsdp import fully_shard
-    ep_rank = get_expert_model_parallel_rank()
-    ep_world_size = get_expert_model_parallel_world_size()
+    ep_rank = ps.get_expert_model_parallel_rank()
+    ep_world_size = ps.get_expert_model_parallel_world_size()
     lr = 1e-2
     betas = (0.9, 0.999)
     weight_decay = 0.0
@@ -81,9 +80,9 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
     moe_params = []
     for param in model.parameters():
         assert len(param.device_mesh.shape) == 1
-        if param.device_mesh == MoeUtils.get_world_mesh():
+        if param.device_mesh == ps.get_world_mesh():
             params.append(param)
-        elif param.device_mesh != MoeUtils.get_world_mesh():
+        elif param.device_mesh != ps.get_world_mesh():
             moe_params.append(param)
 
     optimizer = torch.optim.AdamW([{"params": params}, {"params": moe_params}],
@@ -102,11 +101,11 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
     ref_model = ref_model.to(device, dtype=config.torch_dtype)
     for layer in ref_model.model.layers:
         # wrap moe mlp in edp
-        fully_shard(layer.mlp, mesh = MoeUtils.get_world_mesh())
+        fully_shard(layer.mlp, mesh = ps.get_world_mesh())
         # wrap other parts in dp
-        fully_shard(layer, mesh = MoeUtils.get_world_mesh())
+        fully_shard(layer, mesh = ps.get_world_mesh())
     # wrap remaining parts
-    fully_shard(ref_model, mesh = MoeUtils.get_world_mesh())
+    fully_shard(ref_model, mesh = ps.get_world_mesh())
     ref_optimizer = torch.optim.AdamW(ref_model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
 
     model = model.to(dtype=config.torch_dtype)
@@ -132,8 +131,8 @@ def test_backward(args, model, dataloader, device, rank, prof=None):
         loss = criterion(output["logits"], labels)
         optimizer.zero_grad()
         loss.backward()
-        MoeUtils.scale_moe_gradient(moe_params)
-        total_norm = MoeUtils.clip_grad_norm(model, max_norm=1.0)
+        scale_moe_gradient(moe_params)
+        total_norm = clip_grad_norm(model, max_norm=1.0)
         total_norm = total_norm.to(device)
         optimizer.step()
         params, grads = get_params_and_grads(model)
@@ -213,9 +212,9 @@ def train(args, model, dataloader, device, rank):
     params = []
     moe_params = []
     for param in model.parameters():
-        if param.device_mesh == MoeUtils.get_world_mesh():
+        if param.device_mesh == ps.get_world_mesh():
             params.append(param)
-        elif param.device_mesh != MoeUtils.get_world_mesh():
+        elif param.device_mesh != ps.get_world_mesh():
             moe_params.append(param)
 
     optimizer = torch.optim.AdamW([{"params": params}, {"params": moe_params}],
@@ -244,7 +243,7 @@ def train(args, model, dataloader, device, rank):
         with fsdp2_backward_prefetch_manager:
             output.sum().backward()
 
-        MoeUtils.scale_moe_gradient(moe_params)
+        scale_moe_gradient(moe_params)
         optimizer.step()
         if args.profiling:
             prof.step()
@@ -268,7 +267,7 @@ def setup(rank, args):
         torch_npu.npu.set_device(rank)
     else:
         torch.cuda.set_device(rank)
-    initialize_model_parallel(expert_model_parallel_size=args.ep_size)
+    ps.initialize_model_parallel(expert_model_parallel_size=args.ep_size)
 
     dist.barrier()
 
@@ -281,7 +280,7 @@ def run(rank, args):
     setup(rank, args)
     device = get_device_id()
 
-    model = MoeUtils.create_fsdp2_moe_model(args, device)
+    model = build_fsdp_turbo_model(args, {}, device)
     dist.barrier()
     batch_size_per_gpu = 1
     max_train_step = 10

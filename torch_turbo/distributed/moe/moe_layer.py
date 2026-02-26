@@ -14,6 +14,7 @@ from torch_turbo.distributed.parallel_state import (
 from torch_turbo.distributed.moe.router import TopKRouter
 from torch_turbo.distributed.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from torch_turbo.transformer.module import ModuleSpec, build_module
+from torch_turbo.utils.device import is_npu_available
 
 
 @dataclass
@@ -117,7 +118,7 @@ class MoELayer(BaseMoELayer):
             expert_output, mlp_bias = self.experts(
                 dispatched_input, tokens_per_expert, permuted_probs
             )
-            if self.use_fused_permute_unpermute:
+            if is_npu_available:
                 # apply shape transform for npu fused kernel
                 num_tokens, _ = probs.shape
                 probs = probs.masked_select(routing_map).view(num_tokens, -1)
@@ -145,6 +146,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias, logits
         output, mlp_bias, logits = custom_forward(hidden_states)
-        if "deepseek" in self.config.model_type:
-            return output
+        # TODO: refactor hack to model patch
+        # if "deepseek" in self.config.model_type:
+        #     return output
         return output, logits

@@ -120,7 +120,7 @@ class BackwardPrefetchContext:
         self.in_backward = True
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_value, traceback):
         self.in_backward = False
 
 fsdp2_backward_prefetch_manager = BackwardPrefetchContext()

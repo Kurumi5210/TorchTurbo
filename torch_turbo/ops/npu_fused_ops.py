@@ -109,26 +109,13 @@ def fused_token_permutation_npu(
         "before_permutation_2", tokens_per_expert
     )
     if self.num_local_experts > 1:
-        if self.drop_and_pad:
-            global_input_tokens = (
-                global_input_tokens.view(
-                    self.tp_size * self.ep_size,
-                    self.num_local_experts,
-                    self.capacity,
-                    *global_input_tokens.size()[1:],
-                )
-                .transpose(0, 1)
-                .contiguous()
-                .flatten(start_dim=0, end_dim=2)
-            )
-        else:
-            global_input_tokens, global_probs = sort_chunks_by_idxs(
-                global_input_tokens,
-                self.num_global_tokens_per_local_expert.ravel(),
-                self.sort_input_by_local_experts,
-                probs=None,
-                fused=self.config.moe_permute_fusion,
-            )
+        global_input_tokens, global_probs = sort_chunks_by_idxs(
+            global_input_tokens,
+            self.num_global_tokens_per_local_expert.ravel(),
+            self.sort_input_by_local_experts,
+            probs=None,
+            fused=self.config.moe_permute_fusion,
+        )
 
     tokens_per_expert = self._maybe_dtoh_and_synchronize("before_finish", tokens_per_expert)
 
@@ -174,25 +161,12 @@ def fused_token_unpermutation_npu(
 
     # Unpermutation 2: Unsort tokens by local expert.
     if self.num_local_experts > 1:
-        if self.drop_and_pad:
-            hidden_states = (
-                hidden_states.view(
-                    self.num_local_experts,
-                    self.tp_size * self.ep_size,
-                    self.capacity,
-                    *hidden_states.size()[1:],
-                )
-                .transpose(0, 1)
-                .contiguous()
-                .flatten(start_dim=0, end_dim=2)
-            )
-        else:
-            hidden_states, _ = sort_chunks_by_idxs(
-                hidden_states,
-                self.num_global_tokens_per_local_expert.T.ravel(),
-                self.restore_output_by_local_experts,
-                fused=self.config.moe_permute_fusion,
-            )
+        hidden_states, _ = sort_chunks_by_idxs(
+            hidden_states,
+            self.num_global_tokens_per_local_expert.T.ravel(),
+            self.restore_output_by_local_experts,
+            fused=self.config.moe_permute_fusion,
+        )
 
     # Perform expert parallel AlltoAll communication
     # hidden_states: [SEQL, H] -> [SEQL, H/TP]

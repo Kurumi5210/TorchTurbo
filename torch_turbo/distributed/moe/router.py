@@ -104,7 +104,6 @@ class TopKRouter(Router):
             scores, routing_map, _ = topk_softmax_with_capacity(
                 logits,
                 self.topk,
-                drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
                 num_groups=self.config.moe_router_num_groups,
                 group_topk=self.config.moe_router_group_topk,

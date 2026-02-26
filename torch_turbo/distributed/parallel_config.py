@@ -1,9 +1,14 @@
+import functools
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
 
+
+def init_method_normal(sigma):
+    """Init method based on N(0, sigma)."""
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
 @dataclass
 class MoEConfig:
@@ -49,6 +54,10 @@ class MoEConfig:
     moe_permute_fusion: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
     moe_apply_probs_on_input: bool = False
+
+    def __post_init__(self):
+        if self.init_method is None:
+            self.init_method = init_method_normal(self.init_method_std)
 
 
 @dataclass

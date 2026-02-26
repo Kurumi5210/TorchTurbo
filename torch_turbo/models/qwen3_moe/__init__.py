@@ -19,17 +19,17 @@ def apply_qwen3_moe_patch():
     
     parallel_state = get_parallel_state()
     if parallel_state.sp_enabled():
-        qewn3_moe_model.qwen3_moe_module.create_causal_mask = create_causal_mask
+        qewn3_moe_model.create_causal_mask = create_causal_mask
 
 
 @MODELING_REGISTRY.register("qwen3_moe")
-def register_qwen3_moe_modeling():
+def register_qwen3_moe_modeling(hf_config):
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
     apply_qwen3_moe_patch()
 
     print("Qwen3 MoE modeling registered!")
-    return Qwen3MoeForCausalLM
+    return Qwen3MoeForCausalLM(hf_config)
 
 
 @PARALLEL_CONFIG_REGISTRY.register("qwen3_moe")

@@ -12,6 +12,7 @@ from torch.distributed._tensor import distribute_tensor, DTensor
 
 from torch_turbo.distributed.parallel_state import (
     get_edp_mesh,
+    get_expert_mesh,
     get_world_mesh,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
@@ -24,7 +25,7 @@ class DistParamLoader:
         self.config = config
         self.device = device
         self.path = Path(args.path)
-        self.ep_mesh = get_edp_mesh()
+        self.ep_mesh = get_expert_mesh()
         self.world_mesh = get_world_mesh()
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -255,6 +256,7 @@ class DistParamLoader:
                 mesh = self.world_mesh
 
             sharded_tensor = distribute_tensor(full, mesh, param.placements, src_data_rank=None)
+            # print(f"name: {name}, deivce: {self.device}, rank: {self.rank}, mesh: {mesh}, param: {param.shape}, full: {full.shape}, sharded_tensor: {sharded_tensor.shape}")
 
             with torch.no_grad():
                 param.copy_(nn.Parameter(sharded_tensor))

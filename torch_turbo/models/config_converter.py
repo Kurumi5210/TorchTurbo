@@ -9,7 +9,7 @@ def _get_base_moe_config(hf_config: PretrainedConfig, **override_config_kwargs) 
     ep_size = get_expert_model_parallel_world_size()
     base_config_kwargs = dict(
         # model arch
-        hidden_size=hf_config.moe_intermediate_size,
+        hidden_size=hf_config.hidden_size,
         gated_linear_unit=True,
         activation_func=F.silu,
         # parallel

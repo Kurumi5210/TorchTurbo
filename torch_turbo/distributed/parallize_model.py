@@ -48,11 +48,10 @@ def match_module(fqn_pattern: str, fqn: str, prefix: str = None):
     return match
 
 
-def get_apply_modules(model, apply_modules):
+def get_sp_modules(model, apply_modules):
     parallel_modules = []
-    layers = model.model.layers
     for target_name in apply_modules:
-        for name, module in layers.named_modules():
+        for name, module in model.named_modules():
             if match_module(target_name, name):
                 parallel_modules.append(module)
     return parallel_modules
@@ -60,9 +59,8 @@ def get_apply_modules(model, apply_modules):
 
 def get_fully_shard_plan(model, apply_modules):
     shard_modules = dict()
-    layers = model.model.layers
-    for target_name, shard_strategy in apply_modules:
-        for name, module in layers.named_modules():
+    for target_name, shard_strategy in apply_modules.items():
+        for name, module in model.named_modules():
             if match_module(target_name, name):
                 shard_modules[module] = shard_strategy
     return shard_modules
@@ -71,7 +69,8 @@ def get_fully_shard_plan(model, apply_modules):
 def apply_sp(model, sp_config):
     # qwen: self_attn
     # bailing: attention
-    sp_modules = get_apply_modules(model, sp_config.apply_modules)
+    sp_modules = get_sp_modules(model, sp_config.apply_modules)
+    print(f"apply sp modules: {sp_modules}")
     for module in sp_modules:
         module._flash_attention_forward = ulysses_flash_attention_forward
 
@@ -85,20 +84,23 @@ def apply_ep(model, moe_config, ep_config):
         moe_layer_idx = model.config.first_k_dense_replace
     else:
         moe_layer_idx = 0
-    ep_modules = get_apply_modules(model, ep_config.apply_modules)
-    for i in range(moe_layer_idx, len(ep_modules)):
-        ep_module = ep_modules[i]
-        if hasattr(ep_module, "shared_experts"):
-            moe_layer.shared_experts = ep_module.shared_experts
-        ep_module = moe_layer
+
+    for i, layer in enumerate(model.model.layers):
+        if i < moe_layer_idx:
+            continue
+        layer.register_module(ep_config.apply_modules[0], moe_layer)
 
 
-def apply_fsdp(model, fsdp_config, fsdp_kwargs):
+def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):
     fsdp_plan = get_fully_shard_plan(model, fsdp_config.apply_modules)
+    print(f"apply fsdp sharding plan: {fsdp_plan}")
     for module, shard_strategy in fsdp_plan.items():
         if shard_strategy == 'edp':
+            print(f"apply_fsdp edp: {module}")
             fully_shard(module, mesh=get_edp_mesh(), **fsdp_kwargs)
+            setattr(module, "expert_forward_prefetch", True)
         elif shard_strategy == 'dp':
+            print(f"apply_fsdp dp: {module}")
             fully_shard(module, mesh=get_world_mesh(), **fsdp_kwargs)
 
     for layer in model.model.layers:
@@ -112,7 +114,7 @@ def apply_fsdp(model, fsdp_config, fsdp_kwargs):
     else:
         inter_cls = model.model.layers[0].mlp.experts.__class__
     outermost_cls = model.__class__
-    set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, model.config)
+    set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, hf_config)
 
 
 def build_fsdp_turbo_model(args, fsdp_kwargs, device):
@@ -120,14 +122,14 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
     init_parallel_state(args.sp_size, args.ep_size)
     parallel_state = get_parallel_state()
 
-    config = get_model_config(args)
+    hf_config = get_model_config(args)
     # used for DEBUG
-    config.num_hidden_layers = 1
+    hf_config.num_hidden_layers = 1
     # create parallel model on meta device
     with torch.device("meta"):
-        model = get_model_cls(config)
+        model = get_model_cls(hf_config)
         # get parallel config
-        parallel_plan = get_parallel_plan(config)
+        parallel_plan = get_parallel_plan(hf_config)
         # apply sp modules
         if parallel_state.sp_enabled():
             apply_sp(model, parallel_plan.sp_config)
@@ -138,14 +140,14 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
     model = model.to(dtype=torch.bfloat16)
 
     # apply fully shard modules
-    apply_fsdp(model, parallel_plan.fsdp_config, fsdp_kwargs)
+    apply_fsdp(model, hf_config, parallel_plan.fsdp_config, fsdp_kwargs)
     # create empty tensor for model params on target device
     model.to_empty(device=device)
 
     # patch model buffer
-    patch_model_buffer(config, model, device)
+    patch_model_buffer(hf_config, model, device)
     
     # load distributed weight
-    weight_loader = DistParamLoader(args, config, model, device)
+    weight_loader = DistParamLoader(model, hf_config, device, args)
     weight_loader.load_weights()
     return model

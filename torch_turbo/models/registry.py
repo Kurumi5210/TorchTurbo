@@ -77,25 +77,22 @@ def get_model_config(args):
     config_path = args.path
     return AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-def get_model_cls(model_config):
-    model_type = model_config.model_type
-    print(f"model_type>>>>>>>>{model_type}")
+def get_model_cls(hf_config):
+    model_type = hf_config.model_type
     module_name = _SUPPORT_MODELS[model_type]
     importlib.import_module(f'torch_turbo.models.{module_name}')
-    print(f"get_model_cls>>>>>>>>>{MODELING_REGISTRY[model_type]()}")
     # if model_type not in MODELING_REGISTRY.valid_keys():
     #     return AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
-    return MODELING_REGISTRY[model_type]()
+    return MODELING_REGISTRY[model_type](hf_config)
 
-def get_parallel_plan(model_config):
-    model_type = model_config.model_type
-    moe_config = _CONFIG_CONVERTER_REGISTRY[model_type](model_config)
-    print(f"moe_config>>>>>>>>>>>{moe_config}")
-    print(f"get_parallel_plan>>>>>>>>>{PARALLEL_CONFIG_REGISTRY[model_type]()}")
+def get_parallel_plan(hf_config):
+    model_type = hf_config.model_type
+    moe_config = _CONFIG_CONVERTER_REGISTRY[model_type](hf_config)
+    print(f"Getting model's MoeConfig: {moe_config}")
     sp_config, ep_config, fsdp_config = PARALLEL_CONFIG_REGISTRY[model_type]()
     parallel_plan = ParallelPlanConfig(moe_config, sp_config, ep_config, fsdp_config)
     return parallel_plan
 
-def patch_model_buffer(model_config, model, device):
-    model_type = model_config.model_type
+def patch_model_buffer(hf_config, model, device):
+    model_type = hf_config.model_type
     _BUFFER_REGISTRY[model_type](model, device)

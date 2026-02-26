@@ -170,7 +170,7 @@ def init_mesh(args):
     global _EXPERT_MESH
     global _GRADIENT_SCALING_FACTOR
     _WORLD_MESH = world_mesh
-    _WORLD_MESH = ep_mesh
+    _EXPERT_MESH = ep_mesh
     _GRADIENT_SCALING_FACTOR = gradient_scaling_factor
 
 def get_world_mesh():

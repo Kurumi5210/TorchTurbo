@@ -7,7 +7,7 @@ from torch_turbo.distributed.parallel_config import (
 
 def get_parallel_config():
     sp_plan = SPConfig(['model.layers.*.self_attn'])
-    ep_plan = EPConfig(['model.layers.*.mlp'])
+    ep_plan = EPConfig(['mlp'])
     fsdp_plan = FullyShardConfig({
         'model.layers.*.mlp.experts': 'edp',
         'model.embed_tokens': 'dp',

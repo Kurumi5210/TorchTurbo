@@ -6,11 +6,11 @@ from torch_turbo.distributed.parallel_plan import (
 
 
 def get_parallel_plan():
-    sp_plan = SPPlan(['attention'])
+    sp_plan = SPPlan(['model.layers.*.attention'])
     ep_plan = EPPlan(['mlp'])
     fsdp_plan = FullyShardPlan({
-        'mlp.experts': 'edp',
-        'word_embeddings': 'dp',
+        'model.layers.*.mlp.experts': 'edp',
+        'model.word_embeddings': 'dp',
         'lm_head': 'dp'
     })
     return (sp_plan, ep_plan, fsdp_plan)

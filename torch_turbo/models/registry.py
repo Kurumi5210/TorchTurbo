@@ -3,7 +3,8 @@ from typing import Callable, List, MutableMapping, Optional, Type, Union
 from transformers import AutoConfig
 
 from .buffer_patch import (
-    register_buffer_for_base_model,
+    register_buffer_for_qwen3_moe,
+    register_buffer_for_bailing_v2,
     register_buffer_for_bailing_v2_5
 )
 from torch_turbo.distributed.parallel_plan import ParallelPlan
@@ -17,8 +18,8 @@ _SUPPORT_MODELS = {
 
 
 _BUFFER_REGISTRY = {
-    "qwen3_moe": register_buffer_for_base_model,
-    "bailing_moe": register_buffer_for_base_model,
+    "qwen3_moe": register_buffer_for_qwen3_moe,
+    "bailing_moe": register_buffer_for_bailing_v2,
     "bailing_moe_linear": register_buffer_for_bailing_v2_5
 }
 
@@ -64,6 +65,7 @@ class Registry(MutableMapping):
 MODELING_REGISTRY = Registry()
 MOE_CONFIG_REGISTRY = Registry()
 PARALLEL_PLAN_REGISTRY = Registry()
+
 
 def get_model_config(args):
     config_path = args.path

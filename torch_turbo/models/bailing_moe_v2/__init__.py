@@ -17,16 +17,17 @@ def apply_bailing_moe_v2_patch():
         MoEAlltoAllTokenDispatcher.token_unpermutation = npu_fused_ops.fused_token_unpermutation_npu
 
 
-@MODELING_REGISTRY.register("bailing_moe_v2")
-def register_bailing_moe_v2_modeling():
+@MODELING_REGISTRY.register("bailing_moe")
+def register_bailing_moe_v2_modeling(hf_config):
     from .modeling_bailing_moe_v2 import BailingMoeV2ForCausalLM
 
     apply_bailing_moe_v2_patch()
 
-    return BailingMoeV2ForCausalLM
+    print("BailingMoEV2 modeling registered!")
+    return BailingMoeV2ForCausalLM(hf_config)
 
 
-@MOE_CONFIG_REGISTRY.register("bailing_moe_v2")
+@MOE_CONFIG_REGISTRY.register("bailing_moe")
 def register_bailing_v2_moe_config(hf_config: PretrainedConfig) -> MoEConfig:
     bailing_moe_v2_config_kwargs = get_base_moe_config(
         hf_config = hf_config,
@@ -41,7 +42,7 @@ def register_bailing_v2_moe_config(hf_config: PretrainedConfig) -> MoEConfig:
     return MoEConfig(**bailing_moe_v2_config_kwargs)
 
 
-@PARALLEL_PLAN_REGISTRY.register("bailing_moe_v2")
+@PARALLEL_PLAN_REGISTRY.register("bailing_moe")
 def register_bailing_moe_v2_parallel_plan():
     from .parallel_plan import get_parallel_plan
     return get_parallel_plan()

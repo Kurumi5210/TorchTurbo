@@ -89,6 +89,9 @@ def apply_ep(model, moe_config, ep_plan):
         # initilize moe_layer
         moe_submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
         moe_layer = MoELayer(moe_config, moe_submodules)
+        cur_module = layer.get_submodule(ep_plan.apply_modules[0])
+        if hasattr(cur_module, "shared_experts"):
+            moe_layer.shared_experts = cur_module.shared_experts
 
         layer.register_module(ep_plan.apply_modules[0], moe_layer)
 
@@ -126,7 +129,7 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
 
     hf_config = get_model_config(args)
     # used for DEBUG
-    hf_config.num_hidden_layers = 1
+    hf_config.num_hidden_layers = 2
     # create parallel model on meta device
     with torch.device("meta"):
         model = get_model_cls(hf_config)

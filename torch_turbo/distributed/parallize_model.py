@@ -22,7 +22,7 @@ from torch_turbo.models.registry import (
     get_model_config, 
     get_model_cls,
     get_parallel_plan,
-    patch_model_buffer
+    register_model_buffer
 )
 from torch_turbo.models.weight_loader import DistParamLoader
 from torch_turbo.transformer.module import ModuleSpec
@@ -146,7 +146,7 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
     model.to_empty(device=device)
 
     # patch model buffer
-    patch_model_buffer(hf_config, model, device)
+    register_model_buffer(hf_config, model, device)
     
     # load distributed weight
     weight_loader = DistParamLoader(model, hf_config, device, args)

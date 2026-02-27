@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from torch_turbo.distributed.parallel_config import MoEConfig
+from torch_turbo.distributed.parallel_plan import MoEConfig
 from torch_turbo.distributed.parallel_state import get_expert_model_parallel_group
 from torch_turbo.distributed.comm import (
     all_to_all,

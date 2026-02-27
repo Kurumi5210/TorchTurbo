@@ -10,7 +10,7 @@ from .buffer_patch import (
     register_buffer_for_base_model,
     register_buffer_for_bailing_v2_5
 )
-from torch_turbo.distributed.parallel_config import ParallelPlanConfig
+from torch_turbo.distributed.parallel_plan import ParallelPlan
 
 
 _SUPPORT_MODELS = {
@@ -70,7 +70,7 @@ class Registry(MutableMapping):
 
 
 MODELING_REGISTRY = Registry()
-PARALLEL_CONFIG_REGISTRY = Registry()
+PARALLEL_PLAN_REGISTRY = Registry()
 
 
 def get_model_config(args):
@@ -88,9 +88,9 @@ def get_model_cls(hf_config):
 def get_parallel_plan(hf_config):
     model_type = hf_config.model_type
     moe_config = _CONFIG_CONVERTER_REGISTRY[model_type](hf_config)
-    print(f"Getting model's MoeConfig: {moe_config}")
-    sp_config, ep_config, fsdp_config = PARALLEL_CONFIG_REGISTRY[model_type]()
-    parallel_plan = ParallelPlanConfig(moe_config, sp_config, ep_config, fsdp_config)
+    print(f"Loaded model's MoeConfig: {moe_config}")
+    sp_plan, ep_plan, fsdp_plan = PARALLEL_PLAN_REGISTRY[model_type]()
+    parallel_plan = ParallelPlan(moe_config, sp_plan, ep_plan, fsdp_plan)
     return parallel_plan
 
 def patch_model_buffer(hf_config, model, device):

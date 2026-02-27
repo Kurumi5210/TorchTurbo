@@ -57,7 +57,7 @@ def get_sp_modules(model, apply_modules):
     return parallel_modules
 
 
-def get_fully_shard_plan(model, apply_modules):
+def get_fully_shard_modules(model, apply_modules):
     shard_modules = dict()
     for target_name, shard_strategy in apply_modules.items():
         for name, module in model.named_modules():
@@ -66,19 +66,16 @@ def get_fully_shard_plan(model, apply_modules):
     return shard_modules
 
 
-def apply_sp(model, sp_config):
+def apply_sp(model, sp_plan):
     # qwen: self_attn
     # bailing: attention
-    sp_modules = get_sp_modules(model, sp_config.apply_modules)
+    sp_modules = get_sp_modules(model, sp_plan.apply_modules)
     print(f"apply sp modules: {sp_modules}")
     for module in sp_modules:
         module._flash_attention_forward = ulysses_flash_attention_forward
 
 
-def apply_ep(model, moe_config, ep_config):
-    # initilize moe_layer
-    moe_submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
-    moe_layer = MoELayer(moe_config, moe_submodules)
+def apply_ep(model, moe_config, ep_plan):
     # apply moe_layer
     if hasattr(model.config, "first_k_dense_replace"):
         moe_layer_idx = model.config.first_k_dense_replace
@@ -88,11 +85,16 @@ def apply_ep(model, moe_config, ep_config):
     for i, layer in enumerate(model.model.layers):
         if i < moe_layer_idx:
             continue
-        layer.register_module(ep_config.apply_modules[0], moe_layer)
+        
+        # initilize moe_layer
+        moe_submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
+        moe_layer = MoELayer(moe_config, moe_submodules)
+
+        layer.register_module(ep_plan.apply_modules[0], moe_layer)
 
 
 def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):
-    fsdp_plan = get_fully_shard_plan(model, fsdp_config.apply_modules)
+    fsdp_plan = get_fully_shard_modules(model, fsdp_config.apply_modules)
     print(f"apply fsdp sharding plan: {fsdp_plan}")
     for module, shard_strategy in fsdp_plan.items():
         if shard_strategy == 'edp':
@@ -132,15 +134,14 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
         parallel_plan = get_parallel_plan(hf_config)
         # apply sp modules
         if parallel_state.sp_enabled():
-            apply_sp(model, parallel_plan.sp_config)
+            apply_sp(model, parallel_plan.sp_plan)
         # apply ep modules
         if parallel_state.ep_enabled():
-            apply_ep(model, parallel_plan.moe_config, parallel_plan.ep_config)
-    # TODO: why to bf16?
+            apply_ep(model, parallel_plan.moe_config, parallel_plan.ep_plan)
     model = model.to(dtype=torch.bfloat16)
 
     # apply fully shard modules
-    apply_fsdp(model, hf_config, parallel_plan.fsdp_config, fsdp_kwargs)
+    apply_fsdp(model, hf_config, parallel_plan.fsdp_plan, fsdp_kwargs)
     # create empty tensor for model params on target device
     model.to_empty(device=device)
 

@@ -1,7 +1,7 @@
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from torch_turbo.distributed.parallel_config import MoEConfig
+from torch_turbo.distributed.parallel_plan import MoEConfig
 from torch_turbo.distributed.parallel_state import get_expert_model_parallel_world_size
 
 

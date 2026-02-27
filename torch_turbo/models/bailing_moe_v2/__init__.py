@@ -1,6 +1,6 @@
 import torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 as bailing_moe_v2_model
 from torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-from torch_turbo.models.registry import MODELING_REGISTRY, PARALLEL_CONFIG_REGISTRY
+from torch_turbo.models.registry import MODELING_REGISTRY, PARALLEL_PLAN_REGISTRY
 from torch_turbo.ops import npu_fused_ops
 from torch_turbo.utils.device import is_npu_available
 
@@ -21,7 +21,7 @@ def register_bailing_moe_v2_modeling():
 
     return BailingMoeV2ForCausalLM
 
-@PARALLEL_CONFIG_REGISTRY.register("bailing_moe")
-def register_bailing_moe_v2_parallel_config():
-    from .parallel_config import get_parallel_config
-    return get_parallel_config()
+@PARALLEL_PLAN_REGISTRY.register("bailing_moe")
+def register_bailing_moe_v2_parallel_plan():
+    from .parallel_plan import get_parallel_plan
+    return get_parallel_plan()

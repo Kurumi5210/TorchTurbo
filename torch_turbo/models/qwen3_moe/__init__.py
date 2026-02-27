@@ -1,11 +1,9 @@
-import logging
-
 import transformers.models.qwen3_moe.modeling_qwen3_moe as qewn3_moe_model
 
 from torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torch_turbo.distributed.parallel_state import get_parallel_state
 from torch_turbo.distributed.sequence_parallel.utils import create_causal_mask
-from torch_turbo.models.registry import MODELING_REGISTRY, PARALLEL_CONFIG_REGISTRY
+from torch_turbo.models.registry import MODELING_REGISTRY, PARALLEL_PLAN_REGISTRY
 from torch_turbo.ops import npu_fused_ops
 from torch_turbo.utils.device import is_npu_available
 
@@ -32,9 +30,9 @@ def register_qwen3_moe_modeling(hf_config):
     return Qwen3MoeForCausalLM(hf_config)
 
 
-@PARALLEL_CONFIG_REGISTRY.register("qwen3_moe")
-def register_qwen3_moe_parallel_config():
-    from .parallel_config import get_parallel_config
+@PARALLEL_PLAN_REGISTRY.register("qwen3_moe")
+def register_qwen3_moe_parallel_plan():
+    from .parallel_plan import get_parallel_plan
 
-    print("Qwen3 MoE parallel config registered!")
-    return get_parallel_config()
+    print("Qwen3MoE parallel plan registered!")
+    return get_parallel_plan()

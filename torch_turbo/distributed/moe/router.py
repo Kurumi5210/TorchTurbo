@@ -3,7 +3,7 @@ from typing import Callable
 
 import torch
 
-from torch_turbo.distributed.parallel_config import MoEConfig
+from torch_turbo.distributed.parallel_plan import MoEConfig
 from torch_turbo.distributed.moe.utils import topk_softmax_with_capacity
 
 

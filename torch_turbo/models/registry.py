@@ -5,7 +5,8 @@ from transformers import AutoConfig
 from .buffer_patch import (
     register_buffer_for_qwen3_moe,
     register_buffer_for_bailing_v2,
-    register_buffer_for_bailing_v2_5
+    register_buffer_for_bailing_v2_5,
+    register_buffer_for_kimi_k2
 )
 from torch_turbo.distributed.parallel_plan import ParallelPlan
 
@@ -13,14 +14,16 @@ from torch_turbo.distributed.parallel_plan import ParallelPlan
 _SUPPORT_MODELS = {
     "qwen3_moe": "qwen3_moe",
     "bailing_moe": "bailing_moe_v2",
-    "bailing_moe_linear": "bailing_moe_v2_5"
+    "bailing_moe_linear": "bailing_moe_v2_5",
+    "kimi_k2": "kimi_k2"
 }
 
 
 _BUFFER_REGISTRY = {
     "qwen3_moe": register_buffer_for_qwen3_moe,
     "bailing_moe": register_buffer_for_bailing_v2,
-    "bailing_moe_linear": register_buffer_for_bailing_v2_5
+    "bailing_moe_linear": register_buffer_for_bailing_v2_5,
+    "kimi_k2": register_buffer_for_kimi_k2
 }
 
 

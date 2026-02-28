@@ -1,6 +1,5 @@
 from transformers import PretrainedConfig
 
-import torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 as bailing_moe_v2_model
 from torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torch_turbo.distributed.parallel_plan import MoEConfig
 from torch_turbo.models.registry import MODELING_REGISTRY, MOE_CONFIG_REGISTRY, PARALLEL_PLAN_REGISTRY
@@ -10,6 +9,7 @@ from torch_turbo.utils.device import is_npu_available
 
 
 def apply_bailing_moe_v2_patch():
+    import torch_turbo.models.bailing_moe_v2.modeling_bailing_moe_v2 as bailing_moe_v2_model
     if is_npu_available:
         bailing_moe_v2_model.apply_rotary_pos_emb = npu_fused_ops.apply_rotary_pos_emb_bailing_npu
         bailing_moe_v2_model.BailingMoeV2RMSNorm.forward = npu_fused_ops.fused_rms_norm_forward_npu

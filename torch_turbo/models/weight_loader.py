@@ -11,7 +11,6 @@ from safetensors.torch import load_file
 from torch.distributed._tensor import distribute_tensor, DTensor
 
 from torch_turbo.distributed.parallel_state import (
-    get_edp_mesh,
     get_expert_mesh,
     get_world_mesh,
     get_expert_model_parallel_rank,
@@ -19,10 +18,17 @@ from torch_turbo.distributed.parallel_state import (
 )
 
 
+_HF_BUFFER_NAME_MAP = {
+    "base": {"router": "gate"},
+    "kimi_k2": {"expert_bias": "e_score_correction_bias"}
+}
+
+
 class DistParamLoader:
-    def __init__(self, model, config, device, args):
+    def __init__(self, model, hf_config, moe_conifg, device, args):
         self.model = model
-        self.config = config
+        self.hf_config = hf_config
+        self.moe_config = moe_conifg
         self.device = device
         self.path = Path(args.path)
         self.ep_mesh = get_expert_mesh()
@@ -122,7 +128,7 @@ class DistParamLoader:
 
     def _get_expert_keys(self, prefix, is_weight1):
         keys = []
-        for i in range(self.config.num_experts):
+        for i in range(self.moe_config.num_moe_experts):
             if is_weight1:
                 keys.extend([f"{prefix}.{i}.gate_proj.weight", f"{prefix}.{i}.up_proj.weight"])
             else:
@@ -173,7 +179,7 @@ class DistParamLoader:
 
         if owner == self.rank:
             for i in range(ep_size):
-                num_local_experts = self.config.num_experts // ep_size
+                num_local_experts = self.moe_config.num_moe_experts // ep_size
                 weights = []
                 for j in range(num_local_experts):
                     index = i * num_local_experts + j
@@ -201,7 +207,7 @@ class DistParamLoader:
         prefix = ".".join(prefix_lst[:5])
         owner = self._get_owner_rank(name)
         ep_size = self.ep_world_size
-        num_local_experts = self.config.num_experts // ep_size
+        num_local_experts = self.moe_config.num_moe_experts // ep_size
         result = None
         if owner == self.rank:
             for i in range(ep_size):
@@ -222,17 +228,22 @@ class DistParamLoader:
 
         return result
 
-    def _expert_bias_hf_name(self, name):
-        name = name.replace("router", "gate")
-        if "deepseek" in self.config.model_type:
-            name = name.replace("expert_bias", "e_score_correction_bias")
+    def _hf_buffer_name_convert(self, name):
+        for turbo_name, hf_name in  _HF_BUFFER_NAME_MAP["base"].items():
+            name = name.replace(turbo_name, hf_name)
+
+        model_type = self.hf_config.model_type
+        if model_type in _HF_BUFFER_NAME_MAP.keys():
+            for turbo_name, hf_name in  _HF_BUFFER_NAME_MAP[model_type].items():
+                name = name.replace(turbo_name, hf_name)
         return name
 
     def _broadcast_buffers(self):
          # Load buffers (e.g., bailing expert bias)
         for name, buf in self.model.named_buffers():
             if "router.expert_bias" in name:
-                full = self._broadcast_tensor(self._expert_bias_hf_name(name), buf.shape, buf.dtype)
+                hf_buffer_name = self._hf_buffer_name_convert(name)
+                full = self._broadcast_tensor(hf_buffer_name, buf.shape, buf.dtype)
                 buf.copy_(full)
 
     def _broadcast_params(self):
@@ -249,7 +260,8 @@ class DistParamLoader:
                     full = self._broadcast_to_ep_ranks(name, param, prefix, is_weight1)
                 mesh = self.ep_mesh['edp']
             elif "mlp.router" in name:
-                full = self._broadcast_tensor(name.replace("router", "gate"), param.shape, param.dtype)
+                hf_param_name = name.replace("router", "gate")
+                full = self._broadcast_tensor(hf_param_name, param.shape, param.dtype)
                 mesh = self.world_mesh
             else:
                 full = self._broadcast_tensor(name, param.shape, param.dtype)

@@ -7,7 +7,7 @@ if torch_version() >= (2, 6, 0):
 else:
     from torch.distributed._composable.fsdp import fully_shard
 
-from torch_turbo.distributed.fsdp.moe_fwd_bwd_prefetch import set_moe_forward_prefetch_for_fsdp2_ep
+from torch_turbo.distributed.fsdp2.moe_fwd_bwd_prefetch import set_moe_forward_prefetch_for_fsdp2_ep
 from torch_turbo.distributed.moe.moe_layer import MoESubmodules, MoELayer
 from torch_turbo.distributed.moe.experts import GroupedMLP
 from torch_turbo.distributed.sequence_parallel.ulysses import ulysses_flash_attention_forward
@@ -152,6 +152,6 @@ def build_fsdp_turbo_model(args, fsdp_kwargs, device):
     register_model_buffer(hf_config, model, device)
     
     # load distributed weight
-    weight_loader = DistParamLoader(model, hf_config, device, args)
+    weight_loader = DistParamLoader(model, hf_config, parallel_plan.moe_config, device, args)
     weight_loader.load_weights()
     return model

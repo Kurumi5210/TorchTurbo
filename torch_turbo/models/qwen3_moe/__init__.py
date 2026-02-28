@@ -1,5 +1,3 @@
-import torch
-import transformers.models.qwen3_moe.modeling_qwen3_moe as qewn3_moe_model
 from transformers import PretrainedConfig
 
 from torch_turbo.distributed.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
@@ -13,6 +11,7 @@ from torch_turbo.utils.device import is_npu_available
 
 
 def apply_qwen3_moe_patch():
+    import transformers.models.qwen3_moe.modeling_qwen3_moe as qewn3_moe_model
     if is_npu_available:
         qewn3_moe_model.apply_rotary_pos_emb = npu_fused_ops.apply_rotary_pos_emb_npu
         qewn3_moe_model.Qwen3MoeRMSNorm.forward = npu_fused_ops.fused_rms_norm_forward_npu

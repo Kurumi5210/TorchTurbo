@@ -14,6 +14,7 @@ def _fix_rope_config_for_bailing(config):
 
 
 def register_buffer_for_qwen3_moe(model, device):
+    print("Register buffer for Qwen3MoE...")
     # patch to rotary_emb
     rotary_emb = model.model.rotary_emb
     inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)

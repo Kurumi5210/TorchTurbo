@@ -18,6 +18,36 @@ def all_gather_tensor(local_tensor, ep_name="ep"):
     return output
 
 
+def all_gather_tensor_chunked(local_tensor, ep_name="ep", chunk_dim=0, num_chunks=4):
+    """ gather expert tensors, used for save_model
+    """
+    expert_mesh = get_expert_mesh()
+    group = expert_mesh[ep_name].get_group(0)
+    ep_world_size = dist.get_world_size(group=group)
+
+    local_chunks = torch.tensor_split(local_tensor, num_chunks, dim=chunk_dim)
+    
+    cpu_results = []
+    
+    for chunk in local_chunks:
+        chunk_output_shape = list(chunk.shape)
+        chunk_output_shape[0] = chunk_output_shape[0] * ep_world_size
+        temp_gpu_output = torch.empty(chunk_output_shape, dtype=chunk.dtype, device=chunk.device)
+        dist.all_gather_into_tensor(temp_gpu_output, chunk, group=group)
+        cpu_results.append(temp_gpu_output.cpu())
+        del temp_gpu_output
+    
+    reshaped_parts = []
+    for t in cpu_results:
+        reshaped_parts.append(t.view(ep_world_size, -1, *t.shape[1:]))
+    
+
+    output_cpu_view = torch.cat(reshaped_parts, dim=1)
+    output_cpu = output_cpu_view.flatten(0, 1)  
+    
+    return output_cpu
+
+
 def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_global_buffer=False):
     """Gather tensors and concatenate along the first dimension.
 

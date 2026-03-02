@@ -77,21 +77,25 @@ def get_model_config(args):
 
 def get_model_cls(hf_config):
     model_type = hf_config.model_type
-    module_name = _SUPPORT_MODELS[model_type]
-    importlib.import_module(f'torch_turbo.models.{module_name}')
     return MODELING_REGISTRY[model_type](hf_config)
 
 
 def get_parallel_plan(hf_config):
     model_type = hf_config.model_type
+    
+    module_name = _SUPPORT_MODELS[model_type]
+    importlib.import_module(f'torch_turbo.models.{module_name}')
+
     moe_config = MOE_CONFIG_REGISTRY[model_type](hf_config)
     print(f"Loaded model's MoeConfig: {moe_config}")
+    
     sp_plan, ep_plan, fsdp_plan = PARALLEL_PLAN_REGISTRY[model_type]()
     parallel_plan = ParallelPlan(moe_config, sp_plan, ep_plan, fsdp_plan)
     print(f"Loaded model's ParallelPlan: {moe_config}")
+    
     return parallel_plan
 
 
 def register_model_buffer(hf_config, model, device):
     model_type = hf_config.model_type
-    _BUFFER_REGISTRY[model_type](model, device)
+    return _BUFFER_REGISTRY[model_type](model, device)

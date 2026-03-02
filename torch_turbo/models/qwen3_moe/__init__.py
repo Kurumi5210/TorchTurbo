@@ -20,6 +20,7 @@ def apply_qwen3_moe_patch():
     
     parallel_state = get_parallel_state()
     if parallel_state.sp_enabled():
+        print(f"Monkey patched create_causal_mask in Qwen3Moe Model!")
         qewn3_moe_model.create_causal_mask = create_causal_mask
 
 

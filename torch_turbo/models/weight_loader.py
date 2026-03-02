@@ -16,7 +16,7 @@ from torch_turbo.distributed.parallel_state import (
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size
 )
-
+from torch_turbo.models.registry import get_parallel_plan
 
 _HF_BUFFER_NAME_MAP = {
     "base": {"router": "gate"},
@@ -25,10 +25,11 @@ _HF_BUFFER_NAME_MAP = {
 
 
 class DistParamLoader:
-    def __init__(self, model, hf_config, moe_conifg, device, args):
+    def __init__(self, model, hf_config, device, args):
         self.model = model
         self.hf_config = hf_config
-        self.moe_config = moe_conifg
+        parallel_plan = get_parallel_plan(hf_config)
+        self.moe_config = parallel_plan.moe_config
         self.device = device
         self.path = Path(args.path)
         self.ep_mesh = get_expert_mesh()

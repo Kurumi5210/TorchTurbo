@@ -1,5 +1,7 @@
 import re
+import sys
 import torch
+from typing import Optional
 
 from torch_turbo.utils.torch_utils import torch_version
 if torch_version() >= (2, 6, 0):
@@ -69,10 +71,19 @@ def get_fully_shard_modules(model, apply_modules):
 def apply_sp(model, sp_plan):
     # qwen: self_attn
     # bailing: attention
+    module = sys.modules[model.__module__]
+
     sp_modules = get_sp_modules(model, sp_plan.apply_modules)
     print(f"apply sp modules: {sp_modules}")
     for module in sp_modules:
-        module._flash_attention_forward = ulysses_flash_attention_forward
+        if hasattr(module, "_flash_attention_forward"):
+            module._flash_attention_forward = ulysses_flash_attention_forward
+            print(f"Monkey patched ulysses_flash_attention_forward in {module}!")
+        else:
+            from transformers.integrations import flash_attention
+            flash_attention._flash_attention_forward = ulysses_flash_attention_forward
+            print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
+            break
 
 
 def apply_ep(model, moe_config, ep_plan):
@@ -122,36 +133,55 @@ def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):
     set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, hf_config)
 
 
-def build_fsdp_turbo_model(args, fsdp_kwargs, device):
-    init_mesh(args)
-    init_parallel_state(args.sp_size, args.ep_size)
-    parallel_state = get_parallel_state()
-
-    hf_config = get_model_config(args)
+def apply_parallel_model(
+    hf_config, 
+    parallel_state, 
+    fsdp_kwargs, 
+    device, 
+    torch_dtype=torch.bfloat16
+):
     # used for DEBUG
-    hf_config.num_hidden_layers = 2
+    hf_config.num_hidden_layers = 1
+    
+    # get parallel config
+    parallel_plan = get_parallel_plan(hf_config)
+    moe_config = parallel_plan.moe_config
+
     # create parallel model on meta device
     with torch.device("meta"):
         model = get_model_cls(hf_config)
-        # get parallel config
-        parallel_plan = get_parallel_plan(hf_config)
         # apply sp modules
         if parallel_state.sp_enabled():
             apply_sp(model, parallel_plan.sp_plan)
         # apply ep modules
         if parallel_state.ep_enabled():
-            apply_ep(model, parallel_plan.moe_config, parallel_plan.ep_plan)
-    model = model.to(dtype=torch.bfloat16)
+            apply_ep(model, moe_config, parallel_plan.ep_plan)
+    
+    model = model.to(dtype=torch_dtype)
 
     # apply fully shard modules
     apply_fsdp(model, hf_config, parallel_plan.fsdp_plan, fsdp_kwargs)
     # create empty tensor for model params on target device
     model.to_empty(device=device)
+    
+    return model
+
+
+def build_fsdp_turbo_model(args, fsdp_kwargs, device):
+    init_mesh(args)
+    init_parallel_state(args.sp_size, args.ep_size)
+    parallel_state = get_parallel_state()
+    # get model config
+    hf_config = get_model_config(args)
+
+    # create parallized fsdp model
+    model = apply_parallel_model(hf_config, parallel_state, fsdp_kwargs, device)
 
     # patch model buffer
     register_model_buffer(hf_config, model, device)
     
     # load distributed weight
-    weight_loader = DistParamLoader(model, hf_config, parallel_plan.moe_config, device, args)
+    weight_loader = DistParamLoader(model, hf_config, device, args)
     weight_loader.load_weights()
+
     return model

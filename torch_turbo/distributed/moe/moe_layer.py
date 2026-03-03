@@ -13,16 +13,8 @@ from torch_turbo.distributed.parallel_state import (
 )
 from torch_turbo.distributed.moe.router import TopKRouter
 from torch_turbo.distributed.moe.token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
-from torch_turbo.transformer.module import ModuleSpec, build_module
 from torch_turbo.utils.device import is_npu_available
-
-
-@dataclass
-class MoESubmodules:
-    """MoE Layer Submodule spec"""
-
-    experts: Union[ModuleSpec, type] = None
-    shared_experts: Union[ModuleSpec, type] = None
+from torch_turbo.distributed.moe.experts import GroupedMLP
 
                 
 class BaseMoELayer(torch.nn.Module, ABC):
@@ -70,7 +62,6 @@ class MoELayer(BaseMoELayer):
     def __init__(
         self,
         config: MoEConfig,
-        submodules: Optional[MoESubmodules] = None,
         use_fused_swiglu: Optional[bool] = False,
         use_fused_permute_unpermute: Optional[bool] = False,
         use_te: Optional[bool] = False,
@@ -79,7 +70,6 @@ class MoELayer(BaseMoELayer):
         self.use_fused_swiglu = use_fused_swiglu
         self.use_fused_permute_unpermute = use_fused_permute_unpermute
         self.use_te = use_te
-        self.submodules = submodules
         super(MoELayer, self).__init__(config=config, layer_number=layer_number)
 
         # Initialize router
@@ -96,11 +86,10 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = build_module(self.submodules.experts, self.num_local_experts, self.use_fused_swiglu, self.use_te, self.config)
+        self.experts = GroupedMLP(self.num_local_experts, self.use_fused_swiglu, self.use_te, self.config)
 
         # Initialize shared experts
-        if self.use_shared_expert:
-            self.shared_experts = build_module(self.submodules.shared_experts, config=self.config)
+        self.shared_experts = None
 
     def forward(self, hidden_states: torch.Tensor):
         # debug
@@ -127,6 +116,7 @@ class MoELayer(BaseMoELayer):
                 expert_output = expert_output * permuted_probs.unsqueeze(-1)
                 output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             output = output.to(hidden_states_dtype)
+        
             if hasattr(self, 'shared_expert') and self.shared_expert is not None:
                 shared_expert_output = self.shared_expert(hidden_states)
                 shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
@@ -146,7 +136,5 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias, logits
         output, mlp_bias, logits = custom_forward(hidden_states)
-        # TODO: refactor hack to model patch
-        # if "deepseek" in self.config.model_type:
-        #     return output
+
         return output, logits

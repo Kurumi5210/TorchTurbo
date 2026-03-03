@@ -12,7 +12,7 @@ from torch_turbo.utils.device import is_npu_available
 
 
 def deepseek_moe_forward(self, hidden_states: torch.Tensor):
-    output, logits = MoELayer.forward(hidden_states)
+    output, _ = MoELayer.forward(hidden_states)
     return output
 
 
@@ -55,7 +55,7 @@ def register_kimi_k2_moe_config(hf_config: PretrainedConfig) -> MoEConfig:
 
 
 @PARALLEL_PLAN_REGISTRY.register("kimi_k2")
-def register_bailing_moe_v2_parallel_plan():
+def register_kimi_k2_parallel_plan():
     from .parallel_plan import get_parallel_plan
 
     print("Kimi-K2 parallel plan registered!")

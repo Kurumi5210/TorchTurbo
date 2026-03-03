@@ -10,7 +10,7 @@ else:
     from torch.distributed._composable.fsdp import fully_shard
 
 from torch_turbo.distributed.fsdp2.moe_fwd_bwd_prefetch import set_moe_forward_prefetch_for_fsdp2_ep
-from torch_turbo.distributed.moe.moe_layer import MoESubmodules, MoELayer
+from torch_turbo.distributed.moe.moe_layer import MoELayer
 from torch_turbo.distributed.moe.experts import GroupedMLP
 from torch_turbo.distributed.sequence_parallel.ulysses import ulysses_flash_attention_forward
 from torch_turbo.distributed.parallel_state import (
@@ -27,7 +27,6 @@ from torch_turbo.models.registry import (
     register_model_buffer
 )
 from torch_turbo.models.weight_loader import DistParamLoader
-from torch_turbo.transformer.module import ModuleSpec
 from torch_turbo.utils.device import is_npu_available
 
 if is_npu_available:
@@ -98,8 +97,7 @@ def apply_ep(model, moe_config, ep_plan):
             continue
         
         # initilize moe_layer
-        moe_submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
-        moe_layer = MoELayer(moe_config, moe_submodules)
+        moe_layer = MoELayer(moe_config)
         cur_module = layer.get_submodule(ep_plan.apply_modules[0])
         if hasattr(cur_module, "shared_experts"):
             moe_layer.shared_experts = cur_module.shared_experts
@@ -141,7 +139,7 @@ def apply_parallel_model(
     torch_dtype=torch.bfloat16
 ):
     # used for DEBUG
-    hf_config.num_hidden_layers = 1
+    # hf_config.num_hidden_layers = 1
     
     # get parallel config
     parallel_plan = get_parallel_plan(hf_config)

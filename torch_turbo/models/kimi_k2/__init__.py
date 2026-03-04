@@ -11,11 +11,6 @@ from torch_turbo.ops import npu_fused_ops
 from torch_turbo.utils.device import is_npu_available
 
 
-def deepseek_moe_forward(self, hidden_states: torch.Tensor):
-    output, _ = MoELayer.forward(hidden_states)
-    return output
-
-
 def apply_kimi_k2_patch():
     if is_npu_available:
         kimi_k2_model.apply_rotary_pos_emb = npu_fused_ops.apply_rotary_pos_emb_kimi_moe
@@ -24,6 +19,10 @@ def apply_kimi_k2_patch():
         MoEAlltoAllTokenDispatcher.token_unpermutation = npu_fused_ops.fused_token_unpermutation_npu
     
     # patch moe_layer forward
+    origin_moe_forward = MoELayer.forward
+    def deepseek_moe_forward(self, hidden_states: torch.Tensor):
+        output, _ = origin_moe_forward(self, hidden_states)
+        return output
     MoELayer.forward = deepseek_moe_forward
 
 

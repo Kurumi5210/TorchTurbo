@@ -139,7 +139,7 @@ def apply_parallel_model(
     torch_dtype=torch.bfloat16
 ):
     # used for DEBUG
-    # hf_config.num_hidden_layers = 1
+    # hf_config.num_hidden_layers = 2
     
     # get parallel config
     parallel_plan = get_parallel_plan(hf_config)

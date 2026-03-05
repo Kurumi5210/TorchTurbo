@@ -18,7 +18,8 @@ from torch_turbo.distributed.parallel_state import (
 )
 from torch_turbo.models.registry import get_parallel_plan
 
-_HF_BUFFER_NAME_MAP = {
+
+HF_BUFFER_NAME_MAP = {
     "base": {"router": "gate"},
     "kimi_k2": {"expert_bias": "e_score_correction_bias"}
 }
@@ -230,12 +231,12 @@ class DistParamLoader:
         return result
 
     def _hf_buffer_name_convert(self, name):
-        for turbo_name, hf_name in  _HF_BUFFER_NAME_MAP["base"].items():
+        for turbo_name, hf_name in  HF_BUFFER_NAME_MAP["base"].items():
             name = name.replace(turbo_name, hf_name)
 
         model_type = self.hf_config.model_type
-        if model_type in _HF_BUFFER_NAME_MAP.keys():
-            for turbo_name, hf_name in  _HF_BUFFER_NAME_MAP[model_type].items():
+        if model_type in HF_BUFFER_NAME_MAP.keys():
+            for turbo_name, hf_name in  HF_BUFFER_NAME_MAP[model_type].items():
                 name = name.replace(turbo_name, hf_name)
         return name
 

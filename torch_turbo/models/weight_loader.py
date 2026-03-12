@@ -21,7 +21,8 @@ from torch_turbo.models.registry import get_parallel_plan
 
 HF_BUFFER_NAME_MAP = {
     "base": {"router": "gate"},
-    "kimi_k2": {"expert_bias": "e_score_correction_bias"}
+    "kimi_k2": {"expert_bias": "e_score_correction_bias"},
+    "kimi_k25": {"expert_bias": "e_score_correction_bias"}
 }
 
 
@@ -43,6 +44,7 @@ class DistParamLoader:
         self.start_time = time.perf_counter()
         self.prev_time = self.start_time
         # build meta
+        self.layer_pattern = re.compile(r"(?:^|\.)model\.layers\.(\d+)(?:\.|$)")
         self.param_to_filename = self._load_index_json()
         self.param_to_rank, self.layer_to_rank = self._build_param_to_rank()
         self.local_sd = self._load_local_shards()
@@ -57,10 +59,8 @@ class DistParamLoader:
         return index["weight_map"]
 
     def _get_layer_id(self, param_name):
-        parts = param_name.split('.')
-        if len(parts) >= 3 and parts[0] == "model" and parts[1] == "layers":
-            return int(parts[2])
-        return None
+        m = self.layer_pattern.search(param_name)
+        return int(m.group(1)) if m else None
 
     def _sync_log_rank0(self, content, update_prev = True):
         torch.cuda.synchronize()

@@ -79,3 +79,18 @@ def register_buffer_for_kimi_k2(model, device):
             device=device,
             dtype=torch.get_default_dtype(),
         )
+
+def register_buffer_for_kimi_k25_vision(vision_tower, device):
+    from .kimi_k25.modeling_kimi_k25 import get_1d_sincos_pos_embed
+    pos_emb = vision_tower.patch_embed.pos_emb
+    pos_emb.time_weight = torch.from_numpy(
+        get_1d_sincos_pos_embed(pos_emb.dim, pos_emb.num_frames)).float().unsqueeze(1)
+
+    rope_2d = vision_tower.encoder.rope_2d
+    rope_2d.freqs_cis = rope_2d._precompute_freqs_cis(device)
+
+def register_buffer_for_kimi_k25(model, device):
+    # deal with vision tower
+    register_buffer_for_kimi_k25_vision(model.vision_tower, device)
+    # deal with language_model
+    register_buffer_for_kimi_k2(model.language_model, device)

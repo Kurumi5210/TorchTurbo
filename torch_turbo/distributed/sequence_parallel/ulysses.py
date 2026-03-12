@@ -10,8 +10,13 @@ from .utils import (
     repeat_kv,
     unpad_tensor,
     pad_tensor,
+    slice_input_tensor,
 )
-from torch_turbo.distributed.parallel_state import get_ulysses_sequence_parallel_group, get_ulysses_sequence_parallel_world_size
+from torch_turbo.distributed.parallel_state import (
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
+    get_ulysses_sequence_parallel_rank,
+)
 
 
 def all_to_all_tensor(
@@ -169,3 +174,78 @@ def ulysses_flash_attention_forward(
         attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2)
 
     return attn_output
+
+
+# copied from verl
+def patch_vlm_for_ulysses_input_slicing(model_class: type):
+    """
+    Applies a monkey patch to the forward method of a given model class
+    to enable Ulysses sequence parallelism input slicing.
+    """
+
+    def _create_ulysses_wrapped_decoder_forward(original_forward):
+        def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
+            inputs_embeds = kwargs.get("inputs_embeds")
+            position_ids = kwargs.get("position_ids")
+            visual_pos_masks = kwargs.get("visual_pos_masks")
+            deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
+            call_kwargs = kwargs.copy()
+
+            current_ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+
+            slice_now = (
+                inputs_embeds is not None
+                and current_ulysses_sp_size > 1
+                and getattr(self, "_needs_initial_slice", True)
+            )
+            if slice_now:
+                call_kwargs["inputs_embeds"] = slice_input_tensor(inputs_embeds, dim=1, padding=False)
+                call_kwargs["position_ids"] = slice_input_tensor(position_ids, dim=-1, padding=False)
+                # Also slice visual_pos_masks and deepstack_visual_embeds for Qwen3 VL models
+                if visual_pos_masks is not None:
+                    original_visual_mask = visual_pos_masks
+                    sliced_visual_mask = slice_input_tensor(visual_pos_masks, dim=1, padding=False)
+                    call_kwargs["visual_pos_masks"] = sliced_visual_mask
+
+                    if deepstack_visual_embeds is not None:
+                        sliced_embeds = []
+
+                        num_visual_before = original_visual_mask.sum().item()
+                        num_visual_in_shard = sliced_visual_mask.sum().item()
+
+                        if num_visual_in_shard > 0 and num_visual_before > 0:
+                            # Calculate which visual embeddings belong to this shard
+                            # We need to find the offset of visual tokens in this shard
+                            rank = get_ulysses_sequence_parallel_rank()
+                            seq_len = original_visual_mask.shape[1]
+                            local_seq_len = seq_len // current_ulysses_sp_size
+                            start_idx = rank * local_seq_len
+                            end_idx = start_idx + local_seq_len
+
+                            # Get total visual tokens before and up to the end of the shard's sequence slice
+                            # This correctly handles batches by summing across all samples
+                            visual_start = original_visual_mask[:, :start_idx].sum().item() if start_idx > 0 else 0
+                            visual_end = original_visual_mask[:, :end_idx].sum().item()
+
+                            # Slice each tensor in deepstack_visual_embeds
+                            for embed in deepstack_visual_embeds:
+                                sliced_embeds.append(embed[visual_start:visual_end])
+                        else:
+                            # No visual tokens in this shard, create empty tensors to maintain gradient flow
+                            for embed in deepstack_visual_embeds:
+                                sliced_embeds.append(embed[:0])
+                        call_kwargs["deepstack_visual_embeds"] = sliced_embeds
+
+                self._needs_initial_slice = False
+            try:
+                return original_forward(self, *args, **call_kwargs)
+            finally:
+                if slice_now:
+                    self._needs_initial_slice = True
+
+        return ulysses_wrapped_decoder_forward
+
+    original_forward = model_class.forward
+    wrapped_forward = _create_ulysses_wrapped_decoder_forward(original_forward)
+    model_class.forward = wrapped_forward
+    print(f"Monkey patch {model_class.__name__}.forward for Ulysses SP input slicing.")

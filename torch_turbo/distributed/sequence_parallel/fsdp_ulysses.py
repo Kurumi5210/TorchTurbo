@@ -30,6 +30,17 @@ class FSDPUlyssesShardingManager:
             set_ulysses_sequence_parallel_group(self.prev_sp_group)
             # TODO: check how to set seed for each model
 
+    def preprocess_input(self, batch):
+        if self.device_mesh is not None:
+            sp_group = self.device_mesh["sp"].get_group()
+            sp_size = torch.distributed.get_world_size(group=sp_group)
+            gathered_lists = [None] * sp_size
+            torch.distributed.all_gather_object(gathered_lists, batch, group=sp_group)
+
+            return gathered_lists
+
+        return [batch]
+
     def preprocess_data(self, data: Dict[str, torch.Tensor]):
         """
         AllGather data from sp region
@@ -110,7 +121,7 @@ class FSDPUlyssesShardingManager:
 
         return data
 
-    def preprocess_data_for_different_tensor_shape(self, data: list):
+    def preprocess_data_for_different_tensor_shape(self, data):
         if self.device_mesh is not None:
             sp_group = self.device_mesh["sp"].get_group()
             sp_size = torch.distributed.get_world_size(group=sp_group)

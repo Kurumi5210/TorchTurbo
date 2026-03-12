@@ -41,6 +41,7 @@ def match_module(fqn_pattern: str, fqn: str, prefix: str = None):
         fqn_pattern = [".".join([prefix, pattern]) for pattern in fqn_pattern]
 
     regex_str = re.escape(fqn_pattern).replace(r"\*", r".*")
+    regex_str = regex_str.replace(r"\\d", r"\d").replace(r"\+", r"+")
     regex_str = f"^{regex_str}$"
     regex = re.compile(regex_str)
 
@@ -48,15 +49,20 @@ def match_module(fqn_pattern: str, fqn: str, prefix: str = None):
 
     return match
 
+def find_parent_module(model: torch.nn.Module, target: torch.nn.Module):
+    for parent in model.modules():
+        for name, child in parent.named_children():
+            if child is target:
+                return parent, name
+    return None, None
 
-def get_sp_modules(model, apply_modules):
+def get_matched_modules(model, apply_modules):
     parallel_modules = []
     for target_name in apply_modules:
         for name, module in model.named_modules():
             if match_module(target_name, name):
                 parallel_modules.append(module)
     return parallel_modules
-
 
 def get_fully_shard_modules(model, apply_modules):
     shard_modules = dict()
@@ -72,7 +78,7 @@ def apply_sp(model, sp_plan):
     # bailing: attention
     module = sys.modules[model.__module__]
 
-    sp_modules = get_sp_modules(model, sp_plan.apply_modules)
+    sp_modules = get_matched_modules(model, sp_plan.apply_modules)
     print(f"apply sp modules: {sp_modules}")
     for module in sp_modules:
         if hasattr(module, "_flash_attention_forward"):
@@ -87,22 +93,29 @@ def apply_sp(model, sp_plan):
 
 def apply_ep(model, moe_config, ep_plan):
     # apply moe_layer
-    if hasattr(model.config, "first_k_dense_replace"):
-        moe_layer_idx = model.config.first_k_dense_replace
-    else:
-        moe_layer_idx = 0
-
-    for i, layer in enumerate(model.model.layers):
-        if i < moe_layer_idx:
+    ep_modules = get_matched_modules(model, ep_plan.apply_modules)
+    for module in ep_modules:
+        print(f'ep module: {module}')
+        if not hasattr(module, 'experts'):
             continue
-        
-        # initilize moe_layer
-        moe_layer = MoELayer(moe_config)
-        cur_module = layer.get_submodule(ep_plan.apply_modules[0])
-        if hasattr(cur_module, "shared_experts"):
-            moe_layer.shared_experts = cur_module.shared_experts
 
-        layer.register_module(ep_plan.apply_modules[0], moe_layer)
+        parent, name = find_parent_module(model, module)
+
+        moe_layer = MoELayer(moe_config)
+        if hasattr(module, "shared_experts"):
+            moe_layer.shared_experts = module.shared_experts
+
+        parent._modules[name] = moe_layer
+        print(f"Replace mlp in {parent}")
+
+def apply_fsdp_prefetch(model, config):
+    outer_cls = model.model.layers[0].__class__
+    if hasattr(config, "first_k_dense_replace"):
+       inter_cls = model.model.layers[model.config.first_k_dense_replace].mlp.experts.__class__
+    else:
+       inter_cls = model.model.layers[0].mlp.experts.__class__
+    outermost_cls = model.__class__
+    set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, config)
 
 
 def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):
@@ -112,23 +125,17 @@ def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):
         if shard_strategy == 'edp':
             print(f"apply_fsdp edp: {module}")
             fully_shard(module, mesh=get_edp_mesh(), **fsdp_kwargs)
-            setattr(module, "expert_forward_prefetch", True)
         elif shard_strategy == 'dp':
             print(f"apply_fsdp dp: {module}")
             fully_shard(module, mesh=get_world_mesh(), **fsdp_kwargs)
 
-    for layer in model.model.layers:
-        fully_shard(layer, mesh = get_world_mesh(), **fsdp_kwargs)
-        setattr(layer, "moe_forward_prefetch", True)
-
     fully_shard(model, mesh = get_world_mesh(), **fsdp_kwargs)
-    outer_cls = model.model.layers[0].__class__
-    if hasattr(model.config, "first_k_dense_replace"):
-        inter_cls = model.model.layers[model.config.first_k_dense_replace].mlp.experts.__class__
+
+    # Fixme: used to determine the model is vl
+    if hasattr(hf_config, 'vision_config'):
+        apply_fsdp_prefetch(model.language_model, hf_config.text_config)
     else:
-        inter_cls = model.model.layers[0].mlp.experts.__class__
-    outermost_cls = model.__class__
-    set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, hf_config)
+        apply_fsdp_prefetch(model, hf_config)
 
 
 def apply_parallel_model(
@@ -139,7 +146,7 @@ def apply_parallel_model(
     torch_dtype=torch.bfloat16
 ):
     # used for DEBUG
-    # hf_config.num_hidden_layers = 2
+    # hf_config.text_config.num_hidden_layers = 3
     
     # get parallel config
     parallel_plan = get_parallel_plan(hf_config)
@@ -161,7 +168,6 @@ def apply_parallel_model(
     apply_fsdp(model, hf_config, parallel_plan.fsdp_plan, fsdp_kwargs)
     # create empty tensor for model params on target device
     model.to_empty(device=device)
-    
     return model
 
 

@@ -308,8 +308,8 @@ def main(args):
 
 
 # command:
-#   export PYTHONPATH=/sfs_turbo/xiyun/rl/3d/opensource/MindSpeed:/sfs_turbo/xiyun/rl/new/test/tt/torchturbo:$PYTHONPATH
-#   python example/fsdp2/dummy_run_qwen3_ep_npu.py  --path /sfs_turbo/pretrained_models/Qwen3-30B-A3B
+#   export PYTHONPATH=/opt/MindSpeed:$PYTHONPATH
+#   python example/fsdp2/dummy_run_tt_model_ep.py --ep_size 8 --path /sfs_turbo/pretrained_models/Kimi_K25_bf16/
 if __name__ == "__main__":
     import argparse
 

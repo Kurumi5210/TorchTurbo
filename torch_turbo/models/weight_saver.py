@@ -34,6 +34,10 @@ class DistParamSaver:
         # Only rank 0 will save hf model and,
         # offload to cpu to save LLMs which may be too large to fit in one GPU
         full_sd = {}
+        if hasattr(self.model.config, "vision_config"):
+            config = self.model.config.text_config
+        else:
+            config = self.model.config
 
         for name, param in self.model.state_dict().items():
             if isinstance(param, DTensor):
@@ -46,16 +50,16 @@ class DistParamSaver:
                     num_experts = self.moe_config.num_moe_experts
                     full_tensor = all_gather_tensor_chunked(full_tensor, ep_name="ep", num_chunks=self.ep_size)
                     if "weight1" in name:
-                        experts = torch.split(full_tensor, self.model.config.hidden_size)
+                        experts = torch.split(full_tensor, config.hidden_size)
                         for i in range(num_experts):
                             gate_proj = f"{prefix}.{i}.gate_proj.weight"
                             up_proj = f"{prefix}.{i}.up_proj.weight"
-                            expert2 = torch.split(experts[i].t(), self.model.config.moe_intermediate_size)
+                            expert2 = torch.split(experts[i].t(), config.moe_intermediate_size)
                             full_sd[gate_proj] = expert2[0].cpu()
                             full_sd[up_proj] = expert2[1].cpu()
                     else:
                         # weight2
-                        experts = torch.split(full_tensor, self.model.config.moe_intermediate_size)
+                        experts = torch.split(full_tensor, config.moe_intermediate_size)
                         for i in range(num_experts):
                             down_proj = f"{prefix}.{i}.down_proj.weight"
                             full_sd[down_proj] = experts[i].t().cpu()
@@ -78,6 +82,11 @@ class DistParamSaver:
         # Only rank 0 will save hf model and,
         # offload to cpu to save LLMs which may be too large to fit in one GPU
         full_sd = {}
+        if hasattr(self.model.config, "vision_config"):
+            config = self.model.config.text_config
+        else:
+            config = self.model.config
+
 
         for name, param in self.model.named_parameters():
             if isinstance(param, DTensor):
@@ -92,16 +101,16 @@ class DistParamSaver:
                     num_local_experts = self.moe_config.num_moe_experts // self.ep_size
                         
                     if "fc1_linear" in name:
-                        experts = torch.split(full_tensor, self.model.config.moe_intermediate_size * 2)
+                        experts = torch.split(full_tensor, config.moe_intermediate_size * 2)
                         for i in range(self.ep_size):
                             expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
                             gate_proj = f"{prefix}.{expert_idx}.gate_proj.weight"
                             up_proj = f"{prefix}.{expert_idx}.up_proj.weight"
-                            expert2 = torch.split(experts[i], self.model.config.moe_intermediate_size)
+                            expert2 = torch.split(experts[i], config.moe_intermediate_size)
                             full_sd[gate_proj] = expert2[0].cpu()
                             full_sd[up_proj] = expert2[1].cpu()
                     elif "fc2_linear" in name:
-                        experts = torch.split(full_tensor, self.model.config.hidden_size)
+                        experts = torch.split(full_tensor, config.hidden_size)
                         for i in range(self.ep_size):
                             expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
                             down_proj = f"{prefix}.{expert_idx}.down_proj.weight"

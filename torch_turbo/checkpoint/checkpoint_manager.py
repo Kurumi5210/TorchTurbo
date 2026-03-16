@@ -143,11 +143,12 @@ class CheckpointingManager:
         lr_scheduler = extra.get("lr_scheduler", None)
         state_dict = dict()
         model_sd = model.state_dict()
+        world_mesh = get_world_mesh()
         # HACK: change device mesh to use dcp
         for name in list(model_sd.keys()):
             if "mlp.experts.weight" in name:
                 local_tensor = model_sd[name].to_local()
-                model_sd[name] = DTensor.from_local(local_tensor, device_mesh=WORLD_MESH, placements=[Shard(0)])
+                model_sd[name] = DTensor.from_local(local_tensor, device_mesh=world_mesh, placements=[Shard(0)])
         state_dict["model"] =  model_sd
         if not save_only_model:
             if optimizer is not None:

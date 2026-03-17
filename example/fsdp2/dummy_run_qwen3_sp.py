@@ -15,7 +15,6 @@ from torchturbo.torch_turbo.distributed.parallel_state import (
     get_expert_model_parallel_world_size
 )
 from torch_turbo.moe.moe_utils import MoeUtils, slice_tensor_for_ep_rank
-from torch_turbo.utils.fsdp2_backward_prefetch import fsdp2_backward_prefetch_manager
 from torch_turbo.utils.torch_utils import compare_tensors
 from torch_turbo.utils.device import get_device_name, get_device_id, get_nccl_backend, is_npu_available
 from torch_turbo.sequence_parallel.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -316,8 +315,7 @@ def train(args, model, dataloader, device, rank):
         output = model(**batch)
         output = output["logits"]
 
-        with fsdp2_backward_prefetch_manager:
-            output.sum().backward()
+        output.sum().backward()
 
         MoeUtils.scale_moe_gradient(moe_params)
         optimizer.step()

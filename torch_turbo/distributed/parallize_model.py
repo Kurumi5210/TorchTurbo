@@ -9,7 +9,7 @@ if torch_version() >= (2, 6, 0):
 else:
     from torch.distributed._composable.fsdp import fully_shard
 
-from torch_turbo.distributed.fsdp2.moe_fwd_bwd_prefetch import set_moe_forward_prefetch_for_fsdp2_ep
+from torch_turbo.distributed.fsdp2.moe_fwd_bwd_prefetch import setup_moe_prefetch
 from torch_turbo.distributed.moe.moe_layer import MoELayer
 from torch_turbo.distributed.moe.experts import GroupedMLP
 from torch_turbo.distributed.sequence_parallel.ulysses import ulysses_flash_attention_forward
@@ -109,13 +109,13 @@ def apply_ep(model, moe_config, ep_plan):
         print(f"Replace mlp in {parent}")
 
 def apply_fsdp_prefetch(model, config):
-    outer_cls = model.model.layers[0].__class__
+    layer_cls = model.model.layers[0].__class__
     if hasattr(config, "first_k_dense_replace"):
-       inter_cls = model.model.layers[model.config.first_k_dense_replace].mlp.experts.__class__
+       expert_cls = model.model.layers[config.first_k_dense_replace].mlp.experts.__class__
     else:
-       inter_cls = model.model.layers[0].mlp.experts.__class__
-    outermost_cls = model.__class__
-    set_moe_forward_prefetch_for_fsdp2_ep(model, outer_cls, inter_cls, outermost_cls, config)
+       expert_cls = model.model.layers[0].mlp.experts.__class__
+    model_cls = model.__class__
+    setup_moe_prefetch(model, layer_cls, expert_cls, model_cls, config)
 
 
 def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):

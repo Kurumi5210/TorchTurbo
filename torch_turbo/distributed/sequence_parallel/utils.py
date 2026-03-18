@@ -113,7 +113,7 @@ def ulysses_pad(
         assert position_ids_rmpad.size(-2) == 1
         assert input_ids_rmpad.size(-1) == position_ids_rmpad.size(-1), f"input_ids shape: {input_ids_rmpad.shape}, position_ids shape: {position_ids_rmpad.shape}"
     if sp_size <= 1:
-        return input_ids_rmpad, position_ids_rmpad, 0
+        return input_ids_rmpad, position_ids_rmpad, labels, 0
     _, total_seq_len = input_ids_rmpad.shape
     if sp_mode == "ulysses":
         pad_size = (sp_size - total_seq_len % sp_size) % sp_size

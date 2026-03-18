@@ -159,8 +159,7 @@ def apply_parallel_model(
         if parallel_state.sp_enabled():
             apply_sp(model, parallel_plan.sp_plan)
         # apply ep modules
-        if parallel_state.ep_enabled():
-            apply_ep(model, moe_config, parallel_plan.ep_plan)
+        apply_ep(model, moe_config, parallel_plan.ep_plan)
     
     model = model.to(dtype=torch_dtype)
 

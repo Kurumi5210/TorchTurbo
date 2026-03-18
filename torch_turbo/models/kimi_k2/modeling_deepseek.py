@@ -144,10 +144,7 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         if seq_len is not None and seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
+        return self.cos_cached.to(x.dtype), self.sin_cached.to(x.dtype)
 
 # Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->DeepseekV3
 class DeepseekV3LinearScalingRotaryEmbedding(DeepseekV3RotaryEmbedding):

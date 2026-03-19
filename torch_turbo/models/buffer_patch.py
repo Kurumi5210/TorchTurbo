@@ -57,37 +57,36 @@ def register_buffer_for_kimi_k2(model, device):
         attn_layer = layer.self_attn
         rotary_emb = attn_layer.rotary_emb
 
-        dim = rotary_emb.dim
-        base = rotary_emb.base
-        max_position_embeddings = rotary_emb.max_position_embeddings
-        
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2).float().to(device) / dim)
-        )
+        init_kwargs = {
+            'dim': rotary_emb.dim,
+            'max_position_embeddings': rotary_emb.max_position_embeddings,
+            'base': rotary_emb.base,
+            'device': device,
+        }
 
-        inv_freq = inv_freq.to(dtype=torch.bfloat16)
+        if hasattr(rotary_emb, 'scaling_factor'):
+            init_kwargs['scaling_factor'] = rotary_emb.scaling_factor
+        if hasattr(rotary_emb, 'original_max_position_embeddings'):
+            init_kwargs['original_max_position_embeddings'] = rotary_emb.original_max_position_embeddings
+        if hasattr(rotary_emb, 'beta_fast'):
+            init_kwargs['beta_fast'] = rotary_emb.beta_fast
+        if hasattr(rotary_emb, 'beta_slow'):
+            init_kwargs['beta_slow'] = rotary_emb.beta_slow
+        if hasattr(rotary_emb, 'mscale'):
+            init_kwargs['mscale'] = rotary_emb.mscale
+        if hasattr(rotary_emb, 'mscale_all_dim'):
+            init_kwargs['mscale_all_dim'] = rotary_emb.mscale_all_dim
 
-        rotary_emb.inv_freq = inv_freq
-        rotary_emb.register_buffer(
-            "inv_freq", 
-            rotary_emb.inv_freq, 
-            persistent=False
-        )
-
-        rotary_emb._set_cos_sin_cache(
-            seq_len=max_position_embeddings,
-            device=device,
-            dtype=torch.get_default_dtype(),
-        )
+        rotary_emb.__init__(**init_kwargs)
 
 def register_buffer_for_kimi_k25_vision(vision_tower, device):
     from .kimi_k25.modeling_kimi_k25 import get_1d_sincos_pos_embed
     pos_emb = vision_tower.patch_embed.pos_emb
-    pos_emb.time_weight = torch.from_numpy(
-        get_1d_sincos_pos_embed(pos_emb.dim, pos_emb.num_frames)).float().unsqueeze(1)
+    time_weight = torch.from_numpy(
+        get_1d_sincos_pos_embed(pos_emb.dim, pos_emb.num_frames)
+    ).float().unsqueeze(1)
+    pos_emb.register_buffer('time_weight', time_weight, persistent=False)
 
-    rope_2d = vision_tower.encoder.rope_2d
-    rope_2d.freqs_cis = rope_2d._precompute_freqs_cis(device)
 
 def register_buffer_for_kimi_k25(model, device):
     # deal with vision tower

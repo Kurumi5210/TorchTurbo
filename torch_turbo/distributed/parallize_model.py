@@ -79,15 +79,12 @@ def apply_sp(model, sp_plan):
     module = sys.modules[model.__module__]
 
     sp_modules = get_matched_modules(model, sp_plan.apply_modules)
-    print(f"apply sp modules: {sp_modules}")
     for module in sp_modules:
         if hasattr(module, "_flash_attention_forward"):
             module._flash_attention_forward = ulysses_flash_attention_forward
-            print(f"Monkey patched ulysses_flash_attention_forward in {module}!")
         else:
             from transformers.integrations import flash_attention
             flash_attention._flash_attention_forward = ulysses_flash_attention_forward
-            print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
             break
 
 
@@ -95,7 +92,6 @@ def apply_ep(model, moe_config, ep_plan):
     # apply moe_layer
     ep_modules = get_matched_modules(model, ep_plan.apply_modules)
     for module in ep_modules:
-        print(f'ep module: {module}')
         if not hasattr(module, 'experts'):
             continue
 
@@ -106,7 +102,6 @@ def apply_ep(model, moe_config, ep_plan):
             moe_layer.shared_experts = module.shared_experts
 
         parent._modules[name] = moe_layer
-        print(f"Replace mlp in {parent}")
 
 def apply_fsdp_prefetch(model, config):
     layer_cls = model.model.layers[0].__class__
@@ -120,13 +115,10 @@ def apply_fsdp_prefetch(model, config):
 
 def apply_fsdp(model, hf_config, fsdp_config, fsdp_kwargs):
     fsdp_plan = get_fully_shard_modules(model, fsdp_config.apply_modules)
-    print(f"apply fsdp sharding plan: {fsdp_plan}")
     for module, shard_strategy in fsdp_plan.items():
         if shard_strategy == 'edp':
-            print(f"apply_fsdp edp: {module}")
             fully_shard(module, mesh=get_edp_mesh(), **fsdp_kwargs)
         elif shard_strategy == 'dp':
-            print(f"apply_fsdp dp: {module}")
             fully_shard(module, mesh=get_world_mesh(), **fsdp_kwargs)
 
     fully_shard(model, mesh = get_world_mesh(), **fsdp_kwargs)

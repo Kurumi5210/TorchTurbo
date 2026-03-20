@@ -77,7 +77,7 @@ class DistParamSaver:
         else:
             config = self.model.config
 
-        for name, param in self.model.state_dict().items():
+        for name, param in self.model.named_parameters():
             if isinstance(param, DTensor):
                 full_tensor = param.full_tensor()
             else:
@@ -113,8 +113,19 @@ class DistParamSaver:
             else:
                 if name in local_params:
                     full_sd[name] = full_tensor.cpu()
-                else:
-                    del full_tensor
+
+        # Handle buffers
+        for name, buf in self.model.named_buffers():
+            if self.model_type in HF_BUFFER_NAME_MAP.keys():
+                if "mlp.router" in name and "expert_bias" in name:
+                    new_name = name.replace("router", "gate")
+                    new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
+                    name = new_name
+                    if name in local_params:
+                        if isinstance(buf, DTensor):
+                            full_sd[name] = buf.full_tensor().cpu()
+                        else:
+                            full_sd[name] = buf.cpu()
 
         return full_sd
 
@@ -163,8 +174,19 @@ class DistParamSaver:
             else:
                 if name in local_params:
                     full_sd[name] = full_tensor.cpu()
-                else:
-                    del full_tensor
+
+        # Handle buffers
+        for name, buf in self.model.named_buffers():
+            if self.model_type in HF_BUFFER_NAME_MAP.keys():
+                if "mlp.router" in name and "expert_bias" in name:
+                    new_name = name.replace("router", "gate")
+                    new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
+                    name = new_name
+                    if name in local_params:
+                        if isinstance(buf, DTensor):
+                            full_sd[name] = buf.full_tensor().cpu()
+                        else:
+                            full_sd[name] = buf.cpu()
 
         return full_sd
 

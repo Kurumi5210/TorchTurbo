@@ -2,6 +2,8 @@ import json
 import re
 import shutil
 from pathlib import Path
+import psutil
+import gc
 
 import torch
 import torch.distributed as dist
@@ -77,7 +79,20 @@ class DistParamSaver:
         else:
             config = self.model.config
 
+        cleanup_freq = 50
+        param_count = 0
+
+        def _gc_cleanup():
+            gc.collect()
+            gpu_mem = self._get_gpu_memory_usage_percent()
+            cpu_mem = self._get_cpu_memory_usage_percent()
+            if torch.distributed.get_rank() == 0:
+                print(f"⚠️  Memory alert - GPU: {gpu_mem:.1f}%, CPU: {cpu_mem:.1f}%")
+
         for name, param in self.model.named_parameters():
+            param_count += 1
+            if torch.distributed.get_rank() == 0:
+                print(f"[saving] param_name: {name}")
             if isinstance(param, DTensor):
                 full_tensor = param.full_tensor()
             else:
@@ -97,6 +112,7 @@ class DistParamSaver:
                             full_sd[gate_proj] = expert2[0].cpu()
                         if up_proj in local_params:
                             full_sd[up_proj] = expert2[1].cpu()
+                        del expert2
                 else:
                     # weight2
                     experts = torch.split(full_tensor, config.moe_intermediate_size)
@@ -104,18 +120,26 @@ class DistParamSaver:
                         down_proj = f"{prefix}.{i}.down_proj.weight"
                         if down_proj in local_params:
                             full_sd[down_proj] = experts[i].t().cpu()
+                del full_tensor, experts
             elif "mlp.router" in name:
                 new_name = name.replace("router", "gate")
                 if self.model_type in HF_BUFFER_NAME_MAP.keys():
                     new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
                 if new_name in local_params:
                     full_sd[new_name] = full_tensor.cpu()
+                del full_tensor
             else:
                 if name in local_params:
                     full_sd[name] = full_tensor.cpu()
+                del full_tensor
+            if param_count % cleanup_freq == 0:
+                _gc_cleanup()
 
         # Handle buffers
         for name, buf in self.model.named_buffers():
+            param_count += 1
+            if torch.distributed.get_rank() == 0:
+                print(f"[saving] buf_name: {name}")
             if self.model_type in HF_BUFFER_NAME_MAP.keys():
                 if "mlp.router" in name and "expert_bias" in name:
                     new_name = name.replace("router", "gate")
@@ -126,8 +150,22 @@ class DistParamSaver:
                             full_sd[name] = buf.full_tensor().cpu()
                         else:
                             full_sd[name] = buf.cpu()
+            del buf
+            if param_count % cleanup_freq == 0:
+                _gc_cleanup()
 
         return full_sd
+
+    def _get_gpu_memory_usage_percent(self):
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            if reserved > 0:
+                return (allocated / reserved) * 100
+        return 0.0
+
+    def _get_cpu_memory_usage_percent(self):
+        return psutil.virtual_memory().percent
 
     def _get_te_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save (TE version)."""
@@ -190,11 +228,14 @@ class DistParamSaver:
 
         return full_sd
 
-    def save_model(self, save_path):
+    def save_model(self, save_path, use_hf_format: bool = True):
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
         save_path = Path(save_path)
+        if use_hf_format:
+            save_path = save_path / "huggingface"
+
         if rank == 0:
             save_path.mkdir(parents=True, exist_ok=True)
 

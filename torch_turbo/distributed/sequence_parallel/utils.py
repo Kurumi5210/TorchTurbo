@@ -33,8 +33,15 @@ def pad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
     return torch.cat([x, pad], dim=dim)
 
 
-def create_causal_mask(config, input_embeds, attention_mask, cache_position, past_key_values, position_ids):
-    # do not split attention mask into chunks under ulyssess sequence parallel's condition
+def create_causal_mask(*args, **kwargs):
+    attention_mask = kwargs.get("attention_mask", None)
+
+    return attention_mask
+
+
+def create_sliding_window_causal_mask(*args, **kwargs):
+    attention_mask = kwargs.get("attention_mask", None)
+
     return attention_mask
 
 

@@ -7,7 +7,8 @@ from .buffer_patch import (
     register_buffer_for_bailing_v2,
     register_buffer_for_bailing_v2_5,
     register_buffer_for_kimi_k2,
-    register_buffer_for_kimi_k25
+    register_buffer_for_kimi_k25,
+    register_buffer_for_olmo3,
 )
 from torch_turbo.distributed.parallel_plan import ParallelPlan
 
@@ -18,6 +19,7 @@ _SUPPORT_MODELS = {
     "bailing_moe_linear": "bailing_moe_v2_5",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
+    "olmo3": "olmo3",
 }
 
 
@@ -26,7 +28,8 @@ _BUFFER_REGISTRY = {
     "bailing_moe": register_buffer_for_bailing_v2,
     "bailing_moe_linear": register_buffer_for_bailing_v2_5,
     "kimi_k2": register_buffer_for_kimi_k2,
-    "kimi_k25": register_buffer_for_kimi_k25
+    "kimi_k25": register_buffer_for_kimi_k25,
+    "olmo3": register_buffer_for_olmo3,
 }
 
 
@@ -35,8 +38,8 @@ class Registry(MutableMapping):
         self._model_mapping = dict()
 
     def __getitem__(self, key):
-        return self._model_mapping[key]
-    
+        return self._model_mapping.get(key)
+
     def __setitem__(self, key, value):
         self._model_mapping[key] = value
 
@@ -48,7 +51,7 @@ class Registry(MutableMapping):
 
     def __len__(self):
         return len(self._model_mapping)
-    
+
     def valid_keys(self) -> List[str]:
         return list(self.keys())
         
@@ -85,17 +88,23 @@ def get_model_cls(hf_config):
 
 def get_parallel_plan(hf_config):
     model_type = hf_config.model_type
-    
+
     module_name = _SUPPORT_MODELS[model_type]
     importlib.import_module(f'torch_turbo.models.{module_name}')
 
-    moe_config = MOE_CONFIG_REGISTRY[model_type](hf_config)
-    print(f"Loaded model's MoeConfig: {moe_config}")
-    
+    moe_config_builder = MOE_CONFIG_REGISTRY[model_type]
+    if moe_config_builder is not None:
+        moe_config = moe_config_builder(hf_config)
+        print(f"Loaded model's MoeConfig: {moe_config}")
+    else:
+        # for dense model
+        moe_config = None
+        print(f"Model type '{model_type}' has no MOE config (dense model)")
+
     sp_plan, ep_plan, fsdp_plan = PARALLEL_PLAN_REGISTRY[model_type]()
     parallel_plan = ParallelPlan(moe_config, sp_plan, ep_plan, fsdp_plan)
-    print(f"Loaded model's ParallelPlan: {moe_config}")
-    
+    print(f"Loaded model's ParallelPlan: {parallel_plan}")
+
     return parallel_plan
 
 

@@ -13,6 +13,16 @@ def _fix_rope_config_for_bailing(config):
         config.partial_rotary_factor = partial_rotary_factor
 
 
+def register_buffer_for_olmo3(model, device):
+    print("Register buffer for Olmo3...")
+    # patch to rotary_emb
+    rotary_emb = model.model.rotary_embs
+    inv_freq, _ = rotary_emb.sliding_attention.rope_init_fn(model.config, device)
+    rotary_emb.sliding_attention.register_buffer("inv_freq", inv_freq, persistent=False)
+    inv_freq, _ = rotary_emb.full_attention.rope_init_fn(model.config, device)
+    rotary_emb.full_attention.register_buffer("inv_freq", inv_freq, persistent=False)
+
+
 def register_buffer_for_qwen3_moe(model, device):
     print("Register buffer for Qwen3MoE...")
     # patch to rotary_emb

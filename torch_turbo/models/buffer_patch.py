@@ -23,6 +23,14 @@ def register_buffer_for_olmo3(model, device):
     rotary_emb.full_attention.register_buffer("inv_freq", inv_freq, persistent=False)
 
 
+def register_buffer_for_qwen3(model, device):
+    print("Register buffer for Qwen3...")
+    # patch to rotary_emb
+    rotary_emb = model.model.rotary_emb
+    inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
+    rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)
+
+
 def register_buffer_for_qwen3_moe(model, device):
     print("Register buffer for Qwen3MoE...")
     # patch to rotary_emb

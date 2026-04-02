@@ -34,6 +34,53 @@ def get_seqlens_in_batch(attention_mask: "torch.Tensor") -> "torch.Tensor":
     seqlens = counts[counts.nonzero().squeeze(dim=-1)]
     return seqlens
 
+def packing_mask_to_causal_mask(attention_mask: "torch.Tensor") -> "torch.Tensor":
+    r"""Convert packing attention mask to causal attention mask.
+
+    Args:
+        attention_mask: (batch, seqlen), packing mode where values 1, 2, 3... indicate
+                        different sequences within each batch, and 0 indicates padding.
+
+    Returns:
+        causal_mask: (total_len, total_len) where total_len is the total number of
+                     non-padding tokens. Each sequence block is a lower triangular matrix.
+
+    e.g.
+    ```python
+    # input (batch=2, seqlen=6)
+    [
+        [1, 1, 2, 2, 2, 0],
+        [1, 2, 2, 3, 3, 3],
+    ]
+    # sequences: [seq1(len=2), seq2(len=3), seq3(len=1), seq4(len=2), seq5(len=3)]
+    # total_len = 2 + 3 + 1 + 2 + 3 = 11
+    # output shape: (11, 11)
+    # Each sequence block is a lower triangular matrix:
+    # seq1: positions 0-1, can see 0-1 within seq1
+    # seq2: positions 2-4, can see 2-4 within seq2
+    # etc.
+    ```
+    """
+    assert attention_mask.size(0) == 1, "packing mode only support bs==1"
+    seqlens = get_seqlens_in_batch(attention_mask)  # (num_sequences,)
+    total_len = seqlens.sum().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))  # (num_sequences + 1,)
+
+    # Create causal mask: each sequence block is lower triangular
+    causal_mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=attention_mask.device)
+
+    for i in range(len(seqlens)):
+        start = cu_seqlens[i].item()
+        end = cu_seqlens[i + 1].item()
+        seq_len = end - start
+        # Lower triangular matrix for this sequence
+        causal_mask[start:end, start:end] = torch.tril(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=attention_mask.device)
+        )
+
+    return causal_mask
+
+
 # packing attention mask copied from llamma-factory
 def get_unpad_data_lf(attention_mask: "torch.Tensor") -> tuple["torch.Tensor", "torch.Tensor", int]:
     r"""Prepare the indices and seqlens for flash attn varlen function.

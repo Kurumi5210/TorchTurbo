@@ -164,6 +164,8 @@ def ulysses_pad_and_slice_inputs(
         torch.Tensor: padded and sliced position_ids
         int: pad size
     """
+    if sp_size == 1:
+        return input_ids_rmpad, position_ids_rmpad, labels, 0
     input_ids_rmpad, position_ids_rmpad, labels, pad_size = ulysses_pad(
         input_ids_rmpad, position_ids_rmpad, labels, sp_size, sp_mode=sp_mode, pad_value=pad_value)
     input_ids_rmpad = slice_input_tensor(input_ids_rmpad, dim=1, padding=False, sp_mode=sp_mode)

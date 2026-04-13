@@ -22,7 +22,8 @@ from torch_turbo.models.registry import get_parallel_plan
 HF_BUFFER_NAME_MAP = {
     "base": {"router": "gate"},
     "kimi_k2": {"expert_bias": "e_score_correction_bias"},
-    "kimi_k25": {"expert_bias": "e_score_correction_bias"}
+    "kimi_k25": {"expert_bias": "e_score_correction_bias"},
+    "glm_moe_dsa": {"expert_bias": "e_score_correction_bias"},
 }
 
 

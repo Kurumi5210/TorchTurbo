@@ -120,7 +120,7 @@ def create_packing_attention_mask(batch_size, seq_lengths, device='cpu'):
     return attention_mask
 
 
-def run_dsa_attn_forward(module, hidden_states, position_embeddings, attention_mask, skip_indexer=False):
+def run_dsa_attn_forward(module, hidden_states, position_embeddings, attention_mask):
     """Run the naive dsa_attn_forward implementation."""
     with torch.no_grad():
         seed_all()
@@ -132,12 +132,11 @@ def run_dsa_attn_forward(module, hidden_states, position_embeddings, attention_m
             past_key_value=None,
             use_cache=False,
             output_attentions=False,
-            skip_indexer=skip_indexer
         )
     return output
 
 
-def run_npu_fused_dsa_attn_forward(module, hidden_states, position_embeddings, attention_mask, skip_indexer=False):
+def run_npu_fused_dsa_attn_forward(module, hidden_states, position_embeddings, attention_mask):
     """Run the NPU optimized npu_fused_dsa_attn_forward implementation."""
     with torch.no_grad():
         seed_all()
@@ -150,8 +149,6 @@ def run_npu_fused_dsa_attn_forward(module, hidden_states, position_embeddings, a
             use_cache=False,
             output_attentions=False,
             indexer_loss_coeff=1.0,
-            use_fused_loss=True,  # Enable fused loss for equivalence test
-            skip_indexer=skip_indexer
         )
     return output
 
@@ -219,15 +216,6 @@ def test_single_sequence(device='cpu', seq_len=2048):
     position_embeddings = (cos, sin)
 
     attention_mask = create_packing_attention_mask(batch_size, [seq_len], device)
-
-    print("\n" + "="*60)
-    print(f"Compare mla vs. mla_absorb (skip_indexer=True)")
-    print("="*60)
-
-    output_torch = run_dsa_attn_forward(module, hidden_states, position_embeddings, attention_mask, True)
-    output_npu = run_npu_fused_dsa_attn_forward(module, hidden_states, position_embeddings, attention_mask, True)
-
-    compare_outputs(output_torch, output_npu, "single_sequence mla vs. mla_absorb")
 
     print("\n" + "="*60)
     print(f"Compare mla vs. mla_absorb_sparse_attn (with indexer)")
@@ -325,16 +313,13 @@ def test_indexer_equivalence(device='cpu', seq_lengths=[2048, 2048]):
 def test_backward_equivalence(device='cpu', seq_len=2048):
     """Test backward pass equivalence between dsa_attn_forward and npu_fused_dsa_attn_forward.
 
-    This tests gradient computation for the main attention path (excluding indexer)
-    by using skip_indexer=True.
-
     Compares:
     - Gradient of hidden_states
     - Gradients of attention parameters (q_proj, kv_a_proj, kv_b_proj, o_proj, etc.)
     - Excludes indexer parameters since backward implementations differ
     """
     print("\n" + "="*60)
-    print(f"Test: Backward Equivalence (seq_len={seq_len}, skip_indexer=True)")
+    print(f"Test: Backward Equivalence (seq_len={seq_len})")
     print("="*60)
 
     # Create two identical models

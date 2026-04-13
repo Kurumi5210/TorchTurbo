@@ -102,6 +102,7 @@ def load_config_from_path(path: str, config_class):
         print(f"Loading config from {config_path}")
         with open(config_path) as f:
             config_dict = json.load(f)
+        config_dict['num_hidden_layers'] = 4
         config = config_class(**config_dict)
     else:
         print("Using default config (smaller model for demo)")
@@ -111,7 +112,7 @@ def load_config_from_path(path: str, config_class):
             hidden_size=2048,
             intermediate_size=4096,
             moe_intermediate_size=1024,
-            num_hidden_layers=8,
+            num_hidden_layers=4,
             num_attention_heads=16,
             num_key_value_heads=16,
             n_shared_experts=1,
@@ -119,14 +120,13 @@ def load_config_from_path(path: str, config_class):
             routed_scaling_factor=2.5,
             num_experts_per_tok=2,
         )
-    config.num_hidden_layers = 4
     return config
 
 
 def create_model_on_meta_device(config, model_class):
     """Create model on meta device for efficient memory usage."""
     print("Creating model on meta device...")
-    with torch.device("meta"):
+    with torch.device("cpu"):
         model = model_class(config)
     print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters:\n{model}")
     return model

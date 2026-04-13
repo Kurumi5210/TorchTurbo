@@ -10,6 +10,7 @@ from .buffer_patch import (
     register_buffer_for_kimi_k25,
     register_buffer_for_olmo3,
     register_buffer_for_qwen3,
+    register_buffer_for_glm5
 )
 from torch_turbo.distributed.parallel_plan import ParallelPlan
 
@@ -22,6 +23,7 @@ _SUPPORT_MODELS = {
     "kimi_k25": "kimi_k25",
     "olmo3": "olmo3",
     "qwen3": "qwen3",
+    "glm_moe_dsa": "glm_moe_dsa",
 }
 
 
@@ -33,6 +35,7 @@ _BUFFER_REGISTRY = {
     "kimi_k25": register_buffer_for_kimi_k25,
     "olmo3": register_buffer_for_olmo3,
     "qwen3":register_buffer_for_qwen3,
+    "glm_moe_dsa": register_buffer_for_glm5,
 }
 
 

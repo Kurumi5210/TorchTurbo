@@ -153,46 +153,6 @@ class TestDsaAttentionEquivalence:
 
         return hidden_states, position_embeddings, attention_mask
 
-    def test_mla_vs_mla_absorb_single_sequence(self, model, device, seed):
-        """Test MLA naive vs MLA absorb with single sequence.
-
-        Note: seq_len should be >= index_topk (2048) for valid sparse attention.
-        """
-        torch.manual_seed(seed)
-        seed_all()
-
-        seq_len = 2048  # Must be >= index_topk (2048)
-        hidden_states, position_embeddings, attention_mask = self._create_inputs(
-            model, seq_len, device
-        )
-
-        # Run both implementations
-        output_naive, _, _ = dsa_attn_forward(
-            model,
-            hidden_states,
-            position_embeddings,
-            attention_mask,
-            skip_indexer=True,  # Skip indexer for pure MLA comparison
-        )
-
-        output_absorb, _, _ = npu_fused_dsa_attn_forward(
-            model,
-            hidden_states,
-            position_embeddings,
-            attention_mask,
-            indexer_loss_coeff=1.0,
-            use_fused_loss=False,
-            skip_indexer=True,  # Skip indexer for pure MLA absorb comparison
-        )
-
-        # Compare outputs
-        assert output_naive.shape == output_absorb.shape, \
-            f"Shape mismatch: naive={output_naive.shape}, absorb={output_absorb.shape}"
-
-        # Allow some numerical tolerance
-        assert torch.allclose(output_naive, output_absorb, rtol=1e-2, atol=1e-2), \
-            f"Output mismatch: max diff={(output_naive - output_absorb).abs().max()}"
-
     def test_mla_vs_mla_absorb_with_indexer(self, model, device, seed):
         """Test MLA naive vs MLA absorb with indexer.
 
@@ -212,7 +172,6 @@ class TestDsaAttentionEquivalence:
             hidden_states,
             position_embeddings,
             attention_mask,
-            skip_indexer=False,  # Enable indexer
         )
 
         output_absorb, _, _ = npu_fused_dsa_attn_forward(
@@ -221,8 +180,6 @@ class TestDsaAttentionEquivalence:
             position_embeddings,
             attention_mask,
             indexer_loss_coeff=1.0,
-            use_fused_loss=True,
-            skip_indexer=False,  # Enable indexer
         )
 
         # Compare outputs
@@ -288,7 +245,6 @@ class TestPackingMode:
             hidden_states,
             position_embeddings,
             attention_mask,
-            skip_indexer=False,
         )
 
         output_absorb, _, _  = npu_fused_dsa_attn_forward(
@@ -297,8 +253,6 @@ class TestPackingMode:
             position_embeddings,
             attention_mask,
             indexer_loss_coeff=1.0,
-            use_fused_loss=True,
-            skip_indexer=False,
         )
 
         assert torch.allclose(output_naive, output_absorb, rtol=1e-2, atol=1e-2), \
@@ -332,7 +286,6 @@ class TestPackingMode:
             hidden_states,
             position_embeddings,
             attention_mask,
-            skip_indexer=False,
         )
 
         output_absorb, _, _  = npu_fused_dsa_attn_forward(
@@ -341,8 +294,6 @@ class TestPackingMode:
             position_embeddings,
             attention_mask,
             indexer_loss_coeff=1.0,
-            use_fused_loss=True,
-            skip_indexer=False,
         )
 
         assert torch.allclose(output_naive, output_absorb, rtol=1e-2, atol=1e-2), \
@@ -365,7 +316,6 @@ class TestPackingMode:
         """Test packing mode with various configurations.
 
         Note: All tests use NPU-compatible config: num_heads=64, index_topk=2048.
-        skip_indexer=True to avoid kl_loss constraints.
         """
         config = create_test_config()  # NPU-compatible: num_heads=64, index_topk=2048
         model = GlmMoeDsaAttention(config, layer_idx=0).to(device)
@@ -388,14 +338,13 @@ class TestPackingMode:
 
         attention_mask = create_packing_attention_mask(batch_size, seq_lengths, device)
 
-        # Run both implementations with skip_indexer=True to avoid kl_loss constraints
+        # Run both implementations
         seed_all()
         output_naive, _, _  = dsa_attn_forward(
             model,
             hidden_states,
             position_embeddings,
             attention_mask,
-            skip_indexer=False,
         )
 
         seed_all()
@@ -405,8 +354,6 @@ class TestPackingMode:
             position_embeddings,
             attention_mask,
             indexer_loss_coeff=1.0,
-            use_fused_loss=True,
-            skip_indexer=False,
         )
 
         # Check shape
@@ -515,9 +462,6 @@ class TestIndexerEquivalence:
 class TestBackwardEquivalence:
     """Test backward pass equivalence between dsa_attn_forward and npu_fused_dsa_attn_forward.
 
-    This tests gradient computation for the main attention path (excluding indexer)
-    by using skip_indexer=True.
-
     Compares:
     - Gradient of hidden_states
     - Gradients of attention parameters (q_proj, kv_a_proj, kv_b_proj, o_proj, etc.)
@@ -571,7 +515,6 @@ class TestBackwardEquivalence:
         seed_all()
         output_torch, _, _ = dsa_attn_forward(
             model_torch, hidden_torch, position_embeddings, attention_mask,
-            skip_indexer=False,
         )
 
         loss_target = torch.randn_like(output_torch)
@@ -582,7 +525,7 @@ class TestBackwardEquivalence:
         seed_all()
         output_npu, _, _ = npu_fused_dsa_attn_forward(
             model_npu, hidden_npu, position_embeddings, attention_mask,
-            skip_indexer=False, indexer_loss_coeff=0.0, use_fused_loss=True,
+            indexer_loss_coeff=0.0,
         )
 
         loss_npu = ((output_npu - loss_target) ** 2).mean()
@@ -612,7 +555,6 @@ class TestBackwardEquivalence:
         seed_all()
         output_torch, _, _ = dsa_attn_forward(
             model_torch, hidden_torch, position_embeddings, attention_mask,
-            skip_indexer=False,
         )
 
         loss_target = torch.randn_like(output_torch)
@@ -623,7 +565,7 @@ class TestBackwardEquivalence:
         seed_all()
         output_npu, _, _ = npu_fused_dsa_attn_forward(
             model_npu, hidden_npu, position_embeddings, attention_mask,
-            skip_indexer=False, indexer_loss_coeff=0.0, use_fused_loss=True,
+            indexer_loss_coeff=0.0,
         )
 
         loss_npu = ((output_npu - loss_target) ** 2).mean()

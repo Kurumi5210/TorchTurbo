@@ -108,9 +108,10 @@ def apply_ep(model, moe_config, ep_plan):
 
 def apply_fsdp_prefetch(model, config):
     # Skip MoE prefetch setup for dense models without experts
-    if not hasattr(model.model.layers[0].mlp, 'experts'):
-        print(f"Model {config.model_type} is dense (no experts), skipping MoE prefetch setup")
-        return
+    for layer in model.model.layers:
+        if hasattr(layer, 'experts'):
+            print(f"Model {config.model_type} is dense (no experts), skipping MoE prefetch setup")
+            return
 
     layer_cls = model.model.layers[0].__class__
     if hasattr(config, "first_k_dense_replace"):

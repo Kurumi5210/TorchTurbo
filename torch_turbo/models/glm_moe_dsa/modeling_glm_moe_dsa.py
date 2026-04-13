@@ -495,16 +495,20 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             module.e_score_correction_bias.zero_()
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, GlmMoeDsaModel):
-            module.gradient_checkpointing = value
+    # WARNING: the following code is old stype of gradient checkpoint which should not use
+    # def _set_gradient_checkpointing(self, module, value=False):
+    #     if isinstance(module, GlmMoeDsaModel):
+    #         module.gradient_checkpointing = value
 
 
 class GlmMoeDsaRotaryEmbedding(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig, device=None):
         super().__init__()
         self.config = config
+        self.attention_scaling = 1.0
 
+    def _precompute_inv_freq(self, device):
+        config = self.config
         rope_theta = config.rope_parameters["rope_theta"]
         partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 1.0)
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
@@ -513,12 +517,14 @@ class GlmMoeDsaRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
         )
-
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.attention_scaling = 1.0
+        return inv_freq
 
     @torch.no_grad()
     def forward(self, x, position_ids):
+        if not hasattr(self, 'inv_freq'):
+            self.register_buffer('inv_freq',
+                                 self._precompute_inv_freq(x.device),
+                                 persistent=False)
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -630,17 +636,18 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
             if self.gradient_checkpointing and self.training:
                 use_cache = False
+                past_key_value = None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
-                    attention_mask=attention_mask,
-                    position_embeddings=position_embeddings,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
+                    attention_mask,
+                    position_ids,
+                    past_key_value,
+                    use_cache,
+                    output_attentions,
+                    position_embeddings,
                 )
             else:
                 layer_outputs = decoder_layer(

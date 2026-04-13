@@ -111,3 +111,6 @@ def register_buffer_for_kimi_k25(model, device):
     register_buffer_for_kimi_k25_vision(model.vision_tower, device)
     # deal with language_model
     register_buffer_for_kimi_k2(model.language_model, device)
+
+def register_buffer_for_glm5(model, device):
+    pass

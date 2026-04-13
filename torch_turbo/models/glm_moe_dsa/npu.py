@@ -1,25 +1,38 @@
+import functools
 from typing import Optional, Tuple
 
 from contextlib import nullcontext
 
 import torch
 from torch import nn
-from torch import Tensor
 import torch.nn.functional as F
-import torch.distributed as dist
 
 import torch_npu
+from torch_turbo.utils.functools import cache
 
 from .modeling_glm_moe_dsa import apply_rotary_pos_emb, eager_attention_forward
 from torch_turbo.utils.flash_attn_utils import packing_mask_to_causal_mask, get_seqlens_in_batch
-
+from torch_turbo.distributed.sequence_parallel.ulysses import (
+    gather_seq_scatter_heads,
+    gather_heads_scatter_seq,
+    all_gather_sp,
+)
+from torch_turbo.distributed.parallel_state import (
+    get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
+    get_ulysses_sequence_parallel_rank,
+)
 
 # ============================================================================
-# MLA Absorb Mode - DSA Indexer Loss AutoScaler
+# DSA Indexer Loss AutoScaler
 # ============================================================================
-
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
-    """An AutoScaler that triggers the backward pass and scales the grad for DSA indexer loss."""
+    """An AutoScaler that triggers the backward pass and scales the grad for DSA indexer loss.
+
+    This is used to apply a gradient scale to the DSA indexer loss during training.
+    The scale is shared via the class attribute `main_loss_backward_scale` which is
+    typically set to match the main training loss scale.
+    """
 
     main_loss_backward_scale: torch.Tensor = None
 
@@ -48,19 +61,16 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
 
 
 # ============================================================================
-# MLA Absorb Mode - Fused Lightning Indexer KL Loss
+# Fused Lightning Indexer KL Loss
 # ============================================================================
-
 class LILossTrain(torch.autograd.Function):
     """
     A custom autograd function that computes kl loss in sparse lightning indexer.
-
     This interface implements the backward functionality of npu_lightning_indexer and integrates the loss computation.
     The npu_lightning_indexer selects the top-k pairs between queries and keys in attention that exhibit the strongest
     intrinsic correlations, storing them in sparse_indices. This reduces the computational cost of attention in
     long-sequence scenarios and improves training performance.
     """
-
     @staticmethod
     def forward(
             ctx,
@@ -97,7 +107,6 @@ class LILossTrain(torch.autograd.Function):
             layout=layout,
             sparse_mode=sparse_mode,
         )
-
         ctx.save_for_backward(d_query_index, d_key_index, d_weights)
         return loss[0]
 
@@ -109,7 +118,6 @@ class LILossTrain(torch.autograd.Function):
             d_query_index = d_query_index * grad_scale
             d_key_index = d_key_index * grad_scale
             d_weights = d_weights * grad_scale
-
         res_list = [None] * 12
         return None, None, d_query_index, d_key_index, d_weights, *res_list
 
@@ -133,7 +141,6 @@ def fused_sparse_lightning_indexer_kl_loss(
         sparse_mode=3,
 ):
     """NPU Sparse Lightning Indexer KL Divergence Loss Function.
-
     Args:
         query: [T, H, D] in TND layout - Attention query (bfloat16/float16)
         key: [T, 1, D] in TND layout - Attention key (KV_N=1 for MLA absorb) (bfloat16/float16)
@@ -150,10 +157,8 @@ def fused_sparse_lightning_indexer_kl_loss(
         actual_seq_klen: list[int64] - cumulative sequence lengths for key (for packing)
         layout: input layout format (TND or BSND)
         sparse_mode: sparse computation mode (3 = causal/rightDownCausal)
-
     Returns:
         loss: KL divergence loss scaled by total_tokens
-
     NPU API Constraints (npu_sparse_lightning_indexer_grad_kl_loss):
         - query shape N (num_heads) must be 64 or 128
         - topK must be 2048 (integer multiple of 1024, < 8192)
@@ -161,30 +166,11 @@ def fused_sparse_lightning_indexer_kl_loss(
         - softmax_max/softmax_sum dtype: float32
         - actual_seq_qlen/klen dtype: int64
     """
-    # =====================================================================
-    # NPU API Constraints Validation
-    # =====================================================================
-    num_heads = query.shape[1]  # N dimension in TND layout
-    topk = sparse_indices.shape[-1]
-
-    # Constraint: query shape N must be 64 or 128
-    if num_heads not in (64, 128):
-        raise ValueError(
-            f"npu_sparse_lightning_indexer_grad_kl_loss requires query N (num_heads) "
-            f"to be 64 or 128, but got {num_heads}. "
-            f"Please config num_attention_heads=64 or 128 in model config."
-        )
-
-    # Constraint: topK must be 2048 (integer multiple of 1024, < 8192)
-    if topk != 2048:
-        raise ValueError(
-            f"npu_sparse_lightning_indexer_grad_kl_loss requires topK=2048, "
-            f"but got topK={topk}. Please config index_topk=2048 in model config."
-        )
-
     # Get dimensions for scaling
-    total_tokens = query.shape[0]
-
+    if layout == "TND":
+        total_tokens = query.shape[0]
+    else:
+        total_tokens = query.shape[0] * query.shape[1]
     loss = LILossTrain.apply(
         query, key, query_index, key_index, weights,
         sparse_indices, softmax_max, softmax_sum,
@@ -192,7 +178,6 @@ def fused_sparse_lightning_indexer_kl_loss(
         actual_seq_qlen, actual_seq_klen, layout, sparse_mode,
     )
     return loss / total_tokens
-
 
 def fix_invalid_topk_indices(
     topk_indices: torch.Tensor,
@@ -208,13 +193,9 @@ def fix_invalid_topk_indices(
     Args:
         topk_indices: [batch_size, seq_len, topk] - Selected top-k indices
         attention_mask: [batch_size, seq_len] - Packing attention mask with values 1, 2, 3...
-        batch_size: Batch size
-        seq_len: Sequence length
-        total_len: Total key length
-        topk: Number of top-k indices
 
     Returns:
-        Fixed topk_indices with invalid positions replaced
+        topk_indices: [seq_len, 1, topk] - Fixed top-k indices with invalid positions replaced (TND layout)
     """
     batch_size, seq_len, topk = topk_indices.shape
     dtype = topk_indices.dtype
@@ -265,7 +246,7 @@ def fix_invalid_topk_indices(
     seq_start_positions_expanded = seq_start_positions.unsqueeze(0).unsqueeze(-1).expand_as(topk_indices)
     topk_indices = torch.where(valid_mask, topk_indices, seq_start_positions_expanded)
 
-    return topk_indices.to(dtype)
+    return topk_indices.to(dtype).view(seq_len, 1, -1)
 
 
 def fix_npu_topk_indices(
@@ -284,13 +265,13 @@ def fix_npu_topk_indices(
     2. Converts sub-sequence relative positions to global positions
 
     Args:
-        topk_indices: [1, total_tokens, topk] - NPU output with relative positions and -1 for invalid
+        topk_indices: [T, 1, topk] - NPU output with relative positions and -1 for invalid
         attention_mask: [1, total_tokens] - Packing attention mask with values 1, 2, 3...
 
     Returns:
-        topk_indices: [1, total_tokens, topk] - Global indices with invalid positions fixed
+        topk_indices: [T, 1, topk] - Global indices with invalid positions fixed
     """
-    _, total_tokens, topk = topk_indices.shape
+    total_tokens, _, topk = topk_indices.shape
     device = topk_indices.device
     dtype = topk_indices.dtype
 
@@ -307,8 +288,8 @@ def fix_npu_topk_indices(
         end = cu_seqlens[seq_idx + 1].item()
         seq_start_positions[start:end] = start
 
-    # Expand seq_start_positions to match topk_indices shape
-    seq_start_expanded = seq_start_positions.unsqueeze(0).unsqueeze(-1).expand_as(topk_indices)
+    # Expand seq_start_positions to match topk_indices shape [T, 1, topk]
+    seq_start_expanded = seq_start_positions.unsqueeze(-1).unsqueeze(-1).expand_as(topk_indices)
 
     # Create mask for valid indices (not -1)
     valid_mask = topk_indices >= 0
@@ -335,24 +316,25 @@ def create_index_mask(
     - Other positions: -inf
 
     Args:
-        topk_indices: [1, seq_length, topk] - Selected top-k indices (batch_size=1 for packing)
+        topk_indices: [T, 1, topk] - Selected top-k indices (TND layout, N=1 for MLA)
 
     Returns:
-        index_mask: [1, 1, seq_length, total_len] - Sparse attention mask
+        index_mask: [1, 1, T, T] - Sparse attention mask
     """
-    batch_size, seq_length, _ = topk_indices.shape
-    total_len = topk_indices.shape[1]  # For packing mode, total_len == seq_length
+    seq_length, _, _ = topk_indices.shape
+    total_len = seq_length  # For packing mode, total_len == seq_length
     device = topk_indices.device
 
     # Create full mask with -inf
     index_mask = torch.full(
-        (batch_size, seq_length, total_len),
+        (1, seq_length, total_len),
         float("-inf"),
         device=device,
         dtype=dtype,
     )
     # Set selected positions to 0.0
-    index_mask.scatter_(-1, topk_indices, 0.0)
+    # topk_indices is [T, 1, topk], need to squeeze the N dimension for scatter
+    index_mask.scatter_(-1, topk_indices.squeeze(1).unsqueeze(0), 0.0)
     # Add head dimension: [batch, seq, kv] -> [batch, 1, seq, kv]
     index_mask = index_mask.unsqueeze(1)
 
@@ -439,7 +421,7 @@ def indexer_forward_npu(
         use_cache: Whether to use KV caching for generation
 
     Returns:
-        topk_indices: [1, total_tokens, topk] - Top-k indices for sparse attention
+        topk_indices: [T, 1, topk] - Top-k indices for sparse attention (TND layout)
     """
     # Step 1: Get query, key, weights from forward_with_index
     query_index, key_index, weights = indexer_forward_with_index(
@@ -467,17 +449,19 @@ def indexer_forward_with_index(
     This computes the query, key projections and weights for the lightning indexer.
     The outputs can be reused for both topk selection and KL loss computation.
 
+    With SP: each rank computes on local sequence chunk in parallel (no communication).
+
     Args:
         self: GlmMoeDsaIndexer instance
-        hidden_states: [batch_size, seq_len, hidden_size] - Input hidden states (BSND format)
-        q_resid: [batch_size, seq_len, q_lora_rank] - Low-rank query residual
-        position_embeddings: Tuple of (cos, sin) for rotary embeddings
+        hidden_states: [batch_size, seq_len/sp_size, hidden_size] - Input hidden states (BSND format, local with SP)
+        q_resid: [batch_size, seq_len/sp_size, q_lora_rank] - Low-rank query residual (local with SP)
+        position_embeddings: Tuple of (cos, sin) for rotary embeddings (local with SP)
         use_cache: Must be False (training only, no KV cache)
 
     Returns:
-        query_index: [T, N, D] - Query for lightning indexer in TND layout
-        key_index: [T, 1, D] - Key for lightning indexer in TND layout
-        weights: [T, N] - Weights for lightning indexer in TND layout
+        query_index: [B, S/sp_size, H, D] - Query for lightning indexer in BSND layout (local with SP)
+        key_index: [B, S/sp_size, 1, D] - Key for lightning indexer in BSND layout (local with SP)
+        weights: [B, S/sp_size, H] - Weights for lightning indexer in BSND layout (local with SP)
     """
     # Training only - no KV cache support
     assert not use_cache, "indexer_forward_with_index does not support use_cache (training only)"
@@ -514,26 +498,85 @@ def indexer_forward_with_index(
     if k_bf16.dim() == 3:
         k_bf16 = k_bf16.unsqueeze(2)
 
-    # Store total_len for forward_with_scores
-    total_len = k_bf16.shape[1]
-    self._total_key_len = total_len
+    return q_bf16, k_bf16, weights_bf16
 
-    # Convert from BSND to TND: [B, S, N, D] -> [T, N, D]
-    query_index = q_bf16.view(1, seq_len, self.n_heads, self.head_dim).squeeze(0)  # [T, N, D]
-    key_index = k_bf16.view(1, total_len, 1, self.head_dim).squeeze(0)  # [T, 1, D]
-    weights_tnd = weights_bf16.view(1, seq_len, self.n_heads).squeeze(0)  # [T, N]
 
-    return query_index, key_index, weights_tnd
+@cache
+def get_sp_local_cu_seqlens(attention_mask):
+    """Get sequence parallel local cumulative sequence lengths for TND layout.
 
-def get_cu_seqlens_npu(attention_mask):
-    assert attention_mask is not None, "must be"
-    if hasattr(attention_mask, "cu_seqlens"):
-        return attention_mask.cu_seqlens
+    Computes the cumulative sequence lengths for query and key sequences
+    in the local SP rank, and the corresponding global positions in the KV sequence.
 
-    seqlens = get_seqlens_in_batch(attention_mask)  # (num_sequences,)
-    cu_seqlens = torch.cumsum(seqlens, dim=0).to(torch.int32)  # (num_sequences)
-    attention_mask.cu_seqlens = cu_seqlens
-    return cu_seqlens
+    Args:
+        attention_mask: [1, total_tokens] - Packing attention mask with values 1, 2, 3...
+
+    Returns:
+        Tuple of (mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, pad) where:
+            mode: "TND" or "BSND" - the layout for NPU ops
+            q_cu_seqlens: [num_sequences] - cumulative sequence lengths for query (local, int32)
+            kv_cu_seqlens: [num_sequences] - cumulative sequence lengths for key (global, int32)
+            kv_start: int - global start position of KV for this rank's sequences
+            kv_end: int - global end position of KV for this rank's sequences
+            pad: int - padding in the local sequence
+    """
+    if attention_mask is None or torch.max(attention_mask) <= 1:
+        return ("BSND", None, None, 0, 0, 0)
+
+    sp_group = get_ulysses_sequence_parallel_group()
+    sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
+    bs, seq_len = attention_mask.shape
+    assert bs == 1, "must be"
+
+    if sp_size > 1:
+        chunk_size = seq_len // sp_size
+        assert seq_len % sp_size == 0, "must be"
+        sp_rank = get_ulysses_sequence_parallel_rank(sp_group)
+        start = sp_rank * chunk_size
+        end = (sp_rank + 1) * chunk_size
+        local_attention_mask = attention_mask[:, start:end]
+    else:
+        sp_rank = 0
+        start = 0
+        end = seq_len
+        local_attention_mask = attention_mask
+
+    local_seqlens = get_seqlens_in_batch(local_attention_mask)
+    q_cu_seqlens = torch.cumsum(local_seqlens, dim=0).to(torch.int32)
+    if len(q_cu_seqlens) == 0:
+        fake_len = local_attention_mask.size(1)
+        q_cu_seqlens = F.pad(q_cu_seqlens, (1, 0))
+        q_cu_seqlens[0] = fake_len
+        return ("TND", q_cu_seqlens, q_cu_seqlens, 0, fake_len, 0)
+
+    # assume padding belongs to the last sequence
+    pad = local_attention_mask.size(1) - q_cu_seqlens[-1].item()
+    q_cu_seqlens[-1] = local_attention_mask.size(1)
+
+    full_seqlens = get_seqlens_in_batch(attention_mask)  # (num_sequences,)
+    valid_total_len = torch.sum(full_seqlens)
+    full_seqlens[-1] += attention_mask.size(1) - valid_total_len
+    full_cu_seqlens = F.pad(torch.cumsum(full_seqlens, dim=0), (1, 0))  # (num_sequences+1,)
+
+    # deal with kv
+    unique_ids = torch.unique(local_attention_mask[local_attention_mask != 0], sorted=True)
+    assert len(unique_ids) > 0, "must be"
+
+    kv_seqlens_list = []
+    for seq_id in unique_ids:
+        seq_idx = seq_id - 1
+        kv_seqlens_list.append(full_seqlens[seq_idx].item())
+
+    kv_cu_seqlens = torch.cumsum(
+        torch.tensor(kv_seqlens_list, dtype=torch.int32, device=attention_mask.device),
+        dim=0).to(torch.int32)
+
+    first_seq_id = unique_ids[0] - 1
+    kv_start = full_cu_seqlens[first_seq_id].item()
+    last_seq_id = unique_ids[-1]
+    kv_end = full_cu_seqlens[last_seq_id].item()
+
+    return ("TND", q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, pad)
 
 def indexer_forward_with_scores(
     self,
@@ -550,37 +593,39 @@ def indexer_forward_with_scores(
 
     Args:
         self: GlmMoeDsaIndexer instance
-        query_index: [T, N, D] - Query from forward_with_index in TND layout
-        key_index: [T, 1, D] - Key from forward_with_index in TND layout
-        weights: [T, N] - Weights from forward_with_index in TND layout
+        query_index: [B, S/sp, H, D] or [T/sp, H, D] - Query in BSND or TND layout
+        key_index: [B, T, 1, D] or [T, 1, D] - Key in BSND or TND layout (global after all-gather)
+        weights: [B, S/sp, H] or [T/sp, H] - Weights in BSND or TND layout
         attention_mask: [1, total_tokens] - Packing attention mask with values 1, 2, 3...
 
     Returns:
-        topk_indices: [1, total_tokens, topk] - Selected sparse indices (relative positions, unfixed)
-        topk_score: [1, total_tokens, topk] - Scores for selected indices
+        topk_indices: [T_local, 1, topk] - Selected sparse indices (relative positions, to be fixed to global, TND layout)
+                      [B, T_local, 1, topk] - BSND layout
+        topk_score: [T_local, 1, topk] - Scores for selected indices (TND layout)
+                    [B, T_local, 1, topk] - BSND layout
     """
-    topk = min(self.index_topk, query_index.shape[0])
+    topk = self.index_topk
 
     # Get cumulative sequence lengths for TND layout
-    cu_seqlens = get_cu_seqlens_npu(attention_mask)
+    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, _ = get_sp_local_cu_seqlens(attention_mask)
 
-    # NPU lightning indexer with TND layout
+    if mode == "TND":
+        query_index = query_index.view(-1, query_index.size(-2), query_index.size(-1))
+        key_index = key_index.view(-1, 1, key_index.size(-1))[kv_start:kv_end]
+        weights = weights.view(-1, weights.size(-1))
+
     topk_indices, topk_score = torch_npu.npu_lightning_indexer(
         query_index,
         key_index,
         weights,
-        actual_seq_lengths_query=cu_seqlens,
-        actual_seq_lengths_key=cu_seqlens,
-        layout_query='TND',
-        layout_key='TND',
+        actual_seq_lengths_query=q_cu_seqlens,
+        actual_seq_lengths_key=kv_cu_seqlens,
+        layout_query=mode,
+        layout_key=mode,
         sparse_count=topk,
         sparse_mode=3,  # rightDownCausal mode
         return_value=True,
     )
-
-    # Reshape: [T, 1, topk] -> [1, T, topk]
-    topk_indices = topk_indices.squeeze(1).unsqueeze(0)
-    topk_score = topk_score.squeeze(1).unsqueeze(0)
 
     return topk_indices, topk_score
 
@@ -596,7 +641,7 @@ def generate_sparse_mask(
     Generate sparse attention mask from topk indices.
 
     Args:
-        topk_indices: [1, seq_len, topk] - Fixed top-k indices (global positions)
+        topk_indices: [T, 1, topk] - Fixed top-k indices (global positions, TND layout)
         attention_mask: Packing attention mask (not used for sparse mode)
         seq_length: Sequence length
         dtype: Data type for the mask
@@ -618,15 +663,10 @@ def dsa_attn_forward(
     past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     use_cache: bool = False,
     output_attentions: bool = False,
-    skip_indexer: bool = False,  # If True, skip indexer and use pure causal mask
     **kwargs,
 ):
     """
-    DSA attention forward with optional indexer skip for debugging.
-
-    Args:
-        skip_indexer: If True, skip indexer and use pure causal mask for attention.
-                      This is useful for comparing MLA naive vs MLA absorb without indexer interference.
+    DSA attention forward.
     """
     batch_size, seq_length = hidden_states.shape[:-1]
     cos, sin = position_embeddings
@@ -667,29 +707,20 @@ def dsa_attn_forward(
     present_key_value = (key_states, value_states) if use_cache else None
 
     # =================================================================
-    # Indexer or pure causal mask
+    # Indexer: generate sparse mask
     # =================================================================
-    if skip_indexer:
-        # Use pure causal mask for debugging MLA vs MLA absorb
-        topk_indices = None
-        # Create causal mask from packing mask
-        causal_mask = packing_mask_to_causal_mask(attention_mask)
-        combined_mask = torch.zeros(batch_size, 1, seq_length, seq_length, device=hidden_states.device, dtype=query_states.dtype)
-        combined_mask = combined_mask.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-    else:
-        # Use indexer to generate sparse mask
-        topk_indices = indexer_forward_npu(
-            self.indexer,
-            hidden_states.detach(),
-            q_resid.detach(),
-            position_embeddings,
-            attention_mask,
-            use_cache=use_cache,
-        )
+    topk_indices = indexer_forward_npu(
+        self.indexer,
+        hidden_states.detach(),
+        q_resid.detach(),
+        position_embeddings,
+        attention_mask,
+        use_cache=use_cache,
+    )
 
-        # Convert to sparse mask
-        indices_fixed = fix_npu_topk_indices(topk_indices, attention_mask)
-        combined_mask = create_index_mask(indices_fixed, dtype=query_states.dtype)
+    # Convert to sparse mask
+    indices_fixed = fix_npu_topk_indices(topk_indices, attention_mask)
+    combined_mask = create_index_mask(indices_fixed, dtype=query_states.dtype)
     # =================================================================
 
 
@@ -713,49 +744,33 @@ def dsa_attn_forward(
     return attn_output, attn_weights, present_key_value
 
 
-def npu_fused_dsa_attn_forward(
+def _npu_prepare_qkv_for_mla_absorb(
     self,
     hidden_states: torch.Tensor,
     position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-    attention_mask: Optional[torch.Tensor],
-    past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    use_cache: bool = False,
-    output_attentions: bool = False,
-    indexer_loss_coeff: float = 1.0,
-    use_fused_loss: bool = True,
-    skip_indexer: bool = False,  # If True, skip indexer and use dense attention for debugging
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    NPU fused DSA attention forward with MLA absorb mode (training only).
+    Prepare QKV tensors for NPU fused DSA attention with MLA absorb mode.
 
-    This implementation:
-    1. Uses MLA absorb pattern - absorb W_UK into q_nope projection
-    2. Uses compressed KV directly (no up-projection) for k_lat and v_lat
-    3. Uses npu_lightning_indexer for sparse index selection
-    4. Uses npu_sparse_flash_attention for core attention
-    5. Uses fused_sparse_lightning_indexer_kl_loss for training loss
+    This function performs:
+    1. Query projection and RoPE application
+    2. MLA Absorb: absorb W_UK into W_UQ (q_nope projection)
+    3. Key-Value compression (MLA absorb mode: no up-projection)
 
     Args:
+        self: GlmMoeDsaAttention module
         hidden_states: [batch_size, seq_len, hidden_size]
         position_embeddings: Tuple of (cos, sin) for rotary embeddings
-        attention_mask: Packing attention mask [1, seq_len] with values 1, 2, 3...
-        past_key_value: Must be None (training only, no KV cache)
-        use_cache: Must be False (training only, no KV cache)
-        output_attentions: Must be False (not supported in sparse mode)
-        indexer_loss_coeff: Loss coefficient for DSA indexer
-        use_fused_loss: Whether to use fused lightning indexer KL loss
-        skip_indexer: If True, skip indexer and use dense attention. For debugging MLA vs MLA absorb.
 
     Returns:
-        attn_output: [batch_size, seq_len, hidden_size]
+        q_nope_absorbed: [B, S, H, kv_lora_rank] - Query with absorbed W_UK
+        q_pe: [B, S, H, qk_rope_head_dim] - Query RoPE component
+        k_lat: [B, S, 1, kv_lora_rank] - Compressed key (no up-projection)
+        v_lat: [B, S, 1, kv_lora_rank] - Compressed value (no up-projection)
+        k_pe: [B, S, 1, qk_rope_head_dim] - Key RoPE component
+        q_resid: [B, S, q_lora_rank] or None - Query residual for indexer
+        kv_b_weight: [H, qk_nope + v_head, kv_lora_rank] - KV projection weight for output projection
     """
-    # Training only - no KV cache support
-    assert past_key_value is None, "npu_fused_dsa_attn_forward does not support past_key_value (training only)"
-    assert not use_cache, "npu_fused_dsa_attn_forward does not support use_cache (training only)"
-    assert not output_attentions, "npu_fused_dsa_attn_forward does not support output_attentions"
-    assert attention_mask is not None, "must be, only support packing mode"
-    assert torch.max(attention_mask) >= 0, "must be, only support packing mode"
-
     batch_size, seq_length = hidden_states.shape[:-1]
     cos, sin = position_embeddings
 
@@ -803,168 +818,255 @@ def npu_fused_dsa_attn_forward(
     k_pe = k_pe.unsqueeze(2)  # [B, S, 1, qk_rope_head_dim]
     k_pe = apply_rotary_pos_emb(k_pe.transpose(1, 2), cos, sin, unsqueeze_dim=1).transpose(1, 2)
 
+    return q_nope_absorbed, q_pe, k_lat, v_lat, k_pe, q_resid, kv_b_weight
+
+
+def _npu_compute_sparse_indices(
+    self,
+    hidden_states: torch.Tensor,
+    q_resid: Optional[torch.Tensor],
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    sp_enabled: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute sparse indices using npu_lightning_indexer.
+
+    SP strategy:
+        Available when sequence parallel size is 2^n. The sp rank should
+        satisfy the kv-key sequence requirement of npu_lightning_indexer.
+
+    Args:
+        self: GlmMoeDsaAttention module
+        hidden_states: [batch_size, seq_len/sp_size, hidden_size] (local with SP)
+        q_resid: [batch_size, seq_len/sp_size, q_lora_rank] or None (local with SP)
+        position_embeddings: Tuple of (cos, sin)
+        attention_mask: Packing attention mask (full sequence, not split in SP)
+        sp_enabled: Whether sequence parallelism is enabled
+
+    Returns:
+        topk_indices: [T, 1, topk] - Selected sparse indices in TND layout
+        query_index: [B, S/sp_size, H, D] - Query for lightning indexer in BSND
+        key_index: [B, S/sp_size, 1, D] - Key for lightning indexer in BSND
+        weights_indexer: [B, S/sp_size, H] - Weights for lightning indexer in BSND
+    """
+    # Phase 1: Get query, key, weights for indexer (LOCAL sequence, SP parallel)
+    query_index, key_index, weights_indexer = indexer_forward_with_index(
+        self.indexer,
+        hidden_states.detach(),
+        q_resid.detach() if q_resid is not None else None,
+        position_embeddings,
+    )
+
+    # Phase 1.5: All-gather full key sequence (if SP enabled)
+    if sp_enabled:
+        # All-gather key_index: [B, N/sp, 1, D] -> [B, N, 1, D]
+        key_index = all_gather_sp(key_index, dim=1)
+
+    # Phase 2: Get topk indices using npu_lightning_indexer
+    topk_indices, _ = indexer_forward_with_scores(
+        self.indexer,
+        query_index,
+        key_index,
+        weights_indexer,
+        attention_mask,
+    )
+
+    return topk_indices, query_index, key_index, weights_indexer
+
+
+def npu_fused_dsa_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    use_cache: bool = False,
+    output_attentions: bool = False,
+    **kwargs,
+):
+    """
+    NPU fused DSA attention forward with MLA absorb mode (training only).
+
+    This implementation:
+    1. Uses MLA absorb pattern - absorb W_UK into q_nope projection
+    2. Uses compressed KV directly (no up-projection) for k_lat and v_lat
+    3. Uses npu_lightning_indexer for sparse index selection
+    4. Uses npu_sparse_flash_attention for core attention
+    5. Uses fused_sparse_lightning_indexer_kl_loss for training loss
+    6. Supports Ulysses sequence parallelism (SP)
+
+    Ulysses SP for MLA (all-to-all communication is done via all_gather_sp, not all-to-all):
+    - KV (head=1): all-gather sequence before attention -> [B, seq/sp, 1, D] -> [B, seq, 1, D]
+    - Q (H heads): no communication before attention (heads are parallel)
+
+    Args:
+        hidden_states: [batch_size, seq_len/sp_size, hidden_size] (with SP)
+        position_embeddings: Tuple of (cos, sin) for rotary embeddings
+        attention_mask: Packing attention mask [1, seq_len] with values 1, 2, 3... (full sequence, not split)
+        past_key_value: Must be None (training only, no KV cache)
+        use_cache: Must be False (training only, no KV cache)
+        output_attentions: Must be False (not supported in sparse mode)
+
+    Returns:
+        attn_output: [batch_size, seq_len/sp_size, hidden_size] (with SP)
+    """
+    # Training only - no KV cache support
+    assert past_key_value is None, "npu_fused_dsa_attn_forward does not support past_key_value (training only)"
+    assert not use_cache, "npu_fused_dsa_attn_forward does not support use_cache (training only)"
+    assert not output_attentions, "npu_fused_dsa_attn_forward does not support output_attentions"
+
+    # Get SP info
+    sp_group = get_ulysses_sequence_parallel_group()
+    sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
+    sp_enabled = sp_size > 1
+
+    # =====================================================================
+    # 1-3. Prepare QKV tensors with MLA absorb
+    # =====================================================================
+    batch_size = hidden_states.size(0)
+    q_nope_absorbed, q_pe, k_lat, v_lat, k_pe, q_resid, kv_b_weight = _npu_prepare_qkv_for_mla_absorb(
+        self, hidden_states, position_embeddings
+    )
+
     # =====================================================================
     # 4. Compute sparse indices using npu_lightning_indexer
-    #    Split into forward_with_index and forward_with_scores for reuse
-    #    Detach inputs to isolate indexer branch from main attention branch (MindSpeed-LLM pattern)
     # =====================================================================
-    if skip_indexer:
-        # Skip indexer for debugging MLA absorb vs MLA naive
-        topk_indices = None
-        query_index, key_index, weights_indexer = None, None, None
-    else:
-        # Phase 1: Get query, key, weights for indexer (used for both topk and KL loss)
-        # Detach inputs to create independent computation graph for indexer
-        query_index, key_index, weights_indexer = indexer_forward_with_index(
-            self.indexer,
-            hidden_states.detach() if use_fused_loss else hidden_states,
-            q_resid.detach() if use_fused_loss else q_resid,
-            position_embeddings,
-        )
-
-        # Phase 2: Get topk indices using npu_lightning_indexer
-        # Use no_grad for forward_with_scores when using fused loss (MindSpeed-LLM pattern)
-        dsa_indexer_context = torch.no_grad() if use_fused_loss else nullcontext()
-        with dsa_indexer_context:
-            topk_indices, _ = indexer_forward_with_scores(
-                self.indexer,
-                query_index,
-                key_index,
-                weights_indexer,
-                attention_mask,
-            )
+    topk_indices, query_index, key_index, weights_indexer = _npu_compute_sparse_indices(
+        self,
+        hidden_states,
+        q_resid,
+        position_embeddings,
+        attention_mask,
+        sp_enabled,
+    )
 
     # =====================================================================
-    # 5. Core attention
+    # 5. SP communication before attention
+    #    KV: all-gather sequence to get full context (since head=1, can't use all-to-all)
+    #    Q: heads are already parallel (no communication needed before attention)
     # =====================================================================
-    if skip_indexer:
-        # Use MLA absorb score calculation directly (MQA decode style)
-        # Reference: MLA forward MQA decode branch
-        # q_nope_absorbed: [B, S, H, kv_lora_rank] (已吸收W_UK)
-        # k_lat: [B, S, 1, kv_lora_rank] (compressed KV, 不扩展heads)
-        # q_pe: [B, S, H, qk_rope]
-        # k_pe: [B, S, 1, qk_rope]
-        # v_lat: [B, S, 1, kv_lora_rank]
+    if sp_enabled:
+        # KV: all-gather sequence to get full context for attention
+        # k_lat: [B, seq/sp, 1, kv_lora] -> [B, seq, 1, kv_lora]
+        k_lat = all_gather_sp(k_lat, dim=1)
+        # v_lat: [B, seq/sp, 1, kv_lora] -> [B, seq, 1, kv_lora]
+        v_lat = all_gather_sp(v_lat, dim=1)
+        # k_pe: [B, seq/sp, 1, qk_rope] -> [B, seq, 1, qk_rope]
+        k_pe = all_gather_sp(k_pe, dim=1)
 
-        # scores = (q_nope_absorbed @ k_lat.T + q_pe @ k_pe.T) * scale
-        # [B, S, H, kv_lora] @ [B, T, 1, kv_lora].T -> [B, S, H, T]
-        scores_nope = torch.einsum('bshc,btc->bsht', q_nope_absorbed, k_lat.squeeze(2))
-        scores_rope = torch.einsum('bshr,btr->bsht', q_pe.squeeze(2), k_pe.squeeze(2))
-        scores = (scores_nope + scores_rope) * self.scaling
+    # =====================================================================
+    # 6. Core attention - sparse attention with npu_sparse_flash_attention (TND layout)
+    # =====================================================================
+    # TND layout: T = total_tokens, N = num_heads, D = head_dim
 
-        # Create causal mask from packing mask and apply to scores
-        causal_mask = packing_mask_to_causal_mask(attention_mask)
-        scores = scores.masked_fill(~causal_mask.unsqueeze(1), float('-inf'))
+    # Get cumulative sequence lengths for TND layout
+    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, pad = get_sp_local_cu_seqlens(attention_mask)
+    # kv_start and kv_end can be used to slice the full KV tensor to get relevant portion
+    # For now, the full KV is all-gathered, so these are not immediately used
+    scale_value = self.scaling
 
-        # softmax
-        attn_weights = scores.softmax(dim=-1)
-
-        # output = attn_weights @ v_lat
-        # [B, S, H, T] @ [B, T, 1, kv_lora] -> [B, S, H, kv_lora]
-        attn_output = torch.einsum('bsht,btc->bshc', attn_weights, v_lat.squeeze(2))
-
-        softmax_max, softmax_sum = None, None
-    else:
-        # Use sparse attention with npu_sparse_flash_attention (TND layout)
-        # TND layout: T = total_tokens, N = num_heads, D = head_dim
-
-        # Get cumulative sequence lengths for TND layout
-        cu_seqlens = get_cu_seqlens_npu(attention_mask)
-        scale_value = self.scaling
-
+    if mode == "TND":
         # Convert from BSND to TND layout
-        query = q_nope_absorbed.view(-1, self.num_heads, self.kv_lora_rank).to(torch.bfloat16)
-        query_rope = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim).to(torch.bfloat16)
+        num_heads = q_nope_absorbed.shape[2]
+        query = q_nope_absorbed.view(-1, num_heads, self.kv_lora_rank)
+        query_rope = q_pe.view(-1, num_heads, self.qk_rope_head_dim)
+        key = k_lat.view(-1, 1, self.kv_lora_rank)[kv_start:kv_end]
+        value = v_lat.view(-1, 1, self.kv_lora_rank)[kv_start:kv_end]
+        key_rope = k_pe.view(-1, 1, self.qk_rope_head_dim)[kv_start:kv_end]
+        sparse_indices = topk_indices.view(-1, 1, self.indexer.index_topk)
+    else:
+        query = q_nope_absorbed
+        query_rope = q_pe
+        key = k_lat
+        value = v_lat
+        key_rope = k_pe
+        sparse_indices = topk_indices
 
-        key = k_lat.view(-1, 1, self.kv_lora_rank).to(torch.bfloat16)
-        value = v_lat.view(-1, 1, self.kv_lora_rank).to(torch.bfloat16)
-        key_rope = k_pe.view(-1, 1, self.qk_rope_head_dim).to(torch.bfloat16)
-
-        sparse_indices = topk_indices.view(-1, 1, self.indexer.index_topk).to(torch.int32)
-
-        # Call npu_sparse_flash_attention with TND layout
-        attn_output, softmax_max, softmax_sum, *_ = torch_npu.npu_sparse_flash_attention(
-            query, key, value,
-            sparse_indices,
-            scale_value,  # positional argument
-            block_table=None,
-            actual_seq_lengths_query=cu_seqlens,
-            actual_seq_lengths_kv=cu_seqlens,
-            query_rope=query_rope,
-            key_rope=key_rope,
-            sparse_block_size=1,
-            layout_query='TND',
-            layout_kv='TND',
-            sparse_mode=3,
-            attention_mode=2,
-            return_softmax_lse=True,
-        )
+    # Call npu_sparse_flash_attention with TND layout
+    attn_output, softmax_max, softmax_sum, *_ = torch_npu.npu_sparse_flash_attention(
+        query, key, value,
+        sparse_indices,
+        scale_value,  # positional argument
+        block_table=None,
+        actual_seq_lengths_query=q_cu_seqlens,
+        actual_seq_lengths_kv=kv_cu_seqlens,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        sparse_block_size=1,
+        layout_query=mode,
+        layout_kv=mode,
+        sparse_mode=3,
+        attention_mode=2,
+        return_softmax_lse=True,
+    )
 
     # =====================================================================
-    # 6. MLA Absorb: absorb W_UV into W_O (output projection)
+    # 7. Compute DSA indexer loss BEFORE post-attention SP
+    #    (NPU API requires H=64 or 128, so compute loss with full heads)
+    # =====================================================================
+    loss = None
+    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+    if self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0:
+        if mode == "TND":
+            query_index_for_loss = query_index.view(-1, query_index.size(-2), query_index.size(-1))
+            weights_indexer_for_loss = weights_indexer.view(-1, weights_indexer.size(-1))
+            key_index_for_loss = key_index.view(-1, 1, key_index.size(-1))[kv_start:kv_end]
+        else:
+            query_index_for_loss = query_index
+            weights_indexer_for_loss = weights_indexer
+            key_index_for_loss = key_index
+        softmax_max_for_loss = softmax_max
+        softmax_sum_for_loss = softmax_sum
+        query_for_loss = query
+        query_rope_for_loss = query_rope
+        key_for_loss = key
+        key_rope_for_loss = key_rope
+
+        # Compute loss
+        loss = fused_sparse_lightning_indexer_kl_loss(
+            query_for_loss,
+            key_for_loss,
+            query_index_for_loss,
+            key_index_for_loss,
+            weights_indexer_for_loss,
+            topk_indices,
+            softmax_max_for_loss,
+            softmax_sum_for_loss,
+            scale_value=scale_value,
+            query_rope=query_rope_for_loss,
+            key_rope=key_rope_for_loss,
+            actual_seq_qlen=q_cu_seqlens,
+            actual_seq_klen=kv_cu_seqlens,
+            layout=mode,
+            sparse_mode=3,
+        )
+        loss = loss * indexer_loss_coeff
+
+    attn_output = attn_output.view(batch_size, -1, self.num_heads, self.kv_lora_rank)
+
+    # =====================================================================
+    # 8. MLA Absorb: absorb W_UV into W_O (output projection)
     #    attn_out = attn_weight * (v * W_UV) * W_O
     #             = (attn_weight * v * W_UV) * W_O
     # =====================================================================
     # kv_b_weight is already [H, qk_nope + v_head, kv_lora_rank]
     # Get W_UV: [H, v_head, kv_lora] and permute to [H, kv_lora, v_head]
     w_uv = kv_b_weight[:, -self.v_head_dim:]  # [H, v_head, kv_lora_rank]
-    w_uv_t = w_uv.permute(0, 2, 1).contiguous()  # [H, kv_lora_rank, v_head_dim]
-
-    if skip_indexer:
-        # Dense mode: attn_output is [B, S, H, kv_lora_rank]
-        # Project: [B, S, H, kv_lora] @ [H, kv_lora, v_head] -> [B, S, H, v_head]
-        attn_output = torch.einsum('bshd,hdv->bshv', attn_output, w_uv_t).contiguous()
-        # Reshape to [B, S, H * v_head_dim]
-        attn_output = attn_output.view(batch_size, seq_length, self.num_heads * self.v_head_dim)
-    else:
-        # Sparse mode: attn_output is [T, H, kv_lora_rank] in TND layout
-        # Project: [T, H, kv_lora] @ [H, kv_lora, v_head] -> [T, H, v_head]
-        attn_output = torch.einsum('thd,hdv->thv', attn_output, w_uv_t).contiguous()
-        attn_output = attn_output.to(hidden_states.dtype)
-        # Convert back from TND [T, H, v_head_dim] to [B, S, H * v_head_dim]
-        attn_output = attn_output.view(batch_size, seq_length, self.num_heads * self.v_head_dim)
+    # Sparse mode: attn_output is [B, S, H, kv_lora_rank] (after SP restore)
+    # Project: [B, S, H, kv_lora] @ [H, kv_lora, v_head]^T -> [B, S, H, kv_lora]
+    attn_output = torch.einsum('bshd,hvd->bshv', attn_output, w_uv).contiguous()
+    attn_output = attn_output.to(hidden_states.dtype)
+    # Reshape to [B, S, H * v_head_dim]
+    attn_output = attn_output.view(batch_size, -1, self.num_heads * self.v_head_dim)
 
     # Output projection
     attn_output = self.o_proj(attn_output)
 
     # =====================================================================
-    # 7. Compute DSA indexer loss (if training with fused loss and not skip_indexer)
+    # 9. Apply DSA indexer loss (if computed)
     # =====================================================================
-    if self.training and torch.is_grad_enabled() and use_fused_loss and not skip_indexer:
-        # query_index, key_index, weights_indexer are already in TND layout:
-        # query_index: [T, N, D]
-        # key_index: [T, 1, D]
-        # weights_indexer: [T, N]
-
-        # Convert query and key from BSND to TND for loss computation
-        query_for_loss = q_nope_absorbed.view(-1, self.num_heads, self.kv_lora_rank).detach().to(torch.bfloat16)
-        key_for_loss = k_lat.view(-1, 1, self.kv_lora_rank).detach().to(torch.bfloat16)
-
-        # query_rope and key_rope for loss: convert to TND
-        query_rope_for_loss = q_pe.view(-1, self.num_heads, self.qk_rope_head_dim).detach().to(torch.bfloat16)
-        key_rope_for_loss = k_pe.view(-1, 1, self.qk_rope_head_dim).detach().to(torch.bfloat16)
-
-        # Compute loss using TND layout
-        loss = fused_sparse_lightning_indexer_kl_loss(
-            query_for_loss,        # [T, H, kv_lora_rank] bfloat16
-            key_for_loss,          # [T, 1, kv_lora_rank] bfloat16
-            query_index,           # [T, N, D] bfloat16
-            key_index,             # [T, 1, D] bfloat16
-            weights_indexer,       # [T, N] bfloat16
-            topk_indices,          # [T, 1, topk] int32
-            softmax_max,           # [1, T, H] float32
-            softmax_sum,           # [1, T, H] float32
-            scale_value=scale_value,
-            query_rope=query_rope_for_loss,  # [T, H, qk_rope] bfloat16
-            key_rope=key_rope_for_loss,      # [T, 1, qk_rope] bfloat16
-            actual_seq_qlen=cu_seqlens,      # list[int64]
-            actual_seq_klen=cu_seqlens,      # list[int64]
-            layout='TND',
-            sparse_mode=3,
-        )
-        loss = loss * indexer_loss_coeff
-
-        # Apply loss scaling through autograd function
+    if loss is not None:
         attn_output = DSAIndexerLossAutoScaler.apply(attn_output, loss)
 
     return attn_output, None, None

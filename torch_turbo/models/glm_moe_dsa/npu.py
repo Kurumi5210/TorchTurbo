@@ -520,12 +520,12 @@ def get_sp_local_cu_seqlens(attention_mask):
             kv_end: int - global end position of KV for this rank's sequences
             pad: int - padding in the local sequence
     """
-    if attention_mask is None or torch.max(attention_mask) <= 1:
-        return ("BSND", None, None, 0, 0, 0)
+    bs, seq_len = attention_mask.shape
+    if attention_mask is None or (bs != 1 and torch.max(attention_mask) <= 1):
+        return ("BSND", None, None, 0, 0)
 
     sp_group = get_ulysses_sequence_parallel_group()
     sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
-    bs, seq_len = attention_mask.shape
     assert bs == 1, "must be"
 
     # assume padding belongs to the last sequence
@@ -553,7 +553,7 @@ def get_sp_local_cu_seqlens(attention_mask):
         fake_len = local_attention_mask.size(1)
         q_cu_seqlens = F.pad(q_cu_seqlens, (1, 0))
         q_cu_seqlens[0] = fake_len
-        return ("TND", q_cu_seqlens, q_cu_seqlens, 0, fake_len, 0)
+        return ("TND", q_cu_seqlens, q_cu_seqlens, 0, fake_len)
 
     full_seqlens = get_seqlens_in_batch(attention_mask)  # (num_sequences,)
     full_cu_seqlens = F.pad(torch.cumsum(full_seqlens, dim=0), (1, 0))  # (num_sequences+1,)

@@ -528,6 +528,11 @@ def get_sp_local_cu_seqlens(attention_mask):
     bs, seq_len = attention_mask.shape
     assert bs == 1, "must be"
 
+    # assume padding belongs to the last sequence
+    max_value = torch.max(attention_mask)
+    attention_mask = attention_mask.clone()
+    attention_mask[attention_mask == 0] = max_value
+
     if sp_size > 1:
         chunk_size = seq_len // sp_size
         assert seq_len % sp_size == 0, "must be"
@@ -535,6 +540,7 @@ def get_sp_local_cu_seqlens(attention_mask):
         start = sp_rank * chunk_size
         end = (sp_rank + 1) * chunk_size
         local_attention_mask = attention_mask[:, start:end]
+        attention_mask = attention_mask[:, 0:end]
     else:
         sp_rank = 0
         start = 0
@@ -549,13 +555,7 @@ def get_sp_local_cu_seqlens(attention_mask):
         q_cu_seqlens[0] = fake_len
         return ("TND", q_cu_seqlens, q_cu_seqlens, 0, fake_len, 0)
 
-    # assume padding belongs to the last sequence
-    pad = local_attention_mask.size(1) - q_cu_seqlens[-1].item()
-    q_cu_seqlens[-1] = local_attention_mask.size(1)
-
     full_seqlens = get_seqlens_in_batch(attention_mask)  # (num_sequences,)
-    valid_total_len = torch.sum(full_seqlens)
-    full_seqlens[-1] += attention_mask.size(1) - valid_total_len
     full_cu_seqlens = F.pad(torch.cumsum(full_seqlens, dim=0), (1, 0))  # (num_sequences+1,)
 
     # deal with kv
@@ -573,10 +573,9 @@ def get_sp_local_cu_seqlens(attention_mask):
 
     first_seq_id = unique_ids[0] - 1
     kv_start = full_cu_seqlens[first_seq_id].item()
-    last_seq_id = unique_ids[-1]
-    kv_end = full_cu_seqlens[last_seq_id].item()
+    kv_end = end
 
-    return ("TND", q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, pad)
+    return ("TND", q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end)
 
 def indexer_forward_with_scores(
     self,
@@ -607,7 +606,7 @@ def indexer_forward_with_scores(
     topk = self.index_topk
 
     # Get cumulative sequence lengths for TND layout
-    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, _ = get_sp_local_cu_seqlens(attention_mask)
+    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end = get_sp_local_cu_seqlens(attention_mask)
 
     if mode == "TND":
         query_index = query_index.view(-1, query_index.size(-2), query_index.size(-1))
@@ -961,7 +960,7 @@ def npu_fused_dsa_attn_forward(
     # TND layout: T = total_tokens, N = num_heads, D = head_dim
 
     # Get cumulative sequence lengths for TND layout
-    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end, pad = get_sp_local_cu_seqlens(attention_mask)
+    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end = get_sp_local_cu_seqlens(attention_mask)
     # kv_start and kv_end can be used to slice the full KV tensor to get relevant portion
     # For now, the full KV is all-gathered, so these are not immediately used
     scale_value = self.scaling
@@ -1006,7 +1005,7 @@ def npu_fused_dsa_attn_forward(
     #    (NPU API requires H=64 or 128, so compute loss with full heads)
     # =====================================================================
     loss = None
-    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.1)
     if self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0:
         if mode == "TND":
             query_index_for_loss = query_index.view(-1, query_index.size(-2), query_index.size(-1))

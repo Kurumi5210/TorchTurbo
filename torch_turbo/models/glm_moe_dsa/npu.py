@@ -502,7 +502,7 @@ def indexer_forward_with_index(
 
 
 @cache
-def get_sp_local_cu_seqlens(attention_mask):
+def get_sp_local_cu_seqlens(attention_mask, bs, local_seq_size, device):
     """Get sequence parallel local cumulative sequence lengths for TND layout.
 
     Computes the cumulative sequence lengths for query and key sequences
@@ -520,12 +520,22 @@ def get_sp_local_cu_seqlens(attention_mask):
             kv_end: int - global end position of KV for this rank's sequences
             pad: int - padding in the local sequence
     """
-    bs, seq_len = attention_mask.shape
-    if attention_mask is None or (bs != 1 and torch.max(attention_mask) <= 1):
-        return ("BSND", None, None, 0, 0)
-
     sp_group = get_ulysses_sequence_parallel_group()
     sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
+    sp_rank = get_ulysses_sequence_parallel_rank(sp_group)
+    if attention_mask is None or (bs != 1 and torch.max(attention_mask) <= 1):
+        kv_end = local_seq_size * (sp_rank + 1)
+        q_seqlens = torch.cumsum(
+            torch.full((bs,), local_seq_size, dtype=torch.int32, device=device),
+            dim=0
+        ).to(torch.int32)
+        kv_cu_seqlens = torch.cumsum(
+            torch.full((bs,), kv_end, dtype=torch.int32, device=device),
+            dim=0
+        ).to(torch.int32)
+        return ("BSND", q_seqlens, kv_cu_seqlens, 0, kv_end)
+
+    bs, seq_len = attention_mask.shape
     assert bs == 1, "must be"
 
     # assume padding belongs to the last sequence
@@ -536,7 +546,6 @@ def get_sp_local_cu_seqlens(attention_mask):
     if sp_size > 1:
         chunk_size = seq_len // sp_size
         assert seq_len % sp_size == 0, "must be"
-        sp_rank = get_ulysses_sequence_parallel_rank(sp_group)
         start = sp_rank * chunk_size
         end = (sp_rank + 1) * chunk_size
         local_attention_mask = attention_mask[:, start:end]
@@ -606,11 +615,19 @@ def indexer_forward_with_scores(
     topk = self.index_topk
 
     # Get cumulative sequence lengths for TND layout
-    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end = get_sp_local_cu_seqlens(attention_mask)
+    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end = get_sp_local_cu_seqlens(
+        attention_mask, query_index.size(0), query_index.size(1), query_index.device
+    )
 
+    # deal with inputs
     if mode == "TND":
         query_index = query_index.view(-1, query_index.size(-2), query_index.size(-1))
         key_index = key_index.view(-1, 1, key_index.size(-1))[kv_start:kv_end]
+        weights = weights.view(-1, weights.size(-1))
+    else:
+        query_index = query_index.view(-1, query_index.size(-2), query_index.size(-1))
+        key_index = key_index[:, kv_start:kv_end].contiguous()
+        key_index = key_index.view(-1, 1, key_index.size(-1))
         weights = weights.view(-1, weights.size(-1))
 
     topk_indices, topk_score = torch_npu.npu_lightning_indexer(
@@ -619,8 +636,8 @@ def indexer_forward_with_scores(
         weights,
         actual_seq_lengths_query=q_cu_seqlens,
         actual_seq_lengths_key=kv_cu_seqlens,
-        layout_query=mode,
-        layout_key=mode,
+        layout_query="TND",
+        layout_key="TND",
         sparse_count=topk,
         sparse_mode=3,  # rightDownCausal mode
         return_value=True,
@@ -960,14 +977,18 @@ def npu_fused_dsa_attn_forward(
     # TND layout: T = total_tokens, N = num_heads, D = head_dim
 
     # Get cumulative sequence lengths for TND layout
-    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end = get_sp_local_cu_seqlens(attention_mask)
+    mode, q_cu_seqlens, kv_cu_seqlens, kv_start, kv_end = get_sp_local_cu_seqlens(
+        attention_mask,
+        q_nope_absorbed.size(0),
+        q_nope_absorbed.size(1),
+        q_nope_absorbed.device
+    )
     # kv_start and kv_end can be used to slice the full KV tensor to get relevant portion
     # For now, the full KV is all-gathered, so these are not immediately used
     scale_value = self.scaling
 
+    num_heads = q_nope_absorbed.shape[2]
     if mode == "TND":
-        # Convert from BSND to TND layout
-        num_heads = q_nope_absorbed.shape[2]
         query = q_nope_absorbed.view(-1, num_heads, self.kv_lora_rank)
         query_rope = q_pe.view(-1, num_heads, self.qk_rope_head_dim)
         key = k_lat.view(-1, 1, self.kv_lora_rank)[kv_start:kv_end]
@@ -975,12 +996,13 @@ def npu_fused_dsa_attn_forward(
         key_rope = k_pe.view(-1, 1, self.qk_rope_head_dim)[kv_start:kv_end]
         sparse_indices = topk_indices.view(-1, 1, self.indexer.index_topk)
     else:
-        query = q_nope_absorbed
-        query_rope = q_pe
-        key = k_lat
-        value = v_lat
-        key_rope = k_pe
-        sparse_indices = topk_indices
+        # BSND to TND
+        query = q_nope_absorbed.contiguous().view(-1, num_heads, self.kv_lora_rank)
+        query_rope = q_pe.contiguous().view(-1, num_heads, self.qk_rope_head_dim)
+        key = k_lat[:, kv_start:kv_end].contiguous().view(-1, 1, self.kv_lora_rank)
+        value = v_lat[:, kv_start:kv_end].contiguous().view(-1, 1, self.kv_lora_rank)
+        key_rope = k_pe[:, kv_start:kv_end].contiguous().view(-1, 1, self.qk_rope_head_dim)
+        sparse_indices = topk_indices.view(-1, 1, self.indexer.index_topk)
 
     # Call npu_sparse_flash_attention with TND layout
     attn_output, softmax_max, softmax_sum, *_ = torch_npu.npu_sparse_flash_attention(
@@ -993,8 +1015,8 @@ def npu_fused_dsa_attn_forward(
         query_rope=query_rope,
         key_rope=key_rope,
         sparse_block_size=1,
-        layout_query=mode,
-        layout_kv=mode,
+        layout_query="TND",
+        layout_kv="TND",
         sparse_mode=3,
         attention_mode=2,
         return_softmax_lse=True,
@@ -1012,16 +1034,17 @@ def npu_fused_dsa_attn_forward(
             weights_indexer_for_loss = weights_indexer.view(-1, weights_indexer.size(-1))
             key_index_for_loss = key_index.view(-1, 1, key_index.size(-1))[kv_start:kv_end]
         else:
-            query_index_for_loss = query_index
-            weights_indexer_for_loss = weights_indexer
-            key_index_for_loss = key_index
+            query_index_for_loss = query_index.view(-1, query_index.size(-2), query_index.size(-1))
+            weights_indexer_for_loss = weights_indexer.view(-1, weights_indexer.size(-1))
+            key_index = key_index[:, kv_start:kv_end].contiguous()
+            key_index_for_loss = key_index.view(-1, 1, key_index.size(-1))
+
         softmax_max_for_loss = softmax_max
         softmax_sum_for_loss = softmax_sum
         query_for_loss = query
         query_rope_for_loss = query_rope
         key_for_loss = key
         key_rope_for_loss = key_rope
-
         # Compute loss
         loss = fused_sparse_lightning_indexer_kl_loss(
             query_for_loss,
@@ -1037,7 +1060,7 @@ def npu_fused_dsa_attn_forward(
             key_rope=key_rope_for_loss,
             actual_seq_qlen=q_cu_seqlens,
             actual_seq_klen=kv_cu_seqlens,
-            layout=mode,
+            layout="TND",
             sparse_mode=3,
         )
         loss = loss * indexer_loss_coeff

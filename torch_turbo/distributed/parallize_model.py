@@ -83,8 +83,8 @@ def apply_sp(model, sp_plan):
         if hasattr(module, "_flash_attention_forward"):
             module._flash_attention_forward = ulysses_flash_attention_forward
         else:
-            from transformers.integrations import flash_attention
-            flash_attention._flash_attention_forward = ulysses_flash_attention_forward
+            import transformers.integrations.flash_attention as flash_attn_module
+            flash_attn_module._flash_attention_forward = ulysses_flash_attention_forward
             break
 
 

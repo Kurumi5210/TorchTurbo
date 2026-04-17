@@ -42,14 +42,20 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(
-    x: torch.Tensor,
+    q: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
 ) -> torch.Tensor:
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    return (x * cos) + (rotate_half(x) * sin)
+
+    x1 = q[..., 0::2]
+    x2 = q[..., 1::2]
+    t = torch.cat((x1, x2), dim=-1)
+
+    t_embed = (t * cos) + (rotate_half(t) * sin)
+    return t_embed.to(q.dtype)
 
 class GlmMoeDsaIndexer(nn.Module):
     """

@@ -1027,7 +1027,7 @@ def npu_fused_dsa_attn_forward(
     #    (NPU API requires H=64 or 128, so compute loss with full heads)
     # =====================================================================
     loss = None
-    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.01)
+    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
     if self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0:
         if mode == "TND":
             query_index_for_loss = query_index.view(-1, query_index.size(-2), query_index.size(-1))

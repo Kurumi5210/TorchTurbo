@@ -1,6 +1,9 @@
 import json
+import logging
+import os
 import re
 import shutil
+import time
 from pathlib import Path
 import psutil
 import gc
@@ -14,6 +17,18 @@ from .weight_loader import HF_BUFFER_NAME_MAP
 from torch_turbo.distributed.comm import all_gather_tensor, all_gather_tensor_chunked
 from torch_turbo.distributed.parallel_state import get_expert_mesh
 from torch_turbo.models.registry import get_parallel_plan
+
+logger = logging.getLogger(__name__)
+
+# If root logger is not configured, add a default handler for this module
+if not logging.getLogger().handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    ))
+    _handler.setLevel(logging.INFO)
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 class DistParamSaver:
@@ -31,6 +46,10 @@ class DistParamSaver:
         self.processing_class = processing_class
         self.src_path = Path(args.path) if hasattr(args, 'path') and args.path else None
         self.model_type = model.config.model_type
+
+        # Async transfer setup (one-time use)
+        self._transfer_stream = torch.cuda.Stream()
+        self._pending_events = []
 
     def _load_index_json(self, path):
         """Load the model.safetensors.index.json file."""
@@ -73,6 +92,11 @@ class DistParamSaver:
 
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
+        start_time = time.perf_counter()
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            logger.info(f"_get_local_hf_state_dict starting...")
+
         full_sd = {}
         if hasattr(self.model.config, "vision_config"):
             config = self.model.config.text_config
@@ -83,16 +107,19 @@ class DistParamSaver:
         param_count = 0
 
         def _gc_cleanup():
+            gpu_before = self._get_gpu_memory_usage_percent()
+            cpu_before = self._get_cpu_memory_usage_percent()
+            torch.cuda.empty_cache()
             gc.collect()
-            gpu_mem = self._get_gpu_memory_usage_percent()
-            cpu_mem = self._get_cpu_memory_usage_percent()
+            gpu_after = self._get_gpu_memory_usage_percent()
+            cpu_after = self._get_cpu_memory_usage_percent()
             if torch.distributed.get_rank() == 0:
-                print(f"⚠️  Memory alert - GPU: {gpu_mem:.1f}%, CPU: {cpu_mem:.1f}%")
+                logger.info(f"Memory alert - GPU: {gpu_before:.1f}% -> {gpu_after:.1f}% , CPU: {cpu_before:.1f}% -> {cpu_after:.1f}%")
 
         for name, param in self.model.named_parameters():
             param_count += 1
             if torch.distributed.get_rank() == 0:
-                print(f"[saving] param_name: {name}")
+                logger.info(f"[saving] param_name: {name}")
             if isinstance(param, DTensor):
                 full_tensor = param.full_tensor()
             else:
@@ -101,7 +128,7 @@ class DistParamSaver:
             if "mlp.experts" in name:
                 prefix = name[:-8]
                 num_experts = self.moe_config.num_moe_experts
-                full_tensor = all_gather_tensor_chunked(full_tensor, ep_name="ep", num_chunks=self.ep_size)
+                full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
                 if "weight1" in name:
                     experts = torch.split(full_tensor, config.hidden_size)
                     for i in range(num_experts):
@@ -109,9 +136,9 @@ class DistParamSaver:
                         up_proj = f"{prefix}.{i}.up_proj.weight"
                         expert2 = torch.split(experts[i].t(), config.moe_intermediate_size)
                         if gate_proj in local_params:
-                            full_sd[gate_proj] = expert2[0].cpu()
+                            full_sd[gate_proj] = self._async_cpu_copy(expert2[0])
                         if up_proj in local_params:
-                            full_sd[up_proj] = expert2[1].cpu()
+                            full_sd[up_proj] = self._async_cpu_copy(expert2[1])
                         del expert2
                 else:
                     # weight2
@@ -119,50 +146,89 @@ class DistParamSaver:
                     for i in range(num_experts):
                         down_proj = f"{prefix}.{i}.down_proj.weight"
                         if down_proj in local_params:
-                            full_sd[down_proj] = experts[i].t().cpu()
+                            full_sd[down_proj] = self._async_cpu_copy(experts[i].t())
                 del full_tensor, experts
             elif "mlp.router" in name:
                 new_name = name.replace("router", "gate")
                 if self.model_type in HF_BUFFER_NAME_MAP.keys():
                     new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
                 if new_name in local_params:
-                    full_sd[new_name] = full_tensor.cpu()
+                    full_sd[new_name] = self._async_cpu_copy(full_tensor)
                 del full_tensor
             else:
                 if name in local_params:
-                    full_sd[name] = full_tensor.cpu()
+                    full_sd[name] = self._async_cpu_copy(full_tensor)
                 del full_tensor
-            if param_count % cleanup_freq == 0:
+            if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
+                self._sync_all_transfers()
                 _gc_cleanup()
 
         # Handle buffers
         for name, buf in self.model.named_buffers():
             param_count += 1
             if torch.distributed.get_rank() == 0:
-                print(f"[saving] buf_name: {name}")
+                logger.info(f"[saving] buf_name: {name}")
             if self.model_type in HF_BUFFER_NAME_MAP.keys():
                 if "mlp.router" in name and "expert_bias" in name:
                     new_name = name.replace("router", "gate")
                     new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
                     name = new_name
+                    if isinstance(buf, DTensor):
+                        buf = buf.full_tensor()
                     if name in local_params:
-                        if isinstance(buf, DTensor):
-                            full_sd[name] = buf.full_tensor().cpu()
-                        else:
-                            full_sd[name] = buf.cpu()
+                        full_sd[name] = self._async_cpu_copy(buf)
             del buf
             if param_count % cleanup_freq == 0:
                 _gc_cleanup()
 
+        # Final sync before returning
+        self._sync_all_transfers()
+
+        elapsed = time.perf_counter() - start_time
+        if rank == 0:
+            logger.info(f"_get_local_hf_state_dict completed in {elapsed:.2f}s")
+
         return full_sd
 
+    def _async_cpu_copy(self, tensor):
+        """Async GPU->CPU copy using pinned memory."""
+        if not torch.cuda.is_available() or self._transfer_stream is None:
+            return tensor.cpu()
+
+        # Allocate fresh pinned buffer each time
+        cpu_pinned = torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device='cpu',
+            pin_memory=True
+        )
+
+        # Non-blocking copy on dedicated stream
+        with torch.cuda.stream(self._transfer_stream):
+            cpu_pinned.copy_(tensor, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self._transfer_stream)
+            self._pending_events.append(event)
+
+        return cpu_pinned
+
+    def _sync_all_transfers(self):
+        """Wait for all pending async transfers to complete."""
+        if not self._pending_events:
+            return
+
+        for event in self._pending_events:
+            event.wait()
+        self._pending_events.clear()
+
+        if self._transfer_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._transfer_stream)
+
     def _get_gpu_memory_usage_percent(self):
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated()
-            reserved = torch.cuda.memory_reserved()
-            if reserved > 0:
-                return (allocated / reserved) * 100
-        return 0.0
+        mem_free, mem_total = torch.cuda.mem_get_info()
+        mem_used = mem_total - mem_free
+        utilization = (mem_used / mem_total) * 100.0
+        return utilization
 
     def _get_cpu_memory_usage_percent(self):
         return psutil.virtual_memory().percent
@@ -195,23 +261,23 @@ class DistParamSaver:
                         up_proj = f"{prefix}.{expert_idx}.up_proj.weight"
                         expert2 = torch.split(experts[i], config.moe_intermediate_size)
                         if gate_proj in local_params:
-                            full_sd[gate_proj] = expert2[0].cpu()
+                            full_sd[gate_proj] = self._async_cpu_copy(expert2[0])
                         if up_proj in local_params:
-                            full_sd[up_proj] = expert2[1].cpu()
+                            full_sd[up_proj] = self._async_cpu_copy(expert2[1])
                 elif "fc2_linear" in name:
                     experts = torch.split(full_tensor, config.hidden_size)
                     for i in range(self.ep_size):
                         expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
                         down_proj = f"{prefix}.{expert_idx}.down_proj.weight"
                         if down_proj in local_params:
-                            full_sd[down_proj] = experts[i].cpu()
+                            full_sd[down_proj] = self._async_cpu_copy(experts[i])
             elif "mlp.router" in name:
                 new_name = name.replace("router", "gate")
                 if new_name in local_params:
-                    full_sd[new_name] = full_tensor.cpu()
+                    full_sd[new_name] = self._async_cpu_copy(full_tensor)
             else:
                 if name in local_params:
-                    full_sd[name] = full_tensor.cpu()
+                    full_sd[name] = self._async_cpu_copy(full_tensor)
 
         # Handle buffers
         for name, buf in self.model.named_buffers():
@@ -220,12 +286,12 @@ class DistParamSaver:
                     new_name = name.replace("router", "gate")
                     new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
                     name = new_name
+                    if isinstance(buf, DTensor):
+                        buf = buf.full_tensor()
                     if name in local_params:
-                        if isinstance(buf, DTensor):
-                            full_sd[name] = buf.full_tensor().cpu()
-                        else:
-                            full_sd[name] = buf.cpu()
+                        full_sd[name] = self._async_cpu_copy(buf)
 
+        self._sync_all_transfers()
         return full_sd
 
     def save_model(self, save_path, use_hf_format: bool = True):
@@ -269,9 +335,17 @@ class DistParamSaver:
                 if fn == filename and param_name in state_dict:
                     shard_dict[param_name] = state_dict[param_name]
             if shard_dict:
-                print(f"[Rank {rank}] Saving {filename} with {len(shard_dict)} params...")
-                save_file(shard_dict, (save_path / filename).as_posix())
-
+                logger.info(f"[Rank {rank}] Saving {filename} with {len(shard_dict)} params...")
+                file_start = time.perf_counter()
+                file_path = save_path / filename
+                save_file(shard_dict, file_path.as_posix())
+                # Force flush to filesystem to ensure data is written to NAS
+                with open(file_path, 'rb+') as f:
+                    f.flush()
+                    os.fsync(f.fileno())
+                file_elapsed = time.perf_counter() - file_start
+                logger.info(f"[Rank {rank}] Saved {filename} in {file_elapsed:.2f}s")
+        os.sync()
         torch.distributed.barrier()  # Wait for all ranks to finish saving shards
 
         # Rank 0 saves index and copies other files
@@ -287,10 +361,11 @@ class DistParamSaver:
                 json.dump(index_content, f, indent=2)
 
             self._copy_non_safetensor_files(self.src_path, save_path)
+            os.sync()
 
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(save_path)
 
-            print(f"Rank: {rank} - Saved hf model to {save_path.absolute()}")
+            logger.info(f"Rank: {rank} - Saved hf model to {save_path.absolute()}")
 
         torch.distributed.barrier()

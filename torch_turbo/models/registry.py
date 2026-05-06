@@ -10,7 +10,8 @@ from .buffer_patch import (
     register_buffer_for_kimi_k25,
     register_buffer_for_olmo3,
     register_buffer_for_qwen3,
-    register_buffer_for_glm5
+    register_buffer_for_glm5,
+    register_buffer_for_deepseek_v4,
 )
 from torch_turbo.distributed.parallel_plan import ParallelPlan
 
@@ -24,6 +25,7 @@ _SUPPORT_MODELS = {
     "olmo3": "olmo3",
     "qwen3": "qwen3",
     "glm_moe_dsa": "glm_moe_dsa",
+    "deepseek_v4": "deepseek_v4",
 }
 
 
@@ -36,6 +38,7 @@ _BUFFER_REGISTRY = {
     "olmo3": register_buffer_for_olmo3,
     "qwen3":register_buffer_for_qwen3,
     "glm_moe_dsa": register_buffer_for_glm5,
+    "deepseek_v4": register_buffer_for_deepseek_v4,
 }
 
 
@@ -57,6 +60,12 @@ class Registry(MutableMapping):
 
     def __len__(self):
         return len(self._model_mapping)
+
+    def __contains__(self, key) -> bool:
+        return key in self._model_mapping
+
+    def has(self, key) -> bool:
+        return key in self._model_mapping
 
     def valid_keys(self) -> List[str]:
         return list(self.keys())
@@ -80,7 +89,7 @@ class Registry(MutableMapping):
 MODELING_REGISTRY = Registry()
 MOE_CONFIG_REGISTRY = Registry()
 PARALLEL_PLAN_REGISTRY = Registry()
-
+PARAM_NAME_CONVERTER_REGISTRY = Registry()
 
 def get_model_config(args):
     config_path = args.path
@@ -91,6 +100,13 @@ def get_model_cls(hf_config):
     model_type = hf_config.model_type
     return MODELING_REGISTRY[model_type](hf_config)
 
+def get_param_converter(config, moe_config):
+    model_type = config.model_type
+    if model_type in PARAM_NAME_CONVERTER_REGISTRY:
+        return PARAM_NAME_CONVERTER_REGISTRY[model_type](config, moe_config)
+
+    from torch_turbo.models.name_converter import BaseWeightConverter
+    return BaseWeightConverter(config, moe_config)
 
 def get_parallel_plan(hf_config):
     model_type = hf_config.model_type

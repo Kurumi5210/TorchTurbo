@@ -17,6 +17,7 @@ from torch_turbo.distributed.parallel_state import (
     get_expert_model_parallel_world_size
 )
 from torch_turbo.models.registry import get_parallel_plan
+from torch_turbo.models.registry import get_param_converter
 
 
 HF_BUFFER_NAME_MAP = {
@@ -24,15 +25,14 @@ HF_BUFFER_NAME_MAP = {
     "kimi_k2": {"expert_bias": "e_score_correction_bias"},
     "kimi_k25": {"expert_bias": "e_score_correction_bias"},
     "glm_moe_dsa": {"expert_bias": "e_score_correction_bias"},
+    "deepseek_v4": {"expert_bias": "bias"},
 }
-
 
 class DistParamLoader:
     def __init__(self, model, hf_config, device, args):
         self.model = model
         self.hf_config = hf_config
-        parallel_plan = get_parallel_plan(hf_config)
-        self.moe_config = parallel_plan.moe_config
+        self.moe_config = model.moe_config
         self.device = device
         self.path = Path(args.path)
         self.ep_mesh = get_expert_mesh()
@@ -41,11 +41,12 @@ class DistParamLoader:
         self.world_size = dist.get_world_size()
         self.ep_rank = get_expert_model_parallel_rank()
         self.ep_world_size = get_expert_model_parallel_world_size()
+        self.param_converter = get_param_converter(hf_config, self.moe_config)
         # log related
         self.start_time = time.perf_counter()
         self.prev_time = self.start_time
         # build meta
-        self.layer_pattern = re.compile(r"(?:^|\.)model\.layers\.(\d+)(?:\.|$)")
+        self.layer_pattern = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
         self.param_to_filename = self._load_index_json()
         self.param_to_rank, self.layer_to_rank = self._build_param_to_rank()
         self.local_sd = self._load_local_shards()
@@ -175,26 +176,50 @@ class DistParamLoader:
                 result = tensor.clone()
         return result
 
-    def _broadcast_to_ep_ranks(self, name, param, prefix, is_weight1):
+    def _broadcast_expert_weight1(self, name, param):
         owner = self._get_owner_rank(name)
         ep_size = self.ep_world_size
         result = None
 
         if owner == self.rank:
+            gates, ups = self.param_converter.convert_expert_weight1_to_hf(name)
             for i in range(ep_size):
                 num_local_experts = self.moe_config.num_moe_experts // ep_size
                 weights = []
                 for j in range(num_local_experts):
                     index = i * num_local_experts + j
-                    if is_weight1:
-                        gate = self.local_sd.pop(f"{prefix}.{index}.gate_proj.weight")
-                        up = self.local_sd.pop(f"{prefix}.{index}.up_proj.weight")
-                        weights.append(torch.cat([gate, up]))
-                    else:
-                        down = self.local_sd.pop(f"{prefix}.{index}.down_proj.weight")
-                        weights.append(down.t())
+                    gate = self.local_sd.pop(gates[index]).to(self.device).to(param.dtype)
+                    up = self.local_sd.pop(ups[index]).to(self.device).to(param.dtype)
+                    weights.append(torch.cat([gate, up]))
+
                 tensor = torch.stack(weights, dim=0)
-                tensor = tensor.permute(0, 2, 1) if is_weight1 else tensor
+                tensor = tensor.permute(0, 2, 1)
+                tensor = tensor.reshape(-1, tensor.shape[-1])
+                if self.rank % ep_size == i:
+                    result = tensor
+                 # broadcast to ep_group
+                dist.broadcast(tensor, src=owner)
+                torch.cuda.synchronize()
+        else:
+            result = self._broadcast_empty_tensor(param, owner, ep_size)
+
+        return result
+
+    def _broadcast_expert_weight2(self, name, param):
+        owner = self._get_owner_rank(name)
+        ep_size = self.ep_world_size
+        result = None
+
+        if owner == self.rank:
+            downs = self.param_converter.convert_expert_weight2_to_hf(name)
+            for i in range(ep_size):
+                num_local_experts = self.moe_config.num_moe_experts // ep_size
+                weights = []
+                for j in range(num_local_experts):
+                    index = i * num_local_experts + j
+                    down = self.local_sd.pop(downs[index]).to(self.device).to(param.dtype)
+                    weights.append(down.t())
+                tensor = torch.stack(weights, dim=0)
                 tensor = tensor.reshape(-1, tensor.shape[-1])
                 if self.rank % ep_size == i:
                     result = tensor
@@ -241,29 +266,41 @@ class DistParamLoader:
                 name = name.replace(turbo_name, hf_name)
         return name
 
+    def _fix_buffer_dtype(self):
+        for name, submodule in self.model.named_modules():
+            for buf_name, buf in submodule.named_buffers(recurse=False):
+                full_name = f"{name}.{buf_name}" if name else buf_name
+                if not self.param_converter.is_persist_buffer(full_name):
+                    continue
+                hf_buffer_name = self.param_converter.convert_persist_buffer(full_name)
+                hf_dtype = self.param_converter.get_default_hf_dtype(hf_buffer_name)
+                old_dtype = buf.dtype
+                if old_dtype != hf_dtype:
+                    new_buf = buf.detach().to(hf_dtype)
+                    submodule.register_buffer(buf_name, new_buf)
+                    print(f"Converted {name}.{buf_name}: {old_dtype} -> {hf_dtype}")
+
     def _broadcast_buffers(self):
-         # Load buffers (e.g., bailing expert bias)
+        self._fix_buffer_dtype()
         for name, buf in self.model.named_buffers():
-            if "router.expert_bias" in name:
-                hf_buffer_name = self._hf_buffer_name_convert(name)
+            if self.param_converter.is_persist_buffer(name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
                 full = self._broadcast_tensor(hf_buffer_name, buf.shape, buf.dtype)
-                buf.copy_(full)
+                with torch.no_grad():
+                    buf.copy_(full)
 
     def _broadcast_params(self):
         num_param_tensors = len(list(self.model.parameters()))
         i = 0
         for name, param in self.model.named_parameters():
-            if "mlp.experts" in name:
-                if self.use_te:
-                    prefix = name.split(".")
-                    full = self._te_broadcast_to_ep_ranks(name, param, prefix)
-                else:
-                    is_weight1 = "weight1" in name
-                    prefix = name[:-8]
-                    full = self._broadcast_to_ep_ranks(name, param, prefix, is_weight1)
+            if self.param_converter.is_expert_weight1(name):
+                full = self._broadcast_expert_weight1(name, param)
                 mesh = self.ep_mesh['edp']
-            elif "mlp.router" in name:
-                hf_param_name = name.replace("router", "gate")
+            elif self.param_converter.is_expert_weight2(name):
+                full = self._broadcast_expert_weight2(name, param)
+                mesh = self.ep_mesh['edp']
+            elif self.param_converter.is_router_param(name):
+                hf_param_name = self.param_converter.convert_router_param_to_hf(name)
                 full = self._broadcast_tensor(hf_param_name, param.shape, param.dtype)
                 mesh = self.world_mesh
             else:

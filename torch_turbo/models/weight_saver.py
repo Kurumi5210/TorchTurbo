@@ -17,6 +17,7 @@ from .weight_loader import HF_BUFFER_NAME_MAP
 from torch_turbo.distributed.comm import all_gather_tensor, all_gather_tensor_chunked
 from torch_turbo.distributed.parallel_state import get_expert_mesh
 from torch_turbo.models.registry import get_parallel_plan
+from torch_turbo.models.registry import get_param_converter
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ if not logging.getLogger().handlers:
 class DistParamSaver:
     def __init__(self, model, args, processing_class=None):
         self.model = model
-        self.moe_config = get_parallel_plan(model.config).moe_config
+        self.moe_config = model.moe_config
 
         ep_mesh = get_expert_mesh()
         self.ep = ep_mesh["ep"]
@@ -46,6 +47,7 @@ class DistParamSaver:
         self.processing_class = processing_class
         self.src_path = Path(args.path) if hasattr(args, 'path') and args.path else None
         self.model_type = model.config.model_type
+        self.param_converter = get_param_converter(model.config, self.moe_config)
 
         # Async transfer setup (one-time use)
         self._transfer_stream = torch.cuda.Stream()
@@ -90,6 +92,36 @@ class DistParamSaver:
         local_params = {name for name, fn in weight_map.items() if fn in local_files}
         return local_params, local_files
 
+    def _save_expert_weight1_to_hf(self, name, full_tensor, local_params, full_sd):
+        gates, ups = self.param_converter.convert_expert_weight1_to_hf(name)
+        num_experts = self.moe_config.num_moe_experts
+        full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+        experts = torch.split(full_tensor, self.config.hidden_size)
+        for i in range(num_experts):
+            expert2 = torch.split(experts[i].t(), self.config.moe_intermediate_size)
+            if gates[i] in local_params:
+                full_sd[gates[i]] = self._async_cpu_copy(gates[i], expert2[0])
+            if ups[i] in local_params:
+                full_sd[ups[i]] = self._async_cpu_copy(ups[i], expert2[1])
+            del expert2
+        del experts
+
+    def _save_expert_weight2_to_hf(self, name, full_tensor, local_params, full_sd):
+        downs = self.param_converter.convert_expert_weight2_to_hf(name)
+        num_experts = self.moe_config.num_moe_experts
+        full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
+        # weight2
+        experts = torch.split(full_tensor, self.config.moe_intermediate_size)
+        for i in range(num_experts):
+            if downs[i] in local_params:
+                full_sd[downs[i]] = self._async_cpu_copy(downs[i], experts[i].t())
+        del experts
+
+    def _save_router_param_to_hf(self, name, full_tensor, local_params, full_sd):
+        hf_param_name = self.param_converter.convert_router_param_to_hf(name)
+        if hf_param_name in local_params:
+            full_sd[hf_param_name] = self._async_cpu_copy(hf_param_name, full_tensor)
+
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()
@@ -99,9 +131,9 @@ class DistParamSaver:
 
         full_sd = {}
         if hasattr(self.model.config, "vision_config"):
-            config = self.model.config.text_config
+            self.config = self.model.config.text_config
         else:
-            config = self.model.config
+            self.config = self.model.config
 
         cleanup_freq = 50
         param_count = 0
@@ -125,64 +157,42 @@ class DistParamSaver:
             else:
                 full_tensor = param
 
-            if "mlp.experts" in name:
-                prefix = name[:-8]
-                num_experts = self.moe_config.num_moe_experts
-                full_tensor = all_gather_tensor(full_tensor, ep_name="ep")
-                if "weight1" in name:
-                    experts = torch.split(full_tensor, config.hidden_size)
-                    for i in range(num_experts):
-                        gate_proj = f"{prefix}.{i}.gate_proj.weight"
-                        up_proj = f"{prefix}.{i}.up_proj.weight"
-                        expert2 = torch.split(experts[i].t(), config.moe_intermediate_size)
-                        if gate_proj in local_params:
-                            full_sd[gate_proj] = self._async_cpu_copy(expert2[0])
-                        if up_proj in local_params:
-                            full_sd[up_proj] = self._async_cpu_copy(expert2[1])
-                        del expert2
-                else:
-                    # weight2
-                    experts = torch.split(full_tensor, config.moe_intermediate_size)
-                    for i in range(num_experts):
-                        down_proj = f"{prefix}.{i}.down_proj.weight"
-                        if down_proj in local_params:
-                            full_sd[down_proj] = self._async_cpu_copy(experts[i].t())
-                del full_tensor, experts
-            elif "mlp.router" in name:
-                new_name = name.replace("router", "gate")
-                if self.model_type in HF_BUFFER_NAME_MAP.keys():
-                    new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
-                if new_name in local_params:
-                    full_sd[new_name] = self._async_cpu_copy(full_tensor)
-                del full_tensor
+            if self.param_converter.is_expert_weight1(name):
+                self._save_expert_weight1_to_hf(name, full_tensor, local_params, full_sd)
+            elif self.param_converter.is_expert_weight2(name):
+                self._save_expert_weight2_to_hf(name, full_tensor, local_params, full_sd)
+            elif self.param_converter.is_router_param(name):
+                self._save_router_param_to_hf(name, full_tensor, local_params, full_sd)
             else:
                 if name in local_params:
-                    full_sd[name] = self._async_cpu_copy(full_tensor)
-                del full_tensor
+                    full_sd[name] = self._async_cpu_copy(name, full_tensor)
+            del full_tensor
+
             if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
                 self._sync_all_transfers()
                 _gc_cleanup()
 
-        # Handle buffers
         for name, buf in self.model.named_buffers():
-            param_count += 1
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"[saving] buf_name: {name}")
-            if self.model_type in HF_BUFFER_NAME_MAP.keys():
-                if "mlp.router" in name and "expert_bias" in name:
-                    new_name = name.replace("router", "gate")
-                    new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
-                    name = new_name
-                    if isinstance(buf, DTensor):
-                        buf = buf.full_tensor()
-                    if name in local_params:
-                        full_sd[name] = self._async_cpu_copy(buf)
-            del buf
-            if param_count % cleanup_freq == 0:
-                _gc_cleanup()
+            if self.param_converter.is_persist_buffer(name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+                param_count += 1
+                if torch.distributed.get_rank() == 0:
+                    logger.info(f"[saving] buf_name: {name}->{hf_buffer_name}")
+                if isinstance(buf, DTensor):
+                    buf = buf.full_tensor()
+                if hf_buffer_name in local_params:
+                    full_sd[hf_buffer_name] = self._async_cpu_copy(hf_buffer_name, buf)
+                del buf
+                if param_count % cleanup_freq == 0:
+                    _gc_cleanup()
 
         # Final sync before returning
         self._sync_all_transfers()
+        missing_params = local_params - set(full_sd.keys())
+        extra_params = set(full_sd.keys()) - local_params
+        if len(full_sd.keys()) != len(local_params):
+            logger.error(f"[Rank {self.rank}] Missing params ({len(missing_params)}): {missing_params}")
+            logger.error(f"[Rank {self.rank}] Extra params ({len(extra_params)}): {extra_params}")
 
         elapsed = time.perf_counter() - start_time
         if rank == 0:
@@ -190,11 +200,14 @@ class DistParamSaver:
 
         return full_sd
 
-    def _async_cpu_copy(self, tensor):
+    def _async_cpu_copy(self, name, tensor):
         """Async GPU->CPU copy using pinned memory."""
-        if not torch.cuda.is_available() or self._transfer_stream is None:
+        dtype = self.param_converter.get_default_hf_dtype(name)
+        tensor = tensor.to(dtype)
+        if True:
             return tensor.cpu()
 
+        # following code has bug in npu
         # Allocate fresh pinned buffer each time
         cpu_pinned = torch.empty(
             tensor.shape,
@@ -261,35 +274,38 @@ class DistParamSaver:
                         up_proj = f"{prefix}.{expert_idx}.up_proj.weight"
                         expert2 = torch.split(experts[i], config.moe_intermediate_size)
                         if gate_proj in local_params:
-                            full_sd[gate_proj] = self._async_cpu_copy(expert2[0])
+                            full_sd[gate_proj] = self._async_cpu_copy(gate_proj, expert2[0])
                         if up_proj in local_params:
-                            full_sd[up_proj] = self._async_cpu_copy(expert2[1])
+                            full_sd[up_proj] = self._async_cpu_copy(up_proj, expert2[1])
                 elif "fc2_linear" in name:
                     experts = torch.split(full_tensor, config.hidden_size)
                     for i in range(self.ep_size):
                         expert_idx = i * num_local_experts + int(re.findall(r"\d+", prefix_lst[-1])[0])
                         down_proj = f"{prefix}.{expert_idx}.down_proj.weight"
                         if down_proj in local_params:
-                            full_sd[down_proj] = self._async_cpu_copy(experts[i])
+                            full_sd[down_proj] = self._async_cpu_copy(down_proj, experts[i])
             elif "mlp.router" in name:
                 new_name = name.replace("router", "gate")
                 if new_name in local_params:
-                    full_sd[new_name] = self._async_cpu_copy(full_tensor)
+                    full_sd[new_name] = self._async_cpu_copy(new_name, full_tensor)
             else:
                 if name in local_params:
-                    full_sd[name] = self._async_cpu_copy(full_tensor)
+                    full_sd[name] = self._async_cpu_copy(name, full_tensor)
 
         # Handle buffers
         for name, buf in self.model.named_buffers():
+            if buf in self.model._non_persistent_buffers_set:
+                continue
             if self.model_type in HF_BUFFER_NAME_MAP.keys():
-                if "mlp.router" in name and "expert_bias" in name:
-                    new_name = name.replace("router", "gate")
-                    new_name = new_name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
-                    name = new_name
+                if "mlp.router" in name:
+                    name = name.replace("router", "gate")
+                    if "expert_bias" in name:
+                        name = name.replace("expert_bias", HF_BUFFER_NAME_MAP[self.model_type]["expert_bias"])
                     if isinstance(buf, DTensor):
                         buf = buf.full_tensor()
                     if name in local_params:
-                        full_sd[name] = self._async_cpu_copy(buf)
+                        full_sd[name] = self._async_cpu_copy(name, buf)
+            del buf
 
         self._sync_all_transfers()
         return full_sd
@@ -317,16 +333,6 @@ class DistParamSaver:
             state_dict = self._get_te_local_hf_state_dict(local_params)
         else:
             state_dict = self._get_local_hf_state_dict(local_params)
-
-        # Convert tensors to bfloat16 and ensure contiguous
-        for k in list(state_dict.keys()):
-            v = state_dict[k]
-            if isinstance(v, torch.Tensor):
-                v_bf16 = v.to(torch.bfloat16)
-                if not v_bf16.is_contiguous():
-                    v_bf16 = v_bf16.contiguous()
-                state_dict[k] = v_bf16
-                del v, v_bf16
 
         # Save shards assigned to this rank
         for filename in local_files:

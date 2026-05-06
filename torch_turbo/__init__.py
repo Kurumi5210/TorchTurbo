@@ -79,8 +79,6 @@ def _register_all_custom_models():
     # =================================================================
     # Register GlmMoeDsa (MLA with DSA indexer for sparse attention)
     # =================================================================
-    from .models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
-    from .models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
     import transformers
 
     # lower version transformers adapter
@@ -97,7 +95,17 @@ def _register_all_custom_models():
         setattr(transformers, "TokenizersBackend", TokenizersBackend)
 
     if not hasattr(transformers, "GlmMoeDsaForCausalLM"):
+        from .models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig
+        from .models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
         register_model(GlmMoeDsaConfig, GlmMoeDsaForCausalLM)
+
+    # =================================================================
+    # Register Deepseek V4
+    # =================================================================
+    if not hasattr(transformers, "DeepseekV4ForCausalLM"):
+        from .models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+        from .models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+        register_model(DeepseekV4Config, DeepseekV4ForCausalLM)
 
     # =================================================================
     # Add more models here:

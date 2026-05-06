@@ -69,6 +69,9 @@ class GroupedMLP(torch.nn.Module):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts
+        self.swiglu_limit = getattr(config, 'moe_swiglu_limit', 0.0)
+        if use_fused_swiglu:
+            assert self.swiglu_limit == 0.0, "must be"
 
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
@@ -80,8 +83,13 @@ class GroupedMLP(torch.nn.Module):
                     # use npu fused kernel for glu
                     import torch_npu
                     return torch_npu.npu_swiglu(x, dim=-1)
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
+                # Split into gate and up
+                gate, up = torch.chunk(x, 2, dim=-1)
+                # Apply swiglu_limit if configured (DeepSeek V4 style)
+                if self.swiglu_limit > 0:
+                    up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                    gate = torch.clamp(gate, max=self.swiglu_limit)
+                return self.config.activation_func(gate) * up
 
             self.activation_func = glu
         else:

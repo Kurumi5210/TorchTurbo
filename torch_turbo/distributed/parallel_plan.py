@@ -44,7 +44,7 @@ class MoEConfig:
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. """
     moe_router_topk_scaling_factor: Optional[float] = None
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    """Score function for MoE routing. Can be "softmax", "sigmoid", or "sqrtsoftplus"."""
     moe_router_score_function: str = "softmax"
     moe_router_dtype: Optional[str] = None
     moe_router_enable_expert_bias: bool = False
@@ -54,6 +54,13 @@ class MoEConfig:
     moe_permute_fusion: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
     moe_apply_probs_on_input: bool = False
+    # DeepSeek V4 specific config
+    """Swiglu limit for clamping gate and up values in SwiGLU activation."""
+    moe_swiglu_limit: float = 0.0
+    """Vocabulary size for hash-based routing (first num_hash_layers)."""
+    vocab_size: int = 0
+    """Number of layers that use hash-based routing instead of score-based routing."""
+    num_hash_layers: int = 0
 
     def __post_init__(self):
         if self.init_method is None:
@@ -77,7 +84,8 @@ class EPPlan:
 @dataclass
 class FullyShardPlan:
     # fully shard module list
-    apply_modules: List[str] = None
+    apply_modules: dict = None
+    mp_policy: dict = None
 
 
 @dataclass

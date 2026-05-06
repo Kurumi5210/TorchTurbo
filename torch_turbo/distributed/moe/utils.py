@@ -247,6 +247,9 @@ def topk_softmax_with_capacity(
     scaling_factor: Optional[float] = None,
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
+    use_hash_routing: bool = False,
+    hash_table: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
@@ -263,7 +266,7 @@ def topk_softmax_with_capacity(
         num_groups (int): Number of groups for routed experts.
         group_topk (int): Number of selected groups for each token.
         scaling_factor (float): Scaling factor of routing score in top-k selection.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): The score function to use. Can be "softmax", "sigmoid", or "sqrtsoftplus".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
 
     Returns:
@@ -292,34 +295,63 @@ def topk_softmax_with_capacity(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
+    # Compute all-expert scores based on score_function
     if score_function == "softmax":
         if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            all_scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+            # Will compute softmax after topk
+            all_scores = logits
     elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float()).type_as(logits)
-        if expert_bias is not None:
-            scores_for_routing = scores + expert_bias
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
-        else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        all_scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        all_scores = _softplus_stable(logits.float()).sqrt()
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
+
+    # Get top-k expert indices
+    if use_hash_routing:
+        # Hash routing: use pre-computed expert indices from input_ids
+        assert hash_table is not None, "hash_table required for hash routing"
+        assert input_ids is not None, "input_ids required for hash routing"
+        top_indices = hash_table[input_ids]
+    else:
+        # Score-based routing: select experts based on scores (+ bias if any)
+        scores_for_routing = all_scores
+        if expert_bias is not None and score_function != "softmax":
+            scores_for_routing = all_scores + expert_bias
+        _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+
+    # Compute routing probs for selected experts
+    if score_function == "softmax":
+        if use_pre_softmax:
+            # all_scores is already softmax, gather selected scores
+            scores = torch.gather(all_scores, dim=1, index=top_indices)
+            probs = scores
+        else:
+            # Compute softmax on selected logits only
+            selected_logits = logits.gather(1, top_indices)
+            probs = torch.softmax(selected_logits, dim=-1, dtype=torch.float32).type_as(logits)
+    else:  # sigmoid or sqrtsoftplus
+        # Gather scores for selected experts (without bias!)
+        scores = torch.gather(all_scores, dim=1, index=top_indices)
+        # Normalize scores (like DeepSeek V4 does for non-softmax)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
 
     if scaling_factor:
         probs = probs * scaling_factor
 
     # TODO Try using element-wise operations instead of scatter?
-    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
+    topk_masked_gates = torch.zeros_like(logits, dtype=torch.float32, device=logits.device).scatter(1, top_indices, probs)
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
     tokens_per_expert = topk_map.sum(dim=0)
 
     return topk_masked_gates, topk_map, tokens_per_expert
+
+
+def _softplus_stable(x: torch.Tensor) -> torch.Tensor:
+    """Stable softplus implementation: log(1 + exp(x)) without overflow."""
+    return torch.log1p(torch.exp(-x.abs())) + torch.relu(x)
 
 
 def ensure_divisibility(numerator, denominator):

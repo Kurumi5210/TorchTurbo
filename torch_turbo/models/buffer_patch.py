@@ -1,4 +1,5 @@
 import torch
+import math
 
 
 def _fix_rope_config_for_bailing(config):
@@ -114,3 +115,33 @@ def register_buffer_for_kimi_k25(model, device):
 
 def register_buffer_for_glm5(model, device):
     pass
+
+def register_buffer_for_deepseek_v4(model, device):
+    from torch_turbo.models.deepseek_v4.modeling_deepseek_v4 import generate_hadamard_matrix
+    for layer in model.layers:
+        attn_layer = layer.attn
+        config = attn_layer.config
+
+        if attn_layer.compress_ratio > 1:
+            original_seq_len, rope_theta = config.original_max_position_embeddings, config.compress_rope_theta
+        else:
+            original_seq_len, rope_theta = 0, config.rope_theta
+
+        freqs_cis = attn_layer._precompute_freqs_cis(
+            attn_layer.rope_head_dim,
+            config.max_position_embeddings,
+            original_seq_len,
+            rope_theta,
+            config.rope_factor,
+            config.beta_fast,
+            config.beta_slow,
+        )
+        attn_layer.register_buffer("freqs_cis", freqs_cis, persistent=False)
+
+        # Hadamard matrix for indexer rotation
+        if attn_layer.compress_ratio == 4:
+            hadamard_dim = 2 ** math.ceil(math.log2(config.index_head_dim))
+            hadamard_mat = generate_hadamard_matrix(hadamard_dim)
+            attn_layer.register_buffer("hadamard_mat", hadamard_mat, persistent=False)
+        else:
+            attn_layer.hadamard_mat = None

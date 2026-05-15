@@ -1,5 +1,5 @@
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
 import torch
@@ -85,7 +85,7 @@ class EPPlan:
 class FullyShardPlan:
     # fully shard module list
     apply_modules: dict = None
-    mp_policy: dict = None
+    mp_policy: dict = field(default_factory=dict)
 
 
 @dataclass

@@ -71,6 +71,13 @@ def register_buffer_for_bailing_v2_5(model, device):
             layer.attention.register_buffer('slope', slope, persistent=False)
 
 
+def register_buffer_for_bailing_v3(model, device):
+    # patch to rotary_emb
+    rotary_emb = model.model.rotary_emb
+    inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(rotary_emb.config, device)
+    rotary_emb.register_buffer("inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False)
+
+
 def register_buffer_for_kimi_k2(model, device):
     for layer in model.model.layers:
         attn_layer = layer.self_attn

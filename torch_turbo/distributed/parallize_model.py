@@ -76,16 +76,14 @@ def get_fully_shard_modules(model, apply_modules):
 def apply_sp(model, sp_plan):
     # qwen: self_attn
     # bailing: attention
-    module = sys.modules[model.__module__]
-
     sp_modules = get_matched_modules(model, sp_plan.apply_modules)
+
     for module in sp_modules:
         if hasattr(module, "_flash_attention_forward"):
             module._flash_attention_forward = ulysses_flash_attention_forward
-        else:
-            import transformers.integrations.flash_attention as flash_attn_module
-            flash_attn_module._flash_attention_forward = ulysses_flash_attention_forward
-            break
+
+    import transformers.integrations.flash_attention as flash_attn_module
+    flash_attn_module._flash_attention_forward = ulysses_flash_attention_forward
 
 
 def apply_ep(model, moe_config, ep_plan):
@@ -119,10 +117,21 @@ def apply_fsdp_prefetch(model, config):
         return
 
     model_cls = model.__class__
+    fsdp_model = model
+
     if hasattr(model, 'model'):
         model = model.model
 
-    layer_cls = model.layers[0].__class__
+    # Collect all layer types (e.g. DecoderLayer + MTPLayer)
+    layer_classes = set()
+    for layer in model.layers:
+        layer_classes.add(layer.__class__)
+
+    if len(layer_classes) == 1:
+        layer_cls = layer_classes.pop()
+    else:
+        layer_cls = tuple(layer_classes)
+
     if hasattr(config, "first_k_dense_replace"):
        moe_layer = model.layers[config.first_k_dense_replace]
     else:
@@ -134,7 +143,7 @@ def apply_fsdp_prefetch(model, config):
         expert_cls = moe_layer.ffn.experts.__class__
     else:
         assert False, "not supported"
-    setup_moe_prefetch(model, layer_cls, expert_cls, model_cls, config)
+    setup_moe_prefetch(fsdp_model, layer_cls, expert_cls, model_cls, config)
 
 def update_fsdp_mp_policy(fsdp_config, fsdp_kwargs):
     """Update mp_policy in fsdp_kwargs based on fsdp_config"""

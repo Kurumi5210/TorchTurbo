@@ -138,7 +138,7 @@ class DistParamLoader:
             else:
                 keys.append(f"{prefix}.{i}.down_proj.weight")
         return keys
-    
+
     def _load_experts_to_device(self):
         for name, _ in self.model.named_parameters():
             if "mlp.experts" not in name or self._get_owner_rank(name) != self.rank:
@@ -285,6 +285,10 @@ class DistParamLoader:
         for name, buf in self.model.named_buffers():
             if self.param_converter.is_persist_buffer(name):
                 hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+                if hf_buffer_name not in self.param_to_filename:
+                    if self.rank == 0:
+                        print(f"[Weight Loader] SKIP buffer (not in checkpoint): {name}", flush=True)
+                    continue
                 full = self._broadcast_tensor(hf_buffer_name, buf.shape, buf.dtype)
                 with torch.no_grad():
                     buf.copy_(full)
@@ -301,9 +305,19 @@ class DistParamLoader:
                 mesh = self.ep_mesh['edp']
             elif self.param_converter.is_router_param(name):
                 hf_param_name = self.param_converter.convert_router_param_to_hf(name)
+                if hf_param_name not in self.param_to_filename:
+                    if self.rank == 0:
+                        print(f"[Weight Loader] SKIP (not in checkpoint): {name}", flush=True)
+                    i += 1
+                    continue
                 full = self._broadcast_tensor(hf_param_name, param.shape, param.dtype)
                 mesh = self.world_mesh
             else:
+                if name not in self.param_to_filename:
+                    if self.rank == 0:
+                        print(f"[Weight Loader] SKIP (not in checkpoint): {name}", flush=True)
+                    i += 1
+                    continue
                 full = self._broadcast_tensor(name, param.shape, param.dtype)
                 mesh = self.world_mesh
 

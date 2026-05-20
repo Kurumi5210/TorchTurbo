@@ -91,19 +91,18 @@ USE_NAIVE_KDA = os.getenv("USE_NAIVE_KDA", "0") == "1"
 USE_EAGER_ATTN = os.getenv("USE_EAGER_ATTN", "0") == "1"
 
 try:
-    if USE_NAIVE_KDA:
-        from .naive_kda import NaiveShortConvolution as ShortConvolution
-        from .naive_kda import naive_recurrent_kda_wrapper as fused_recurrent_kda
-        from .naive_kda import naive_chunk_kda_wrapper as chunk_kda
-    else:
-        from fla.modules import ShortConvolution
-        from fla.ops.kda import chunk_kda, fused_recurrent_kda
-
     from fla.modules import FusedRMSNormGated
-    from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
     from fla.utils import tensor_cache
-except ImportError:
-    raise ImportError("Plese run `pip install -U fla-core`")
+except ImportError as e:
+    raise ImportError("Please run `pip install -U fla-core`") from e
+
+if USE_NAIVE_KDA:
+    from .naive_kda import NaiveShortConvolution as ShortConvolution
+    from .naive_kda import naive_recurrent_kda_wrapper as fused_recurrent_kda
+    from .naive_kda import naive_chunk_kda_wrapper as chunk_kda
+else:
+    from fla.modules import ShortConvolution
+    from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -954,7 +953,6 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
         ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
         ulysses_sp_rank = get_ulysses_sequence_parallel_rank()
 
-        attention_mask = None
         if attention_mask is not None:
             if attention_mask.dim() != 2:
                 attention_mask = kwargs.get("padding_mask")
@@ -962,7 +960,7 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
             if attention_mask is not None and attention_mask.dim() != 2:
                 raise ValueError(
                     "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
-                    "(0 = padding). 3D masks are not supported here.",
+                    "(0 = padding) or a neat_packing index matrix. 3D masks are not supported here.",
                 )
         use_cache = past_key_value is not None
         batch_size, q_len, _ = hidden_states.shape
@@ -970,11 +968,45 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
-        cu_seqlens = kwargs.get('cu_seqlens')
-        indices = None
+        # For SP, slice the mask to get the local portion for this rank.
+        # The full mask is needed for global cu_seqlens (used after gather).
+        if attention_mask is not None and ulysses_sp_size > 1:
+            total_seq_len = attention_mask.shape[1]
+            if total_seq_len != q_len:
+                local_start = ulysses_sp_rank * q_len
+                local_end = (ulysses_sp_rank + 1) * q_len
+                local_mask = attention_mask[:, local_start:local_end].contiguous()
+                global_mask = attention_mask
+            else:
+                local_mask = attention_mask
+                global_mask = attention_mask
+        else:
+            local_mask = attention_mask
+            global_mask = attention_mask
+
+        # Compute cu_seqlens and unpad indices from the attention mask.
+        # get_unpad_data auto-detects neat_packing (max > 1) vs binary masks.
+        indices_local = None
+        cu_seqlens_local = None
+        indices_global = None
+        cu_seqlens_global = None
+
         if attention_mask is not None:
-            indices, cu_seqlens, _ = _get_unpad_data(attention_mask[:, -q_len:])
-            hidden_states = _index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+            indices_local, cu_seqlens_local, _ = get_unpad_data(local_mask[:, -q_len:])
+            if ulysses_sp_size > 1:
+                indices_global, cu_seqlens_global, _ = get_unpad_data(global_mask)
+            else:
+                cu_seqlens_global = cu_seqlens_local
+                indices_global = indices_local
+
+        # Save padded hidden_states for g/beta computation (they need [B, T/sp, H] format)
+        hidden_states_padded = hidden_states
+
+        # Unpad hidden_states for conv1d (varlen mode requires [1, total_valid, ...])
+        if attention_mask is not None:
+            hidden_states = index_first_axis(
+                rearrange(hidden_states, "b s ... -> (b s) ..."), indices_local
+            ).unsqueeze(0)
 
         conv_state_q, conv_state_k, conv_state_v = None, None, None
         recurrent_state = None
@@ -993,9 +1025,9 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
             if past_key_value.layers[self.layer_idx].values is not None:
                 conv_state_q, conv_state_k, conv_state_v = past_key_value.layers[self.layer_idx].values
 
-        q_before_conv = self.q_proj(hidden_states)   # [B, T/sp, H*K]
-        k_before_conv = self.k_proj(hidden_states)   # [B, T/sp, H*K]
-        v_before_conv = self.v_proj(hidden_states)   # [B, T/sp, H*V]
+        q_before_conv = self.q_proj(hidden_states)   # [1, valid_local, H*K] or [B, T/sp, H*K]
+        k_before_conv = self.k_proj(hidden_states)   # [1, valid_local, H*K] or [B, T/sp, H*K]
+        v_before_conv = self.v_proj(hidden_states)   # [1, valid_local, H*V] or [B, T/sp, H*V]
 
         conv_initial_state_q = None
         conv_initial_state_k = None
@@ -1005,9 +1037,20 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
             sp_group = get_ulysses_sequence_parallel_group()
             W = self.conv_size  # kernel_size
 
-            boundary_q = q_before_conv[:, -W:, :]   # [B, W, H*K]
-            boundary_k = k_before_conv[:, -W:, :]   # [B, W, H*K]
-            boundary_v = v_before_conv[:, -W:, :]   # [B, W, H*V]
+            # SP boundary handling needs padded format [B, T/sp, D] for all-gather.
+            # Repad q/k/v_before_conv if they were unpadded.
+            if attention_mask is not None:
+                q_before_conv_padded = pad_input(q_before_conv.squeeze(0), indices_local, batch_size, q_len)
+                k_before_conv_padded = pad_input(k_before_conv.squeeze(0), indices_local, batch_size, q_len)
+                v_before_conv_padded = pad_input(v_before_conv.squeeze(0), indices_local, batch_size, q_len)
+            else:
+                q_before_conv_padded = q_before_conv
+                k_before_conv_padded = k_before_conv
+                v_before_conv_padded = v_before_conv
+
+            boundary_q = q_before_conv_padded[:, -W:, :]   # [B, W, H*K]
+            boundary_k = k_before_conv_padded[:, -W:, :]   # [B, W, H*K]
+            boundary_v = v_before_conv_padded[:, -W:, :]   # [B, W, H*V]
 
             # All-gather boundary tokens
             gathered_q = [torch.empty_like(boundary_q) for _ in range(ulysses_sp_size)]
@@ -1023,35 +1066,72 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
                 prev_boundary_k = gathered_k[ulysses_sp_rank - 1]  # [B, W, H*K]
                 prev_boundary_v = gathered_v[ulysses_sp_rank - 1]  # [B, W, H*V]
                 # cache format: [N, D, W], transpose seq and channel dimensions
-                conv_initial_state_q = prev_boundary_q.transpose(1, 2).contiguous()  # [B, H*K, W]
-                conv_initial_state_k = prev_boundary_k.transpose(1, 2).contiguous()  # [B, H*K, W]
-                conv_initial_state_v = prev_boundary_v.transpose(1, 2).contiguous()  # [B, H*V, W]
+                prev_state_q = prev_boundary_q.transpose(1, 2).contiguous()  # [B, H*K, W]
+                prev_state_k = prev_boundary_k.transpose(1, 2).contiguous()  # [B, H*K, W]
+                prev_state_v = prev_boundary_v.transpose(1, 2).contiguous()  # [B, H*V, W]
+
+                if attention_mask is not None and cu_seqlens_local is not None:
+                    # B=1: only the first segment can continue from the previous rank.
+                    # If it doesn't cross the boundary, conv_initial_state stays None
+                    # (all-zeros initial_state is equivalent to no initial_state).
+                    prev_last_mask_vals = global_mask[:, ulysses_sp_rank * q_len - W : ulysses_sp_rank * q_len]  # [B, W]
+                    b_mask = local_mask[0]
+                    nonzero_idx = b_mask.nonzero(as_tuple=True)
+                    if len(nonzero_idx[0]) > 0:
+                        first_val = b_mask[nonzero_idx[0][0]].item()
+                        prev_last_val = prev_last_mask_vals[0, -1].item()
+                        if first_val != 0 and first_val == prev_last_val:
+                            # First segment continues from the previous rank.
+                            # Mask out boundary tokens from a different sequence.
+                            prev_mask_vals = prev_last_mask_vals[0]  # [W]
+                            seq_mask = (prev_mask_vals == first_val).float()  # [W]
+                            num_segments = len(cu_seqlens_local) - 1
+                            D_q = prev_state_q.shape[1]
+                            D_v = prev_state_v.shape[1]
+                            conv_initial_state_q = torch.zeros(num_segments, D_q, W, device=prev_state_q.device, dtype=prev_state_q.dtype)
+                            conv_initial_state_k = torch.zeros(num_segments, D_q, W, device=prev_state_k.device, dtype=prev_state_k.dtype)
+                            conv_initial_state_v = torch.zeros(num_segments, D_v, W, device=prev_state_v.device, dtype=prev_state_v.dtype)
+                            conv_initial_state_q[0] = prev_state_q[0] * seq_mask.unsqueeze(0)
+                            conv_initial_state_k[0] = prev_state_k[0] * seq_mask.unsqueeze(0)
+                            conv_initial_state_v[0] = prev_state_v[0] * seq_mask.unsqueeze(0)
+                else:
+                    # No cu_seqlens: use [B, D, W] format (original behavior for CPT)
+                    conv_initial_state_q = prev_state_q
+                    conv_initial_state_k = prev_state_k
+                    conv_initial_state_v = prev_state_v
 
         q, conv_state_q = self.q_conv1d(
             x=q_before_conv,
             cache=conv_initial_state_q if conv_initial_state_q is not None else conv_state_q,
             output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens_local if attention_mask is not None else None,
         )
         k, conv_state_k = self.k_conv1d(
             x=k_before_conv,
             cache=conv_initial_state_k if conv_initial_state_k is not None else conv_state_k,
             output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens_local if attention_mask is not None else None,
         )
         v, conv_state_v = self.v_conv1d(
             x=v_before_conv,
             cache=conv_initial_state_v if conv_initial_state_v is not None else conv_state_v,
             output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens_local if attention_mask is not None else None,
         )
 
-        if self.no_kda_lora:
-            g = self.f_proj(hidden_states)
-        else:
-            g = self.f_b_proj(self.f_a_proj(hidden_states))
+        # Repad conv1d output back to [B, T/sp, D] for SP operations and g/beta
+        if attention_mask is not None:
+            q = pad_input(q.squeeze(0), indices_local, batch_size, q_len)
+            k = pad_input(k.squeeze(0), indices_local, batch_size, q_len)
+            v = pad_input(v.squeeze(0), indices_local, batch_size, q_len)
 
-        beta = self.b_proj(hidden_states).float().sigmoid()
+        # Compute g, beta from padded hidden_states (always [B, T/sp, H] format)
+        if self.no_kda_lora:
+            g = self.f_proj(hidden_states_padded)
+        else:
+            g = self.f_b_proj(self.f_a_proj(hidden_states_padded))
+
+        beta = self.b_proj(hidden_states_padded).float().sigmoid()
 
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
@@ -1067,6 +1147,14 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
             beta = gather_seq_scatter_heads(beta, seq_dim=1, head_dim=2)
             # q: [B, T, H/sp, K], k: [B, T, H/sp, K], v: [B, T, H/sp, V]
             # g: [B, T, H/sp, V], beta: [B, T, H/sp]
+
+        # Unpad for chunk_kda (varlen mode requires [1, total_valid, ...])
+        if attention_mask is not None:
+            q = index_first_axis(rearrange(q, "b s ... -> (b s) ..."), indices_global).unsqueeze(0)
+            k = index_first_axis(rearrange(k, "b s ... -> (b s) ..."), indices_global).unsqueeze(0)
+            v = index_first_axis(rearrange(v, "b s ... -> (b s) ..."), indices_global).unsqueeze(0)
+            g = index_first_axis(rearrange(g, "b s ... -> (b s) ..."), indices_global).unsqueeze(0)
+            beta = index_first_axis(rearrange(beta, "b s ... -> (b s) ..."), indices_global).unsqueeze(0)
 
         # Slice A_log and dt_bias
         if ulysses_sp_size > 1:
@@ -1095,7 +1183,7 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
                 use_gate_in_kernel=True,
                 safe_gate=self.safe_gate,
                 lower_bound=self.lower_bound,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_seqlens_global if attention_mask is not None else None,
             )
         else:
             o, recurrent_state = fused_recurrent_kda(
@@ -1111,8 +1199,13 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
                 lower_bound=self.lower_bound,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_seqlens_global if attention_mask is not None else None,
             )
+
+        # Repad chunk_kda output back to [B, T, H/sp, V]
+        if attention_mask is not None:
+            total_seq_len = global_mask.shape[1]
+            o = pad_input(o.squeeze(0), indices_global, batch_size, total_seq_len)
 
         if use_cache and past_key_value is not None and isinstance(past_key_value, Cache):
             target_device = None
@@ -1134,17 +1227,16 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
             o = gather_heads_scatter_seq(o, seq_dim=1, head_dim=2)
             # o: [B, T/sp, H, V]
 
+        # o_norm uses g from the original padded hidden_states
         if self.no_kda_lora:
-            g = self.g_proj(hidden_states)
+            g_out = self.g_proj(hidden_states_padded)
         else:
-            g = self.g_b_proj(self.g_a_proj(hidden_states))
-        g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
-        o = self.o_norm(o, g)
+            g_out = self.g_b_proj(self.g_a_proj(hidden_states_padded))
+        g_out = rearrange(g_out, '... (h d) -> ... h d', d=self.head_dim)
+        o = self.o_norm(o, g_out)
 
         o = rearrange(o, 'b t h d -> b t (h d)')
         o = self.o_proj(o)
-        if attention_mask is not None:
-            o = _pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_value
 
@@ -1226,10 +1318,11 @@ class BailingMoeV3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        last_full_group_end = config.num_hidden_layers // config.layer_group_size * config.layer_group_size
         self.attention_layer_type = (
             "attention"
             if (layer_idx + 1) % config.layer_group_size == 0
-            or layer_idx >= config.num_hidden_layers // config.layer_group_size * config.layer_group_size
+            or (last_full_group_end > 0 and layer_idx >= last_full_group_end)
             else "linear_attention"
         )
 
@@ -1297,15 +1390,13 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 **kwargs,
             )
         else:
-            batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-            device = hidden_states.device
-
             if attention_mask is None:
-                # if attention_mask is None, create a full mask
-                attention_mask = torch.ones((batch_size, seq_len), dtype=torch.int32, device=device)
+                # When SP is active, KimiDeltaAttention needs the full-length mask
+                # for correct global unpad/pad after the all-to-all gather.
+                # Passing None lets KDA skip varlen entirely (correct for no-packing).
+                pass
             elif attention_mask.dim() == 4 and attention_mask.shape[1] == 1:
-                attention_mask = attention_mask[:, 0, -1, :].to(torch.int32)
-                attention_mask = (attention_mask > -1e4).to(torch.int32)
+                raise AssertionError("4D attention mask is not supported. Pass a 2D mask instead.")
             elif attention_mask.dim() == 2:
                 attention_mask = attention_mask.to(torch.int32)
             else:
@@ -1561,7 +1652,13 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
 
         if self._use_flash_attention_2:
             # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+            # Keep the mask if there is padding (0 values) OR if it is a neat_packing
+            # index mask (values > 1 indicating different packed sequences).
+            if attention_mask is not None:
+                if (attention_mask == 0).any() or (attention_mask > 1).any():
+                    pass  # keep the mask
+                else:
+                    attention_mask = None  # all-ones mask, no need to pass
         elif self._use_sdpa and not output_attentions:
             # output_attentions=True can not be supported when using SDPA, and we fall back on
             # the manual implementation that requires a 4D causal mask in all cases.

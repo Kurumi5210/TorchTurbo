@@ -133,9 +133,11 @@ def apply_fsdp_prefetch(model, config):
         layer_cls = tuple(layer_classes)
 
     if hasattr(config, "first_k_dense_replace"):
-       moe_layer = model.layers[config.first_k_dense_replace]
+        moe_layer = model.layers[config.first_k_dense_replace]
+        if (len(model.layers) - config.first_k_dense_replace) < 2:
+            return
     else:
-       moe_layer = expert_cls = model.layers[0]
+        moe_layer = expert_cls = model.layers[0]
 
     if hasattr(moe_layer, 'mlp'):
         expert_cls = moe_layer.mlp.experts.__class__

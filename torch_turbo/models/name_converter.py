@@ -12,6 +12,7 @@ class BaseWeightConverter:
         self.ep_rank = get_expert_model_parallel_rank()
         self.ep_size = get_expert_model_parallel_world_size()
         self.moe_config = moe_config
+        self.config = config
         self.model_type = config.model_type
         self.dtype = config.torch_dtype
 
@@ -52,6 +53,8 @@ class BaseWeightConverter:
         return "gate.e_score_correction_bias"
 
     def get_default_hf_dtype(self, param_name):
+        if self.get_hf_gate_bias_name() in param_name:
+            return torch.float32
         return self.dtype
 
     def is_expert(self, name):
@@ -73,13 +76,15 @@ class BaseWeightConverter:
         if self.get_router_bias_name() in name:
             return name.replace(self.get_router_bias_name(), self.get_hf_gate_bias_name())
         return name
-        
-    def convert_expert_weight1_to_hf(self, name):
+
+    def convert_expert_weight1_to_hf(self, name, only_local_experts = False):
         assert self.is_expert_weight1(name), "must be"
         prefix = name[:-8].replace(self.get_moe_expert_mlp_name(), self.get_hf_expert_mlp_name())
         gates = []
         ups = []
         for i in range(self.ep_size):
+            if only_local_experts and i != self.ep_rank:
+                continue
             num_local_experts = self.moe_config.num_moe_experts // self.ep_size
             for j in range(num_local_experts):
                 index = i * num_local_experts + j
@@ -89,17 +94,69 @@ class BaseWeightConverter:
                 ups.append(up)
         return gates, ups
 
-    def convert_expert_weight2_to_hf(self, name):
+    def get_gate_weight_shape(self):
+        return (self.config.moe_intermediate_size, self.config.hidden_size)
+
+    def get_gate_weight_bytes(self, element_size):
+        return self.config.moe_intermediate_size * self.config.hidden_size * element_size
+
+    def get_up_weight_shape(self):
+        return (self.config.moe_intermediate_size, self.config.hidden_size)
+
+    def get_up_weight_bytes(self, element_size):
+        return self.config.moe_intermediate_size * self.config.hidden_size * element_size
+
+    def get_down_weight_shape(self):
+        return (self.config.hidden_size, self.config.moe_intermediate_size)
+
+    def get_down_weight_bytes(self, element_size):
+        return self.config.moe_intermediate_size * self.config.hidden_size * element_size
+
+    def get_local_ep_w1_hf_state_dict(self, name, tensor):
+        assert self.is_expert_weight1(name), "must be"
+        num_local_experts = self.moe_config.num_moe_experts // self.ep_size
+        experts = torch.split(tensor, self.config.hidden_size)
+        start_index = self.ep_rank * num_local_experts
+        prefix = name[:-8].replace(self.get_moe_expert_mlp_name(), self.get_hf_expert_mlp_name())
+        local_ep_sd = {}
+        for i in range(num_local_experts):
+            index = start_index + i
+            gate =f"{prefix}.{index}.{self.get_expert_gate_name()}.weight"
+            up = f"{prefix}.{index}.{self.get_expert_up_name()}.weight"
+            expert2 = torch.split(experts[i].t(), self.config.moe_intermediate_size)
+            gate_tensor = expert2[0]
+            up_tensor = expert2[1]
+            local_ep_sd[gate] = gate_tensor
+            local_ep_sd[up] = up_tensor
+        return local_ep_sd
+
+    def convert_expert_weight2_to_hf(self, name, only_local_experts = False):
         assert self.is_expert_weight2(name), "must be"
-        prefix = name[:-8]
+        prefix = name[:-8].replace(self.get_moe_expert_mlp_name(), self.get_hf_expert_mlp_name())
         downs = []
         for i in range(self.ep_size):
+            if only_local_experts and i != self.ep_rank:
+                continue
             num_local_experts = self.moe_config.num_moe_experts // self.ep_size
             for j in range(num_local_experts):
                 index = i * num_local_experts + j
                 down =f"{prefix}.{index}.{self.get_expert_down_name()}.weight"
                 downs.append(down)
         return downs
+
+    def get_local_ep_w2_hf_state_dict(self, name, tensor):
+        assert self.is_expert_weight2(name), "must be"
+        num_local_experts = self.moe_config.num_moe_experts // self.ep_size
+        start_index = self.ep_rank * num_local_experts
+        prefix = name[:-8].replace(self.get_moe_expert_mlp_name(), self.get_hf_expert_mlp_name())
+        experts = torch.split(tensor, self.config.moe_intermediate_size)
+        local_ep_sd = {}
+        for i in range(num_local_experts):
+            index = start_index + i
+            down =f"{prefix}.{index}.{self.get_expert_down_name()}.weight"
+            down_tensor = experts[i].t()
+            local_ep_sd[down] = down_tensor
+        return local_ep_sd
 
     def convert_router_param_to_hf(self, name):
         assert self.get_moe_router_name() in name, "must be"

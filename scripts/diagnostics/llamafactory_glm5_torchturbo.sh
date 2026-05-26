@@ -63,8 +63,8 @@ DISTRIBUTED_ARGS="
     --node_rank $NODE_RANK
 "
 
-export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/LLaMA-Factory/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/torchturbo/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
 export TORCH_TURBO_SP_SIZE=2
 export TORCH_TURBO_EP_SIZE=8
 

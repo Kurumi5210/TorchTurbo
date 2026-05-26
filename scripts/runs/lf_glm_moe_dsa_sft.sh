@@ -66,8 +66,8 @@ DISTRIBUTED_ARGS="
 "
 RUN_LF="$(dirname "$0")/run_lf.py"
 
-export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/LLaMA-Factory/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/torchturbo/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
 export TORCH_TURBO_SP_SIZE=2
 export TORCH_TURBO_EP_SIZE=8
 
@@ -85,6 +85,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --dataset $dataset \
     --preprocessing_num_workers $((NNODES * 16)) \
     --cutoff_len ${seq_length} \
+    --neat_packing \
     --template glm4_7 \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \

@@ -1,0 +1,16 @@
+{
+  "science": {
+    "file_name": "/sfs_turbo/data/data/am_think/science.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "system": "system"
+    },
+    "tags": {
+        "role_tag": "from",
+        "content_tag": "value",
+        "user_tag": "human",
+        "assistant_tag": "assistant"
+    }
+  }
+}

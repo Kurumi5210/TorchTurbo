@@ -1,55 +1,26 @@
-import re
-import os
 import json
+import os
 import shutil
+import time
 from pathlib import Path
-from dataclasses import dataclass
-from enum import Enum
-from typing import Optional
 import psutil
 import gc
 
 import torch
 import torch.distributed as dist
-from torch.distributed._tensor import DTensor
 from safetensors.torch import save_file
+from torch.distributed._tensor import DTensor
 
-from .weight_loader import HF_BUFFER_NAME_MAP
-from torchturbo.models.modules.comm import all_gather_tensor, all_gather_tensor_chunked
-from torchturbo.models.modules.moe.moe_layer import BaseMoELayer
-
-
-class MoeParamType(Enum):
-    """Types of MoE parameters."""
-
-    EXPERT = "expert"
-    ROUTER = "router"
-    ROUTER_BUFFER = "router_buffer"
-
-
-@dataclass
-class MoeParamInfo:
-    """Information about an MoE parameter."""
-
-    type: MoeParamType
-    moe_prefix: str
-    num_moe_experts: int
-    local_expert_indices: list
-    hidden_size: int = None
-    moe_ffn_hidden_size: int = None
-    num_local_experts: int = None
-
-
-class DistParamSaver:
+class ShardedParamManager:
     def __init__(
         self,
         model,
         rank,
         mesh,
-        use_transformer_engine,
         path=None,
         processing_class=None,
     ):
+        self.move_to_cpu = True
         self.model = model
 
         self.rank = rank
@@ -58,100 +29,150 @@ class DistParamSaver:
         self.ep_group = self.ep_mesh.get_group(0)
         self.ep_size = dist.get_world_size(group=self.ep_group)
 
-        self.use_te = use_transformer_engine
-        self.processing_class = processing_class
-        self.src_path = Path(path) if path else None
-
         config = model.config
         self.model_type = config.model_type if hasattr(config, "model_type") else None
+        if hasattr(self.model.config, "vision_config"):
+            self.config = self.model.config.text_config
+        else:
+            self.config = self.model.config
 
-        # Build MoE parameter info mapping using isinstance checks
-        self._moe_param_info = self._build_moe_param_info()
+        self.world_size = dist.get_world_size()
+        current_ep_idx = self.mesh.get_local_rank("ep")
+        self.edp_ranks = self.mesh.mesh[:, current_ep_idx].tolist()
 
-    def _build_moe_param_info(self):
-        """Build mapping from parameter names to MoE module info.
+        self.processing_class = processing_class
+        self.src_path = Path(path) if path else None
+        self.model_type = model.config.model_type
+        self.param_converter = model.get_weight_converter(mesh)
+        self.param_size_map = {}
+        self.param_to_rank = {}
+        self.rank_shard_bytes = {}
+        self.rank_to_params = [[] for _ in range(self.world_size)]
+        self.sharded_param_groups = []
+        self.WEIGHT_SHARD_SIZE = 5 * (1024 ** 3)
+        self.local_params = self._build_meta_info()
 
-        Uses isinstance checks to detect MoE layers instead of string matching.
+    def _update_per_shard(self, shard_params, dst_rank):
+        shard_bytes = 0
+        for p in shard_params:
+            self.param_to_rank[p] = dst_rank
+            shard_bytes += self.param_size_map[p]
+        self._update_shard_sizes(dst_rank, shard_bytes)
+        if dst_rank == self.rank:
+            self.sharded_param_groups.append(shard_params)
+        return [], 0
 
-        Returns a dict mapping param/buffer name to MoeParamInfo.
-        """
-        moe_info = {}
-        for name, module in self.model.named_modules():
-            if isinstance(module, BaseMoELayer):
-                moe_config = module.config
-                num_experts = moe_config.num_moe_experts
-                hidden_size = moe_config.hidden_size
-                moe_ffn_hidden_size = getattr(
-                    moe_config,
-                    "moe_ffn_hidden_size",
-                    getattr(moe_config, "moe_intermediate_size", None),
-                )
-                num_local_experts = module.num_local_experts
-                local_expert_indices = module.local_expert_indices
+    def _update_shard_sizes(self, rank, num_bytes):
+        if rank in self.rank_shard_bytes:
+            self.rank_shard_bytes[rank] += num_bytes
+        else:
+            self.rank_shard_bytes[rank] = num_bytes
 
-                # Found an MoE layer, mark all its parameters
-                for param_name, _ in module.named_parameters(recurse=True):
-                    # Ignore shared experts
-                    if "shared_experts" in param_name:
-                        continue
+    def _select_low_pressure_rank(self):
+        lowest = float('inf')
+        result = 0
+        for rank in range(self.world_size):
+            if rank not in self.rank_shard_bytes:
+                # means has not assign a param
+                return rank
+            if lowest > self.rank_shard_bytes[rank]:
+                result = rank
+                lowest = self.rank_shard_bytes[rank]
+        return result
 
-                    full_name = f"{name}.{param_name}" if name else param_name
+    def _assign_param_to_ranks(self, ep_params, edp_ranks, common_params):
+        i = 0
+        num_edp_ranks = len(edp_ranks)
+        accumulated_bytes = 0
+        shard_params = []
+        dst_rank = edp_ranks[0]
+        for param in ep_params:
+            accumulated_bytes += self.param_size_map[param]
+            shard_params.append(param)
+            if accumulated_bytes >= self.WEIGHT_SHARD_SIZE:
+                dst_rank = edp_ranks[i % num_edp_ranks]
+                shard_params, accumulated_bytes = self._update_per_shard(shard_params, dst_rank)
+                i += 1
+        if shard_params:
+            dst_rank = edp_ranks[i % num_edp_ranks]
+            shard_params, accumulated_bytes = self._update_per_shard(shard_params, dst_rank)
+        param_to_rank_list = [None] * self.ep_size
+        dist.all_gather_object(param_to_rank_list, self.param_to_rank, group=self.ep_group)
+        for rank_map in param_to_rank_list:
+            self.param_to_rank.update(rank_map)
 
-                    if "experts" in param_name:
-                        moe_info[full_name] = MoeParamInfo(
-                            type=MoeParamType.EXPERT,
-                            moe_prefix=name,
-                            num_moe_experts=num_experts,
-                            local_expert_indices=local_expert_indices,
-                            hidden_size=hidden_size,
-                            moe_ffn_hidden_size=moe_ffn_hidden_size,
-                            num_local_experts=num_local_experts,
-                        )
-                    elif "router" in param_name:
-                        moe_info[full_name] = MoeParamInfo(
-                            type=MoeParamType.ROUTER,
-                            moe_prefix=name,
-                            num_moe_experts=num_experts,
-                            local_expert_indices=local_expert_indices,
-                            hidden_size=hidden_size,
-                            moe_ffn_hidden_size=moe_ffn_hidden_size,
-                            num_local_experts=num_local_experts,
-                        )
+        # Recompute rank_shard_bytes from full expert assignments across all EP ranks
+        self.rank_shard_bytes = {}
+        for param, rank in self.param_to_rank.items():
+            self._update_shard_sizes(rank, self.param_size_map[param])
 
-                # Mark buffers too
-                for buf_name, _ in module.named_buffers(recurse=True):
-                    full_name = f"{name}.{buf_name}" if name else buf_name
-                    if "router" in buf_name:
-                        moe_info[full_name] = MoeParamInfo(
-                            type=MoeParamType.ROUTER_BUFFER,
-                            moe_prefix=name,
-                            num_moe_experts=num_experts,
-                            local_expert_indices=local_expert_indices,
-                            hidden_size=hidden_size,
-                            moe_ffn_hidden_size=moe_ffn_hidden_size,
-                            num_local_experts=num_local_experts,
-                        )
-        return moe_info
+        shard_params = []
+        accumulated_bytes = 0
+        for param in common_params:
+            accumulated_bytes += self.param_size_map[param]
+            shard_params.append(param)
+            if accumulated_bytes >= self.WEIGHT_SHARD_SIZE:
+                dst_rank = self._select_low_pressure_rank()
+                shard_params, accumulated_bytes = self._update_per_shard(shard_params, dst_rank)
+        if shard_params:
+            dst_rank = self._select_low_pressure_rank()
+            shard_params, accumulated_bytes = self._update_per_shard(shard_params, dst_rank)
 
-    def _get_moe_param_type(self, name) -> Optional[MoeParamType]:
-        """Get MoE parameter type, or None if not an MoE parameter."""
-        info = self._moe_param_info.get(name)
-        return info.type if info else None
+        for param, rank in self.param_to_rank.items():
+            self.rank_to_params[rank].append(param)
 
-    def _get_hf_mlp_prefix(self, name):
-        """Get HF checkpoint prefix (using 'mlp') from model parameter name.
+    def _build_meta_info(self):
+        """Build state_dict containing only the parameters this rank needs to save."""
+        start_time = time.perf_counter()
+        if self.rank == 0:
+            print(f"_build_meta_info starting...")
 
-        The model may use 'moe_layer' or 'mlp' as the module name, but HF checkpoints
-        always use 'mlp'. This converts the prefix accordingly.
-        """
-        info = self._moe_param_info.get(name)
-        if info:
-            # e.g., 'model.layers.0.moe_layer' -> 'model.layers.0.mlp'
-            return info.moe_prefix.replace("moe_layer", "mlp")
-        # Fallback: extract prefix from name (consistent with weight_loader)
-        if ".experts." in name:
-            return name[: name.rfind(".experts.")]
-        return name
+        common_params = []
+        expert_params = []
+        for name, param in self.model.named_parameters():
+            dtype = self.param_converter.get_default_hf_dtype(name)
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            if self.param_converter.is_expert_weight1(name):
+                ep_gates, ep_ups = self.param_converter.convert_expert_weight1_to_hf(name, only_local_experts=True)
+                expert_params.extend(ep_gates)
+                expert_params.extend(ep_ups)
+                gates, ups = self.param_converter.convert_expert_weight1_to_hf(name)
+                gate_size = self.param_converter.get_gate_weight_bytes(element_size)
+                up_size = self.param_converter.get_up_weight_bytes(element_size)
+                for gate in gates:
+                    self.param_size_map[gate] = gate_size
+                for up in ups:
+                    self.param_size_map[up] = up_size
+                assert len(ep_gates) * (gate_size + up_size) == param.numel() * element_size, "must be"
+            elif self.param_converter.is_expert_weight2(name):
+                ep_downs = self.param_converter.convert_expert_weight2_to_hf(name, only_local_experts=True)
+                expert_params.extend(ep_downs)
+                downs = self.param_converter.convert_expert_weight2_to_hf(name)
+                down_size = self.param_converter.get_down_weight_bytes(element_size)
+                for down in downs:
+                    self.param_size_map[down] = down_size
+                assert len(ep_downs) * down_size == param.numel() * element_size, "must be"
+            elif self.param_converter.is_router_param(name):
+                hf_name = self.param_converter.convert_router_param_to_hf(name)
+                common_params.append(hf_name)
+                self.param_size_map[hf_name] = param.numel() * element_size
+            else:
+                common_params.append(name)
+                self.param_size_map[name] = param.numel() * element_size
+
+        for name, buf in self.model.named_buffers():
+            if self.param_converter.is_persist_buffer(name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+                common_params.append(hf_buffer_name)
+                self.param_size_map[hf_buffer_name] = buf.numel() * buf.element_size()
+
+        self._assign_param_to_ranks(expert_params, self.edp_ranks, common_params)
+
+        elapsed = time.perf_counter() - start_time
+        if self.rank == 0:
+            print(f"_build_meta_info completed in {elapsed:.2f}s")
+
+        return set(self.rank_to_params[self.rank])
 
     def _load_index_json(self, path):
         """Load the model.safetensors.index.json file."""
@@ -170,494 +191,157 @@ class DistParamSaver:
         for item in Path(src_path).iterdir():
             if item.is_file():
                 # Skip safetensors files and index json
-                if (
-                    item.suffix == ".safetensors"
-                    or item.name == "model.safetensors.index.json"
-                ):
+                if item.suffix == '.safetensors' or item.name == 'model.safetensors.index.json':
                     continue
                 shutil.copy2(item, dst_path / item.name)
             elif item.is_dir():
                 # Copy directories recursively
                 shutil.copytree(item, dst_path / item.name, dirs_exist_ok=True)
 
-    def _distribute_files_to_ranks(self, weight_map, world_size):
-        """Distribute safetensor files across ranks based on number of files."""
-        files = sorted(set(weight_map.values()))
-        file_to_rank = {}
-        for i, filename in enumerate(files):
-            file_to_rank[filename] = i % world_size
-        return file_to_rank, files
+    def _save_expert_weight1_to_hf(self, name, full_tensor, local_params, full_sd):
+        w1_sd = self.param_converter.get_local_ep_w1_hf_state_dict(name, full_tensor)
+        for w1_name, w1_tensor in w1_sd.items():
+            if w1_name in local_params:
+                full_sd[w1_name] = self._normalize_tensor(w1_name, w1_tensor)
 
-    def _get_local_params_to_save(self, weight_map, world_size):
-        """Get the parameter names and files that this rank needs to save."""
-        file_to_rank, files = self._distribute_files_to_ranks(weight_map, world_size)
-        local_files = {f for f in files if file_to_rank[f] == self.rank}
-        local_params = {name for name, fn in weight_map.items() if fn in local_files}
-        return local_params, local_files
+    def _save_expert_weight2_to_hf(self, name, full_tensor, local_params, full_sd):
+        w2_sd = self.param_converter.get_local_ep_w2_hf_state_dict(name, full_tensor)
+        for w2_name, w2_tensor in w2_sd.items():
+            if w2_name in local_params:
+                full_sd[w2_name] = self._normalize_tensor(w2_name, w2_tensor)
+
+    def _save_router_param_to_hf(self, name, full_tensor, local_params, full_sd):
+        hf_param_name = self.param_converter.convert_router_param_to_hf(name)
+        if hf_param_name in local_params:
+            full_sd[hf_param_name] = self._normalize_tensor(hf_param_name, full_tensor)
+
+    def _gc_cleanup(self):
+        gpu_before = self._get_gpu_memory_usage_percent()
+        cpu_before = self._get_cpu_memory_usage_percent()
+        torch.cuda.empty_cache()
+        gc.collect()
+        gpu_after = self._get_gpu_memory_usage_percent()
+        cpu_after = self._get_cpu_memory_usage_percent()
+        if torch.distributed.get_rank() == 0:
+            print(f"Memory alert - GPU: {gpu_before:.1f}% -> {gpu_after:.1f}% , CPU: {cpu_before:.1f}% -> {cpu_after:.1f}%")
 
     def _get_local_hf_state_dict(self, local_params):
-        """Build state_dict containing only the parameters this rank needs to save.
+        """Build state_dict containing only the parameters this rank needs to save."""
+        start_time = time.perf_counter()
+        if self.rank == 0:
+            print(f"_get_local_hf_state_dict starting...")
 
-        Uses MoE parameter info mapping to detect MoE layers instead of string matching.
-        """
         full_sd = {}
-
-        cleanup_freq = 50
-        param_count = 0
-
-        def _gc_cleanup():
-            gc.collect()
-            gpu_mem = self._get_gpu_memory_usage_percent()
-            cpu_mem = self._get_cpu_memory_usage_percent()
-            if torch.distributed.get_rank() == 0:
-                print(f"⚠️  Memory alert - GPU: {gpu_mem:.1f}%, CPU: {cpu_mem:.1f}%")
-
-        # Cache for gathered expert tensors to avoid redundant gathering
-        # Key: (moe_prefix, is_weight1), Value: gathered tensor
-        gathered_expert_tensors = {}
-
         for name, param in self.model.named_parameters():
-            param_count += 1
             if torch.distributed.get_rank() == 0:
                 print(f"[saving] param_name: {name}")
-
-            # Gather DTensor to full tensor
             if isinstance(param, DTensor):
                 full_tensor = param.full_tensor()
             else:
                 full_tensor = param
 
-            moe_type = self._get_moe_param_type(name)
-
-            if moe_type == MoeParamType.EXPERT:
-                info = self._moe_param_info[name]
-                hf_prefix = self._get_hf_mlp_prefix(name)
-                num_experts = info.num_moe_experts
-                num_local_experts = info.num_local_experts
-                hidden_size = info.hidden_size
-                moe_ffn_hidden_size = info.moe_ffn_hidden_size
-
-                if hidden_size is None or moe_ffn_hidden_size is None:
-                    raise ValueError(
-                        f"Cannot find hidden_size or moe_ffn_hidden_size for {name}"
-                    )
-
-                # Determine if this is weight1 (gate+up) or weight2 (down)
-                is_weight1 = "weight1" in name
-
-                # Use cached gathered tensor if available
-                cache_key = (info.moe_prefix, is_weight1)
-                if cache_key in gathered_expert_tensors:
-                    gathered = gathered_expert_tensors[cache_key]
-                else:
-                    # Gather from expert parallel ranks
-                    gathered = all_gather_tensor_chunked(
-                        full_tensor, group=self.ep_group, num_chunks=self.ep_size
-                    )
-                    gathered_expert_tensors[cache_key] = gathered
-
-                if is_weight1:
-                    # weight1 contains gate_proj and up_proj combined
-                    # Local shape: [hidden_size * num_local_experts, moe_ffn_hidden_size * 2]
-                    # Gathered shape: [hidden_size * num_experts, moe_ffn_hidden_size * 2]
-                    # The gathered tensor is already in natural expert order:
-                    # [E0, E1, ..., E_{num_local-1} from rank 0, E0, E1, ... from rank 1, ...]
-                    # Since local_expert_indices are assigned as [ep_rank * num_local + i for i in range(num_local)],
-                    # the concatenation by rank order produces correct global expert order.
-
-                    # Split into individual experts
-                    experts = torch.split(gathered, hidden_size)
-
-                    for i in range(num_experts):
-                        gate_proj_name = f"{hf_prefix}.experts.{i}.gate_proj.weight"
-                        up_proj_name = f"{hf_prefix}.experts.{i}.up_proj.weight"
-
-                        # Transpose and split gate/up
-                        # expert[i] shape: [H, F*2] -> [F*2, H]
-                        expert_weight = experts[i].t()
-                        # Split into [F, H] each
-                        gate_up_split = torch.split(expert_weight, moe_ffn_hidden_size)
-
-                        if gate_proj_name in local_params:
-                            full_sd[gate_proj_name] = gate_up_split[0].cpu()
-                        if up_proj_name in local_params:
-                            full_sd[up_proj_name] = gate_up_split[1].cpu()
-                        del expert_weight, gate_up_split
-
-                else:
-                    # weight2 contains down_proj
-                    # Local shape: [moe_ffn_hidden_size * num_local_experts, hidden_size]
-                    # Gathered shape: [moe_ffn_hidden_size * num_experts, hidden_size]
-                    # Same as weight1: gathered tensor is already in natural expert order.
-
-                    # Split into individual experts
-                    experts = torch.split(gathered, moe_ffn_hidden_size)
-
-                    for i in range(num_experts):
-                        down_proj_name = f"{hf_prefix}.experts.{i}.down_proj.weight"
-                        if down_proj_name in local_params:
-                            # Transpose for HF format: [F, H] -> [H, F]
-                            full_sd[down_proj_name] = experts[i].t().cpu()
-
-                del full_tensor
-                del gathered, experts
-
-            elif moe_type == MoeParamType.ROUTER:
-                # Router weights - rename router -> gate for HF convention
-                info = self._moe_param_info[name]
-                hf_prefix = self._get_hf_mlp_prefix(name)
-
-                # Get the suffix after moe_prefix
-                suffix = name[len(info.moe_prefix) + 1 :]  # +1 for the dot
-                hf_suffix = suffix.replace("router", "gate")
-                new_name = f"{hf_prefix}.{hf_suffix}"
-
-                # Apply model-specific buffer name mapping
-                if self.model_type in HF_BUFFER_NAME_MAP:
-                    new_name = new_name.replace(
-                        "expert_bias",
-                        HF_BUFFER_NAME_MAP[self.model_type].get(
-                            "expert_bias", "expert_bias"
-                        ),
-                    )
-
-                if new_name in local_params:
-                    full_sd[new_name] = full_tensor.cpu()
-                del full_tensor
-
+            if self.param_converter.is_expert_weight1(name):
+                self._save_expert_weight1_to_hf(name, full_tensor, local_params, full_sd)
+            elif self.param_converter.is_expert_weight2(name):
+                self._save_expert_weight2_to_hf(name, full_tensor, local_params, full_sd)
+            elif self.param_converter.is_router_param(name):
+                self._save_router_param_to_hf(name, full_tensor, local_params, full_sd)
             else:
-                # Non-MoE parameter
                 if name in local_params:
-                    full_sd[name] = full_tensor.cpu()
-                del full_tensor
+                    full_sd[name] = self._normalize_tensor(name, full_tensor)
+            del full_tensor
 
-            if param_count % cleanup_freq == 0:
-                _gc_cleanup()
+            if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
+                self._gc_cleanup()
 
-        # Handle buffers (e.g., expert_bias in router)
         for name, buf in self.model.named_buffers():
-            param_count += 1
-            if torch.distributed.get_rank() == 0:
-                print(f"[saving] buf_name: {name}")
+            if self.param_converter.is_persist_buffer(name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+                if torch.distributed.get_rank() == 0:
+                    print(f"[saving] buf_name: {name}->{hf_buffer_name}")
+                if isinstance(buf, DTensor):
+                    buf = buf.full_tensor()
+                if hf_buffer_name in local_params:
+                    full_sd[hf_buffer_name] = self._normalize_tensor(hf_buffer_name, buf)
+                del buf
+                if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
+                    self._gc_cleanup()
 
-            moe_type = self._get_moe_param_type(name)
+        # Final sync before returning
+        missing_params = local_params - set(full_sd.keys())
+        extra_params = set(full_sd.keys()) - local_params
+        if len(full_sd.keys()) != len(local_params):
+            print(f"[Rank {self.rank}] Missing params ({len(missing_params)}): {missing_params}")
+            print(f"[Rank {self.rank}] Extra params ({len(extra_params)}): {extra_params}")
 
-            if moe_type == MoeParamType.ROUTER_BUFFER:
-                info = self._moe_param_info[name]
-                hf_prefix = self._get_hf_mlp_prefix(name)
-
-                # Get the suffix after moe_prefix
-                suffix = name[len(info.moe_prefix) + 1 :]  # +1 for the dot
-                hf_suffix = suffix.replace("router", "gate")
-                new_name = f"{hf_prefix}.{hf_suffix}"
-
-                # Apply model-specific buffer name mapping
-                if self.model_type in HF_BUFFER_NAME_MAP:
-                    new_name = new_name.replace(
-                        "expert_bias",
-                        HF_BUFFER_NAME_MAP[self.model_type].get(
-                            "expert_bias", "expert_bias"
-                        ),
-                    )
-
-                if new_name in local_params:
-                    if isinstance(buf, DTensor):
-                        full_sd[new_name] = buf.full_tensor().cpu()
-                    else:
-                        full_sd[new_name] = buf.cpu()
-            else:
-                # Non-MoE buffer
-                # Apply model-specific buffer name mapping
-                new_name = name
-                if self.model_type in HF_BUFFER_NAME_MAP:
-                    if "router" in name and "expert_bias" in name:
-                        new_name = name.replace("router", "gate")
-                        new_name = new_name.replace(
-                            "expert_bias",
-                            HF_BUFFER_NAME_MAP[self.model_type].get(
-                                "expert_bias", "expert_bias"
-                            ),
-                        )
-                if new_name in local_params:
-                    if isinstance(buf, DTensor):
-                        full_sd[new_name] = buf.full_tensor().cpu()
-                    else:
-                        full_sd[new_name] = buf.cpu()
-
-            del buf
-            if param_count % cleanup_freq == 0:
-                _gc_cleanup()
+        elapsed = time.perf_counter() - start_time
+        if self.rank == 0:
+            print(f"_get_local_hf_state_dict completed in {elapsed:.2f}s")
 
         return full_sd
 
+    def _normalize_tensor(self, name, tensor):
+        dtype = self.param_converter.get_default_hf_dtype(name)
+        tensor = tensor.to(dtype).contiguous()
+        if self.move_to_cpu:
+            tensor = tensor.cpu()
+        return tensor
+
     def _get_gpu_memory_usage_percent(self):
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated()
-            reserved = torch.cuda.memory_reserved()
-            if reserved > 0:
-                return (allocated / reserved) * 100
-        return 0.0
+        mem_free, mem_total = torch.cuda.mem_get_info()
+        mem_used = mem_total - mem_free
+        utilization = (mem_used / mem_total) * 100.0
+        return utilization
 
     def _get_cpu_memory_usage_percent(self):
         return psutil.virtual_memory().percent
 
-    def _get_te_local_hf_state_dict(self, local_params):
-        """Build state_dict containing only the parameters this rank needs to save (TE version).
+    def save_hf(self, state_dict, save_path):
+        # step 1, assign file index
+        cur_num_shards = len(self.sharded_param_groups)
+        num_shards_list = [0] * self.world_size
+        dist.all_gather_object(num_shards_list, cur_num_shards)
+        start_index = 0
+        cur_start_index = 0
+        for i in range(self.world_size):
+            if i == self.rank:
+                cur_start_index = start_index
+            start_index += num_shards_list[i]
+        num_total_files = start_index
 
-        Uses MoE parameter info mapping to detect MoE layers instead of string matching.
-        """
-        full_sd = {}
-
-        cleanup_freq = 50
-        param_count = 0
-
-        def _gc_cleanup():
-            gc.collect()
-            gpu_mem = self._get_gpu_memory_usage_percent()
-            cpu_mem = self._get_cpu_memory_usage_percent()
-            if torch.distributed.get_rank() == 0:
-                print(f"⚠️  Memory alert - GPU: {gpu_mem:.1f}%, CPU: {cpu_mem:.1f}%")
-
-        # Cache for gathered expert tensors
-        gathered_expert_tensors = {}
-
-        for name, param in self.model.named_parameters():
-            param_count += 1
-            if torch.distributed.get_rank() == 0:
-                print(f"[saving] param_name: {name}")
-
-            # Gather DTensor to full tensor
-            if isinstance(param, DTensor):
-                full_tensor = param.full_tensor()
-            else:
-                full_tensor = param
-
-            moe_type = self._get_moe_param_type(name)
-
-            if moe_type == MoeParamType.EXPERT:
-                info = self._moe_param_info[name]
-                hf_prefix = self._get_hf_mlp_prefix(name)
-                num_experts = info.num_moe_experts
-                num_local_experts = info.num_local_experts
-                hidden_size = info.hidden_size
-                moe_ffn_hidden_size = info.moe_ffn_hidden_size
-
-                if hidden_size is None or moe_ffn_hidden_size is None:
-                    raise ValueError(
-                        f"Cannot find hidden_size or moe_ffn_hidden_size for {name}"
-                    )
-
-                # Determine if this is fc1 (gate+up) or fc2 (down)
-                is_fc1 = "fc1_linear" in name
-
-                # For TE, extract local expert index from parameter name
-                # TE format: layers.X.mlp.experts.fc1_linear.weight_Y where Y is local expert idx
-                local_expert_match = re.search(r"weight_(\d+)$", name)
-                if local_expert_match:
-                    local_expert_idx = int(local_expert_match.group(1))
-                else:
-                    # Fallback: extract from parameter name
-                    local_expert_idx = int(re.findall(r"\d+", name.split(".")[-1])[0])
-
-                # Create cache key that includes local_expert_idx
-                cache_key = (info.moe_prefix, is_fc1, local_expert_idx)
-                if cache_key in gathered_expert_tensors:
-                    gathered = gathered_expert_tensors[cache_key]
-                else:
-                    # For TE, gather from expert parallel ranks
-                    # all_gather_tensor concatenates along first dim by rank order
-                    gathered = all_gather_tensor(full_tensor, group=self.ep_group)
-                    gathered_expert_tensors[cache_key] = gathered
-
-                if is_fc1:
-                    # fc1_linear contains gate_proj and up_proj combined
-                    # Local shape: [moe_ffn_hidden_size * 2, hidden_size] (TE uses transposed)
-                    # Gathered shape: [ep_size * moe_ffn_hidden_size * 2, hidden_size]
-                    # But we process one local_expert_idx at a time
-
-                    # Split by ep_size to get each rank's contribution
-                    experts_fc1 = torch.split(gathered, moe_ffn_hidden_size * 2)
-
-                    for ep_rank in range(self.ep_size):
-                        # Calculate global expert index
-                        expert_idx = ep_rank * num_local_experts + local_expert_idx
-
-                        gate_proj_name = (
-                            f"{hf_prefix}.experts.{expert_idx}.gate_proj.weight"
-                        )
-                        up_proj_name = (
-                            f"{hf_prefix}.experts.{expert_idx}.up_proj.weight"
-                        )
-
-                        # Split gate and up: [F*2, H] -> two [F, H] tensors
-                        gate_up_split = torch.split(
-                            experts_fc1[ep_rank], moe_ffn_hidden_size
-                        )
-
-                        if gate_proj_name in local_params:
-                            full_sd[gate_proj_name] = gate_up_split[0].cpu()
-                        if up_proj_name in local_params:
-                            full_sd[up_proj_name] = gate_up_split[1].cpu()
-                        del gate_up_split
-                    del experts_fc1
-
-                else:
-                    # fc2_linear is down_proj
-                    # Local shape: [hidden_size, moe_ffn_hidden_size] (TE uses transposed)
-                    # Gathered shape: [ep_size * hidden_size, moe_ffn_hidden_size]
-
-                    # Split by ep_size to get each rank's contribution
-                    experts_fc2 = torch.split(gathered, hidden_size)
-
-                    for ep_rank in range(self.ep_size):
-                        # Calculate global expert index
-                        expert_idx = ep_rank * num_local_experts + local_expert_idx
-
-                        down_proj_name = (
-                            f"{hf_prefix}.experts.{expert_idx}.down_proj.weight"
-                        )
-                        if down_proj_name in local_params:
-                            full_sd[down_proj_name] = experts_fc2[ep_rank].cpu()
-                    del experts_fc2
-
-                del full_tensor
-
-            elif moe_type == MoeParamType.ROUTER:
-                # Router weights - rename router -> gate for HF convention
-                info = self._moe_param_info[name]
-                hf_prefix = self._get_hf_mlp_prefix(name)
-
-                # Get the suffix after moe_prefix
-                suffix = name[len(info.moe_prefix) + 1 :]  # +1 for the dot
-                hf_suffix = suffix.replace("router", "gate")
-                new_name = f"{hf_prefix}.{hf_suffix}"
-
-                if new_name in local_params:
-                    full_sd[new_name] = full_tensor.cpu()
-                del full_tensor
-
-            else:
-                # Non-MoE parameter
-                if name in local_params:
-                    full_sd[name] = full_tensor.cpu()
-                del full_tensor
-
-            if param_count % cleanup_freq == 0:
-                _gc_cleanup()
-
-        # Handle buffers
-        for name, buf in self.model.named_buffers():
-            param_count += 1
-            if torch.distributed.get_rank() == 0:
-                print(f"[saving] buf_name: {name}")
-
-            moe_type = self._get_moe_param_type(name)
-
-            if moe_type == MoeParamType.ROUTER_BUFFER:
-                info = self._moe_param_info[name]
-                hf_prefix = self._get_hf_mlp_prefix(name)
-
-                # Get the suffix after moe_prefix
-                suffix = name[len(info.moe_prefix) + 1 :]
-                hf_suffix = suffix.replace("router", "gate")
-                new_name = f"{hf_prefix}.{hf_suffix}"
-
-                # Apply model-specific buffer name mapping
-                if self.model_type in HF_BUFFER_NAME_MAP:
-                    new_name = new_name.replace(
-                        "expert_bias",
-                        HF_BUFFER_NAME_MAP[self.model_type].get(
-                            "expert_bias", "expert_bias"
-                        ),
-                    )
-
-                if new_name in local_params:
-                    if isinstance(buf, DTensor):
-                        full_sd[new_name] = buf.full_tensor().cpu()
-                    else:
-                        full_sd[new_name] = buf.cpu()
-            else:
-                # Non-MoE buffer
-                new_name = name
-                if self.model_type in HF_BUFFER_NAME_MAP:
-                    if "router" in name and "expert_bias" in name:
-                        new_name = name.replace("router", "gate")
-                        new_name = new_name.replace(
-                            "expert_bias",
-                            HF_BUFFER_NAME_MAP[self.model_type].get(
-                                "expert_bias", "expert_bias"
-                            ),
-                        )
-                if new_name in local_params:
-                    if isinstance(buf, DTensor):
-                        full_sd[new_name] = buf.full_tensor().cpu()
-                    else:
-                        full_sd[new_name] = buf.cpu()
-
-            del buf
-            if param_count % cleanup_freq == 0:
-                _gc_cleanup()
-
-        return full_sd
-
-    def save_model(self, save_path, use_hf_format: bool = True):
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-
-        save_path = Path(save_path)
-        if use_hf_format:
-            save_path = save_path / "huggingface"
-
-        if rank == 0:
-            save_path.mkdir(parents=True, exist_ok=True)
-
-        torch.distributed.barrier()  # Ensure directory is created
-
-        assert self.src_path is not None, "must be"
-
-        weight_map, metadata = self._load_index_json(self.src_path)
-        local_params, local_files = self._get_local_params_to_save(
-            weight_map, world_size
-        )
-
-        # Each rank only collects the parameters it needs to save
-        if self.use_te:
-            state_dict = self._get_te_local_hf_state_dict(local_params)
-        else:
-            state_dict = self._get_local_hf_state_dict(local_params)
-
-        # Convert tensors to bfloat16 and ensure contiguous
-        for k in list(state_dict.keys()):
-            v = state_dict[k]
-            if isinstance(v, torch.Tensor):
-                v_bf16 = v.to(torch.bfloat16)
-                if not v_bf16.is_contiguous():
-                    v_bf16 = v_bf16.contiguous()
-                state_dict[k] = v_bf16
-                del v, v_bf16
-
-        # Save shards assigned to this rank
-        for filename in local_files:
+        # step 2, save to shared safetensors files
+        weight_map = {}
+        for cur_param_group in self.sharded_param_groups:
             shard_dict = {}
-            for param_name, fn in weight_map.items():
-                if fn == filename and param_name in state_dict:
-                    shard_dict[param_name] = state_dict[param_name]
+            if cur_param_group:
+                file_name = f"model-{cur_start_index:05d}-of-{num_total_files:05d}.safetensors"
+                cur_start_index += 1
+            for param in cur_param_group:
+                assert param in self.local_params, "must be"
+                assert param in state_dict, "must be"
+                shard_dict[param] = state_dict[param]
+                weight_map[param] = file_name
             if shard_dict:
-                print(
-                    f"[Rank {rank}] Saving {filename} with {len(shard_dict)} params..."
-                )
-                save_file(shard_dict, (save_path / filename).as_posix())
+                print(f"[Rank {self.rank}] Saving {file_name} with {len(shard_dict)} params...")
+                file_start = time.perf_counter()
+                file_path = save_path / file_name
+                save_file(shard_dict, file_path.as_posix())
+                file_elapsed = time.perf_counter() - file_start
+                print(f"[Rank {self.rank}] Saved {file_name} in {file_elapsed:.2f}s")
 
-        torch.distributed.barrier()  # Wait for all ranks to finish saving shards
+        # step 3, deal with non-tensor metas
+        weight_map_list = [None] * self.world_size
+        dist.all_gather_object(weight_map_list, weight_map)
+        final_weight_map = {}
+        for cur_map in weight_map_list:
+            final_weight_map.update(cur_map)
 
-        # Rank 0 saves index and copies other files
-        if rank == 0:
-            # Reconstruct full weight_map for index (only need param_name -> filename mapping)
-            new_weight_map = {
-                param_name: filename for param_name, filename in weight_map.items()
+        if self.rank == 0:
+            _, metadata = self._load_index_json(self.src_path)
+            index_content = {
+                "metadata": metadata,
+                "weight_map": final_weight_map
             }
-
-            index_content = {"metadata": metadata, "weight_map": new_weight_map}
             with open(save_path / "model.safetensors.index.json", "w") as f:
                 json.dump(index_content, f, indent=2)
 
@@ -666,6 +350,30 @@ class DistParamSaver:
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(save_path)
 
-            print(f"Rank: {rank} - Saved hf model to {save_path.absolute()}")
-
+            print(f"Rank: {self.rank} - Saved hf model to {save_path.absolute()}")
+        os.sync()
         torch.distributed.barrier()
+
+    def get_local_hf_state_dict(self):
+        return self._get_local_hf_state_dict(self.local_params)
+
+    def save_model(self, save_path, use_hf_format: bool = True):
+        save_path = Path(save_path)
+        if use_hf_format:
+            save_path = save_path / "huggingface"
+
+        if self.rank == 0:
+            save_path.mkdir(parents=True, exist_ok=True)
+
+        torch.distributed.barrier()  # Ensure directory is created
+
+        assert self.src_path is not None, "must be"
+        # Each rank only collects the parameters it needs to save
+        state_dict = self._get_local_hf_state_dict(self.local_params)
+
+        # Save shards assigned to this rank
+        self.save_hf(state_dict, save_path)
+
+
+# for backward compatiblity
+DistParamSaver=ShardedParamManager

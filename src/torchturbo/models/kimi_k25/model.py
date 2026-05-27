@@ -18,11 +18,12 @@ from torchturbo.models.modules.attention.ulysses import (
 )
 
 from ..registry import register_model
+from ..weight_converter import WeightConverterMixin
 from transformers import AutoModelForCausalLM
 
 
 @register_model("kimi_k25", config_cls=KimiK25Config, auto_class=AutoModelForCausalLM)
-class TurboKimiK25ForConditionalGeneration(KimiK25ForConditionalGeneration):
+class TurboKimiK25ForConditionalGeneration(WeightConverterMixin, KimiK25ForConditionalGeneration):
 
     is_vlm = True
 

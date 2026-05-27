@@ -68,6 +68,8 @@ class FSDP2Backend(BaseBackend):
         self.device = get_device_name()
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
+        self.weight_loader = None
+        self.weight_saver = None
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -204,29 +206,30 @@ class FSDP2Backend(BaseBackend):
         set_moe_layer_forward_prefetch(model, outer_cls, inter_cls, outermost_cls)
 
     def load_model(self, model: nn.Module, model_name_or_path: str):
-        weight_loader = DistParamLoader(
-            model=model,
-            path=model_name_or_path,
-            rank=self.rank,
-            mesh=self._mesh,
-            world_mesh=self._world_mesh,
-            device=self.device,
-            use_transformer_engine=self.use_transformer_engine,
-        )
-        weight_loader.load_weights()
+        if self.weight_loader == None:
+            self.weight_loader = DistParamLoader(
+                model=model,
+                path=model_name_or_path,
+                rank=self.rank,
+                mesh=self._mesh,
+                world_mesh=self._world_mesh,
+                device=self.device,
+                use_transformer_engine=self.use_transformer_engine,
+            )
+        self.weight_loader.load_weights()
 
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
     ):
-        weight_saver = DistParamSaver(
-            model=model,
-            rank=self.rank,
-            mesh=self._mesh,
-            path=model_name_or_path,
-            use_transformer_engine=self.use_transformer_engine,
-            processing_class=None,
-        )
-        weight_saver.save_model(output_dir)
+        if self.weight_saver == None:
+            self.weight_saver = DistParamSaver(
+                model=model,
+                rank=self.rank,
+                mesh=self._mesh,
+                path=model_name_or_path,
+                processing_class=None,
+            )
+        self.weight_saver.save_model(output_dir)
 
     def _shard_model(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
         from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy

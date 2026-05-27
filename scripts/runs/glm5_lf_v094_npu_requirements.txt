@@ -4,3 +4,4 @@ accelerate==1.11.0
 peft==0.17.1
 trl==0.24.0
 matplotlib==3.10.9
+transformers==4.52.4

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # glm_moe_dsa SFT training with torchturbo
 # Usage:
-#   pip install -r scripts/runs/glm5_lf_v094_npu_requirements.txt
+#   pip install -r scripts/runs/glm5_lf_v094_npu_requirements.txt --no-deps
 #   bash scripts/runs/lf_glm5_small_sft.sh
 
 set -o pipefail
@@ -84,6 +84,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --logging_dir /home/admin/logs/tfevent \
     --gradient_checkpointing \
     --dataset_dir ${DATASET_DIR} \
+    --max_samples 1000 \
     --trust_remote_code \
     --disable_shuffling \
     --stage sft \
@@ -93,6 +94,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --dataset $dataset \
     --preprocessing_num_workers $((NNODES * 16)) \
     --cutoff_len ${seq_length} \
+    --neat_packing \
     --template glm4_7 \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \

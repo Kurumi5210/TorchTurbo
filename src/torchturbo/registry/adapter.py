@@ -26,7 +26,7 @@ def _version_matches(version: str, specifier: str) -> bool:
         from packaging.specifiers import SpecifierSet
         from packaging.version import Version
 
-        return Version(version) in SpecifierSet(specifier)
+        return Version(version) in SpecifierSet(specifier, prereleases=True)
     except ImportError:
         # Fallback: very basic check
         logger.warning(

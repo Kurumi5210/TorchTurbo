@@ -10,6 +10,7 @@ from torchturbo.utils.device import is_npu_available, get_device_name
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.models.modules.attention.ulysses.utils import create_causal_mask
 from ..registry import register_model
+from ..weight_converter import WeightConverterMixin
 from transformers import AutoModelForCausalLM
 
 
@@ -28,7 +29,7 @@ class TurboQwen3MoeRotaryEmbedding(Qwen3MoeRotaryEmbedding):
 
 
 @register_model("qwen3_moe", config_cls=Qwen3MoeConfig, auto_class=AutoModelForCausalLM)
-class TurboQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
+class TurboQwen3MoeForCausalLM(WeightConverterMixin, Qwen3MoeForCausalLM):
 
     config_class = Qwen3MoeConfig
     base_model_prefix = "model"

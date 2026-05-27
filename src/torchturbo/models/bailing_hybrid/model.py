@@ -8,6 +8,7 @@ from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispa
 from torchturbo.utils.device import get_device_name, is_npu_available
 
 from ..registry import register_model
+from ..weight_converter import WeightConverterMixin
 from .configuration_bailing_moe_v3 import BailingMoeV3Config
 from .modeling_bailing_moe_v3 import BailingMoeV3ForCausalLM
 
@@ -15,7 +16,7 @@ from .modeling_bailing_moe_v3 import BailingMoeV3ForCausalLM
 @register_model(
     "bailing_hybrid", config_cls=BailingMoeV3Config, auto_class=AutoModelForCausalLM
 )
-class TurboBailingMoeV3ForCausalLM(BailingMoeV3ForCausalLM):
+class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM):
     config_class = BailingMoeV3Config
     base_model_prefix = "model"
 

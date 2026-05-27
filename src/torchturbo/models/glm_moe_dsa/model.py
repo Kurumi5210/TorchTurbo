@@ -15,6 +15,7 @@ from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispa
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..registry import register_model
+from ..weight_converter import WeightConverterMixin
 from transformers import AutoModelForCausalLM
 
 import transformers
@@ -46,7 +47,8 @@ if not hasattr(transformers, "TokenizersBackend"):
 @register_model(
     "glm_moe_dsa", config_cls=GlmMoeDsaConfig, auto_class=AutoModelForCausalLM
 )
-class TurboGlmMoeDsaForCausalLM(GlmMoeDsaForCausalLM):
+class TurboGlmMoeDsaForCausalLM(WeightConverterMixin, GlmMoeDsaForCausalLM):
+    _supports_flash_attn_2 = True
 
     def __init__(self, config: GlmMoeDsaConfig) -> None:
         self._pre_init_patches(config)

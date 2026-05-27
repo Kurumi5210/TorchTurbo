@@ -593,7 +593,7 @@ class GlmMoeDsaRotaryEmbedding(nn.Module):
 
         inv_freq = 1.0 / (
             rope_theta
-            ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
+            ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
         return inv_freq
 
@@ -617,7 +617,7 @@ class GlmMoeDsaRotaryEmbedding(nn.Module):
             else "cpu"
         )
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling

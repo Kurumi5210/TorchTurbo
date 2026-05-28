@@ -271,8 +271,12 @@ class TorchTurboEngine:
         turbo_cls = get_model(model_type) if model_type else None
 
         # we use float32 as main param storage
-        dtype_str = getattr(config, 'dtype', 'float32')
-        config.dtype = 'float32'
+        dtype_attrs = {}
+        dtype_str_list = ['dtype', 'torch_dtype']
+        for attr in dtype_str_list:
+            if hasattr(config, attr):
+                dtype_attrs[attr] = getattr(config, attr)
+                setattr(config, attr, 'float32')
 
         logger.info("Building model on meta device: %s", model_name_or_path)
         with torch.device("meta"):
@@ -284,10 +288,6 @@ class TorchTurboEngine:
                     config, trust_remote_code=trust_remote_code
                 )
 
-            # reset dtype back to default for weight saving
-            config.dtype = dtype_str
-            model.config.dtype = dtype_str
-
             # Resolve parallel plan
             parallel_plan = self._resolve_parallel_plan(model)
 
@@ -298,6 +298,12 @@ class TorchTurboEngine:
             setup_sp = getattr(model, "setup_sp", None)
             if setup_sp and callable(setup_sp):
                 model.setup_sp(self.backend.get_sp_info())
+
+        # reset dtype back to default for weight saving
+        for attr in dtype_str_list:
+            if hasattr(config, attr):
+                setattr(config, attr, dtype_attrs[attr])
+                setattr(model.config, attr, dtype_attrs[attr])
 
         # Load model via backend
         logger.info("Loading model via %s backend", self.config.backend.value)

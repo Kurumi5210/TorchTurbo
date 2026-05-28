@@ -10,6 +10,7 @@ from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
 import torch.distributed as dist
 
 from torchturbo.logging import get_logger
+from torchturbo.utils.flash_attn_utils import get_unpad_data
 from ..base import BaseBackend
 from ...backend_registry import register_backend
 from torchturbo.parallel import (
@@ -143,6 +144,11 @@ class FSDP2Backend(BaseBackend):
 
         self._create_sp_group(plan.sp_size)
 
+    def _patch_transformers(self):
+        # currently assume packing or normal attention mask
+        import transformers.modeling_flash_attention_utils
+        transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
+
     def prepare_model(self, model: nn.Module, parallel_plan: Any = None) -> nn.Module:
         if parallel_plan is None:
             plan = FSDPParallelPlan()
@@ -190,6 +196,8 @@ class FSDP2Backend(BaseBackend):
         ep_size = self.get_ep_info()["ep_size"]
         if ep_size > 1:
             self.gradient_scaling_factor = 1 / ep_size
+
+        self._patch_transformers()
 
         return model
 

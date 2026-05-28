@@ -27,9 +27,14 @@ class BaseWeightConverter:
         self.moe_config = moe_config
         self.config = config
         self.model_type = config.model_type
-        self.dtype = self.get_save_dtype(config.dtype)
+        self.dtype = self.get_save_dtype(config)
 
-    def get_save_dtype(self, dtype_str):
+    def get_save_dtype(self, config):
+        dtype_str = "bfloat16"
+        if hasattr(config, 'dtype'):
+            dtype_str = config.dtype
+        if hasattr(config, "torch_dtype"):
+            dtype_str = config.torch_dtype
         DTYPE_MAP = {
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,

@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torchturbo.utils.device import is_torch_npu_available
 from einops import rearrange, repeat
+from torchturbo.utils.functools import cache
 
 if is_torch_npu_available():
     import math
@@ -102,7 +103,7 @@ def get_unpad_data_normal(attention_mask):
         max_seqlen_in_batch,
     )
 
-
+@cache
 def get_unpad_data(attention_mask):
     if torch.max(attention_mask) > 1:
         return get_unpad_data_lf(attention_mask)

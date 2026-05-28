@@ -84,7 +84,7 @@ def register() -> None:
             ]
         ),
         format_function=FunctionFormatter(
-            slots=["{{content}}<|role_end|>\n\n"], tool_format="glm4_moe"
+            slots=["{{content}}<|role_end|>\n\n"], tool_format="ling_v3"
         ),
         format_tools=ToolFormatter(tool_format="ling_v3"),
         stop_words=[""],

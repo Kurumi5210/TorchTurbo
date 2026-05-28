@@ -1,13 +1,49 @@
 """Custom functools utilities for torch_turbo."""
+
 import functools
 import torch
+
+
+def _same_tensor(a, b):
+    """Check if two tensors share the same storage and view (O(1), no data transfer)."""
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.storage_offset() == b.storage_offset()
+        and a.dtype == b.dtype
+        and a.device == b.device
+    )
+
+
+def _args_match(old_args, new_args, old_kwargs, new_kwargs):
+    """Check if args/kwargs match, using same-storage check for tensors."""
+    if len(old_args) != len(new_args) or len(old_kwargs) != len(new_kwargs):
+        return False
+    for a, b in zip(old_args, new_args):
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            if not _same_tensor(a, b):
+                return False
+        elif a != b:
+            return False
+    for k in old_kwargs:
+        if k not in new_kwargs:
+            return False
+        a, b = old_kwargs[k], new_kwargs[k]
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            if not _same_tensor(a, b):
+                return False
+        elif a != b:
+            return False
+    return True
 
 
 def cache(user_function):
     """
     Simple single-item cache decorator for functions with tensor arguments.
 
-    Uses tensor's shape, device, and data hash as the cache key.
+    Only cache-hits when tensors share the same storage and view (data_ptr +
+    shape + stride + offset match), so no data transfer is needed.
     Suitable for deterministic functions like get_cu_seqlens_npu.
 
     Only keeps the most recent cache entry. When args change, old cache is cleared.
@@ -23,59 +59,28 @@ def cache(user_function):
     Returns:
         Wrapped function with single-item cache.
     """
-    _cache_key = None
+    _cache_args = None
+    _cache_kwargs = None
     _cache_value = None
 
     @functools.wraps(user_function)
     def wrapper(*args, **kwargs):
-        nonlocal _cache_key, _cache_value
+        nonlocal _cache_args, _cache_kwargs, _cache_value
 
-        # Generate cache key from arguments
-        key_parts = []
-
-        # Handle positional args
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                tensor_key = (
-                    tuple(arg.shape),
-                    str(arg.device),
-                    arg.dtype,
-                    arg.stride(),
-                )
-                key_parts.append(("tensor", tensor_key))
-            else:
-                key_parts.append(("other", arg))
-
-        # Handle keyword args
-        for k, v in sorted(kwargs.items()):
-            if isinstance(v, torch.Tensor):
-                tensor_key = (
-                    tuple(v.shape),
-                    str(v.device),
-                    v.dtype,
-                    v.stride(),
-                )
-                key_parts.append((k, "tensor", tensor_key))
-            else:
-                key_parts.append((k, "other", v))
-
-        key = tuple(key_parts)
-
-        # Check if key matches cached key
-        if key == _cache_key:
+        if _cache_args is not None and _args_match(_cache_args, args, _cache_kwargs, kwargs):
             return _cache_value
 
-        # Clear old cache and compute new result
-        _cache_key = key
+        _cache_args = args
+        _cache_kwargs = kwargs
         result = user_function(*args, **kwargs)
         _cache_value = result
 
         return _cache_value
 
-    # Expose cache info
     def cache_clear():
-        nonlocal _cache_key, _cache_value
-        _cache_key = None
+        nonlocal _cache_args, _cache_kwargs, _cache_value
+        _cache_args = None
+        _cache_kwargs = None
         _cache_value = None
 
     wrapper.cache_clear = cache_clear

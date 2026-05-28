@@ -94,7 +94,7 @@ def slice_input_tensor(
         parts = x.size(dim) // sp_world_size
         slc = [slice(None)] * len(x.shape)
         slc[dim] = slice(sp_rank * parts, (sp_rank + 1) * parts)
-        return x[slc].contiguous()
+        return x[tuple(slc)].contiguous()
     else:  # zigzag_ring
         # zigzag ring attention requires that the chunks of the sequence be concatenated according to zigzag, for example:
         # s: [0, 1, 2, 3, 4, 5, 6, 7], sp_size=2

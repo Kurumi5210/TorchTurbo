@@ -55,20 +55,18 @@ from .configuration_bailing_moe_v3 import BailingMoeV3Config
 from transformers.generation.utils import GenerationMixin
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
-from transformers import DynamicLayer
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 try:
     from .naive_kda import NaiveShortConvolution as ShortConvolution
     from .naive_kda import naive_recurrent_kda_wrapper as fused_recurrent_kda
     from .naive_kda import naive_chunk_kda_wrapper as chunk_kda
+    from .naive_kda import RMSNormGated as FusedRMSNormGated
     # from fla.modules import ShortConvolution
     # from fla.ops.kda import chunk_kda, fused_recurrent_kda
-    from fla.modules import FusedRMSNormGated
-    from fla.utils import tensor_cache
+    # from fla.modules import FusedRMSNormGated
+    # from fla.utils import tensor_cache
 except ImportError as exc:
     _FLA_IMPORT_ERROR = exc
     FusedRMSNormGated = None
@@ -216,7 +214,6 @@ def pad_input(
     return _unflatten_batch_seq(output, batch_size, seq_len)
 
 
-@tensor_cache
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -563,7 +560,7 @@ def eager_attention_forward(
     attention_mask: Optional[torch.Tensor],
     scaling: float,
     dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
+    **kwargs,
 ):
     key_states = repeat_kv2(key, module.num_key_value_groups)
     value_states = repeat_kv2(value, module.num_key_value_groups)
@@ -694,7 +691,7 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
 
         batch_size, seq_length = hidden_states.shape[:-1]
@@ -772,7 +769,7 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
 class BailingMoeV3KimiDeltaAttention(nn.Module):
     def __init__(self, config: BailingMoeV3Config, layer_idx: int):
         super().__init__()
-        _require_fla_core()
+        #_require_fla_core()
         self.config = config
         self.mode = "chunk"
 
@@ -871,6 +868,7 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
 
         if past_key_value is not None and isinstance(past_key_value, Cache):
             # ensure the cache list is long enough
+            from transformers import DynamicLayer
             while len(past_key_value.layers) <= self.layer_idx:
                 past_key_value.layers.append(DynamicLayer())
 
@@ -1121,25 +1119,11 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 position_ids=position_ids,
                 past_key_values=past_key_value,
                 use_cache=use_cache,
-                cache_position=cache_position,  #
-                position_embeddings=position_embeddings,  #
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
         else:
-            batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-            device = hidden_states.device
-
-            if attention_mask is None:
-                # if attention_mask is None, create a full mask
-                attention_mask = torch.ones((batch_size, seq_len), dtype=torch.int32, device=device)
-            elif attention_mask.dim() == 4 and attention_mask.shape[1] == 1:
-                attention_mask = attention_mask[:, 0, -1, :].to(torch.int32)
-                attention_mask = (attention_mask > -1e4).to(torch.int32)
-            elif attention_mask.dim() == 2:
-                attention_mask = attention_mask.to(torch.int32)
-            else:
-                raise ValueError(f"Unsupported mask dimension: {attention_mask.shape}")
-
             hidden_states, self_attn_weights, present_key_value = self.attention(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,

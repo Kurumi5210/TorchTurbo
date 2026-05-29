@@ -84,10 +84,7 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
         assert sp_size >= 1, "must be"
-        if self.config.num_nextn_predict_layers > 0:
-            raise NotImplementedError(
-                "BailingMoeV3 sequence parallelism does not support MTP layers yet."
-            )
+
         if self.config._attn_implementation != "flash_attention_2":
             raise NotImplementedError(
                 "BailingMoeV3 sequence parallelism requires flash_attention_2 "
@@ -353,6 +350,12 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
             MoEAlltoAllTokenDispatcher.token_unpermutation = (
                 npu_fused_ops.fused_token_unpermutation_npu
             )
+
+        if config.num_nextn_predict_layers > 0:
+            Warning(
+                "BailingMoeV3 in torchturbo does not support MTP layers yet."
+            )
+            config.num_nextn_predict_layers = 0
 
     def post_weight_load(self):
         """Initialize runtime buffers after weights are on the real device."""

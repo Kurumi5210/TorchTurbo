@@ -222,7 +222,6 @@ class FSDP2Backend(BaseBackend):
                 mesh=self._mesh,
                 world_mesh=self._world_mesh,
                 device=self.device,
-                use_transformer_engine=self.use_transformer_engine,
             )
         self.weight_loader.load_weights()
 

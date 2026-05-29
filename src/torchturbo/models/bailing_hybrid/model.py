@@ -51,8 +51,11 @@ class BailingV3WeightConverter(BaseWeightConverter):
 @cache
 def _get_cu_seqlens(attention_mask):
     if attention_mask is not None and torch.max(attention_mask) > 1:
-        return get_unpad_data_lf(attention_mask)
-    return None, None, None
+        _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
+        if cu_seqlens[-1] != attention_mask.size(1):
+            cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
+        return cu_seqlens
+    return None
 
 @register_model(
     "bailing_hybrid", config_cls=BailingMoeV3Config, auto_class=AutoModelForCausalLM
@@ -139,8 +142,39 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
             else:
                 return apply_causal_conv1d_fn(conv1d, tensor)
 
+        from fla.modules.convolution import causal_conv1d
+        def triton_conv1d_wrapper(conv1d, tensor, cu_seqlens):
+            conv1d_weight = get_parameter_local_cp(conv1d.weight, dim=0).squeeze(1)
+            conv1d_bias = get_parameter_local_cp(conv1d.bias, dim=0) if conv1d.bias else None
+            result, _ = causal_conv1d(
+                x=tensor,
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                residual=None,
+                initial_state=None,
+                output_final_state=False,
+                activation=conv1d.activation,
+                backend='triton',
+                cu_seqlens=cu_seqlens,
+            )
+            return result
+
+        from fla.modules.fused_norm_gate import rms_norm_gated
+        def fused_norm_gate_wrapper(fng, x, g):
+            return rms_norm_gated(
+                x,
+                g,
+                fng.weight,
+                None, # bias
+                fng.activation,
+                residual=None,
+                eps=fng.eps,
+                prenorm=False,
+                residual_in_fp32=False,
+            )
+
         from .modeling_bailing_moe_v3 import _split_last_dim_heads, _merge_last_two_dims
-        from .naive_kda import naive_chunk_kda_wrapper
+        from fla.ops.kda import chunk_kda
         def sp_forward(
             self,
             hidden_states: torch.Tensor,
@@ -153,7 +187,7 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
             assert past_key_value == None, "must be"
             assert self.mode == 'chunk', "Only chunk mode is supported in training."
 
-            _, cu_seqlens, _ = _get_cu_seqlens(attention_mask)
+            cu_seqlens = _get_cu_seqlens(attention_mask)
 
             q = self.q_proj(hidden_states)   # [1, valid_local, H*K] or [B, T/sp, H*K]
             k = self.k_proj(hidden_states)   # [1, valid_local, H*K] or [B, T/sp, H*K]
@@ -164,8 +198,8 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
                 k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size)
                 v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size)
 
-            # TODO: replace with fused ops
-            conv1d_fn = naive_causal_conv1d_wrapper
+            # TODO: replace with fused ops, performance of triton version is very low
+            conv1d_fn = naive_causal_conv1d_wrapper # triton_conv1d_wrapper
             q = conv1d_fn(self.q_conv1d, q, cu_seqlens)
             k = conv1d_fn(self.k_conv1d, k, cu_seqlens)
             v = conv1d_fn(self.v_conv1d, v, cu_seqlens)
@@ -196,8 +230,7 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
                 A_log_local = self.A_log
                 dt_bias_local = self.dt_bias
 
-            # TODO: replace with fused ops
-            kda_fn = naive_chunk_kda_wrapper
+            kda_fn = chunk_kda
             o, _ = kda_fn(
                 q=q,
                 k=k,
@@ -225,7 +258,8 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
             else:
                 g = self.g_b_proj(self.g_a_proj(hidden_states))
             g = _split_last_dim_heads(g, self.head_dim)
-            o = self.o_norm(o, g)
+            # o = self.o_norm(o, g)
+            o = fused_norm_gate_wrapper(self.o_norm, o, g)
 
             o = _merge_last_two_dims(o)
             o = self.o_proj(o)

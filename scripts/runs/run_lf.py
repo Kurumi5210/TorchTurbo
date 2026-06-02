@@ -1,15 +1,21 @@
 #!/usr/bin/env python
 """Launch LlamaFactory training with torchturbo from the torchturbo repo.
 
-All arguments are passed directly to LlamaFactory's run_exp.
-torchturbo is always imported; use TORCH_TURBO_DISABLE=1 to run vanilla LF.
+torchturbo-specific arguments use the ``--tt_*`` prefix and are stripped
+from argv before forwarding to LlamaFactory.  For example::
+
+    torchrun ... run_lf.py --tt_sp_size 2 --tt_ep_size 8 --stage sft ...
+
+The ``--tt_*`` flags replace the ``TORCH_TURBO_*`` environment variables.
+Priority (lowest → highest): defaults → LF args → env vars → ``--tt_*`` CLI args.
 
 Usage:
-    torchrun --nproc_per_node=8 scripts/runs/run_lf.py \
-        --stage sft \
-        --model_name_or_path /path/to/model \
-        --dataset your_dataset \
-        --template qwen3 \
+    torchrun --nproc_per_node=8 scripts/runs/run_lf.py \\
+        --tt_sp_size 2 --tt_ep_size 8 \\
+        --stage sft \\
+        --model_name_or_path /path/to/model \\
+        --dataset your_dataset \\
+        --template qwen3 \\
         --output_dir ./output/my_run
 """
 
@@ -44,16 +50,21 @@ def auto_detect_dataset_dir() -> str | None:
 
 def main():
     import torchturbo  # noqa: F401
+    from torchturbo.engine.args import parse_torchturbo_args, set_torchturbo_args
+
+    # Parse --tt_* flags and strip them from argv
+    argv = sys.argv[1:]
+    tt_args, remaining_argv = parse_torchturbo_args(argv)
+    set_torchturbo_args(tt_args)
 
     # Auto-inject dataset_dir if not explicitly provided
-    argv = sys.argv[1:]
-    if "--dataset_dir" not in argv:
+    if "--dataset_dir" not in remaining_argv:
         dataset_dir = auto_detect_dataset_dir()
         if dataset_dir is not None:
-            argv.extend(["--dataset_dir", dataset_dir])
+            remaining_argv.extend(["--dataset_dir", dataset_dir])
 
     from llamafactory.train.tuner import run_exp
-    run_exp(args=argv)
+    run_exp(args=remaining_argv)
 
 
 if __name__ == "__main__":

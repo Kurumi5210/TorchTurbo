@@ -4,6 +4,7 @@ Structure::
 
     engine/
     ├── __init__.py          # this file — public exports
+    ├── args.py              # TorchTurboArgs CLI definitions
     ├── config.py            # EngineConfig + common configs
     ├── core.py              # TorchTurboEngine facade
     ├── hooks.py             # TrainState, TrainHook
@@ -19,6 +20,7 @@ Structure::
 
 # Import backends first so they auto-register
 from . import backends  # noqa: F401
+from .args import TorchTurboArgs, get_torchturbo_args, parse_torchturbo_args, set_torchturbo_args
 from .backend_registry import get_available_backends, get_backend, register_backend
 from .backends.fsdp2 import FSDP2Backend, FSDPConfig
 from .backends.base import BaseBackend
@@ -35,6 +37,11 @@ from .hooks import TrainHook, TrainState
 
 
 __all__ = [
+    # CLI args
+    "TorchTurboArgs",
+    "get_torchturbo_args",
+    "parse_torchturbo_args",
+    "set_torchturbo_args",
     # Common config
     "ActivationCheckpointingConfig",
     "CheckpointConfig",

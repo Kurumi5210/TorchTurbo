@@ -54,15 +54,20 @@ class RunExpPatch(BasePatch):
             from .utils import build_config_from_lf_args
             from .hooks import LlamaFactoryHook
             from ...engine import TorchTurboEngine
+            from ...engine.args import get_torchturbo_args
 
             model_args, data_args, training_args, finetuning_args, generating_args = (
                 get_train_args(args)
             )
 
+            # Retrieve CLI-parsed torchturbo args (stashed by the entry point)
+            tt_args = get_torchturbo_args()
+
             config = build_config_from_lf_args(
                 training_args=training_args,
                 finetuning_args=finetuning_args,
                 model_args=model_args,
+                torchturbo_args=tt_args,
             )
             engine = TorchTurboEngine(config)
             adapter.engine = engine

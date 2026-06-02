@@ -68,10 +68,10 @@ RUN_LF="$(dirname "$0")/run_lf.py"
 
 export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
 export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
-export TORCH_TURBO_SP_SIZE=2
-export TORCH_TURBO_EP_SIZE=8
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
+    --tt_sp_size 2 \
+    --tt_ep_size 8 \
     --num_train_epochs 1 \
     --report_to tensorboard \
     --logging_dir /home/admin/logs/tfevent \

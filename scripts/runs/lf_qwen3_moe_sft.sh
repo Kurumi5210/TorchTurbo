@@ -65,10 +65,10 @@ RUN_LF="$(dirname "$0")/run_lf.py"
 
 export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/LLaMA-Factory/src:$PYTHONPATH
 export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/torchturbo/src:$PYTHONPATH
-export TORCH_TURBO_SP_SIZE=2
-export TORCH_TURBO_EP_SIZE=8
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
+    --tt_sp_size 2 \
+    --tt_ep_size 8 \
     --disable_shuffling \
     --stage sft \
     --model_name_or_path $model_name_or_path \

@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...engine import EngineConfig
+from ...engine.args import TorchTurboArgs
 from ...engine.config import (
     ActivationCheckpointingConfig,
     CheckpointConfig,
@@ -29,12 +30,13 @@ def build_config_from_lf_args(
     training_args: Any = None,
     finetuning_args: Any = None,
     model_args: Any = None,
+    torchturbo_args: TorchTurboArgs | None = None,
     overrides: dict[str, Any] | None = None,
 ) -> EngineConfig:
     """Build an ``EngineConfig`` from LlamaFactory args.
 
-    Env var overrides (``TORCH_TURBO_*``) are applied automatically
-    by ``EngineConfig.__post_init__``.
+    Priority (lowest → highest): defaults → LF args mapping → ``torchturbo_args``
+    → env vars(via ``EngineConfig.__post_init__``)  → ``overrides`` dict.
 
     Parameters
     ----------
@@ -44,14 +46,20 @@ def build_config_from_lf_args(
         LlamaFactory's ``FinetuningArguments``.
     model_args:
         LlamaFactory's ``ModelArguments``.
+    torchturbo_args:
+        Parsed ``--tt_*`` CLI arguments.  Applied directly during
+        config construction so they override LF-derived values.
     overrides:
-        Optional dict of overrides (highest priority, after env vars).
+        Optional dict of overrides (highest priority, applied after
+        construction).
 
     Returns
     -------
     A fully configured ``EngineConfig``.
     """
-    config = _build_config_from_args(training_args, finetuning_args, model_args)
+    config = _build_config_from_args(
+        training_args, finetuning_args, model_args, torchturbo_args
+    )
     # Note: env vars are already applied by EngineConfig.__post_init__
 
     # Apply explicit overrides (highest priority)
@@ -84,8 +92,16 @@ def _build_config_from_args(
     training_args: Any,
     finetuning_args: Any,
     model_args: Any,
+    torchturbo_args: TorchTurboArgs | None = None,
 ) -> EngineConfig:
-    """Map LlamaFactory args to EngineConfig."""
+    """Map LlamaFactory args and torchturbo CLI args to EngineConfig."""
+
+    tt = torchturbo_args  # shorthand
+
+    # --- Backend ---
+    backend = DistributedBackend.FSDP2
+    if tt is not None and tt.backend is not None:
+        backend = DistributedBackend(tt.backend)
 
     # --- Mixed precision ---
     mixed_precision = MixedPrecisionPolicy.FP32
@@ -96,6 +112,8 @@ def _build_config_from_args(
             mixed_precision = MixedPrecisionPolicy.FP16
         if getattr(training_args, "fp8", False):
             mixed_precision = MixedPrecisionPolicy.FP8
+    if tt is not None and tt.mixed_precision is not None:
+        mixed_precision = MixedPrecisionPolicy(tt.mixed_precision)
 
     # --- FSDP config (from HF's fsdp / fsdp_config) ---
     fsdp_config = _build_fsdp_config(training_args)
@@ -127,10 +145,12 @@ def _build_config_from_args(
             checkpoint_config.dcp_path = output_dir
 
     # --- Parallel plan ---
-    parallel_plan = FSDPParallelPlan()  # empty plan — use standard FSDP sharding
+    sp_size = tt.sp_size if (tt is not None and tt.sp_size is not None) else 1
+    ep_size = tt.ep_size if (tt is not None and tt.ep_size is not None) else 1
+    parallel_plan = FSDPParallelPlan(sp_size=sp_size, ep_size=ep_size)
 
     return EngineConfig(
-        backend=DistributedBackend.FSDP2,
+        backend=backend,
         parallel_plan=parallel_plan,
         mixed_precision=mixed_precision,
         backend_config=fsdp_config,

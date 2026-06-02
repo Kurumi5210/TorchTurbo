@@ -76,10 +76,10 @@ DATASET_DIR="$(dirname "$0")/../../dataset/"
 export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/opensource/LlamaFactory/src/:$PYTHONPATH
 export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/torchturbo/src:$PYTHONPATH
 export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/flash-linear-attention/:$PYTHONPATH
-export TORCH_TURBO_SP_SIZE=2
-export TORCH_TURBO_EP_SIZE=8
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
+    --tt_sp_size 2 \
+    --tt_ep_size 8 \
     --num_train_epochs 1 \
     --report_to tensorboard \
     --logging_dir /home/admin/logs/tfevent \

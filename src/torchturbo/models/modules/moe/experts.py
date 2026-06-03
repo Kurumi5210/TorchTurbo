@@ -75,10 +75,21 @@ class GroupedMLP(torch.nn.Module):
         use_fused_swiglu: bool,
         use_te: bool,
         config: MoEConfig,
+        layer_number: int = None,
     ):
         super().__init__()
         self.config = config
         self.num_local_experts = num_local_experts
+        self.layer_number = layer_number
+        limit_list = getattr(config, "moe_swiglu_limit", None)
+        if (
+            limit_list is not None
+            and layer_number is not None
+            and 0 <= layer_number < len(limit_list)
+        ):
+            self.swiglu_limit = float(limit_list[layer_number])
+        else:
+            self.swiglu_limit = 0.0
 
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
@@ -93,8 +104,11 @@ class GroupedMLP(torch.nn.Module):
                     import torch_npu
 
                     return torch_npu.npu_swiglu(x, dim=-1)
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
+                gate, up = torch.chunk(x, 2, dim=-1)
+                if self.swiglu_limit > 0:
+                    up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                    gate = torch.clamp(gate, max=self.swiglu_limit)
+                return self.config.activation_func(gate) * up
 
             self.activation_func = glu
         else:

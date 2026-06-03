@@ -63,6 +63,8 @@ class BailingMoeV3Config(PretrainedConfig):
         kda_safe_gate=False,
         kda_lower_bound=None,
         short_conv_kernel_size=4,
+        share_expert_swiglu_limit_list=None,
+        expert_swiglu_limit_list=None,
         **kwargs,
     ):
         self.num_hidden_layers = num_hidden_layers
@@ -123,6 +125,8 @@ class BailingMoeV3Config(PretrainedConfig):
         self.kda_safe_gate = kda_safe_gate
         self.kda_lower_bound = kda_lower_bound
         self.short_conv_kernel_size = short_conv_kernel_size
+        self.share_expert_swiglu_limit_list = share_expert_swiglu_limit_list
+        self.expert_swiglu_limit_list = expert_swiglu_limit_list
         super().__init__(
             pad_token_id=pad_token_id, eos_token_id=eos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs
         )

@@ -367,11 +367,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 class BailingMoeV3MLP(nn.Module):
-    def __init__(self, config: BailingMoeV3Config, intermediate_size: int):
+    def __init__(self, config: BailingMoeV3Config, intermediate_size: int, swiglu_limit: float = 0.0):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
+        self.swiglu_limit = swiglu_limit
 
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -379,7 +380,12 @@ class BailingMoeV3MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.act_fn(self.gate_proj(x))
+        up = self.up_proj(x)
+        if self.swiglu_limit and self.swiglu_limit > 0:
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        return self.down_proj(gate * up)
 
 
 class BailingMoeV3Gate(nn.Module):
@@ -451,15 +457,20 @@ class BailingMoeV3SparseMoeBlock(nn.Module):
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config: BailingMoeV3Config):
+    def __init__(self, config: BailingMoeV3Config, layer_idx: int = 0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.num_experts_per_tok = config.num_experts_per_tok
         self._setup_experts()
         self.gate = BailingMoeV3Gate(config)
         if config.num_shared_experts is not None:
+            limit_list = getattr(config, "share_expert_swiglu_limit_list", None)
+            swiglu_limit = limit_list[layer_idx] if limit_list is not None and layer_idx < len(limit_list) else 0.0
             self.shared_experts = BailingMoeV3MLP(
-                config=config, intermediate_size=config.moe_shared_expert_intermediate_size * config.num_shared_experts
+                config=config,
+                intermediate_size=config.moe_shared_expert_intermediate_size * config.num_shared_experts,
+                swiglu_limit=swiglu_limit,
             )
 
     def _setup_experts(self):
@@ -853,7 +864,13 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
                 )
         use_cache = past_key_value is not None
         batch_size, q_len, _ = hidden_states.shape
-        mode = 'fused_recurrent' if q_len <= 64 else self.mode
+
+        # fused_recurrent_kda: no backward in upstream FLA, only for inference/decoding.
+        # chunk_kda: used for all training; handles T < chunk_size (=64) via boundary checks.
+        if use_cache and q_len <= 64:
+            mode = 'fused_recurrent'
+        else:
+            mode = self.mode
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
@@ -986,7 +1003,7 @@ class BailingMoeV3MTPLayer(nn.Module):
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.post_attention_layernorm = BailingMoeV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention = BailingMoeV3MultiLatentAttention(config=config, layer_idx=layer_idx)
-        self.mlp = BailingMoeV3SparseMoeBlock(config)
+        self.mlp = BailingMoeV3SparseMoeBlock(config, layer_idx=layer_idx)
 
         self.hnorm = BailingMoeV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.final_layernorm = BailingMoeV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1066,7 +1083,7 @@ class BailingMoeV3DecoderLayer(nn.Module):
             self.attention = BailingMoeV3KimiDeltaAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = (
-            BailingMoeV3SparseMoeBlock(config)
+            BailingMoeV3SparseMoeBlock(config, layer_idx=layer_idx)
             if (config.num_experts is not None and layer_idx >= config.first_k_dense_replace)
             else BailingMoeV3MLP(config=config, intermediate_size=config.intermediate_size)
         )

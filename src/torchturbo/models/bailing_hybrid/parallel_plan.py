@@ -36,14 +36,17 @@ def _replace_moe_only(
         moe_router_score_function=hf_config.scoring_func,
         moe_router_dtype=hf_config.router_dtype,
         moe_router_enable_expert_bias=True,
+        moe_swiglu_limit=getattr(hf_config, "expert_swiglu_limit_list", None),
     )
     moe_config = MoEConfig(**moe_config_kwargs)
+    layer_number = getattr(original_module, "layer_idx", None)
 
     moe_layer = MoELayer(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
         use_fused_swiglu=False,
+        layer_number=layer_number,
     )
 
     if hasattr(original_module, "shared_experts"):

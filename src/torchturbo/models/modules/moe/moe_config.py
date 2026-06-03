@@ -55,6 +55,8 @@ class MoEConfig:
     moe_permute_fusion: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
     moe_apply_probs_on_input: bool = False
+    """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""
+    moe_swiglu_limit: Optional[List[float]] = None
 
     def __post_init__(self):
         if self.init_method is None:

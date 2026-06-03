@@ -121,6 +121,7 @@ class MoELayer(BaseMoELayer):
             self.use_fused_swiglu,
             self.use_te,
             self.config,
+            layer_number=self.layer_number,
         )
 
         # Initialize shared experts

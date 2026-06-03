@@ -74,6 +74,7 @@ class TorchTurboArgs:
     mixed_precision: str | None = None
     sp_size: int | None = None
     ep_size: int | None = None
+    mtp_loss_scaling_factor: float | None = None
 
     def to_overrides_dict(self) -> dict[str, Any]:
         """Convert to a flat dict suitable for ``EngineConfig.from_dict()``.
@@ -90,6 +91,8 @@ class TorchTurboArgs:
             d["sp_size"] = self.sp_size
         if self.ep_size is not None:
             d["ep_size"] = self.ep_size
+        if self.mtp_loss_scaling_factor is not None:
+            d["mtp_loss_scaling_factor"] = self.mtp_loss_scaling_factor
         return d
 
 
@@ -134,6 +137,16 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SIZE",
         help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
     )
+    parser.add_argument(
+        "--tt_mtp_loss_scaling_factor",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Multi-Token-Prediction loss weight. Overrides "
+        "config.json's mtp_loss_scaling_factor. Set 0 to keep MTP forward "
+        "(for logging) but exclude it from gradients. Only effective when "
+        "the model config has num_nextn_predict_layers > 0.",
+    )
 
     return parser
 
@@ -168,9 +181,19 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         mixed_precision=parsed.tt_mixed_precision,
         sp_size=parsed.tt_sp_size,
         ep_size=parsed.tt_ep_size,
+        mtp_loss_scaling_factor=parsed.tt_mtp_loss_scaling_factor,
     )
 
-    if any(v is not None for v in [args.backend, args.mixed_precision, args.sp_size, args.ep_size]):
+    if any(
+        v is not None
+        for v in [
+            args.backend,
+            args.mixed_precision,
+            args.sp_size,
+            args.ep_size,
+            args.mtp_loss_scaling_factor,
+        ]
+    ):
         logger.info("torchturbo CLI args: %s", args)
 
     return args, remaining

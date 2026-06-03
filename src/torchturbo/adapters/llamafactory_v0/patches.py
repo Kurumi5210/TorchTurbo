@@ -396,8 +396,10 @@ class ComputeLossPatch(BasePatch):
                     trainer_self, model, inputs, return_outputs, **kwargs
                 )
             num_items_in_batch = kwargs.get("num_items_in_batch", None)
-            result = engine.backend.compute_loss(
-                model, inputs, return_outputs, **kwargs
+
+            # Always request outputs so we can scrape MTP diagnostics.
+            loss, outputs = engine.backend.compute_loss(
+                model, inputs, return_outputs=True, **kwargs
             )
 
             # When num_items_in_batch is None (old-style path), HF Trainer's
@@ -407,21 +409,111 @@ class ComputeLossPatch(BasePatch):
             # compensate.
             sp_size = engine.get_sp_info()["sp_size"]
             if num_items_in_batch is None and sp_size > 1:
-                if return_outputs:
-                    loss, outputs = result
-                    loss = loss * sp_size
-                    outputs.loss = loss
-                    result = (loss, outputs)
-                else:
-                    result = result * sp_size
+                loss = loss * sp_size
+                outputs.loss = loss
 
-            return result
+            # Harvest MTP diagnostics for LogMTPPatch. 
+            # Buffer lives on the trainer to survive across micro-batches
+            # inside one logging window.
+            scaling = getattr(getattr(model, "config", None), "mtp_loss_scaling_factor", 0.0)
+            if scaling and float(scaling) != 0:
+                mtp_loss = getattr(outputs, "mtp_loss", None)
+                if mtp_loss:
+                    mtp_log = getattr(trainer_self, "_mtp_loss_buf", None)
+                    if mtp_log is None:
+                        mtp_log = {"mtp": [], "main": [], "scaled": []}
+                        trainer_self._mtp_loss_buf = mtp_log
+                    mtp_log["mtp"].append([float(m.item()) for m in mtp_loss])
+                    main_l = getattr(outputs, "main_loss", None)
+                    if main_l is not None:
+                        mtp_log["main"].append(float(main_l.item()))
+                    scaled = getattr(outputs, "mtp_loss_scaled", None)
+                    if scaled is not None:
+                        mtp_log["scaled"].append(float(scaled.item()))
+
+            return (loss, outputs) if return_outputs else loss
 
         CustomSeq2SeqTrainer.compute_loss = _patched_compute_loss
 
     def revert(self) -> None:
         if self._original:
             self._original = None
+
+
+# ---------------------------------------------------------------------------
+# LogMTPPatch — surface MTP diagnostics in HF Trainer logs
+# ---------------------------------------------------------------------------
+
+
+class LogMTPPatch(BasePatch):
+    """Inject MTP loss diagnostics into ``Trainer.log()``.
+
+    Reads the buffer populated by :class:`ComputeLossPatch` and adds the
+    following keys to the logs dict (only when MTP is active and
+    ``mtp_loss_scaling_factor > 0``):
+
+    - ``mtp_loss/i``       — mean of i-th MTP head's loss over the window
+    - ``mtp_loss/avg``     — mean across MTP heads
+    - ``mtp_loss/scaled``  — mean of ``scaling_factor * sum(mtp_loss_i)``
+    - ``mtp_loss/main``    — mean of the detached main-path loss (for cross-check)
+
+    Skipped entirely when ``mtp_loss_scaling_factor`` is ``0`` or the model
+    has no MTP layers — no buffer, no extra log keys.
+
+    The buffer is cleared after each log call.
+    """
+
+    name = "log_mtp"
+    supported_versions = _LF_V0
+
+    def __init__(self) -> None:
+        self._original = None
+        self._cls = None
+
+    def patch(self, engine: TorchTurboEngine) -> None:
+        try:
+            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
+        except ImportError:
+            return
+
+        self._cls = CustomSeq2SeqTrainer
+        self._original = CustomSeq2SeqTrainer.log
+
+        def _patched_log(trainer_self, logs, *args, **kwargs):
+            mtp_log = getattr(trainer_self, "_mtp_loss_buf", None)
+            if mtp_log and mtp_log.get("mtp"):
+                rows = mtp_log["mtp"]
+                num_layers = len(rows[0]) if rows else 0
+                if num_layers > 0:
+                    # Per-layer mean over the logging window
+                    by_layer = list(zip(*rows))
+                    per_layer_mean = [sum(c) / len(c) for c in by_layer]
+                    for i, m in enumerate(per_layer_mean):
+                        logs[f"mtp_loss/{i}"] = round(m, 6)
+                    logs["mtp_loss/avg"] = round(
+                        sum(per_layer_mean) / num_layers, 6
+                    )
+                if mtp_log.get("main"):
+                    logs["mtp_loss/main"] = round(
+                        sum(mtp_log["main"]) / len(mtp_log["main"]), 6
+                    )
+                if mtp_log.get("scaled"):
+                    logs["mtp_loss/scaled"] = round(
+                        sum(mtp_log["scaled"]) / len(mtp_log["scaled"]), 6
+                    )
+                mtp_log["mtp"].clear()
+                mtp_log["main"].clear()
+                mtp_log["scaled"].clear()
+            return self._original(trainer_self, logs, *args, **kwargs)
+
+        CustomSeq2SeqTrainer.log = _patched_log
+        logger.info("LogMTPPatch applied — MTP loss will appear in Trainer logs")
+
+    def revert(self) -> None:
+        if self._cls and self._original:
+            self._cls.log = self._original
+            self._original = None
+            self._cls = None
 
 
 # ---------------------------------------------------------------------------

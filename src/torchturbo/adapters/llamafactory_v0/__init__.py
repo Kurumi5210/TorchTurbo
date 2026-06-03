@@ -41,6 +41,7 @@ from .patches import (
     TrainerTrainPatch,
     ComputeLossPatch,
     SaveModelPatch,
+    LogMTPPatch,
 )
 from .utils import build_config_from_lf_args, compute_sft_loss
 
@@ -112,6 +113,7 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         self.add_patch(TrainerTrainPatch())
         self.add_patch(ComputeLossPatch())
         self.add_patch(SaveModelPatch())
+        self.add_patch(LogMTPPatch())
 
         # RunExpPatch is special: it intercepts run_sft, builds the
         # engine, then calls self.apply_patches(engine) for the rest

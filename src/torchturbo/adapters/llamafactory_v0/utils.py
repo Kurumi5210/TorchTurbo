@@ -149,6 +149,11 @@ def _build_config_from_args(
     ep_size = tt.ep_size if (tt is not None and tt.ep_size is not None) else 1
     parallel_plan = FSDPParallelPlan(sp_size=sp_size, ep_size=ep_size)
 
+    # --- Extra: carry through MTP scaling so backend / patches can read it ---
+    extra: dict[str, Any] = {}
+    if tt is not None and tt.mtp_loss_scaling_factor is not None:
+        extra["mtp_loss_scaling_factor"] = float(tt.mtp_loss_scaling_factor)
+
     return EngineConfig(
         backend=backend,
         parallel_plan=parallel_plan,
@@ -157,6 +162,7 @@ def _build_config_from_args(
         activation_checkpointing=ac_config,
         comm=comm_config,
         checkpoint=checkpoint_config,
+        extra=extra,
     )
 
 

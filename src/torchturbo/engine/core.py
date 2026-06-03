@@ -255,6 +255,17 @@ class TorchTurboEngine:
                 trust_remote_code=trust_remote_code,
             )
 
+        # Apply EngineConfig.extra overrides onto the model config.
+        mtp_override = self.config.extra.get("mtp_loss_scaling_factor")
+        if mtp_override is not None and hasattr(config, "mtp_loss_scaling_factor"):
+            old = getattr(config, "mtp_loss_scaling_factor", None)
+            config.mtp_loss_scaling_factor = float(mtp_override)
+            logger.info(
+                "Override mtp_loss_scaling_factor on model config: %s -> %s",
+                old,
+                mtp_override,
+            )
+
         if model_cls is None:
             model_cls = AutoModelForCausalLM
 

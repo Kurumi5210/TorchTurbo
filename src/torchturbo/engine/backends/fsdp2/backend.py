@@ -518,13 +518,90 @@ class FSDP2Backend(BaseBackend):
         outputs = model(**inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
 
+        # Main path loss
+        loss = self._compute_ce_loss_sp(
+            logits=logits,
+            labels=labels,
+            shift_extra=0,
+            sp_size=sp_size,
+            sp_group=sp_group,
+            sp_rank=sp_rank,
+            num_items_in_batch=num_items_in_batch,
+        )
+
+        # MTP path loss
+        # use the same SP-aware CE helper as the main path.
+        mtp_logits_list = getattr(outputs, "mtp_logits", None)
+        mtp_losses: list[torch.Tensor] = []
+        if mtp_logits_list:
+            for i, mtp_logits in enumerate(mtp_logits_list):
+                # i-th MTP head predicts token_{t + i + 2}, so shift labels
+                # (i + 1) extra positions vs the main path.
+                mtp_loss_i = self._compute_ce_loss_sp(
+                    logits=mtp_logits,
+                    labels=labels,
+                    shift_extra=i + 1,
+                    sp_size=sp_size,
+                    sp_group=sp_group,
+                    sp_rank=sp_rank,
+                    num_items_in_batch=num_items_in_batch,
+                )
+                mtp_losses.append(mtp_loss_i)
+
+        scaling = getattr(getattr(model, "config", None), "mtp_loss_scaling_factor", 0.0)
+        scaling = float(scaling) if scaling is not None else 0.0
+        scaled_mtp_total = None
+
+        if mtp_losses and scaling > 0.0:
+            scaled_mtp_total = sum(mtp_losses) * scaling
+            total_loss = loss + scaled_mtp_total
+        else:
+            total_loss = loss
+
+        # Stash diagnostics on outputs for LogMTPPatch to read.
+        outputs.loss = total_loss
+        outputs.main_loss = loss.detach()
+        if mtp_losses:
+            outputs.mtp_loss = [m.detach() for m in mtp_losses]
+            outputs.mtp_loss_scaled = (
+                scaled_mtp_total.detach()
+                if scaled_mtp_total is not None
+                else torch.zeros((), device=loss.device, dtype=loss.dtype)
+            )
+        return (total_loss, outputs) if return_outputs else total_loss
+
+
+    def _compute_ce_loss_sp(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        shift_extra: int,
+        sp_size: int,
+        sp_group: Any,
+        sp_rank: int,
+        num_items_in_batch: int | None,
+    ) -> torch.Tensor:
+        """Shared SP-aware shifted-CE loss helper.
+
+        Parameters
+        ----------
+        logits:
+            ``(B, T/sp_size, V)`` — already SP-local.
+        labels:
+            ``(B, T)`` — full sequence labels (caller passes the same tensor
+            for main and MTP paths).
+        shift_extra:
+            Extra positions to shift left.  Main path uses ``0`` (just the
+            standard "predict next token" shift).  i-th MTP head uses
+            ``i + 1`` (predict token at t+i+2 instead of t+1).
+        """
         from torch.nn import CrossEntropyLoss
 
         loss_fct = CrossEntropyLoss(reduction="sum")
 
-        # shift labels
-        labels = nn.functional.pad(labels, (0, 1), value=loss_fct.ignore_index)
-        labels = labels[..., 1:].contiguous()
+        # Shift labels by (1 + shift_extra) positions to the left.
+        labels = nn.functional.pad(labels, (0, 1 + shift_extra), value=loss_fct.ignore_index)
+        labels = labels[..., 1 + shift_extra :].contiguous()
         label_num = (labels != loss_fct.ignore_index).sum()
         if sp_size > 1:
             labels = slice_input_tensor(
@@ -569,8 +646,7 @@ class FSDP2Backend(BaseBackend):
             loss /= label_num
             loss /= sp_size
 
-        outputs.loss = loss
-        return (loss, outputs) if return_outputs else loss
+        return loss
 
     def _scale_moe_gradient(self, params):
         if len(params) < 1:

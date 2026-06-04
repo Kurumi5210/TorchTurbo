@@ -31,7 +31,12 @@ class BaseBackend(ABC):
         self.config = config
 
     @abstractmethod
-    def prepare_model(self, model: nn.Module, parallel_plan: Any = None) -> nn.Module:
+    def prepare_model(
+        self,
+        model: nn.Module,
+        parallel_plan: Any = None,
+        peft_config: Any = None,
+    ) -> nn.Module:
         """Wrap / shard the model according to this backend's strategy.
 
         Parameters
@@ -41,6 +46,11 @@ class BaseBackend(ABC):
         parallel_plan:
             Optional ``ParallelPlan`` with layer-name → placement mapping.
             If provided, applies per-layer sharding based on FQN patterns.
+        peft_config:
+            Optional PEFT/LoRA configuration (``LoraConfig`` or ``dict``).
+            When provided, LoRA adapters are applied **after** module
+            replacement but **before** sharding.  Backends that don't
+            support PEFT should raise an error if this is non-None.
         """
 
     @abstractmethod

@@ -33,6 +33,7 @@ from .config import (
     MixedPrecisionPolicy,
 )
 from .core import TorchTurboEngine
+from . import peft  # noqa: F401
 from .hooks import TrainHook, TrainState
 
 

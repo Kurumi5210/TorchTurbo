@@ -30,9 +30,9 @@ class BaseWeightConverter:
         self.dtype = self.get_save_dtype(config)
 
     def get_save_dtype(self, config):
-        dtype_str = "bfloat16"
         if hasattr(config, 'dtype'):
-            dtype_str = config.dtype
+            return config.dtype
+        dtype_str = "bfloat16"
         if hasattr(config, "torch_dtype"):
             dtype_str = config.torch_dtype
         DTYPE_MAP = {

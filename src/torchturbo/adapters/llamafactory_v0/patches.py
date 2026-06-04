@@ -51,7 +51,7 @@ class RunExpPatch(BasePatch):
             callbacks: list[Any] | None = None,
         ):
             from llamafactory.hparams import get_train_args
-            from .utils import build_config_from_lf_args
+            from .utils import build_config_from_lf_args, build_lora_config_from_lf_args, strip_lora_args
             from .hooks import LlamaFactoryHook
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
@@ -78,6 +78,30 @@ class RunExpPatch(BasePatch):
                     output_dir=getattr(training_args, "output_dir", "./output"),
                 )
             )
+
+            # If LlamaFactory is using LoRA, build the peft_config and pass
+            # it to LoadModelPatch so that LoRA is applied at the right point
+            # in the model preparation pipeline (after module replacement,
+            # before FSDP2 sharding).
+            if getattr(finetuning_args, "finetuning_type", None) == "lora":
+                peft_config = build_lora_config_from_lf_args(finetuning_args)
+                if peft_config is not None:
+                    # Find the LoadModelPatch and set its peft_config
+                    for patch in adapter._patches:
+                        if isinstance(patch, LoadModelPatch):
+                            patch.set_peft_config(peft_config)
+                            logger.info(
+                                "torchturbo: LoRA config set for LoadModelPatch "
+                                "(r=%d, target_modules=%s)",
+                                peft_config.r,
+                                peft_config.target_modules,
+                            )
+                            break
+
+                # Strip LoRA CLI flags and change --finetuning_type to "full"
+                # so that LlamaFactory's own init_adapter won't try to apply
+                # LoRA again when it re-parses the args.
+                args = strip_lora_args(args)
 
             # apply_patches checks version compat for each patch
             adapter.apply_patches(engine)
@@ -213,6 +237,12 @@ class LoadModelPatch(BasePatch):
     (and related Auto classes) so that when LF calls ``load_class.from_pretrained()``,
     it goes through ``engine.prepare_model()`` instead.
 
+    When LlamaFactory is using LoRA (``finetuning_type == "lora"``), this
+    patch extracts the LoRA config from LlamaFactory's ``FinetuningArguments``
+    and passes it to ``engine.prepare_model(peft_config=...)`` so that LoRA
+    is applied **after** module replacement but **before** FSDP2 sharding —
+    the correct ordering for torchturbo's MoE models.
+
     All other LF logic (config patching, adapter init, value head, etc.) is preserved.
     """
 
@@ -231,6 +261,15 @@ class LoadModelPatch(BasePatch):
     def __init__(self) -> None:
         self._originals: dict[str, Any] = {}  # class_name → original from_pretrained
         self._module = None
+        self._peft_config = None  # cached LoRA config from LF args
+
+    def set_peft_config(self, peft_config: Any) -> None:
+        """Set the PEFT config to be passed to ``engine.prepare_model()``.
+
+        Called by ``RunExpPatch`` when it detects that LlamaFactory is
+        using LoRA finetuning.
+        """
+        self._peft_config = peft_config
 
     def patch(self, engine: TorchTurboEngine) -> None:
         try:
@@ -268,11 +307,15 @@ class LoadModelPatch(BasePatch):
 
                     trust_remote_code = kwargs.get("trust_remote_code", False)
 
+                    # Pass peft_config if available (LoRA finetuning)
+                    peft_config = self._peft_config
+
                     model = engine.prepare_model(
                         model_name_or_path=pretrained_model_name_or_path,
                         torch_dtype=torch_dtype,
                         trust_remote_code=trust_remote_code,
                         init_kwargs=kwargs,
+                        peft_config=peft_config,
                     )
 
                     return model
@@ -734,7 +777,16 @@ class CreateOptimizerPatch(BasePatch):
 
 
 class SaveModelPatch(BasePatch):
-    """Delegate save_model to engine.save_model."""
+    """Delegate save_model to the appropriate backend.
+
+    For LoRA (PeftModel): merges LoRA weights back into the base model
+    (in-place, no extra GPU memory beyond the delta computation), then
+    delegates to ``engine.save_model()`` for FSDP2-aware sharded saving.
+    This avoids the OOM that would result from unwrapping a large FSDP2
+    model to call ``PeftModel.save_pretrained()``.
+
+    For full model (no LoRA): delegates to ``engine.save_model()`` directly.
+    """
 
     name = "save_model"
     supported_versions = _LF_V0
@@ -744,9 +796,6 @@ class SaveModelPatch(BasePatch):
         self._cls = None
 
     def patch(self, engine: TorchTurboEngine) -> None:
-        if not hasattr(engine, "save_model"):
-            return
-
         try:
             from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
         except ImportError:
@@ -760,8 +809,9 @@ class SaveModelPatch(BasePatch):
             if output_dir is None:
                 output_dir = trainer_self.args.output_dir
 
+            # Full model: delegate to engine's FSDP2-aware save
             logger.info(
-                "torchturbo: Intercepting save_model → engine.save_model(%s)",
+                "torchturbo: saving full model via engine.save_model(%s)",
                 output_dir,
             )
             engine.save_model(trainer_self.model, output_dir)
@@ -777,3 +827,172 @@ class SaveModelPatch(BasePatch):
             self._cls.save_model = self._orig_save_model
             self._orig_save_model = None
             self._cls = None
+
+
+# ---------------------------------------------------------------------------
+# RegisterAutoclassPatch — fix register_autoclass for wrapped models
+# ---------------------------------------------------------------------------
+
+
+def _find_base_model_class(model: Any) -> type | None:
+    """Walk through PeftModel / FSDP2 wrappers to find the inner
+    ``PreTrainedModel`` subclass.
+
+    ``register_for_auto_class`` must be called on the *original* model class
+    (e.g. ``LlamaForCausalLM``) so that ``custom_object_save`` stores the
+    correct ``module.ClassName`` in ``config.auto_map`` — not the wrapper
+    class name (e.g. ``FSDPPeftModelForCausalLM``).
+
+    Unwrapping strategy (in order):
+
+    1. **MRO walk**: FSDP2 uses ``fully_shard`` which mutates ``__class__``
+       in-place, creating a subclass like ``FSDP<PfxModelForCausalLM>`` whose
+       MRO includes the original class.  We check the MRO for any class with
+       ``register_for_auto_class``.
+
+    2. **PeftModel unwrapping**: If the MRO doesn't contain a
+       ``PreTrainedModel``, the outermost layer is likely a ``PeftModel``.
+       Calling ``get_base_model()`` returns the underlying transformer model
+       (e.g. ``LlamaForCausalLM``), whose MRO *will* contain it.
+
+    We intentionally do **not** follow the ``.module`` attribute here.
+    FSDP2 does not create wrapper objects with ``.module``; it mutates
+    ``__class__`` in-place.  Following ``.module`` on an arbitrary
+    ``nn.Module`` risks descending into unrelated sub-modules.
+    """
+    seen: set[int] = set()
+    cur = model
+    while cur is not None:
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+
+        # Check MRO of the current object for a PreTrainedModel subclass.
+        # FSDP2 creates a new class: type("FSDP" + cls.__name__, (FSDPModule, cls), {})
+        # so the original cls is in the MRO.  PeftModelForCausalLM does NOT
+        # inherit from PreTrainedModel, so this won't match at that layer —
+        # we need to unwrap first.
+        for cls in type(cur).__mro__:
+            if hasattr(cls, "register_for_auto_class") and cls is not object:
+                return cls
+
+        # PeftModel → get_base_model() returns the original transformer model
+        try:
+            from peft import PeftModel
+
+            if isinstance(cur, PeftModel):
+                cur = cur.get_base_model()
+                continue
+        except ImportError:
+            pass
+
+        # No more wrappers to peel — give up
+        break
+
+    return None
+
+
+class RegisterAutoclassPatch(BasePatch):
+    """Fix ``register_autoclass`` for PeftModel / FSDP-wrapped models.
+
+    ``register_for_auto_class`` is a ``@classmethod`` on
+    ``PreTrainedModel`` that sets ``cls._auto_class`` so that
+    ``save_pretrained`` / ``custom_object_save`` writes the correct
+    ``auto_map`` entry in ``config.json``.
+
+    When torchturbo applies LoRA + FSDP2, ``model.__class__`` becomes a
+    wrapper (e.g. ``FSDPPeftModelForCausalLM``) that lacks this method.
+    LlamaFactory's ``register_autoclass()`` then crashes with
+    ``AttributeError``.
+
+    The fix: replace ``register_autoclass`` so that when the model class
+    lacks ``register_for_auto_class``, we walk through the wrapper layers
+    to find the inner ``PreTrainedModel`` subclass (e.g.
+    ``LlamaForCausalLM``) and call ``register_for_auto_class`` on *that*
+    class.  This guarantees ``save_pretrained`` stores the original class
+    name in ``auto_map``, not the wrapper's.
+    """
+
+    name = "register_autoclass"
+    supported_versions = _LF_V0
+
+    def __init__(self) -> None:
+        self._patched_modules: dict[Any, Any] = {}
+        self._original = None
+
+    def patch(self, engine: TorchTurboEngine | None = None) -> None:
+        try:
+            from llamafactory.model.model_utils import misc as misc_module
+        except ImportError:
+            logger.debug(
+                "llamafactory.model.model_utils.misc not found — "
+                "skipping RegisterAutoclassPatch."
+            )
+            return
+
+        if not hasattr(misc_module, "register_autoclass"):
+            logger.debug(
+                "register_autoclass not found in misc module — "
+                "skipping RegisterAutoclassPatch."
+            )
+            return
+
+        original_fn = misc_module.register_autoclass
+        self._original = original_fn
+        self._module = misc_module
+
+        def _patched_register_autoclass(config, model, tokenizer):
+            if "AutoConfig" in getattr(config, "auto_map", {}):
+                config.__class__.register_for_auto_class()
+
+            if "AutoModelForCausalLM" in getattr(config, "auto_map", {}):
+                model_cls = model.__class__
+                if not hasattr(model_cls, "register_for_auto_class"):
+                    # Wrapper class (e.g. FSDPPeftModelForCausalLM) lacks
+                    # register_for_auto_class — find the inner model class.
+                    base_cls = _find_base_model_class(model)
+                    if base_cls is not None:
+                        logger.info(
+                            "torchturbo: register_autoclass — using %s "
+                            "instead of %s for register_for_auto_class",
+                            base_cls.__name__,
+                            model_cls.__name__,
+                        )
+                        model_cls = base_cls
+                    else:
+                        logger.warning(
+                            "torchturbo: register_autoclass — could not find "
+                            "a PreTrainedModel subclass on %s; skipping "
+                            "register_for_auto_class",
+                            model_cls.__name__,
+                        )
+                if hasattr(model_cls, "register_for_auto_class"):
+                    model_cls.register_for_auto_class()
+
+            if "AutoTokenizer" in tokenizer.init_kwargs.get("auto_map", {}):
+                tokenizer.__class__.register_for_auto_class()
+
+        # Patch the source module
+        misc_module.register_autoclass = _patched_register_autoclass
+        self._patched_modules[misc_module] = original_fn
+
+        # Also patch importers that bound the function by name, e.g.
+        #   from .model_utils.misc import register_autoclass
+        import sys
+
+        for mod in list(sys.modules.values()):
+            if mod is None or mod is misc_module:
+                continue
+            if getattr(mod, "register_autoclass", None) is original_fn:
+                self._patched_modules[mod] = original_fn
+                mod.register_autoclass = _patched_register_autoclass
+
+        logger.info("RegisterAutoclassPatch applied")
+
+    def revert(self) -> None:
+        for mod, original in self._patched_modules.items():
+            mod.register_autoclass = original
+        self._patched_modules.clear()
+        self._original = None
+
+

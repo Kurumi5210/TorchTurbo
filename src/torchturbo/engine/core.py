@@ -217,6 +217,7 @@ class TorchTurboEngine:
         model_cls: type | None = None,
         trust_remote_code: bool = False,
         init_kwargs: dict[str, Any] | None = None,
+        peft_config: Any | None = None,
     ) -> nn.Module:
         """Build a model on meta device, shard it, then load weights.
 
@@ -234,6 +235,13 @@ class TorchTurboEngine:
             Passed to HuggingFace ``from_pretrained``.
         init_kwargs:
             Additional keyword arguments
+        peft_config:
+            Optional PEFT/LoRA configuration (``LoraConfig`` or ``dict``).
+            When provided, LoRA adapters are applied **after** module
+            replacement but **before** FSDP2 sharding.  The
+            ``torchturbo.engine.peft`` module automatically registers a custom
+            LoRA handler for ``GroupedMLP`` (MoE experts with grouped
+            matmul).
 
         Returns
         -------
@@ -291,12 +299,12 @@ class TorchTurboEngine:
         turbo_cls = get_model(model_type) if model_type else None
 
         # we use float32 as main param storage
-        dtype_attrs = {}
-        dtype_str_list = ['dtype', 'torch_dtype']
-        for attr in dtype_str_list:
-            if hasattr(config, attr):
-                dtype_attrs[attr] = getattr(config, attr)
-                setattr(config, attr, 'float32')
+        if hasattr(config, 'dtype'):
+            orig_dtype = config.dtype
+            config.dtype = torch.float32
+        else:
+            orig_dtype = config.torch_dtype
+            config.torch_dtype = "float32"
 
         logger.info("Building model on meta device: %s", model_name_or_path)
         with torch.device("meta"):
@@ -311,19 +319,21 @@ class TorchTurboEngine:
             # Resolve parallel plan
             parallel_plan = self._resolve_parallel_plan(model)
 
-            # Prepare model via backend
+            # Prepare model via backend (module replacement → LoRA → sharding).
             logger.info("Sharding model via %s backend", self.config.backend.value)
-            model = self.backend.prepare_model(model, parallel_plan=parallel_plan)
+            model = self.backend.prepare_model(
+                model, parallel_plan=parallel_plan, peft_config=peft_config
+            )
 
             setup_sp = getattr(model, "setup_sp", None)
             if setup_sp and callable(setup_sp):
                 model.setup_sp(self.backend.get_sp_info())
 
         # reset dtype back to default for weight saving
-        for attr in dtype_str_list:
-            if hasattr(config, attr):
-                setattr(config, attr, dtype_attrs[attr])
-                setattr(model.config, attr, dtype_attrs[attr])
+        if hasattr(config, 'dtype'):
+            config.dtype = orig_dtype
+        else:
+            config.torch_dtype = orig_dtype
 
         # Load model via backend
         logger.info("Loading model via %s backend", self.config.backend.value)
@@ -762,7 +772,10 @@ class TorchTurboEngine:
         except ImportError:
             DTensor = None
 
-        header = f"{'Parameter':<60} {'Shape':<20} {'Dtype':<12} {'Device':<10} {'Mesh':<30} {'Placements'}"
+        max_name_len = max(len(fqn) for fqn, _ in model.named_parameters())
+        name_col = max(max_name_len, len("Parameter")) + 2  # +2 for padding
+
+        header = f"{'Parameter':<{name_col}} {'Shape':<20} {'Dtype':<12} {'Device':<10} {'Mesh':<30} {'Placements'}"
         sep = "-" * len(header)
         lines = [sep, header, sep]
 
@@ -784,7 +797,7 @@ class TorchTurboEngine:
                 placements = "local"
 
             lines.append(
-                f"{fqn:<60} {shape:<20} {dtype:<12} {device:<10} {mesh_info:<30} {placements}"
+                f"{fqn:<{name_col}} {shape:<20} {dtype:<12} {device:<10} {mesh_info:<30} {placements}"
             )
 
         lines.append(sep)

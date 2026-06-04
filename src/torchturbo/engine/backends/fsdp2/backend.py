@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from torchturbo.logging import get_logger
 from torchturbo.utils.flash_attn_utils import get_unpad_data
+from torchturbo.engine.peft.naming import strip_peft_prefix
 from ..base import BaseBackend
 from ...backend_registry import register_backend
 from torchturbo.parallel import (
@@ -149,22 +150,26 @@ class FSDP2Backend(BaseBackend):
         import transformers.modeling_flash_attention_utils
         transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
 
-    def prepare_model(self, model: nn.Module, parallel_plan: Any = None) -> nn.Module:
-        if parallel_plan is None:
-            plan = FSDPParallelPlan()
-        elif not isinstance(parallel_plan, FSDPParallelPlan):
-            raise ValueError(
-                f"FSDP2Backend requires an FSDPParallelPlan, got {type(parallel_plan).__name__}"
-            )
-        else:
-            plan = parallel_plan
+    def _replace_modules(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
+        """Replace modules according to the parallel plan (e.g., MoE layers).
 
+        This is separated from :meth:`prepare_model` so that LoRA can be
+        applied *after* module replacement but *before* FSDP2 sharding.
+
+        Parameters
+        ----------
+        model : nn.Module
+            The model (typically on meta device).
+        plan : FSDPParallelPlan
+            The parallel plan containing ``replace_module`` specs.
+
+        Returns
+        -------
+        nn.Module
+            The model with replaced modules.
+        """
         config = model.config
 
-        # Initialize DeviceMesh and SP groups
-        self._init_mesh(plan)
-
-        # Module replacement or patching
         if plan.plan and isinstance(plan.plan, dict):
             for fqn, submodule in list(model.named_modules()):
                 if fqn == "":
@@ -184,13 +189,44 @@ class FSDP2Backend(BaseBackend):
                         parent = model.get_submodule(parent_fqn)
                         setattr(parent, name, new_module)
                         logger.info(
-                            "FSDP2Backend repalced module %s with %s",
+                            "FSDP2Backend replaced module %s with %s",
                             fqn,
                             type(new_module).__name__,
                         )
                     else:
                         logger.info("FSDP2Backend patched module %s in-place", fqn)
 
+        return model
+
+    def prepare_model(
+        self,
+        model: nn.Module,
+        parallel_plan: Any = None,
+        peft_config: Any = None,
+    ) -> nn.Module:
+        if parallel_plan is None:
+            plan = FSDPParallelPlan()
+        elif not isinstance(parallel_plan, FSDPParallelPlan):
+            raise ValueError(
+                f"FSDP2Backend requires an FSDPParallelPlan, got {type(parallel_plan).__name__}"
+            )
+        else:
+            plan = parallel_plan
+
+        # Initialize DeviceMesh and SP groups
+        self._init_mesh(plan)
+
+        # Phase 1: Module replacement (e.g., MoE layers).
+        model = self._replace_modules(model, plan)
+
+        # Phase 2: Apply LoRA (after module replacement, before sharding).
+        if peft_config is not None:
+            from ...peft import apply_peft
+
+            logger.info("Applying PEFT LoRA to model")
+            model = apply_peft(model, peft_config)
+
+        # Phase 3: FSDP2 sharding.
         model = self._shard_model(model, parallel_plan)
 
         ep_size = self.get_ep_info()["ep_size"]
@@ -228,7 +264,7 @@ class FSDP2Backend(BaseBackend):
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
     ):
-        if self.weight_saver == None:
+        if self.weight_saver is None:
             self.weight_saver = DistParamSaver(
                 model=model,
                 rank=self.rank,
@@ -277,7 +313,8 @@ class FSDP2Backend(BaseBackend):
         if has_plan:
             # Module-level specifications (offload, no_shard)
             for fqn, submodule in model.named_modules():
-                spec = plan.match(fqn)
+                clean_fqn = strip_peft_prefix(fqn)
+                spec = plan.match(clean_fqn)
 
                 # Check for module-specific offload, OR global config offload
                 should_offload = getattr(self, "cpu_offload", False)
@@ -303,7 +340,8 @@ class FSDP2Backend(BaseBackend):
 
             # Module-level Placements
             for fqn, submodule in reversed(list(model.named_modules())):
-                spec = plan.match(fqn)
+                clean_fqn = strip_peft_prefix(fqn)
+                spec = plan.match(clean_fqn)
                 placement_spec = None
 
                 if isinstance(spec, FSDPPlanSpec) and spec.placement is not None:
@@ -334,6 +372,7 @@ class FSDP2Backend(BaseBackend):
         )
 
         for fqn, m in model.named_modules():
+            clean_fqn = strip_peft_prefix(fqn)
             if isinstance(m, nn.ModuleList):
                 for child in m:
                     if not getattr(child, "_fsdp_no_shard", False):
@@ -461,10 +500,15 @@ class FSDP2Backend(BaseBackend):
             )
             edp_total_norm_list.append(edp_total_norm)
 
-        dp_total_norm = _get_total_norm(grads, norm_type=norm_type)
-        dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
+        if not edp_total_norm_list and not grads:
+            return torch.tensor(0.0)
 
-        all_norms = edp_total_norm_list + [dp_total_norm]
+        if grads:
+            dp_total_norm = _get_total_norm(grads, norm_type=norm_type)
+            dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
+            all_norms = edp_total_norm_list + [dp_total_norm]
+        else:
+            all_norms = edp_total_norm_list
         total_norm = torch.linalg.vector_norm(torch.cat(all_norms), norm_type)
 
         if moe_params:

@@ -13,6 +13,8 @@ import torch.nn as nn
 from safetensors.torch import load_file
 from torch.distributed._tensor import distribute_tensor, DTensor
 
+from torchturbo.engine.peft.naming import strip_peft_prefix, is_peft_adapter_param
+from torchturbo.engine.peft.weights import get_peft_init_config, init_lora_tensor
 
 class DistParamLoader:
     def __init__(
@@ -204,9 +206,10 @@ class DistParamLoader:
         for name, submodule in self.model.named_modules():
             for buf_name, buf in submodule.named_buffers(recurse=False):
                 full_name = f"{name}.{buf_name}" if name else buf_name
-                if not self.param_converter.is_persist_buffer(full_name):
+                clean_name = strip_peft_prefix(full_name)
+                if not self.param_converter.is_persist_buffer(clean_name):
                     continue
-                hf_buffer_name = self.param_converter.convert_persist_buffer(full_name)
+                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
                 hf_dtype = self.param_converter.get_default_hf_dtype(hf_buffer_name)
                 old_dtype = buf.dtype
                 if old_dtype != hf_dtype:
@@ -217,42 +220,104 @@ class DistParamLoader:
     def _broadcast_buffers(self):
         self._fix_buffer_dtype()
         for name, buf in self.model.named_buffers():
-            if self.param_converter.is_persist_buffer(name):
-                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+            clean_name = strip_peft_prefix(name)
+            if self.param_converter.is_persist_buffer(clean_name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
                 if hf_buffer_name not in self.param_to_filename:
                     if self.rank == 0:
-                        print(f"[Weight Loader] SKIP buffer (not in checkpoint): {name}", flush=True)
+                        print(f"[Weight Loader] SKIP buffer (not in checkpoint): {clean_name} (original: {name})", flush=True)
                     continue
                 full = self._broadcast_tensor(hf_buffer_name, buf.shape, buf.dtype)
                 with torch.no_grad():
                     buf.copy_(full)
 
+    def _init_and_broadcast_lora(self, clean_name, param):
+        """Initialize a LoRA adapter param on the source rank and broadcast.
+
+        Expert LoRA params are initialized on edp_rank=0 and broadcast
+        within the edp group.  Non-expert LoRA params are initialized on
+        global rank 0 and broadcast to the world.
+
+        Initialization follows the PEFT ``init_lora_weights`` config.
+
+        Returns ``(full_tensor, mesh)``.
+        """
+        is_a = (".lora_A." in clean_name
+                or ".lora_A2." in clean_name
+                or ".lora_embedding_A." in clean_name)
+        # GroupedMLPLoRA params are direct children of the .experts. module
+        # (e.g. model.layers.1.mlp.experts.lora_A.default.weight).
+        # shared_experts use standard lora.Linear and have an intermediate
+        # module (e.g. model.layers.1.mlp.shared_experts.gate_proj.lora_A.default.weight).
+        # lora_A2 / lora_B2 are unique to GroupedMLPLoRA.
+        is_expert = (
+            ".experts.lora_A2." in clean_name
+            or ".experts.lora_B2." in clean_name
+            or ".experts.lora_A." in clean_name
+            or ".experts.lora_B." in clean_name
+        )
+        init_lora_weights, r = get_peft_init_config(self.model)
+
+        if is_expert:
+            edp_mesh = self.mesh["edp"]
+            edp_group = edp_mesh.get_group()
+            edp_rank = edp_mesh.get_local_rank()
+            # src for dist.broadcast must be a global rank.
+            edp_src_global = dist.get_global_rank(edp_group, 0)
+
+            if edp_rank == 0:
+                full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
+                init_lora_tensor(full, is_a, init_lora_weights, r)
+            else:
+                full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
+
+            dist.broadcast(full, src=edp_src_global, group=edp_group, async_op=False)
+            return full, edp_mesh
+        else:
+            if self.rank == 0:
+                full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
+                init_lora_tensor(full, is_a, init_lora_weights, r)
+            else:
+                full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
+
+            dist.broadcast(full, src=0, async_op=False)
+            return full, self.world_mesh
+
     def _broadcast_params(self):
         num_param_tensors = len(list(self.model.parameters()))
         i = 0
         for name, param in self.model.named_parameters():
-            if self.param_converter.is_expert_weight1(name):
-                full = self._broadcast_expert_weight1(name, param)
+            # Strip PEFT prefixes (base_model.model. and base_layer.)
+            # so that parameter names match the HF checkpoint format.
+            clean_name = strip_peft_prefix(name)
+
+            # LoRA adapter parameters: initialize on the source rank of the
+            # corresponding process group, then broadcast.  They do not exist
+            # in the base model checkpoint.
+            if is_peft_adapter_param(clean_name):
+                full, mesh = self._init_and_broadcast_lora(clean_name, param)
+            elif self.param_converter.is_expert_weight1(clean_name):
+                full = self._broadcast_expert_weight1(clean_name, param)
                 mesh = self.mesh['edp']
-            elif self.param_converter.is_expert_weight2(name):
-                full = self._broadcast_expert_weight2(name, param)
+            elif self.param_converter.is_expert_weight2(clean_name):
+                full = self._broadcast_expert_weight2(clean_name, param)
                 mesh = self.mesh['edp']
-            elif self.param_converter.is_router_param(name):
-                hf_param_name = self.param_converter.convert_router_param_to_hf(name)
+            elif self.param_converter.is_router_param(clean_name):
+                hf_param_name = self.param_converter.convert_router_param_to_hf(clean_name)
                 if hf_param_name not in self.param_to_filename:
                     if self.rank == 0:
-                        print(f"[Weight Loader] SKIP (not in checkpoint): {name}", flush=True)
+                        print(f"[Weight Loader] SKIP (not in checkpoint): {clean_name} (original: {name})", flush=True)
                     i += 1
                     continue
                 full = self._broadcast_tensor(hf_param_name, param.shape, param.dtype)
                 mesh = self.world_mesh
             else:
-                if name not in self.param_to_filename:
+                if clean_name not in self.param_to_filename:
                     if self.rank == 0:
-                        print(f"[Weight Loader] SKIP (not in checkpoint): {name}", flush=True)
+                        print(f"[Weight Loader] SKIP (not in checkpoint): {clean_name} (original: {name})", flush=True)
                     i += 1
                     continue
-                full = self._broadcast_tensor(name, param.shape, param.dtype)
+                full = self._broadcast_tensor(clean_name, param.shape, param.dtype)
                 mesh = self.world_mesh
 
             sharded_tensor = distribute_tensor(full, mesh, param.placements, src_data_rank=None)

@@ -11,6 +11,9 @@ import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
 
+from torchturbo.engine.peft.weights import apply_lora_delta, build_lora_delta_map
+from torchturbo.engine.peft.naming import strip_peft_prefix, is_peft_adapter_param
+
 class ShardedParamManager:
     def __init__(
         self,
@@ -51,6 +54,10 @@ class ShardedParamManager:
         self.sharded_param_groups = []
         self.WEIGHT_SHARD_SIZE = 5 * (1024 ** 3)
         self.local_params = self._build_meta_info()
+        self._lora_delta_map = build_lora_delta_map(model)
+        if self._lora_delta_map and self.rank == 0:
+            print(f"[LoRA] Detected {len(self._lora_delta_map)} base parameters "
+                  f"with LoRA deltas to merge during save")
 
     def _update_per_shard(self, shard_params, dst_rank):
         shard_bytes = 0
@@ -130,13 +137,20 @@ class ShardedParamManager:
         common_params = []
         expert_params = []
         for name, param in self.model.named_parameters():
-            dtype = self.param_converter.get_default_hf_dtype(name)
+            # Strip PEFT prefixes so names match the HF checkpoint format.
+            # Skip LoRA adapter params (lora_A, lora_B) — they are not part
+            # of the base model checkpoint.
+            clean_name = strip_peft_prefix(name)
+            if is_peft_adapter_param(clean_name):
+                continue
+
+            dtype = self.param_converter.get_default_hf_dtype(clean_name)
             element_size = torch.tensor([], dtype=dtype).element_size()
-            if self.param_converter.is_expert_weight1(name):
-                ep_gates, ep_ups = self.param_converter.convert_expert_weight1_to_hf(name, only_local_experts=True)
+            if self.param_converter.is_expert_weight1(clean_name):
+                ep_gates, ep_ups = self.param_converter.convert_expert_weight1_to_hf(clean_name, only_local_experts=True)
                 expert_params.extend(ep_gates)
                 expert_params.extend(ep_ups)
-                gates, ups = self.param_converter.convert_expert_weight1_to_hf(name)
+                gates, ups = self.param_converter.convert_expert_weight1_to_hf(clean_name)
                 gate_size = self.param_converter.get_gate_weight_bytes(element_size)
                 up_size = self.param_converter.get_up_weight_bytes(element_size)
                 for gate in gates:
@@ -144,25 +158,26 @@ class ShardedParamManager:
                 for up in ups:
                     self.param_size_map[up] = up_size
                 assert len(ep_gates) * (gate_size + up_size) == param.numel() * element_size, "must be"
-            elif self.param_converter.is_expert_weight2(name):
-                ep_downs = self.param_converter.convert_expert_weight2_to_hf(name, only_local_experts=True)
+            elif self.param_converter.is_expert_weight2(clean_name):
+                ep_downs = self.param_converter.convert_expert_weight2_to_hf(clean_name, only_local_experts=True)
                 expert_params.extend(ep_downs)
-                downs = self.param_converter.convert_expert_weight2_to_hf(name)
+                downs = self.param_converter.convert_expert_weight2_to_hf(clean_name)
                 down_size = self.param_converter.get_down_weight_bytes(element_size)
                 for down in downs:
                     self.param_size_map[down] = down_size
                 assert len(ep_downs) * down_size == param.numel() * element_size, "must be"
-            elif self.param_converter.is_router_param(name):
-                hf_name = self.param_converter.convert_router_param_to_hf(name)
+            elif self.param_converter.is_router_param(clean_name):
+                hf_name = self.param_converter.convert_router_param_to_hf(clean_name)
                 common_params.append(hf_name)
                 self.param_size_map[hf_name] = param.numel() * element_size
             else:
-                common_params.append(name)
-                self.param_size_map[name] = param.numel() * element_size
+                common_params.append(clean_name)
+                self.param_size_map[clean_name] = param.numel() * element_size
 
         for name, buf in self.model.named_buffers():
-            if self.param_converter.is_persist_buffer(name):
-                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+            clean_name = strip_peft_prefix(name)
+            if self.param_converter.is_persist_buffer(clean_name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
                 common_params.append(hf_buffer_name)
                 self.param_size_map[hf_buffer_name] = buf.numel() * buf.element_size()
 
@@ -233,32 +248,43 @@ class ShardedParamManager:
 
         full_sd = {}
         for name, param in self.model.named_parameters():
+            # Strip PEFT prefixes and skip LoRA adapter params.
+            clean_name = strip_peft_prefix(name)
+            if is_peft_adapter_param(clean_name):
+                continue
+
             if torch.distributed.get_rank() == 0:
-                print(f"[saving] param_name: {name}")
+                print(f"[saving] param_name: {clean_name} (original: {name})")
             if isinstance(param, DTensor):
                 full_tensor = param.full_tensor()
             else:
                 full_tensor = param
 
-            if self.param_converter.is_expert_weight1(name):
-                self._save_expert_weight1_to_hf(name, full_tensor, local_params, full_sd)
-            elif self.param_converter.is_expert_weight2(name):
-                self._save_expert_weight2_to_hf(name, full_tensor, local_params, full_sd)
-            elif self.param_converter.is_router_param(name):
-                self._save_router_param_to_hf(name, full_tensor, local_params, full_sd)
+            # Merge LoRA deltas into the base weight without modifying the model.
+            full_tensor = apply_lora_delta(
+                full_tensor, clean_name, self._lora_delta_map
+            )
+
+            if self.param_converter.is_expert_weight1(clean_name):
+                self._save_expert_weight1_to_hf(clean_name, full_tensor, local_params, full_sd)
+            elif self.param_converter.is_expert_weight2(clean_name):
+                self._save_expert_weight2_to_hf(clean_name, full_tensor, local_params, full_sd)
+            elif self.param_converter.is_router_param(clean_name):
+                self._save_router_param_to_hf(clean_name, full_tensor, local_params, full_sd)
             else:
-                if name in local_params:
-                    full_sd[name] = self._normalize_tensor(name, full_tensor)
+                if clean_name in local_params:
+                    full_sd[clean_name] = self._normalize_tensor(clean_name, full_tensor)
             del full_tensor
 
             if self._get_cpu_memory_usage_percent() >= 80 or self._get_gpu_memory_usage_percent() >= 80:
                 self._gc_cleanup()
 
         for name, buf in self.model.named_buffers():
-            if self.param_converter.is_persist_buffer(name):
-                hf_buffer_name = self.param_converter.convert_persist_buffer(name)
+            clean_name = strip_peft_prefix(name)
+            if self.param_converter.is_persist_buffer(clean_name):
+                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
                 if torch.distributed.get_rank() == 0:
-                    print(f"[saving] buf_name: {name}->{hf_buffer_name}")
+                    print(f"[saving] buf_name: {clean_name}->{hf_buffer_name}")
                 if isinstance(buf, DTensor):
                     buf = buf.full_tensor()
                 if hf_buffer_name in local_params:

@@ -194,6 +194,195 @@ def _build_fsdp_config(training_args: Any) -> FSDPConfig:
     )
 
 
+def build_lora_config_from_lf_args(finetuning_args: Any) -> Any | None:
+    """Build a ``peft.LoraConfig`` from LlamaFactory's ``FinetuningArguments``.
+
+    Maps LlamaFactory LoRA fields (``lora_rank``, ``lora_alpha``,
+    ``lora_target``, ``lora_dropout``, ``init_lora_weights``, ``use_rslora``,
+    ``use_dora``) to a :class:`peft.LoraConfig` and registers the
+    :class:`~torchturbo.models.modules.moe.experts.GroupedMLP` custom module
+    handler so that MoE expert layers are included in LoRA.
+
+    After extracting the LoRA config, **all LoRA-related fields on
+    ``finetuning_args`` are reset to their defaults** and
+    ``finetuning_type`` is changed to ``"full"`` so that downstream
+    LlamaFactory code does not attempt to apply LoRA itself (torchturbo
+    manages the entire LoRA lifecycle via ``engine.prepare_model``).
+
+    Returns ``None`` if PEFT is not installed.
+    """
+    try:
+        from peft import LoraConfig, TaskType
+    except ImportError:
+        logger.warning("peft not installed — cannot build LoraConfig from LF args.")
+        return None
+
+    # Map LlamaFactory finetuning args to LoraConfig fields.
+    # LlamaFactory uses: finetuning_type="lora", lora_rank, lora_alpha,
+    # lora_target, lora_dropout, etc.
+    lora_rank = getattr(finetuning_args, "lora_rank", 8)
+    lora_alpha = getattr(finetuning_args, "lora_alpha", lora_rank * 2)
+    lora_target = getattr(finetuning_args, "lora_target", "all-linear")
+    lora_dropout = getattr(finetuning_args, "lora_dropout", 0.0)
+
+    # Optional LoRA init / scaling flags from LlamaFactory.
+    use_rslora = getattr(finetuning_args, "use_rslora", False)
+    use_dora = getattr(finetuning_args, "use_dora", False)
+
+    # init_lora_weights: bool | str
+    # Supports True, False, or strings like "gaussian", "pissa",
+    # "pissa_niter_<N>", "olora", "eva", "loftq", "corda", "orthogonal".
+    # LlamaFactory exposes this via pissa_init / pissa_iter; if those
+    # are set we derive init_lora_weights from them, otherwise default
+    # to True (standard Kaiming-uniform-A / zeros-B init).
+    pissa_init = getattr(finetuning_args, "pissa_init", False)
+    if pissa_init:
+        pissa_iter = getattr(finetuning_args, "pissa_iter", 16)
+        if pissa_iter == -1:
+            init_lora_weights = "pissa"
+        else:
+            init_lora_weights = f"pissa_niter_{pissa_iter}"
+    else:
+        init_lora_weights = True
+
+    # Handle target_modules: LlamaFactory uses comma-separated string or list.
+    # "all" in LlamaFactory means "all linear modules" — same as PEFT's "all-linear".
+    if isinstance(lora_target, str):
+        if lora_target in ("all", "all-linear"):
+            target_modules = "all-linear"
+        else:
+            target_modules = [m.strip() for m in lora_target.split(",") if m.strip()]
+    elif isinstance(lora_target, (list, set)):
+        # Handle "all" / "all-linear" appearing as list elements — they are
+        # supersets of any specific target, so just use the string form.
+        normalized = {str(m).strip().lower() for m in lora_target}
+        if normalized & {"all", "all-linear"}:
+            target_modules = "all-linear"
+        else:
+            target_modules = list(lora_target)
+    else:
+        target_modules = "all-linear"
+
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        init_lora_weights=init_lora_weights,
+        use_rslora=use_rslora,
+        use_dora=use_dora,
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    return lora_config
+
+
+# LlamaFactory LoRA CLI flags that must be stripped from ``remaining_argv``
+# when torchturbo manages LoRA.  HF's ``HfArgumentParser`` accepts both
+# ``--flag value`` and ``--flag=value`` forms; boolean flags (``--use_rslora``)
+# are consumed without a value.
+_LORA_CLI_FLAGS: list[str] = [
+    # LoRA hyper-parameters (each takes a value)
+    "lora_rank",
+    "lora_alpha",
+    "lora_target",
+    "lora_dropout",
+    "additional_target",
+    "loraplus_lr_ratio",
+    "loraplus_lr_embedding",
+    "pissa_iter",
+    # Boolean flags (no value consumed)
+    "use_rslora",
+    "use_dora",
+    "pissa_init",
+    "pissa_convert",
+    "create_new_adapter",
+]
+
+
+def strip_lora_args(args: Any) -> Any:
+    """Strip LoRA-related flags from LlamaFactory CLI args.
+
+    When torchturbo manages the LoRA lifecycle, LlamaFactory must not
+    apply LoRA itself.  This function removes all ``--lora_*``,
+    ``--use_rslora``, ``--use_dora``, ``--pissa_*``, etc. flags from the
+    arg list and changes ``--finetuning_type lora`` to
+    ``--finetuning_type full``.
+
+    Handles ``list[str]`` (CLI argv), ``dict`` (pre-parsed), and ``None``.
+    Returns a **new** object; the input is never mutated.
+    """
+    if args is None:
+        return None
+
+    # --- dict form ---
+    if isinstance(args, dict):
+        stripped = dict(args)
+        if stripped.get("finetuning_type") == "lora":
+            stripped["finetuning_type"] = "full"
+        for flag in _LORA_CLI_FLAGS:
+            stripped.pop(flag, None)
+        return stripped
+
+    # --- list[str] form (CLI argv) ---
+    if isinstance(args, (list, tuple)):
+        bool_flags = {
+            "use_rslora",
+            "use_dora",
+            "pissa_init",
+            "pissa_convert",
+            "create_new_adapter",
+        }
+        val_flags = set(_LORA_CLI_FLAGS) - bool_flags
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            tok = args[i]
+
+            # --finetuning_type=lora  →  --finetuning_type=full
+            if tok.startswith("--finetuning_type=lora"):
+                out.append("--finetuning_type=full")
+                i += 1
+                continue
+
+            # --finetuning_type lora  (separate tokens)
+            if tok == "--finetuning_type" and i + 1 < len(args) and args[i + 1] == "lora":
+                out.append("--finetuning_type")
+                out.append("full")
+                i += 2
+                continue
+
+            # --flag=value  form (single token with =)
+            if tok.startswith("--") and "=" in tok:
+                key_eq = tok.split("=", 1)[0][2:]  # strip leading --
+                if key_eq in val_flags or key_eq in bool_flags:
+                    i += 1  # skip --flag=value
+                    continue
+
+            # --flag value  (separate tokens) or --bool-flag (no value)
+            if tok.startswith("--"):
+                key = tok[2:]  # strip leading --
+                if key in val_flags and i + 1 < len(args):
+                    i += 2  # skip --flag and value
+                    continue
+                if key in bool_flags:
+                    i += 1  # skip --bool-flag
+                    continue
+
+            out.append(tok)
+            i += 1
+
+        logger.info(
+            "torchturbo: stripped LoRA CLI flags and set finetuning_type=full "
+            "(LoRA managed by torchturbo engine)"
+        )
+        return out
+
+    # Unknown type — return as-is
+    return args
+
+
 def compute_sft_loss(
     model: nn.Module,
     batch: dict[str, torch.Tensor],

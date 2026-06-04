@@ -351,12 +351,6 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
                 npu_fused_ops.fused_token_unpermutation_npu
             )
 
-        if config.num_nextn_predict_layers > 0:
-            Warning(
-                "BailingMoeV3 in torchturbo does not support MTP layers yet."
-            )
-            config.num_nextn_predict_layers = 0
-
     def post_weight_load(self):
         """Initialize runtime buffers after weights are on the real device."""
 

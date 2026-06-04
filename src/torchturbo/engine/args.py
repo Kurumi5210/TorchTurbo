@@ -68,12 +68,24 @@ class TorchTurboArgs:
         Sequence parallelism group size.
     ep_size:
         Expert parallelism group size.
+    enable_mtp:
+        Whether to build Multi-Token-Prediction (MTP) layers.  ``True`` forces
+        the MTP heads on (and applies a Megatron-style default scaling of 0.1
+        when ``mtp_loss_scaling_factor`` is unset).  ``False`` forces them off
+        (``num_nextn_predict_layers`` is overridden to 0 — no MTP weights are
+        loaded, no MTP forward).  ``None`` (default) means follow the model's
+        config.json.
+    mtp_loss_scaling_factor:
+        Weight applied to each MTP head's loss before adding to the main
+        loss.  ``None`` follows config.json; ``0`` keeps MTP forward (for
+        logging) but excludes it from gradients.
     """
 
     backend: str | None = None
     mixed_precision: str | None = None
     sp_size: int | None = None
     ep_size: int | None = None
+    enable_mtp: bool | None = None
     mtp_loss_scaling_factor: float | None = None
 
     def to_overrides_dict(self) -> dict[str, Any]:
@@ -91,6 +103,8 @@ class TorchTurboArgs:
             d["sp_size"] = self.sp_size
         if self.ep_size is not None:
             d["ep_size"] = self.ep_size
+        if self.enable_mtp is not None:
+            d["enable_mtp"] = self.enable_mtp
         if self.mtp_loss_scaling_factor is not None:
             d["mtp_loss_scaling_factor"] = self.mtp_loss_scaling_factor
         return d
@@ -138,17 +152,52 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
     )
     parser.add_argument(
+        "--tt_enable_mtp",
+        type=_str2bool,
+        default=None,
+        metavar="BOOL",
+        help="Opt-in switch for Multi-Token-Prediction (MTP) layers. "
+        "true  = build MTP heads (uses config.json's num_nextn_predict_layers), "
+        "load their weights, run forward, compute MTP loss, and use a "
+        "Megatron-style default scaling 0.1 if --tt_mtp_loss_scaling_factor "
+        "is not given. "
+        "false / unset (default) = MTP is OFF: num_nextn_predict_layers is "
+        "overridden to 0, MTP weights are not loaded, no MTP forward, no "
+        "extra memory — even if the checkpoint's config.json ships with "
+        "MTP enabled.",
+    )
+    parser.add_argument(
         "--tt_mtp_loss_scaling_factor",
         type=float,
         default=None,
         metavar="FLOAT",
-        help="Multi-Token-Prediction loss weight. Overrides "
-        "config.json's mtp_loss_scaling_factor. Set 0 to keep MTP forward "
-        "(for logging) but exclude it from gradients. Only effective when "
-        "the model config has num_nextn_predict_layers > 0.",
+        help="Multi-Token-Prediction loss weight (only meaningful when "
+        "--tt_enable_mtp true).  Set 0 to keep MTP forward (for logging) "
+        "but exclude it from gradients.  Default when --tt_enable_mtp true "
+        "is set without this flag: 0.1 (Megatron-LM default; matches "
+        "DeepSeek-V3 paper's steady-state λ).  Ignored when MTP is off.",
     )
 
     return parser
+
+
+def _str2bool(value: str) -> bool:
+    """argparse type for boolean CLI flags.
+
+    Accepts the conventional spellings (``true / false / 1 / 0 / yes / no``)
+    case-insensitively.  Raises ``ArgumentTypeError`` otherwise so the user
+    sees a clear error instead of a silent truthy-string surprise.
+    """
+    if isinstance(value, bool):
+        return value
+    v = value.strip().lower()
+    if v in ("true", "1", "yes", "y", "t", "on"):
+        return True
+    if v in ("false", "0", "no", "n", "f", "off"):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean (true/false), got {value!r}"
+    )
 
 
 def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
@@ -181,6 +230,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         mixed_precision=parsed.tt_mixed_precision,
         sp_size=parsed.tt_sp_size,
         ep_size=parsed.tt_ep_size,
+        enable_mtp=parsed.tt_enable_mtp,
         mtp_loss_scaling_factor=parsed.tt_mtp_loss_scaling_factor,
     )
 
@@ -191,6 +241,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.mixed_precision,
             args.sp_size,
             args.ep_size,
+            args.enable_mtp,
             args.mtp_loss_scaling_factor,
         ]
     ):

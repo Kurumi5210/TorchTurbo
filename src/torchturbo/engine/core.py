@@ -257,58 +257,17 @@ class TorchTurboEngine:
 
         # Apply EngineConfig.extra overrides onto the model config.
         enable_mtp = self.config.extra.get("enable_mtp")
-        mtp_override = self.config.extra.get("mtp_loss_scaling_factor")
+        mtp_scaling = self.config.extra.get("mtp_loss_scaling_factor")
 
-        if enable_mtp is True:
-            # User explicitly opted in.
-            if hasattr(config, "num_nextn_predict_layers") and config.num_nextn_predict_layers == 0:
-                logger.warning(
-                    "tt_enable_mtp=true but model config has "
-                    "num_nextn_predict_layers=0; nothing to enable. Check the "
-                    "model's config.json — MTP heads must be defined there."
-                )
-            # Apply Megatron-style default scaling when user did not specify one.
-            # 0.1 matches NVIDIA Megatron-LM's argparse default.
-            if mtp_override is None:
-                mtp_override = 0.1
-                logger.info(
-                    "tt_enable_mtp=true without --tt_mtp_loss_scaling_factor; "
-                    "defaulting to %s (Megatron-style)",
-                    mtp_override,
-                )
+        if enable_mtp:
+            if hasattr(config, "mtp_loss_scaling_factor") and mtp_scaling is not None:
+                config.mtp_loss_scaling_factor = float(mtp_scaling)
+                logger.info("MTP enabled with scaling=%s", mtp_scaling)
         else:
-            # Default (enable_mtp is None) or explicit --tt_enable_mtp false:
-            # MTP is off.  Strip the heads so weights are not loaded and
-            # forward skips them.
+            # Default or explicit false: strip MTP heads so their weights
+            # are not loaded and forward skips them.
             if hasattr(config, "num_nextn_predict_layers"):
-                old_layers = config.num_nextn_predict_layers
-                if old_layers != 0:
-                    config.num_nextn_predict_layers = 0
-                    reason = (
-                        "tt_enable_mtp=false"
-                        if enable_mtp is False
-                        else "tt_enable_mtp not set (MTP is opt-in)"
-                    )
-                    logger.info(
-                        "%s: num_nextn_predict_layers %d -> 0 "
-                        "(MTP heads stripped; their checkpoint weights will be skipped)",
-                        reason,
-                        old_layers,
-                    )
-            if hasattr(config, "mtp_loss_scaling_factor"):
-                config.mtp_loss_scaling_factor = 0.0
-            # Drop any scaling override; without MTP layers it would be a no-op
-            # and the explicit override log line below would be misleading.
-            mtp_override = None
-
-        if mtp_override is not None and hasattr(config, "mtp_loss_scaling_factor"):
-            old = getattr(config, "mtp_loss_scaling_factor", None)
-            config.mtp_loss_scaling_factor = float(mtp_override)
-            logger.info(
-                "Override mtp_loss_scaling_factor on model config: %s -> %s",
-                old,
-                mtp_override,
-            )
+                config.num_nextn_predict_layers = 0
 
         if model_cls is None:
             model_cls = AutoModelForCausalLM

@@ -69,24 +69,23 @@ class TorchTurboArgs:
     ep_size:
         Expert parallelism group size.
     enable_mtp:
-        Whether to build Multi-Token-Prediction (MTP) layers.  ``True`` forces
-        the MTP heads on (and applies a Megatron-style default scaling of 0.1
-        when ``mtp_loss_scaling_factor`` is unset).  ``False`` forces them off
-        (``num_nextn_predict_layers`` is overridden to 0 — no MTP weights are
-        loaded, no MTP forward).  ``None`` (default) means follow the model's
-        config.json.
+        Whether to build Multi-Token-Prediction (MTP) layers.  ``True``
+        opts in: build MTP heads, load their weights, run forward, compute
+        loss.  ``False`` (default) — MTP is OFF
+        (``num_nextn_predict_layers`` is overridden to 0).
     mtp_loss_scaling_factor:
         Weight applied to each MTP head's loss before adding to the main
-        loss.  ``None`` follows config.json; ``0`` keeps MTP forward (for
-        logging) but excludes it from gradients.
+        loss.  Defaults to ``0.1`` (Megatron-LM default).  Ignored when MTP
+        is off.  Set ``0`` to keep MTP forward (for logging) but exclude it
+        from gradients.
     """
 
     backend: str | None = None
     mixed_precision: str | None = None
     sp_size: int | None = None
     ep_size: int | None = None
-    enable_mtp: bool | None = None
-    mtp_loss_scaling_factor: float | None = None
+    enable_mtp: bool = False
+    mtp_loss_scaling_factor: float | None = 0.1
 
     def to_overrides_dict(self) -> dict[str, Any]:
         """Convert to a flat dict suitable for ``EngineConfig.from_dict()``.
@@ -154,7 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tt_enable_mtp",
         type=_str2bool,
-        default=None,
+        default=False,
         metavar="BOOL",
         help="Opt-in switch for Multi-Token-Prediction (MTP) layers. "
         "true  = build MTP heads (uses config.json's num_nextn_predict_layers), "
@@ -169,13 +168,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tt_mtp_loss_scaling_factor",
         type=float,
-        default=None,
+        default=0.1,
         metavar="FLOAT",
         help="Multi-Token-Prediction loss weight (only meaningful when "
         "--tt_enable_mtp true).  Set 0 to keep MTP forward (for logging) "
-        "but exclude it from gradients.  Default when --tt_enable_mtp true "
-        "is set without this flag: 0.1 (Megatron-LM default; matches "
-        "DeepSeek-V3 paper's steady-state λ).  Ignored when MTP is off.",
+        "but exclude it from gradients.  Default: 0.1 (Megatron-LM default). "
+        "Ignored when MTP is off.",
     )
 
     return parser

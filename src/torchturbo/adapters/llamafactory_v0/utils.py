@@ -151,10 +151,10 @@ def _build_config_from_args(
 
     # --- Extra: carry through MTP scaling so backend / patches can read it ---
     extra: dict[str, Any] = {}
-    if tt is not None and tt.enable_mtp is not None:
+    if tt is not None:
         extra["enable_mtp"] = bool(tt.enable_mtp)
-    if tt is not None and tt.mtp_loss_scaling_factor is not None:
-        extra["mtp_loss_scaling_factor"] = float(tt.mtp_loss_scaling_factor)
+        if tt.mtp_loss_scaling_factor is not None:
+            extra["mtp_loss_scaling_factor"] = float(tt.mtp_loss_scaling_factor)
 
     return EngineConfig(
         backend=backend,

@@ -152,50 +152,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tt_enable_mtp",
-        type=_str2bool,
-        default=False,
-        metavar="BOOL",
-        help="Opt-in switch for Multi-Token-Prediction (MTP) layers. "
-        "true  = build MTP heads (uses config.json's num_nextn_predict_layers), "
-        "load their weights, run forward, compute MTP loss, and use a "
-        "Megatron-style default scaling 0.1 if --tt_mtp_loss_scaling_factor "
-        "is not given. "
-        "false / unset (default) = MTP is OFF: num_nextn_predict_layers is "
-        "overridden to 0, MTP weights are not loaded, no MTP forward, no "
-        "extra memory — even if the checkpoint's config.json ships with "
-        "MTP enabled.",
+        action="store_true",
+        help="Build Multi-Token-Prediction (MTP) layers. Off by default.",
     )
     parser.add_argument(
         "--tt_mtp_loss_scaling_factor",
         type=float,
         default=0.1,
         metavar="FLOAT",
-        help="Multi-Token-Prediction loss weight (only meaningful when "
-        "--tt_enable_mtp true).  Set 0 to keep MTP forward (for logging) "
-        "but exclude it from gradients.  Default: 0.1 (Megatron-LM default). "
-        "Ignored when MTP is off.",
+        help="MTP loss weight. Ignored when MTP is off.",
     )
 
     return parser
-
-
-def _str2bool(value: str) -> bool:
-    """argparse type for boolean CLI flags.
-
-    Accepts the conventional spellings (``true / false / 1 / 0 / yes / no``)
-    case-insensitively.  Raises ``ArgumentTypeError`` otherwise so the user
-    sees a clear error instead of a silent truthy-string surprise.
-    """
-    if isinstance(value, bool):
-        return value
-    v = value.strip().lower()
-    if v in ("true", "1", "yes", "y", "t", "on"):
-        return True
-    if v in ("false", "0", "no", "n", "f", "off"):
-        return False
-    raise argparse.ArgumentTypeError(
-        f"Expected a boolean (true/false), got {value!r}"
-    )
 
 
 def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:

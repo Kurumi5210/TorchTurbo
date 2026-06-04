@@ -548,8 +548,16 @@ class FSDP2Backend(BaseBackend):
                 )
                 mtp_losses.append(mtp_loss_i)
 
-        scaling = getattr(getattr(model, "config", None), "mtp_loss_scaling_factor", 0.0)
-        scaling = float(scaling) if scaling is not None else 0.0
+        # Read MTP scaling straight from the CLI args.
+        # Defaults to 0.1 (Megatron-LM default).
+        from torchturbo.engine.args import get_torchturbo_args
+
+        tt_args = get_torchturbo_args()
+        scaling = float(
+            tt_args.mtp_loss_scaling_factor
+            if tt_args is not None and tt_args.mtp_loss_scaling_factor is not None
+            else 0.1
+        )
         scaled_mtp_total = None
 
         if mtp_losses and scaling > 0.0:

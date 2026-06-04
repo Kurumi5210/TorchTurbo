@@ -255,18 +255,24 @@ class TorchTurboEngine:
                 trust_remote_code=trust_remote_code,
             )
 
-        # Apply EngineConfig.extra overrides onto the model config.
-        enable_mtp = self.config.extra.get("enable_mtp")
-        mtp_scaling = self.config.extra.get("mtp_loss_scaling_factor")
-
-        if enable_mtp:
-            if hasattr(config, "mtp_loss_scaling_factor") and mtp_scaling is not None:
-                config.mtp_loss_scaling_factor = float(mtp_scaling)
-                logger.info("MTP enabled with scaling=%s", mtp_scaling)
+        if self.config.extra.get("enable_mtp"):
+            n_mtp = getattr(config, "num_nextn_predict_layers", 0)
+            if n_mtp > 0:
+                logger.info("MTP enabled: %d MTP layer(s) will be built", n_mtp)
+            else:
+                logger.warning(
+                    "--tt_enable_mtp passed but model config has "
+                    "num_nextn_predict_layers=0 — nothing to enable."
+                )
         else:
-            # Default or explicit false: strip MTP heads so their weights
-            # are not loaded and forward skips them.
             if hasattr(config, "num_nextn_predict_layers"):
+                if config.num_nextn_predict_layers > 0:
+                    logger.info(
+                        "MTP off (default): stripping %d MTP layer(s) — "
+                        "their checkpoint weights will be skipped. "
+                        "Pass --tt_enable_mtp to enable.",
+                        config.num_nextn_predict_layers,
+                    )
                 config.num_nextn_predict_layers = 0
 
         if model_cls is None:

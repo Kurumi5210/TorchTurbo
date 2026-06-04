@@ -153,8 +153,6 @@ def _build_config_from_args(
     extra: dict[str, Any] = {}
     if tt is not None:
         extra["enable_mtp"] = bool(tt.enable_mtp)
-        if tt.mtp_loss_scaling_factor is not None:
-            extra["mtp_loss_scaling_factor"] = float(tt.mtp_loss_scaling_factor)
 
     return EngineConfig(
         backend=backend,

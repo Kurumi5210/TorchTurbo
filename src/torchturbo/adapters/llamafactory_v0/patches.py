@@ -412,24 +412,22 @@ class ComputeLossPatch(BasePatch):
                 loss = loss * sp_size
                 outputs.loss = loss
 
-            # Harvest MTP diagnostics for LogMTPPatch. 
+            # Harvest MTP diagnostics for LogMTPPatch.
             # Buffer lives on the trainer to survive across micro-batches
             # inside one logging window.
-            scaling = getattr(getattr(model, "config", None), "mtp_loss_scaling_factor", 0.0)
-            if scaling and float(scaling) != 0:
-                mtp_loss = getattr(outputs, "mtp_loss", None)
-                if mtp_loss:
-                    mtp_log = getattr(trainer_self, "_mtp_loss_buf", None)
-                    if mtp_log is None:
-                        mtp_log = {"mtp": [], "main": [], "scaled": []}
-                        trainer_self._mtp_loss_buf = mtp_log
-                    mtp_log["mtp"].append([float(m.item()) for m in mtp_loss])
-                    main_l = getattr(outputs, "main_loss", None)
-                    if main_l is not None:
-                        mtp_log["main"].append(float(main_l.item()))
-                    scaled = getattr(outputs, "mtp_loss_scaled", None)
-                    if scaled is not None:
-                        mtp_log["scaled"].append(float(scaled.item()))
+            mtp_loss = getattr(outputs, "mtp_loss", None)
+            if mtp_loss:
+                mtp_log = getattr(trainer_self, "_mtp_loss_buf", None)
+                if mtp_log is None:
+                    mtp_log = {"mtp": [], "main": [], "scaled": []}
+                    trainer_self._mtp_loss_buf = mtp_log
+                mtp_log["mtp"].append([float(m.item()) for m in mtp_loss])
+                main_l = getattr(outputs, "main_loss", None)
+                if main_l is not None:
+                    mtp_log["main"].append(float(main_l.item()))
+                scaled = getattr(outputs, "mtp_loss_scaled", None)
+                if scaled is not None:
+                    mtp_log["scaled"].append(float(scaled.item()))
 
             return (loss, outputs) if return_outputs else loss
 

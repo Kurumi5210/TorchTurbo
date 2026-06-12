@@ -1,9 +1,5 @@
 # Bailing MoE V3
 
-## 运行脚本
-
-`scripts/runs/lf_bailing_moe_v3_sft.sh`
-
 ### AIStudio 环境
 
 ```python
@@ -45,20 +41,9 @@ def torch_train():
     node_gpu_num = 16
     node_num = 1
 
-    env_dir = '/sfs_turbo/zhisan/0507/'
     command = ""
     command += f"export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && "
-    command += f"pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && \
-        cd /sfs_turbo/zlj/workspace/LLaMA-Factory && \
-        pip install -r requirements.txt -i https://pypi.antfin-inc.com/simple/ && \
-        pip install deepspeed==0.16.0 -i https://pypi.antfin-inc.com/simple/ && \
-        pip install transformers==4.57.3 -i https://pypi.antfin-inc.com/simple/ && \
-        pip install tensorboard -i https://pypi.antfin-inc.com/simple/ && \
-        pip install /sfs_turbo/zhisan/envs/triton_ascend-3.5.1.dev2026042622-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl --no-deps && \
-        cd {env_dir}/flash-linear-attention && \
-        pip install -e . --force-reinstall --no-deps -i https://pypi.antfin-inc.com/simple/ && \
-        /sfs_turbo/zhisan/envs/ascendnpu-ir_1.1.0_linux-aarch64.run --install && \
-        pip list && "
+    command += f"pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && "
 
     command += ' sleep inf'
     name = 'bailing_moe_v3_env'
@@ -93,7 +78,21 @@ if __name__ == "__main__":
 
 ## 运行方式
 
-`sh scripts/runs/lf_bailing_moe_v3_sft.sh`
+### PT
+```bash
+sh scripts/runs/npu_deps/bailing_v3_deps.sh
+# Optional when running the script outside this repo:
+# export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
+sh scripts/runs/lf_bailing_v3_tiny_pt.sh
+```
+
+### SFT
+```bash
+sh scripts/runs/npu_deps/bailing_v3_deps.sh
+# Optional when running the script outside this repo:
+# export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
+sh scripts/runs/lf_bailing_v3_tiny_sft.sh
+```
 
 ## 和 DeepSpeed 对比
 

@@ -35,12 +35,14 @@ class RunExpPatch(BasePatch):
         self.adapter = adapter
         self._original = None
         self._module = None
+        self._launcher_module = None
+        self._train_module = None
 
     def patch(self, engine: TorchTurboEngine | None = None) -> None:
         try:
             from llamafactory.train import tuner as tuner_module
         except ImportError:
-            raise ImportError("tuner in llmafactory.train not found.")
+            raise ImportError("tuner in llamafactory.train not found.")
 
         self._module = tuner_module
         self._original = tuner_module.run_exp
@@ -51,7 +53,11 @@ class RunExpPatch(BasePatch):
             callbacks: list[Any] | None = None,
         ):
             from llamafactory.hparams import get_train_args
-            from .utils import build_config_from_lf_args, build_lora_config_from_lf_args, strip_lora_args
+            from .utils import (
+                build_config_from_lf_args,
+                build_lora_config_from_lf_args,
+                strip_lora_args,
+            )
             from .hooks import LlamaFactoryHook
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
@@ -59,9 +65,36 @@ class RunExpPatch(BasePatch):
             model_args, data_args, training_args, finetuning_args, generating_args = (
                 get_train_args(args)
             )
+            stage = getattr(finetuning_args, "stage", None)
+
+            if stage not in {"sft", "pt"}:
+                if stage == "dpo":
+                    logger.warning(
+                        "torchturbo: DPO integration is reserved for a future "
+                        "patch. Running native LlamaFactory for now."
+                    )
+                else:
+                    logger.warning(
+                        "torchturbo: LlamaFactory stage %r is not enabled for "
+                        "TorchTurbo yet; running native LlamaFactory.",
+                        stage,
+                    )
+                return self._original(args, callbacks)
 
             # Retrieve CLI-parsed torchturbo args (stashed by the entry point)
             tt_args = get_torchturbo_args()
+
+            peft_config = None
+            if getattr(finetuning_args, "finetuning_type", None) == "lora":
+                peft_config = build_lora_config_from_lf_args(
+                    finetuning_args,
+                    model_args=model_args,
+                )
+                if peft_config is None:
+                    raise RuntimeError(
+                        "TorchTurbo LlamaFactory LoRA requires PEFT to build "
+                        "the adapter config before engine initialization."
+                    )
 
             config = build_config_from_lf_args(
                 training_args=training_args,
@@ -83,20 +116,18 @@ class RunExpPatch(BasePatch):
             # it to LoadModelPatch so that LoRA is applied at the right point
             # in the model preparation pipeline (after module replacement,
             # before FSDP2 sharding).
-            if getattr(finetuning_args, "finetuning_type", None) == "lora":
-                peft_config = build_lora_config_from_lf_args(finetuning_args)
-                if peft_config is not None:
-                    # Find the LoadModelPatch and set its peft_config
-                    for patch in adapter._patches:
-                        if isinstance(patch, LoadModelPatch):
-                            patch.set_peft_config(peft_config)
-                            logger.info(
-                                "torchturbo: LoRA config set for LoadModelPatch "
-                                "(r=%d, target_modules=%s)",
-                                peft_config.r,
-                                peft_config.target_modules,
-                            )
-                            break
+            if peft_config is not None:
+                # Find the LoadModelPatch and set its peft_config
+                for patch in adapter._patches:
+                    if isinstance(patch, LoadModelPatch):
+                        patch.set_peft_config(peft_config)
+                        logger.info(
+                            "torchturbo: LoRA config set for LoadModelPatch "
+                            "(r=%d, target_modules=%s)",
+                            peft_config.r,
+                            peft_config.target_modules,
+                        )
+                        break
 
                 # Strip LoRA CLI flags and change --finetuning_type to "full"
                 # so that LlamaFactory's own init_adapter won't try to apply
@@ -108,7 +139,7 @@ class RunExpPatch(BasePatch):
 
             logger.info(
                 "torchturbo: engine ready, entering run_exp for stage: %s",
-                finetuning_args.stage,
+                stage,
             )
             return self._original(args, callbacks)
 
@@ -148,81 +179,6 @@ class RunExpPatch(BasePatch):
             self._train_module.run_exp = self._original
             self._train_module = None
         self._original = None
-
-
-# ---------------------------------------------------------------------------
-# SPTrainingPatch — adjust LF's Trainer for sequence parallelism
-# ---------------------------------------------------------------------------
-
-
-class SPTrainingPatch(BasePatch):
-    """Adjust LlamaFactory's Trainer for sequence parallelism.
-
-    When SP is enabled:
-    1. ``gradient_accumulation_steps *= sp_size`` to keep global batch size
-    2. ``get_train_dataloader()`` uses SP-aware ``DistributedSampler``
-       (ranks in the same SP group get the same data)
-    """
-
-    name = "sp_training"
-    supported_versions = _LF_V0
-
-    def __init__(self) -> None:
-        self._original_get_dataloader = None
-        self._cls = None
-        self._orig_grad_accum = None
-
-    def patch(self, engine: TorchTurboEngine) -> None:
-        # 1. Adjust gradient_accumulation_steps on HF training_args
-        #    (LF's Trainer reads this, not engine.fit)
-        try:
-            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
-        except ImportError:
-            return
-
-        self._cls = CustomSeq2SeqTrainer
-
-        # 2. Patch get_train_dataloader for SP-aware sampling
-        self._original_get_dataloader = CustomSeq2SeqTrainer.get_train_dataloader
-
-        def _patched_get_train_dataloader(trainer_self):
-            from torch.utils.data import DataLoader, DistributedSampler
-
-            # Get SP info
-            sp_info = engine.get_sp_info()
-            sp_size = sp_info["sp_size"]
-
-            # Adjust training_args grad_accum (once)
-            args = trainer_self.args
-            if not getattr(args, "_sp_adjusted", False):
-                orig = args.gradient_accumulation_steps
-                args.gradient_accumulation_steps = orig * sp_size
-                args._sp_adjusted = True
-                logger.info(
-                    "SP=%d: gradient_accumulation_steps %d → %d",
-                    sp_size,
-                    orig,
-                    args.gradient_accumulation_steps,
-                )
-
-            dataset = trainer_self.train_dataset
-            return engine.create_dataloader(
-                dataset=dataset,
-                batch_size=trainer_self._train_batch_size,
-                collate_fn=trainer_self.data_collator,
-                num_workers=args.dataloader_num_workers,
-                pin_memory=args.dataloader_pin_memory,
-                drop_last=args.dataloader_drop_last,
-                shuffle=False,
-            )
-
-        CustomSeq2SeqTrainer.get_train_dataloader = _patched_get_train_dataloader
-        logger.info("Patched Trainer.get_train_dataloader for SP")
-
-    def revert(self) -> None:
-        if self._cls and self._original_get_dataloader:
-            self._cls.get_train_dataloader = self._original_get_dataloader
-            self._original_get_dataloader = None
 
 
 # ---------------------------------------------------------------------------
@@ -344,217 +300,81 @@ class LoadModelPatch(BasePatch):
 
 
 # ---------------------------------------------------------------------------
-# TrainerTrainPatch
+# TrainerClassPatch — replace LF workflow trainer classes with TT subclasses
 # ---------------------------------------------------------------------------
 
 
-class TrainerTrainPatch(BasePatch):
-    """Bridge CustomSeq2SeqTrainer.train to fire engine hook on_train_begin."""
+class TrainerClassPatch(BasePatch):
+    """Replace LlamaFactory workflow trainer references with TT subclasses."""
 
-    name = "trainer_train"
+    name = "trainer_class"
     supported_versions = _LF_V0
 
     def __init__(self) -> None:
-        self._original = None
-        self._cls = None
+        self._originals: list[tuple[Any, str, Any]] = []
 
     def patch(self, engine: TorchTurboEngine) -> None:
-        try:
-            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
-        except ImportError:
-            return
+        self._patch_sft(engine)
+        self._patch_pt(engine)
+        # TODO: wire DPO here once TorchTurbo has a preference-loss contract.
 
-        self._cls = CustomSeq2SeqTrainer
-        self._original = CustomSeq2SeqTrainer.train
+    def _replace(self, module: Any, attr_name: str, patched_cls: type) -> None:
+        from .trainer import unwrap_torchturbo_trainer_class
 
-        def _patched_train(trainer_self, *args, **kwargs):
-            from ...engine.hooks import TrainState
-
-            # 1. Fire on_train_begin BEFORE starting the actual HF trainer loop
-            sp_info = engine.backend.get_sp_info()
-
-            num_epochs = (
-                int(trainer_self.args.num_train_epochs)
-                if hasattr(trainer_self, "args")
-                else 1
-            )
-            max_steps = (
-                trainer_self.args.max_steps if hasattr(trainer_self, "args") else None
-            )
-
-            t_state = TrainState(
-                model=trainer_self.model,
-                optimizer=trainer_self.optimizer,
-                lr_scheduler=trainer_self.lr_scheduler,
-                num_epochs=num_epochs,
-                max_steps=max_steps,
-                sp_info=sp_info,
-            )
-            engine._fire(engine.hooks, "on_train_begin", t_state)
-
-            # 2. Proceed with actual train loop
-            return self._original(trainer_self, *args, **kwargs)
-
-        CustomSeq2SeqTrainer.train = _patched_train
+        original = unwrap_torchturbo_trainer_class(getattr(module, attr_name))
+        self._originals.append((module, attr_name, original))
+        setattr(module, attr_name, patched_cls)
         logger.info(
-            "TrainerTrainPatch applied to intercept on_train_begin across all workflows"
+            "torchturbo: replaced %s.%s with %s",
+            getattr(module, "__name__", repr(module)),
+            attr_name,
+            patched_cls.__name__,
         )
 
-    def revert(self) -> None:
-        if self._cls and self._original:
-            self._cls.train = self._original
-            self._original = None
-            self._cls = None
-
-
-# ---------------------------------------------------------------------------
-# ComputeLossPatch
-# ---------------------------------------------------------------------------
-
-
-class ComputeLossPatch(BasePatch):
-    """Wrap ``compute_loss`` to calculate mathematically accurate SP Loss natively."""
-
-    name = "compute_loss"
-    supported_versions = _LF_V0
-
-    def __init__(self) -> None:
-        self._original = None
-
-    def patch(self, engine: TorchTurboEngine) -> None:
+    def _patch_sft(self, engine: TorchTurboEngine) -> None:
         try:
-            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
-        except ImportError:
-            return
-
-        self._original = CustomSeq2SeqTrainer.compute_loss
-
-        logger.info("Applying ComputeLossPatch for optimized SP loss reduction")
-
-        def _patched_compute_loss(
-            trainer_self, model, inputs, return_outputs=False, **kwargs
-        ):
-            if not "labels" in inputs:
-                return self._original(
-                    trainer_self, model, inputs, return_outputs, **kwargs
-                )
-            num_items_in_batch = kwargs.get("num_items_in_batch", None)
-
-            # Always request outputs so we can scrape MTP diagnostics.
-            loss, outputs = engine.backend.compute_loss(
-                model, inputs, return_outputs=True, **kwargs
+            from llamafactory.train.sft import workflow as sft_workflow
+            from .trainer import (
+                make_torchturbo_trainer,
+                unwrap_torchturbo_trainer_class,
             )
-
-            # When num_items_in_batch is None (old-style path), HF Trainer's
-            # training_step divides by gradient_accumulation_steps which
-            # equals original_ga * sp_size.  But SP ranks share the same
-            # data, so Trainer over-divides by sp_size.  Pre-multiply to
-            # compensate.
-            sp_size = engine.get_sp_info()["sp_size"]
-            if num_items_in_batch is None and sp_size > 1:
-                loss = loss * sp_size
-                outputs.loss = loss
-
-            # Harvest MTP diagnostics for LogMTPPatch.
-            # Buffer lives on the trainer to survive across micro-batches
-            # inside one logging window.
-            mtp_loss = getattr(outputs, "mtp_loss", None)
-            if mtp_loss:
-                mtp_log = getattr(trainer_self, "_mtp_loss_buf", None)
-                if mtp_log is None:
-                    mtp_log = {"mtp": [], "main": [], "scaled": []}
-                    trainer_self._mtp_loss_buf = mtp_log
-                mtp_log["mtp"].append([float(m.item()) for m in mtp_loss])
-                main_l = getattr(outputs, "main_loss", None)
-                if main_l is not None:
-                    mtp_log["main"].append(float(main_l.item()))
-                scaled = getattr(outputs, "mtp_loss_scaled", None)
-                if scaled is not None:
-                    mtp_log["scaled"].append(float(scaled.item()))
-
-            return (loss, outputs) if return_outputs else loss
-
-        CustomSeq2SeqTrainer.compute_loss = _patched_compute_loss
-
-    def revert(self) -> None:
-        if self._original:
-            self._original = None
-
-
-# ---------------------------------------------------------------------------
-# LogMTPPatch — surface MTP diagnostics in HF Trainer logs
-# ---------------------------------------------------------------------------
-
-
-class LogMTPPatch(BasePatch):
-    """Inject MTP loss diagnostics into ``Trainer.log()``.
-
-    Reads the buffer populated by :class:`ComputeLossPatch` and adds the
-    following keys to the logs dict (only when MTP is active and
-    ``mtp_loss_scaling_factor > 0``):
-
-    - ``mtp_loss/i``       — mean of i-th MTP head's loss over the window
-    - ``mtp_loss/avg``     — mean across MTP heads
-    - ``mtp_loss/scaled``  — mean of ``scaling_factor * sum(mtp_loss_i)``
-    - ``mtp_loss/main``    — mean of the detached main-path loss (for cross-check)
-
-    Skipped entirely when ``mtp_loss_scaling_factor`` is ``0`` or the model
-    has no MTP layers — no buffer, no extra log keys.
-
-    The buffer is cleared after each log call.
-    """
-
-    name = "log_mtp"
-    supported_versions = _LF_V0
-
-    def __init__(self) -> None:
-        self._original = None
-        self._cls = None
-
-    def patch(self, engine: TorchTurboEngine) -> None:
-        try:
-            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
         except ImportError:
+            logger.warning("LlamaFactory SFT trainer not found; skipping trainer patch.")
             return
 
-        self._cls = CustomSeq2SeqTrainer
-        self._original = CustomSeq2SeqTrainer.log
+        base_cls = unwrap_torchturbo_trainer_class(sft_workflow.CustomSeq2SeqTrainer)
+        patched_cls = make_torchturbo_trainer(
+            base_cls,
+            engine=engine,
+            stage="sft",
+            loss_mode="causal_lm",
+        )
+        self._replace(sft_workflow, "CustomSeq2SeqTrainer", patched_cls)
 
-        def _patched_log(trainer_self, logs, *args, **kwargs):
-            mtp_log = getattr(trainer_self, "_mtp_loss_buf", None)
-            if mtp_log and mtp_log.get("mtp"):
-                rows = mtp_log["mtp"]
-                num_layers = len(rows[0]) if rows else 0
-                if num_layers > 0:
-                    # Per-layer mean over the logging window
-                    by_layer = list(zip(*rows))
-                    per_layer_mean = [sum(c) / len(c) for c in by_layer]
-                    for i, m in enumerate(per_layer_mean):
-                        logs[f"mtp_loss/{i}"] = round(m, 6)
-                    logs["mtp_loss/avg"] = round(
-                        sum(per_layer_mean) / num_layers, 6
-                    )
-                if mtp_log.get("main"):
-                    logs["mtp_loss/main"] = round(
-                        sum(mtp_log["main"]) / len(mtp_log["main"]), 6
-                    )
-                if mtp_log.get("scaled"):
-                    logs["mtp_loss/scaled"] = round(
-                        sum(mtp_log["scaled"]) / len(mtp_log["scaled"]), 6
-                    )
-                mtp_log["mtp"].clear()
-                mtp_log["main"].clear()
-                mtp_log["scaled"].clear()
-            return self._original(trainer_self, logs, *args, **kwargs)
+    def _patch_pt(self, engine: TorchTurboEngine) -> None:
+        try:
+            from llamafactory.train.pt import workflow as pt_workflow
+            from .trainer import (
+                make_torchturbo_trainer,
+                unwrap_torchturbo_trainer_class,
+            )
+        except ImportError:
+            logger.warning("LlamaFactory PT trainer not found; skipping trainer patch.")
+            return
 
-        CustomSeq2SeqTrainer.log = _patched_log
-        logger.info("LogMTPPatch applied — MTP loss will appear in Trainer logs")
+        base_cls = unwrap_torchturbo_trainer_class(pt_workflow.CustomTrainer)
+        patched_cls = make_torchturbo_trainer(
+            base_cls,
+            engine=engine,
+            stage="pt",
+            loss_mode="causal_lm",
+        )
+        self._replace(pt_workflow, "CustomTrainer", patched_cls)
 
     def revert(self) -> None:
-        if self._cls and self._original:
-            self._cls.log = self._original
-            self._original = None
-            self._cls = None
+        for module, attr_name, original in reversed(self._originals):
+            setattr(module, attr_name, original)
+        self._originals.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -694,139 +514,11 @@ class AcceleratorPatch(BasePatch):
             Accelerator.prepare = self._orig_prepare
             self._orig_prepare = None
         if self._orig_clip_grad_norm is not None:
-            Accelerator.clip_grad_norm = self._orig_clip_grad_norm
+            Accelerator.clip_grad_norm_ = self._orig_clip_grad_norm
             self._orig_clip_grad_norm = None
         if self._orig_backward is not None:
             Accelerator.backward = self._orig_backward
             self._orig_backward = None
-
-
-# ---------------------------------------------------------------------------
-# CreateOptimizerPatch — use engine.prepare_optimizer for optimizer creation
-# ---------------------------------------------------------------------------
-
-
-class CreateOptimizerPatch(BasePatch):
-    """Delegate optimizer creation to ``engine.prepare_optimizer()``.
-
-    Replaces ``CustomSeq2SeqTrainer.create_optimizer`` so the optimizer
-    is created through the engine's backend (e.g. FSDP2Backend), ensuring
-    parameters are correctly bound to the already-sharded model.
-    """
-
-    name = "create_optimizer"
-    supported_versions = _LF_V0
-
-    def __init__(self) -> None:
-        self._orig_create_optimizer = None
-        self._trainer_cls = None
-
-    def patch(self, engine: TorchTurboEngine) -> None:
-        try:
-            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
-        except ImportError:
-            logger.warning(
-                "CustomSeq2SeqTrainer not found — skipping CreateOptimizerPatch."
-            )
-            return
-
-        self._trainer_cls = CustomSeq2SeqTrainer
-        self._orig_create_optimizer = CustomSeq2SeqTrainer.create_optimizer
-
-        def _patched_create_optimizer(trainer_self):
-            if trainer_self.optimizer is not None:
-                return trainer_self.optimizer
-
-            from transformers import Trainer
-
-            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
-                trainer_self.args,
-                trainer_self.model,
-            )
-
-            # Remove keys that engine.prepare_optimizer doesn't need
-            optimizer_kwargs.pop("params", None)
-            optimizer_kwargs.pop("model", None)
-            optimizer_kwargs.pop("optimizer_dict", None)
-
-            trainer_self.optimizer = engine.prepare_optimizer(
-                optimizer_cls,
-                **optimizer_kwargs,
-            )
-            logger.info(
-                "torchturbo: created optimizer via engine.prepare_optimizer "
-                "(%s, %s)",
-                optimizer_cls.__name__,
-                {k: v for k, v in optimizer_kwargs.items() if k != "params"},
-            )
-            return trainer_self.optimizer
-
-        CustomSeq2SeqTrainer.create_optimizer = _patched_create_optimizer
-        logger.info("CreateOptimizerPatch applied")
-
-    def revert(self) -> None:
-        if self._trainer_cls is not None and self._orig_create_optimizer is not None:
-            self._trainer_cls.create_optimizer = self._orig_create_optimizer
-            self._orig_create_optimizer = None
-            self._trainer_cls = None
-
-
-# ---------------------------------------------------------------------------
-# SaveModelPatch
-# ---------------------------------------------------------------------------
-
-
-class SaveModelPatch(BasePatch):
-    """Delegate save_model to the appropriate backend.
-
-    For LoRA (PeftModel): merges LoRA weights back into the base model
-    (in-place, no extra GPU memory beyond the delta computation), then
-    delegates to ``engine.save_model()`` for FSDP2-aware sharded saving.
-    This avoids the OOM that would result from unwrapping a large FSDP2
-    model to call ``PeftModel.save_pretrained()``.
-
-    For full model (no LoRA): delegates to ``engine.save_model()`` directly.
-    """
-
-    name = "save_model"
-    supported_versions = _LF_V0
-
-    def __init__(self) -> None:
-        self._orig_save_model = None
-        self._cls = None
-
-    def patch(self, engine: TorchTurboEngine) -> None:
-        try:
-            from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
-        except ImportError:
-            logger.warning("CustomSeq2SeqTrainer not found — skipping SaveModelPatch.")
-            return
-
-        self._cls = CustomSeq2SeqTrainer
-        self._orig_save_model = CustomSeq2SeqTrainer.save_model
-
-        def _patched_save_model(trainer_self, output_dir=None, _internal_call=False):
-            if output_dir is None:
-                output_dir = trainer_self.args.output_dir
-
-            # Full model: delegate to engine's FSDP2-aware save
-            logger.info(
-                "torchturbo: saving full model via engine.save_model(%s)",
-                output_dir,
-            )
-            engine.save_model(trainer_self.model, output_dir)
-
-            if trainer_self.args.push_to_hub and not _internal_call:
-                trainer_self.push_to_hub(commit_message="Model save")
-
-        CustomSeq2SeqTrainer.save_model = _patched_save_model
-        logger.info("SaveModelPatch applied")
-
-    def revert(self) -> None:
-        if self._cls is not None and self._orig_save_model is not None:
-            self._cls.save_model = self._orig_save_model
-            self._orig_save_model = None
-            self._cls = None
 
 
 # ---------------------------------------------------------------------------
@@ -994,5 +686,3 @@ class RegisterAutoclassPatch(BasePatch):
             mod.register_autoclass = original
         self._patched_modules.clear()
         self._original = None
-
-

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# glm_moe_dsa SFT training with torchturbo
+# Bailing V3 tiny SFT training with torchturbo
 # Usage:
 #   bash scripts/runs/npu_deps/bailing_v3_deps.sh
-#   bash scripts/runs/lf_glm5_small_sft.sh
+#   bash scripts/runs/lf_bailing_v3_tiny_sft.sh
 set -o pipefail
 
 set -ex
@@ -17,6 +17,13 @@ export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
+
+# # Deterministic computation
+# export HCCL_DETERMINISTIC=True
+# export LCCL_DETERMINISTIC=1
+# export CLOSE_MATMUL_K_SHIFT=1
+# export ATB_MATMUL_SHUFFLE_K_ENABLE=0
+# export ATB_LLM_LCOC_ENABLE=0
 
 if [ -z "$USER_NAME" ]; then
     echo "Error: USER_NAME is not set"
@@ -70,12 +77,21 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
-RUN_LF="$(dirname "$0")/run_lf.py"
-DATASET_DIR="$(dirname "$0")/../../dataset/"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RUN_LF="${SCRIPT_DIR}/run_lf.py"
+DATASET_DIR="${REPO_ROOT}/dataset/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/opensource/LlamaFactory/src/:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/torchturbo/src:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/flash-linear-attention/:$PYTHONPATH
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/flash-linear-attention/:$PYTHONPATH
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size 2 \

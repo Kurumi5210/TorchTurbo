@@ -1,5 +1,6 @@
 from typing_extensions import override
 
+import types
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -157,17 +158,24 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
             return result
 
         from fla.modules.fused_norm_gate import rms_norm_gated
-        def fused_norm_gate_wrapper(fng, x, g):
+        def _patched_o_norm_forward(
+            fng,
+            x,
+            g,
+            residual=None,
+            prenorm=False,
+            residual_in_fp32=False,
+        ):
             return rms_norm_gated(
                 x,
                 g,
                 fng.weight,
-                None, # bias
+                getattr(fng, "bias", None),
                 fng.activation,
-                residual=None,
+                residual=residual,
                 eps=fng.eps,
-                prenorm=False,
-                residual_in_fp32=False,
+                prenorm=prenorm,
+                residual_in_fp32=residual_in_fp32,
             )
 
         from .modeling_bailing_moe_v3 import _split_last_dim_heads, _merge_last_two_dims
@@ -255,8 +263,9 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
             else:
                 g = self.g_b_proj(self.g_a_proj(hidden_states))
             g = _split_last_dim_heads(g, self.head_dim)
-            # o = self.o_norm(o, g)
-            o = fused_norm_gate_wrapper(self.o_norm, o, g)
+
+            self.o_norm.forward = types.MethodType(_patched_o_norm_forward, self.o_norm)
+            o = self.o_norm(o, g)
 
             o = _merge_last_two_dims(o)
             o = self.o_proj(o)

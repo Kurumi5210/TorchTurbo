@@ -34,15 +34,10 @@ from .compat import is_llamafactory_v0
 from .hooks import LlamaFactoryHook
 from .patches import (
     AcceleratorPatch,
-    CreateOptimizerPatch,
     LoadModelPatch,
     RegisterAutoclassPatch,
     RunExpPatch,
-    SPTrainingPatch,
-    TrainerTrainPatch,
-    ComputeLossPatch,
-    SaveModelPatch,
-    LogMTPPatch,
+    TrainerClassPatch,
 )
 from .utils import build_config_from_lf_args, build_lora_config_from_lf_args, compute_sft_loss
 
@@ -110,12 +105,7 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         # Register patches — inner patches applied by RunExpPatch
         self.add_patch(LoadModelPatch())
         self.add_patch(AcceleratorPatch())
-        self.add_patch(CreateOptimizerPatch())
-        self.add_patch(SPTrainingPatch())
-        self.add_patch(TrainerTrainPatch())
-        self.add_patch(ComputeLossPatch())
-        self.add_patch(SaveModelPatch())
-        self.add_patch(LogMTPPatch())
+        self.add_patch(TrainerClassPatch())
         self.add_patch(RegisterAutoclassPatch())
 
         # RunExpPatch is special: it intercepts run_sft, builds the

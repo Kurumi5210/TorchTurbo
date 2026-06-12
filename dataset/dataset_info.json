@@ -12,5 +12,11 @@
         "user_tag": "human",
         "assistant_tag": "assistant"
     }
+  },
+  "wikipedia_en": {
+    "file_name": "/sfs_turbo/zhisan/datasets/olm-wikipedia-data/origin/data",
+    "columns": {
+      "prompt": "text"
+    }
   }
 }

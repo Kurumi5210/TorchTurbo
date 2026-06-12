@@ -70,8 +70,9 @@ Arguments:
                         e.g. --rank 0 2 4. Each rank's artifacts are stored in
                         a standalone rank_<N>/ subdirectory under --output_dir.
                         In compare mode, comparison runs for each specified rank.
-    --trainer_class     Fully qualified trainer class to monkey-patch
-                        (default: llamafactory.train.sft.trainer.CustomSeq2SeqTrainer).
+    --stage             LlamaFactory training stage: sft or pt (default: sft).
+    --trainer_class     Fully qualified trainer class to monkey-patch.
+                        Defaults to the stage-specific LlamaFactory trainer.
     --extra_lf_args     Extra LlamaFactory args as key-value pairs,
                         e.g. --extra_lf_args --gradient_checkpointing True
     --dataset_dir       Path to LlamaFactory data directory containing dataset_info.json.
@@ -151,12 +152,18 @@ class ModuleDivergenceResult:
     rng_device_match: bool | None = None
 
 
+DEFAULT_TRAINER_CLASSES = {
+    "sft": "llamafactory.train.sft.trainer.CustomSeq2SeqTrainer",
+    "pt": "llamafactory.train.pt.workflow.CustomTrainer",
+}
+
+
 # ───────────────────────── CLI ─────────────────────────
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Fine-grained SFT loss comparison",
+        description="Fine-grained LlamaFactory training comparison",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -173,6 +180,12 @@ def parse_args():
     )
     p.add_argument(
         "--dataset", type=str, default="identity", help="LlamaFactory dataset name"
+    )
+    p.add_argument(
+        "--stage",
+        choices=["sft", "pt"],
+        default="sft",
+        help="LlamaFactory training stage",
     )
     p.add_argument(
         "--template", type=str, default="qwen3", help="LlamaFactory chat template"
@@ -299,9 +312,10 @@ def parse_args():
     p.add_argument(
         "--trainer_class",
         type=str,
-        default="llamafactory.train.sft.trainer.CustomSeq2SeqTrainer",
+        default=None,
         help="Fully qualified trainer class to monkey-patch, "
-        "e.g. 'llamafactory.train.sft.torch_turbo_trainer.TorchTurboTrainer'",
+        "e.g. 'llamafactory.train.sft.trainer.CustomSeq2SeqTrainer'. "
+        "If omitted, the default is selected from --stage.",
     )
     p.add_argument(
         "--no_save_model",
@@ -316,6 +330,16 @@ def parse_args():
         "If not set, auto-detected from the llamafactory package location.",
     )
     return p.parse_args()
+
+
+def resolve_trainer_class(args) -> str:
+    """Return the trainer class to patch for the requested LF stage."""
+    if args.trainer_class:
+        return args.trainer_class
+    try:
+        return DEFAULT_TRAINER_CLASSES[args.stage]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported LlamaFactory stage: {args.stage!r}") from exc
 
 
 def get_rank():
@@ -1629,18 +1653,18 @@ def seed_all(seed=42):
     import numpy as np
     import torch
     from llamafactory.extras.misc import (
-        is_cuda_available,
-        is_npu_available,
+        is_torch_cuda_available,
+        is_torch_npu_available,
     )
 
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if is_cuda_available:
+    if is_torch_cuda_available():
         torch.cuda.manual_seed_all(seed)
         torch.cuda.manual_seed(seed)
-    elif is_npu_available:
+    elif is_torch_npu_available():
         import torch_npu
 
         os.environ["HCCL_DETERMINISTIC"] = str(True)
@@ -1656,7 +1680,7 @@ def seed_all(seed=42):
 
 
 def run_training(args, label: str):
-    """Run LlamaFactory SFT for 1 step with full diagnostics."""
+    """Run LlamaFactory training for 1 step with full diagnostics."""
     import torch
     from transformers import TrainerCallback
 
@@ -1747,12 +1771,13 @@ def run_training(args, label: str):
     diag_cb = DiagnosticCallback()
 
     # Monkey-patch Trainer.training_step to capture inputs
-    module_path, class_name = args.trainer_class.rsplit(".", 1)
+    trainer_class = resolve_trainer_class(args)
+    module_path, class_name = trainer_class.rsplit(".", 1)
     import importlib
 
     trainer_module = importlib.import_module(module_path)
     trainer = getattr(trainer_module, class_name)
-    print(f"[{label}] Using trainer: {args.trainer_class}")
+    print(f"[{label}] Using trainer: {trainer_class}")
     orig_training_step = trainer.training_step
 
     _input_captured = False
@@ -1774,7 +1799,7 @@ def run_training(args, label: str):
 
     # Build LF args
     lf_args = {
-        "stage": "sft",
+        "stage": args.stage,
         "do_train": True,
         "model_name_or_path": args.model_name_or_path,
         "dataset": args.dataset,

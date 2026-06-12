@@ -133,6 +133,12 @@ class FSDP2Backend(BaseBackend):
         world_size = dist.get_world_size()
 
         ep_size = getattr(plan, "ep_size", 1)
+        sp_size = getattr(plan, "sp_size", 1)
+        if world_size % sp_size != 0:
+            raise ValueError(
+                f"World size ({world_size}) must be divisible by "
+                f"sp_size ({sp_size}) for sequence parallelism."
+            )
 
         world_size = world_size
         device_name = get_device_name()
@@ -143,7 +149,7 @@ class FSDP2Backend(BaseBackend):
 
         logger.info("Created DeviceMesh")
 
-        self._create_sp_group(plan.sp_size)
+        self._create_sp_group(sp_size)
 
     def _patch_transformers(self):
         # currently assume packing or normal attention mask
@@ -463,6 +469,8 @@ class FSDP2Backend(BaseBackend):
         moe_params = []
         edp = self._mesh["edp"]
         for param in model.parameters():
+            if not param.requires_grad:
+                continue
             if param.device_mesh != edp:
                 params.append(param)
             else:

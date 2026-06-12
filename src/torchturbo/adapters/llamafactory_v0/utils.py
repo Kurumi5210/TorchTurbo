@@ -57,6 +57,8 @@ def build_config_from_lf_args(
     -------
     A fully configured ``EngineConfig``.
     """
+    _raise_if_unsupported_finetuning_type(finetuning_args)
+
     config = _build_config_from_args(
         training_args, finetuning_args, model_args, torchturbo_args
     )
@@ -194,23 +196,61 @@ def _build_fsdp_config(training_args: Any) -> FSDPConfig:
     )
 
 
-def build_lora_config_from_lf_args(finetuning_args: Any) -> Any | None:
+def _raise_if_unsupported_finetuning_type(finetuning_args: Any) -> None:
+    if getattr(finetuning_args, "finetuning_type", None) == "oft":
+        raise NotImplementedError(
+            "TorchTurbo LlamaFactory adapter does not support "
+            "finetuning_type=oft yet."
+        )
+
+
+def _get_unsupported_lora_options(
+    finetuning_args: Any,
+    model_args: Any | None = None,
+) -> list[str]:
+    if getattr(finetuning_args, "finetuning_type", None) != "lora":
+        return []
+
+    checks = {
+        "adapter_name_or_path": getattr(model_args, "adapter_name_or_path", None)
+        is not None,
+        "additional_target": getattr(finetuning_args, "additional_target", None)
+        is not None,
+        "loraplus_lr_ratio": getattr(finetuning_args, "loraplus_lr_ratio", None)
+        is not None,
+        "pissa_init": bool(getattr(finetuning_args, "pissa_init", False)),
+        "pissa_convert": bool(getattr(finetuning_args, "pissa_convert", False)),
+        "create_new_adapter": bool(getattr(finetuning_args, "create_new_adapter", False)),
+        "use_llama_pro": bool(getattr(finetuning_args, "use_llama_pro", False)),
+    }
+    return [name for name, enabled in checks.items() if enabled]
+
+
+def build_lora_config_from_lf_args(
+    finetuning_args: Any,
+    model_args: Any | None = None,
+) -> Any | None:
     """Build a ``peft.LoraConfig`` from LlamaFactory's ``FinetuningArguments``.
 
-    Maps LlamaFactory LoRA fields (``lora_rank``, ``lora_alpha``,
-    ``lora_target``, ``lora_dropout``, ``init_lora_weights``, ``use_rslora``,
-    ``use_dora``) to a :class:`peft.LoraConfig` and registers the
+    Maps supported LlamaFactory LoRA fields (``lora_rank``, ``lora_alpha``,
+    ``lora_target``, ``lora_dropout``, ``use_rslora``, ``use_dora``) to a
+    :class:`peft.LoraConfig` and registers the
     :class:`~torchturbo.models.modules.moe.experts.GroupedMLP` custom module
     handler so that MoE expert layers are included in LoRA.
 
-    After extracting the LoRA config, **all LoRA-related fields on
-    ``finetuning_args`` are reset to their defaults** and
-    ``finetuning_type`` is changed to ``"full"`` so that downstream
-    LlamaFactory code does not attempt to apply LoRA itself (torchturbo
-    manages the entire LoRA lifecycle via ``engine.prepare_model``).
+    Call :func:`strip_lora_args` before re-entering LlamaFactory so that
+    LlamaFactory does not apply LoRA itself.  TorchTurbo passes this config
+    into ``engine.prepare_model`` and owns the LoRA lifecycle from there.
 
     Returns ``None`` if PEFT is not installed.
     """
+    unsupported = _get_unsupported_lora_options(finetuning_args, model_args)
+    if unsupported:
+        raise NotImplementedError(
+            "TorchTurbo LlamaFactory adapter does not support "
+            f"LoRA options {', '.join(unsupported)} yet."
+        )
+
     try:
         from peft import LoraConfig, TaskType
     except ImportError:
@@ -228,22 +268,6 @@ def build_lora_config_from_lf_args(finetuning_args: Any) -> Any | None:
     # Optional LoRA init / scaling flags from LlamaFactory.
     use_rslora = getattr(finetuning_args, "use_rslora", False)
     use_dora = getattr(finetuning_args, "use_dora", False)
-
-    # init_lora_weights: bool | str
-    # Supports True, False, or strings like "gaussian", "pissa",
-    # "pissa_niter_<N>", "olora", "eva", "loftq", "corda", "orthogonal".
-    # LlamaFactory exposes this via pissa_init / pissa_iter; if those
-    # are set we derive init_lora_weights from them, otherwise default
-    # to True (standard Kaiming-uniform-A / zeros-B init).
-    pissa_init = getattr(finetuning_args, "pissa_init", False)
-    if pissa_init:
-        pissa_iter = getattr(finetuning_args, "pissa_iter", 16)
-        if pissa_iter == -1:
-            init_lora_weights = "pissa"
-        else:
-            init_lora_weights = f"pissa_niter_{pissa_iter}"
-    else:
-        init_lora_weights = True
 
     # Handle target_modules: LlamaFactory uses comma-separated string or list.
     # "all" in LlamaFactory means "all linear modules" — same as PEFT's "all-linear".
@@ -269,7 +293,7 @@ def build_lora_config_from_lf_args(finetuning_args: Any) -> Any | None:
         target_modules=target_modules,
         lora_dropout=lora_dropout,
         bias="none",
-        init_lora_weights=init_lora_weights,
+        init_lora_weights=True,
         use_rslora=use_rslora,
         use_dora=use_dora,
         task_type=TaskType.CAUSAL_LM,

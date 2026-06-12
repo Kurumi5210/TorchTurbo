@@ -1,9 +1,8 @@
-# torchturbo
+# TorchTurbo
 
-**Model-first distributed training for LlamaFactory workloads.**
+**Model-first distributed training for post-training workloads.**
 
-`torchturbo` 是一个以模型为中心的分布式训练加速框架。它通过
-Adapter 接入现有训练框架，由模型声明 ParallelPlan，并交给 Engine / Backend
+`TorchTurbo` 是一个以模型为中心的分布式训练加速框架，基于FSDP2训练引擎的3D并行方案，使能GPU/NPU高性能算子，提升训练显存/计算效率。它提供Engine和Adapter，可以灵活接入现有的后训练框架（例如：LLaMA-Factory/Asystem）。由模型声明 ParallelPlan，并交给 Engine / Backend
 执行分布式训练。
 
 ## 架构

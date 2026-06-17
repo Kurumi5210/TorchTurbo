@@ -1,6 +1,7 @@
 """FSDP2 distributed backend — ``torch.distributed.fsdp.fully_shard``."""
 
 import os
+import re
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -72,6 +73,7 @@ class FSDP2Backend(BaseBackend):
         self.gradient_scaling_factor = 1.0
         self.weight_loader = None
         self.weight_saver = None
+        self._ignored_param_names: list[str] = []
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -204,6 +206,48 @@ class FSDP2Backend(BaseBackend):
 
         return model
 
+    def _get_ignored_params(
+        self, model: nn.Module, ignored_param_names: list[str]
+    ) -> set[nn.Parameter]:
+        """Collect parameters whose names match ignored-param regex patterns."""
+        if not ignored_param_names:
+            return set()
+
+        ignored_patterns = [re.compile(pattern) for pattern in ignored_param_names]
+        ignored_params = set()
+        for name, param in model.named_parameters():
+            if any(pattern.search(name) for pattern in ignored_patterns):
+                ignored_params.add(param)
+        return ignored_params
+
+    def _get_ignored_param_names(self, plan: FSDPParallelPlan) -> list[str]:
+        ignored_param_names = []
+        for spec in plan.plan.values():
+            if isinstance(spec, FSDPPlanSpec) and spec.ignored_param_names:
+                ignored_param_names.extend(spec.ignored_param_names)
+        return ignored_param_names
+
+    def _register_ignored_params_grad_sync(
+        self, ignored_params: set[nn.Parameter]
+    ) -> None:
+        """Register post-accumulate-gradient hooks for FSDP ignored_params.
+
+        FSDP does not manage gradient synchronization for ignored_params,
+        so we must manually all-reduce their gradients across the DP world.
+        FSDP2 uses ReduceOp.AVG by default, so we use AVG here to match.
+        """
+        if not ignored_params:
+            return
+
+        world_group = dist.group.WORLD
+        for param in ignored_params:
+
+            def _grad_hook(p):
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=world_group)
+
+            param.register_post_accumulate_grad_hook(_grad_hook)
+
     def prepare_model(
         self,
         model: nn.Module,
@@ -267,6 +311,12 @@ class FSDP2Backend(BaseBackend):
             )
         self.weight_loader.load_weights()
 
+        # Register gradient all-reduce hooks for ignored_params after load_weights.
+        # load_weights calls to_empty, which replaces Parameter objects.
+        if self._ignored_param_names:
+            ignored_params = self._get_ignored_params(model, self._ignored_param_names)
+            self._register_ignored_params_grad_sync(ignored_params)
+
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
     ):
@@ -309,6 +359,14 @@ class FSDP2Backend(BaseBackend):
 
         if hasattr(self, "reshard_after_forward"):
             fsdp_kwargs["reshard_after_forward"] = self.reshard_after_forward
+
+        # Collect parameters matching ignored_param_names patterns into ignored_params.
+        ignored_param_names = self._get_ignored_param_names(plan)
+        ignored_params = self._get_ignored_params(model, ignored_param_names)
+        if ignored_params:
+            fsdp_kwargs["ignored_params"] = ignored_params
+            # Store ignored_param_names for lazy grad hook registration after load.
+            self._ignored_param_names = list(ignored_param_names)
 
         def _wrap(mod: nn.Module, target_mesh: Any) -> None:
             kw = fsdp_kwargs.copy()
@@ -467,16 +525,24 @@ class FSDP2Backend(BaseBackend):
         """For FSDP2, create the optimizer."""
         params = []
         moe_params = []
+        ignored_params = []
         edp = self._mesh["edp"]
         for param in model.parameters():
             if not param.requires_grad:
                 continue
-            if param.device_mesh != edp:
-                params.append(param)
+            if hasattr(param, "device_mesh"):
+                if param.device_mesh == edp:
+                    moe_params.append(param)
+                else:
+                    params.append(param)
             else:
-                moe_params.append(param)
+                ignored_params.append(param)
 
-        optimizer_params = [{"params": params}, {"params": moe_params}]
+        optimizer_params = [
+            {"params": params},
+            {"params": moe_params},
+            {"params": ignored_params},
+        ]
 
         return optimizer_cls(optimizer_params, **optimizer_kwargs)
 
@@ -486,17 +552,25 @@ class FSDP2Backend(BaseBackend):
         grads = []
         moe_params = []
         moe_grads = []
+        # Parameters not managed by FSDP (ignored_params) have plain tensors,
+        # not DTensors; they must be handled separately to avoid mixed-type errors.
+        ignored_params = []
+        ignored_grads = []
         edp = self._mesh["edp"] if self._mesh is not None else None
 
         for param in parameters:
             # Skip parameters without gradients to ensure correctness.
             if param.grad is not None:
-                if edp is not None and param.device_mesh == edp:
-                    moe_params.append(param)
-                    moe_grads.append(param.grad)
+                if hasattr(param, "device_mesh"):
+                    if edp is not None and param.device_mesh == edp:
+                        moe_params.append(param)
+                        moe_grads.append(param.grad)
+                    else:
+                        params.append(param)
+                        grads.append(param.grad)
                 else:
-                    params.append(param)
-                    grads.append(param.grad)
+                    ignored_params.append(param)
+                    ignored_grads.append(param.grad)
 
         edp_total_norm_list = []
         if moe_params:
@@ -508,21 +582,26 @@ class FSDP2Backend(BaseBackend):
             )
             edp_total_norm_list.append(edp_total_norm)
 
-        if not edp_total_norm_list and not grads:
+        if not edp_total_norm_list and not grads and not ignored_grads:
             return torch.tensor(0.0)
 
+        all_norms = edp_total_norm_list
         if grads:
             dp_total_norm = _get_total_norm(grads, norm_type=norm_type)
             dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
-            all_norms = edp_total_norm_list + [dp_total_norm]
-        else:
-            all_norms = edp_total_norm_list
+            all_norms.append(dp_total_norm)
+        # Compute norm for non-DTensor ignored grads separately.
+        if ignored_grads:
+            ignored_total_norm = _get_total_norm(ignored_grads, norm_type=norm_type)
+            all_norms.append(ignored_total_norm.unsqueeze(0))
         total_norm = torch.linalg.vector_norm(torch.cat(all_norms), norm_type)
 
         if moe_params:
             _clip_grads_with_norm_(moe_params, max_norm, total_norm)
         if params:
             _clip_grads_with_norm_(params, max_norm, total_norm)
+        if ignored_params:
+            _clip_grads_with_norm_(ignored_params, max_norm, total_norm)
 
         return total_norm
 

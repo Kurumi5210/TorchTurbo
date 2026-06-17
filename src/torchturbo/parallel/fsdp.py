@@ -55,6 +55,10 @@ class FSDPPlanSpec:
         A callable to replace the matched module. Signature: `(original_module, **kwargs) -> nn.Module`
     module_kwargs:
         Keyword arguments to pass to the `replace_module` callable.
+    ignored_param_names:
+        Regex patterns for parameter names to exclude from FSDP sharding.
+        Matched parameters will be passed to ``fully_shard(ignored_params=...)``
+        and thus won't be cast by ``mp_policy``.
     """
 
     placement: FSDPPlacementSpec | None = None
@@ -62,6 +66,7 @@ class FSDPPlanSpec:
     cpu_offload: bool = False
     replace_module: Any | None = None
     module_kwargs: dict[str, Any] = field(default_factory=dict)
+    ignored_param_names: list[str] = field(default_factory=list)
 
 
 @dataclass

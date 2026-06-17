@@ -105,10 +105,13 @@ class GroupedMLP(torch.nn.Module):
 
                     return torch_npu.npu_swiglu(x, dim=-1)
                 gate, up = torch.chunk(x, 2, dim=-1)
+                # Apply swiglu_limit if configured (DeepSeek V4 style).
                 if self.swiglu_limit > 0:
-                    up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-                    gate = torch.clamp(gate, max=self.swiglu_limit)
-                return self.config.activation_func(gate) * up
+                    up = torch.clamp(
+                        up.float(), min=-self.swiglu_limit, max=self.swiglu_limit
+                    )
+                    gate = torch.clamp(gate.float(), max=self.swiglu_limit)
+                return (self.config.activation_func(gate) * up).to(x.dtype)
 
             self.activation_func = glu
         else:

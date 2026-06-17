@@ -320,7 +320,12 @@ class DistParamLoader:
                 full = self._broadcast_tensor(clean_name, param.shape, param.dtype)
                 mesh = self.world_mesh
 
-            sharded_tensor = distribute_tensor(full, mesh, param.placements, src_data_rank=None)
+            if isinstance(param, DTensor):
+                sharded_tensor = distribute_tensor(
+                    full, mesh, param.placements, src_data_rank=None
+                )
+            else:
+                sharded_tensor = full
             # print(f"name: {name}, deivce: {self.device}, rank: {self.rank}, mesh: {mesh}, param: {param.shape}, full: {full.shape}, sharded_tensor: {sharded_tensor.shape}")
 
             with torch.no_grad():

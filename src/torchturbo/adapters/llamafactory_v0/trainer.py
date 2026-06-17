@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ...logging import get_logger
@@ -99,8 +100,9 @@ class TorchTurboTrainerBase:
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        logger.info("torchturbo: saving model via engine.save_model(%s)", output_dir)
-        engine.save_model(self.model, output_dir)
+        save_path = str(Path(output_dir) / "huggingface")
+        logger.info("torchturbo: saving model via engine.save_model(%s)", save_path)
+        engine.save_model(self.model, save_path)
 
         if getattr(self.args, "push_to_hub", False) and not _internal_call:
             self.push_to_hub(commit_message="Model save")

@@ -383,10 +383,8 @@ class ShardedParamManager:
     def get_local_hf_state_dict(self):
         return self._get_local_hf_state_dict(self.local_params)
 
-    def save_model(self, save_path, use_hf_format: bool = True):
+    def save_model(self, save_path):
         save_path = Path(save_path)
-        if use_hf_format:
-            save_path = save_path / "huggingface"
 
         if self.rank == 0:
             save_path.mkdir(parents=True, exist_ok=True)

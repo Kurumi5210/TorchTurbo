@@ -65,14 +65,9 @@ class BaseMoELayer(torch.nn.Module, ABC):
         self.layer_number = layer_number
 
     @abstractmethod
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, input_ids=None):
         """Forward method for the MoE layer."""
         pass
-
-    def set_layer_number(self, layer_number: int):
-        """Set the layer number for the MoE layer."""
-        self.layer_number = layer_number
-        self.router.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
@@ -99,7 +94,7 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config)
+        self.router = TopKRouter(config=self.config, layer_number=self.layer_number)
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "alltoall":
@@ -130,15 +125,15 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, input_ids=None):
         # debug
         rank = torch.distributed.get_rank()
 
         # process MoE
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, input_ids=None):
             hidden_states_dtype = hidden_states.dtype
-            probs, routing_map, logits = self.router(hidden_states)
-            if self.config.moe_router_score_function != "sigmoid":
+            probs, routing_map, logits = self.router(hidden_states, input_ids)
+            if self.config.moe_router_score_function == "softmax":
                 probs = probs / probs.sum(dim=-1, keepdim=True)
             logits = logits.view(-1, logits.shape[-1])
             (dispatched_input, tokens_per_expert, permuted_probs) = (
@@ -198,5 +193,5 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias, logits
 
-        output, mlp_bias, logits = custom_forward(hidden_states)
+        output, mlp_bias, logits = custom_forward(hidden_states, input_ids)
         return output, logits

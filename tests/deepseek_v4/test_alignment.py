@@ -1,33 +1,44 @@
-"""
-Test script to align DeepSeek V4 model implementations.
+"""Align DeepSeekV4 v3 modeling with the infer-style reference.
 
-Uses original model.py and modeling_deepseek_v4.py with monkey-patched
-kernel operations to replace fused ops with native PyTorch for alignment testing.
+The infer reference follows the original v2 test target:
+
+    torch_turbo/models/deepseek_v4/model.py
+
+The modeling side uses the v3 implementation under:
+
+    src/torchturbo/models/deepseek_v4/modeling_deepseek_v4.py
 
 Usage:
-    # Run both implementations and compare
-    python example/deepseek_v4/test_alignment.py
+    python tests/deepseek_v4/test_alignment.py --device cpu --seq-len 128
 
-    # Set device via environment variable
-    DEVICE=cuda python example/deepseek_v4/test_alignment.py
+    DEVICE=cpu SEQ_LEN=128 python tests/deepseek_v4/test_alignment.py
 """
 
+import argparse
 import os
 import sys
 import math
-import json
 from pathlib import Path
-from typing import Optional
 
-import torch
-import torch.nn.functional as F
-from safetensors.torch import save_file
+try:
+    import torch
+    import torch.nn.functional as F
+except ModuleNotFoundError:
+    if "pytest" in sys.modules:
+        import pytest
 
-# Add repo root to path
-# __file__ = .../torchturbo/tests/deepseek_v4/test_alignment.py
-# REPO_ROOT = .../torchturbo (the package root)
-REPO_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(REPO_ROOT))
+        pytest.skip("torch is required for DeepSeekV4 alignment tests", allow_module_level=True)
+    raise
+
+os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
+
+# __file__ = <repo>/tests/deepseek_v4/test_alignment.py
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = REPO_ROOT / "src"
+INFER_REFERENCE_DIR = REPO_ROOT / "torch_turbo" / "models" / "deepseek_v4"
+for path in (SRC_ROOT, REPO_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 # Small model config for testing
 TEST_CONFIG_MODELING = {
@@ -344,9 +355,9 @@ sys.modules['fast_hadamard_transform'] = _mock_fht
 
 def get_modeling_model(config_dict, device='cpu', dtype=torch.bfloat16):
     """Create modeling_deepseek_v4 model with small config."""
-    from torch_turbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
-    from torch_turbo.models.deepseek_v4 import modeling_deepseek_v4 as modeling_module
-    from torch_turbo.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from torchturbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+    from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as modeling_module
+    from torchturbo.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
     # Monkey-patch modeling's hadamard functions to use the shared implementation,
     # ensuring both model.py and modeling use identical Hadamard transform.
@@ -370,9 +381,11 @@ def get_modeling_model(config_dict, device='cpu', dtype=torch.bfloat16):
 
 
 def get_model_model(config_dict, device='cpu', dtype=torch.bfloat16):
-    """Create model.py model with small config."""
-    # Import model.py after installing mock
-    sys.path.insert(0, str(REPO_ROOT / "torch_turbo" / "models" / "deepseek_v4"))
+    """Create infer reference model.py model with small config."""
+    if not (INFER_REFERENCE_DIR / "model.py").is_file():
+        raise FileNotFoundError(f"infer reference model.py not found: {INFER_REFERENCE_DIR}")
+    if str(INFER_REFERENCE_DIR) not in sys.path:
+        sys.path.insert(0, str(INFER_REFERENCE_DIR))
     from model import ModelArgs, Transformer
 
     config = ModelArgs(**config_dict)
@@ -553,11 +566,35 @@ def run_forward_model(model, input_ids):
     return logits
 
 
+def test_model_alignment_cpu():
+    seed = 42
+    device = "cpu"
+    batch_size = 1
+    seq_len = 128
+
+    seed_all(seed)
+    input_ids = create_test_input(batch_size, seq_len, TEST_CONFIG_MODELING["vocab_size"], device, seed)
+    modeling_model, _ = get_modeling_model(TEST_CONFIG_MODELING, device)
+    model_model, _ = get_model_model(TEST_CONFIG_MODEL, device)
+    align_weights(modeling_model, model_model)
+
+    modeling_out = run_forward_modeling(modeling_model, input_ids)
+    model_out = run_forward_model(model_model, input_ids)
+    torch.testing.assert_close(modeling_out, model_out, atol=1e-5, rtol=1e-5)
+
+
 def main():
-    device = os.environ.get('DEVICE', 'cpu')
-    batch_size = int(os.environ.get('BATCH_SIZE', '1'))
-    seq_len = int(os.environ.get('SEQ_LEN', '1024'))
-    seed = int(os.environ.get('SEED', '42'))
+    parser = argparse.ArgumentParser(description="DeepSeekV4 modeling vs infer-reference alignment")
+    parser.add_argument("--device", default=os.environ.get("DEVICE", "cpu"))
+    parser.add_argument("--batch-size", type=int, default=int(os.environ.get("BATCH_SIZE", "1")))
+    parser.add_argument("--seq-len", type=int, default=int(os.environ.get("SEQ_LEN", "1024")))
+    parser.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
+    args = parser.parse_args()
+
+    device = args.device
+    batch_size = args.batch_size
+    seq_len = args.seq_len
+    seed = args.seed
 
     print("="*70)
     print("DeepSeek V4 Model Alignment Test")
@@ -566,6 +603,8 @@ def main():
     print(f"Batch size: {batch_size}")
     print(f"Sequence length: {seq_len}")
     print(f"Seed: {seed}")
+    print(f"Repo root: {REPO_ROOT}")
+    print(f"Infer reference: {INFER_REFERENCE_DIR / 'model.py'}")
     print()
 
     # Set seed

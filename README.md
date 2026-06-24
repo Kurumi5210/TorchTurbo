@@ -201,7 +201,8 @@ bash scripts/runs/lf_bailing_moe_v3_sft.sh
 docs/runs/
 ├── qwen3_moe/
 ├── glm_moe_dsa/
-└── bailing_moe_v3/
+├── bailing_moe_v3/
+└── deepseek_v4/
 ```
 
 ## 支持模型
@@ -211,6 +212,7 @@ docs/runs/
 | Qwen3 MoE | `qwen3_moe` | MoE | `docs/runs/qwen3_moe/README.md` |
 | GLM MoE DSA | `glm_moe_dsa` | MoE / DSA | `docs/runs/glm_moe_dsa/README.md` |
 | Bailing MoE V3 | `bailing_hybrid` | MoE / MLA / KDA | `docs/runs/bailing_moe_v3/README.md` |
+| DeepSeekV4 | `deepseek_v4` | MoE / DSA / HC | `docs/runs/deepseek_v4/README.md` |
 | Kimi K25 | `kimi_k25` | VLM / MoE | TODO |
 
 ## 环境变量

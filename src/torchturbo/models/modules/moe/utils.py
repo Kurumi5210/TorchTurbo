@@ -253,6 +253,9 @@ def topk_softmax_with_capacity(
     scaling_factor: Optional[float] = None,
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
+    use_hash_routing: bool = False,
+    hash_table: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
@@ -301,15 +304,31 @@ def topk_softmax_with_capacity(
             return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
-        if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        if use_hash_routing:
+            assert (
+                hash_table is not None and input_ids is not None
+            ), "Hash routing requires hash_table and input_ids."
+            top_indices = hash_table[input_ids]
+            probs = torch.gather(scores, dim=1, index=top_indices)
+        elif use_pre_softmax:
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
-    elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float()).type_as(logits)
-        if expert_bias is not None:
+            top_scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            probs = torch.softmax(top_scores, dim=-1, dtype=torch.float32).type_as(logits)
+    elif score_function in ("sigmoid", "sqrtsoftplus"):
+        if score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float()).type_as(logits)
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+
+        if use_hash_routing:
+            assert (
+                hash_table is not None and input_ids is not None
+            ), "Hash routing requires hash_table and input_ids."
+            top_indices = hash_table[input_ids]
+            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        elif expert_bias is not None:
             scores_for_routing = scores + expert_bias
             _, top_indices = compute_topk(
                 scores_for_routing, topk, num_groups, group_topk

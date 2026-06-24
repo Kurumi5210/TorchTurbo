@@ -1,5 +1,5 @@
 from abc import ABC
-from typing import Callable
+from typing import Optional
 
 import torch
 
@@ -58,15 +58,19 @@ class Router(ABC, torch.nn.Module):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(self, config: MoEConfig) -> None:
+    def __init__(self, config: MoEConfig, layer_number: Optional[int] = None) -> None:
         """Initialize the zero token dropping router."""
         super().__init__(config=config)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
+        self.layer_number = layer_number
+        self.use_hash_routing = self._is_hash_routing_layer()
 
-        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        self.enable_expert_bias = (
+            self.config.moe_router_enable_expert_bias and not self.use_hash_routing
+        )
         if self.enable_expert_bias:
             self.register_buffer(
                 "local_tokens_per_expert",
@@ -81,6 +85,24 @@ class TopKRouter(Router):
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
+        if self.use_hash_routing:
+            self.register_buffer(
+                "tid2eid",
+                torch.stack(
+                    [
+                        torch.randperm(self.config.num_moe_experts)[: self.topk]
+                        for _ in range(self.config.vocab_size)
+                    ]
+                ).long(),
+            )
+
+    def _is_hash_routing_layer(self):
+        return (
+            self.layer_number is not None
+            and self.layer_number < self.config.num_hash_layers
+            and self.config.vocab_size > 0
+        )
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.
@@ -92,7 +114,7 @@ class TopKRouter(Router):
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
 
-    def routing(self, logits: torch.Tensor):
+    def routing(self, logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """Top-k routing function
 
         Args:
@@ -105,6 +127,9 @@ class TopKRouter(Router):
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
+        input_ids = input_ids.view(-1) if input_ids is not None else None
+        if self.use_hash_routing and input_ids is None:
+            raise ValueError("Hash routing requires input_ids.")
 
         if self.routing_type == "none":
             # A naive top-k routing without load balancing
@@ -117,6 +142,9 @@ class TopKRouter(Router):
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
+                use_hash_routing=self.use_hash_routing,
+                hash_table=getattr(self, "tid2eid", None),
+                input_ids=input_ids,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
@@ -127,7 +155,7 @@ class TopKRouter(Router):
 
         return scores, routing_map
 
-    def forward(self, input: torch.Tensor):
+    def forward(self, input: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
@@ -138,6 +166,6 @@ class TopKRouter(Router):
 
         logits = self.gating(input)
 
-        scores, routing_map = self.routing(logits)
+        scores, routing_map = self.routing(logits, input_ids)
 
         return scores, routing_map, logits

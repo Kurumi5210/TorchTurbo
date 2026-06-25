@@ -95,6 +95,19 @@ class RunExpPatch(BasePatch):
                         "TorchTurbo LlamaFactory LoRA requires PEFT to build "
                         "the adapter config before engine initialization."
                     )
+                logger.info(
+                    "torchturbo: LoRA mode detected — r=%d, alpha=%d, "
+                    "target_modules=%s, dropout=%.2f",
+                    peft_config.r,
+                    peft_config.lora_alpha,
+                    peft_config.target_modules,
+                    peft_config.lora_dropout,
+                )
+            else:
+                logger.info(
+                    "torchturbo: Full-parameter training mode (finetuning_type=%s)",
+                    getattr(finetuning_args, "finetuning_type", "full"),
+                )
 
             config = build_config_from_lf_args(
                 training_args=training_args,
@@ -104,6 +117,9 @@ class RunExpPatch(BasePatch):
             )
             engine = TorchTurboEngine(config)
             adapter.engine = engine
+
+            # Stash template name for downstream use (e.g. collator upgrade)
+            engine._lf_template_name = getattr(data_args, "template", None)
 
             engine.add_hook(
                 LlamaFactoryHook(
@@ -179,6 +195,99 @@ class RunExpPatch(BasePatch):
             self._train_module.run_exp = self._original
             self._train_module = None
         self._original = None
+
+
+# ---------------------------------------------------------------------------
+# CollatorPatch — skip fake image injection
+# ---------------------------------------------------------------------------
+
+
+class CollatorPatch(BasePatch):
+    """Patch collator for VLM models that need special handling in torchturbo.
+
+    - Text-only batch: skip fake image/audio injection.
+    - block_diag_attn (neat_packing): skip get_rope_func, backend handles position_ids.
+    - No block_diag_attn: let get_rope_func run, then prepend text_position_ids → [4, bsz, seq].
+    """
+
+    name = "collator"
+    supported_versions = _LF_V0
+
+    _PATCHED_MODEL_TYPES = ("qwen3_5_moe",)
+
+    def __init__(self) -> None:
+        self._original_call = None
+        self._cls = None
+
+    def patch(self, engine: "TorchTurboEngine | None" = None) -> None:
+        try:
+            from llamafactory.data.collator import MultiModalDataCollatorForSeq2Seq
+        except ImportError:
+            return
+
+        self._cls = MultiModalDataCollatorForSeq2Seq
+        self._original_call = MultiModalDataCollatorForSeq2Seq.__call__
+        patched_types = self._PATCHED_MODEL_TYPES
+        original_call = self._original_call
+
+        def _patched_call(collator_self, features):
+            import torch
+
+            model_type = getattr(getattr(collator_self, "model", None), "config", None)
+            model_type = getattr(model_type, "model_type", None)
+            if model_type not in patched_types:
+                return original_call(collator_self, features)
+
+            plugin = collator_self.template.mm_plugin
+            block_diag = getattr(collator_self, "block_diag_attn", False)
+            has_mm = any(feature.get("images") or feature.get("videos") or feature.get("audios") for feature in features)
+
+            # Cache MLLM dataset detection to avoid per-batch isinstance scans.
+            # A dataset is MLLM if any feature has a list-typed images/videos/audios
+            # column (even empty [] from packing). TEXT datasets set these to None.
+            is_mllm = getattr(collator_self, "_torchturbo_is_mllm", None)
+            if is_mllm is None:
+                is_mllm = any(
+                    isinstance(feature.get("images"), list) or
+                    isinstance(feature.get("videos"), list) or
+                    isinstance(feature.get("audios"), list)
+                    for feature in features
+                )
+                collator_self._torchturbo_is_mllm = is_mllm
+
+            saved_img = saved_aud = saved_rope = None
+            if not has_mm and not is_mllm:
+                saved_img, saved_aud = plugin.image_token, plugin.audio_token
+                plugin.image_token = None
+                plugin.audio_token = None
+            if block_diag:
+                saved_rope = collator_self.get_rope_func
+                collator_self.get_rope_func = None
+
+            result = original_call(collator_self, features)
+
+            if saved_img is not None:
+                plugin.image_token, plugin.audio_token = saved_img, saved_aud
+            if saved_rope is not None:
+                collator_self.get_rope_func = saved_rope
+
+            if not block_diag and "position_ids" in result:
+                pos = result["position_ids"]
+                if pos.ndim == 3 and pos.shape[0] == 3:
+                    text_pos = torch.arange(pos.shape[-1], device=pos.device, dtype=pos.dtype)
+                    text_pos = text_pos.reshape(1, 1, -1).expand(1, pos.shape[1], -1)
+                    result["position_ids"] = torch.cat([text_pos, pos], dim=0)
+
+            return result
+
+        MultiModalDataCollatorForSeq2Seq.__call__ = _patched_call
+        logger.info("CollatorPatch applied for %s", patched_types)
+
+    def revert(self) -> None:
+        if self._cls and self._original_call:
+            self._cls.__call__ = self._original_call
+            self._original_call = None
+            self._cls = None
 
 
 # ---------------------------------------------------------------------------
@@ -686,3 +795,121 @@ class RegisterAutoclassPatch(BasePatch):
             mod.register_autoclass = original
         self._patched_modules.clear()
         self._original = None
+
+
+# ---------------------------------------------------------------------------
+# LogCallbackPatch — inject grad_norm into trainer_log.jsonl
+# ---------------------------------------------------------------------------
+
+
+class LogCallbackPatch(BasePatch):
+    """Inject ``grad_norm`` into ``LogCallback.on_log`` JSON output.
+
+    LlamaFactory's ``LogCallback.on_log`` writes a JSON dict to
+    ``trainer_log.jsonl`` every step, but does not include ``grad_norm``.
+    This patch wraps ``_write_log`` to add it.
+
+    ``_write_log`` is submitted to a thread pool by ``on_log``, so we
+    cannot reference ``state`` from the patched ``_write_log`` — the
+    ``state`` object may have been mutated by the next step by the time
+    the thread pool worker runs.  Instead we stash the scalar
+    ``grad_norm`` value on the callback instance *before* calling the
+    original ``on_log``, so the thread pool worker reads a stable copy.
+    """
+
+    name = "log_callback"
+    supported_versions = _LF_V0
+
+    def __init__(self) -> None:
+        self._original_on_log = None
+        self._original_write_log = None
+
+    def patch(self, engine: TorchTurboEngine | None = None) -> None:
+        try:
+            from llamafactory.train.callbacks import LogCallback
+        except ImportError:
+            logger.debug("LogCallback not found; skipping LogCallbackPatch.")
+            return
+
+        self._original_on_log = LogCallback.on_log
+        self._original_write_log = LogCallback._write_log
+        _orig_write_log = self._original_write_log
+
+        def _patched_write_log(callback_self, output_dir, logs):
+            gn = getattr(callback_self, "_tt_grad_norm", None)
+            if gn is not None:
+                new_logs = {}
+                for k, v in logs.items():
+                    new_logs[k] = v
+                    if k == "loss":
+                        new_logs["grad_norm"] = round(gn, 6)
+                logs = new_logs
+            return _orig_write_log(callback_self, output_dir, logs)
+
+        def _patched_on_log(callback_self, args, state, control, **kwargs):
+            callback_self._tt_grad_norm = state.log_history[-1].get("grad_norm")
+            self._original_on_log(callback_self, args, state, control, **kwargs)
+
+        LogCallback.on_log = _patched_on_log
+        LogCallback._write_log = _patched_write_log
+        logger.info(
+            "LogCallbackPatch applied — grad_norm will be written to trainer_log.jsonl"
+        )
+
+    def revert(self) -> None:
+        if self._original_on_log is not None:
+            from llamafactory.train.callbacks import LogCallback
+            LogCallback.on_log = self._original_on_log
+            self._original_on_log = None
+        if self._original_write_log is not None:
+            from llamafactory.train.callbacks import LogCallback
+            LogCallback._write_log = self._original_write_log
+            self._original_write_log = None
+
+
+# ---------------------------------------------------------------------------
+# PretrainProcessorPatch — multimodal CPT packing with image-boundary protection
+# ---------------------------------------------------------------------------
+
+
+class PretrainProcessorPatch(BasePatch):
+    """Patch PretrainDatasetProcessor to support multimodal CPT packing.
+
+    Open-source LlamaFactory's PretrainDatasetProcessor ignores images.
+    When the batch contains ``_images``, this patch delegates to
+    ``pretrain_mllm.preprocess_multimodal_pretrain`` which performs
+    image-boundary-aware packing.
+    """
+
+    name = "pretrain_processor"
+    supported_versions = _LF_V0
+
+    def __init__(self) -> None:
+        self._original = None
+
+    def patch(self, engine: TorchTurboEngine | None = None) -> None:
+        try:
+            from llamafactory.data.processor.pretrain import PretrainDatasetProcessor
+        except ImportError:
+            logger.debug("PretrainDatasetProcessor not found; skipping.")
+            return
+
+        original = PretrainDatasetProcessor.preprocess_dataset
+        self._original = original
+
+        def _patched(self, examples):
+            img_examples = examples.get("_images", [None] * len(examples["_prompt"]))
+            if not any(x is not None for x in img_examples):
+                return original(self, examples)
+
+            from .utils import preprocess_multimodal_pretrain
+            return preprocess_multimodal_pretrain(self, examples, img_examples)
+
+        PretrainDatasetProcessor.preprocess_dataset = _patched
+        logger.info("PretrainProcessorPatch applied")
+
+    def revert(self) -> None:
+        if self._original is not None:
+            from llamafactory.data.processor.pretrain import PretrainDatasetProcessor
+            PretrainDatasetProcessor.preprocess_dataset = self._original
+            self._original = None

@@ -86,6 +86,10 @@ class TorchTurboArgs:
     ep_size: int | None = None
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
+    freeze_vision_tower: bool = False
+    freeze_multi_modal_projector: bool = False
+    freeze_language_model: bool = False
+    profiling: bool = False
 
     def to_overrides_dict(self) -> dict[str, Any]:
         """Convert to a flat dict suitable for ``EngineConfig.from_dict()``.
@@ -162,6 +166,26 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="FLOAT",
         help="MTP loss weight. Ignored when MTP is off.",
     )
+    parser.add_argument(
+        "--tt_freeze_vision_tower",
+        action="store_true",
+        help="Freeze vision encoder parameters (requires_grad=False).",
+    )
+    parser.add_argument(
+        "--tt_freeze_multi_modal_projector",
+        action="store_true",
+        help="Freeze multi-modal projector parameters (requires_grad=False).",
+    )
+    parser.add_argument(
+        "--tt_freeze_language_model",
+        action="store_true",
+        help="Freeze language model parameters (requires_grad=False).",
+    )
+    parser.add_argument(
+        "--tt_profiling",
+        action="store_true",
+        help="Enable NPU/CUDA profiling. Outputs to {output_dir}/profiling/.",
+    )
 
     return parser
 
@@ -198,6 +222,10 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         ep_size=parsed.tt_ep_size,
         enable_mtp=parsed.tt_enable_mtp,
         mtp_loss_scaling_factor=parsed.tt_mtp_loss_scaling_factor,
+        freeze_vision_tower=parsed.tt_freeze_vision_tower,
+        freeze_multi_modal_projector=parsed.tt_freeze_multi_modal_projector,
+        freeze_language_model=parsed.tt_freeze_language_model,
+        profiling=parsed.tt_profiling,
     )
 
     if any(

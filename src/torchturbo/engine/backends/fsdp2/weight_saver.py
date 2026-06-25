@@ -30,8 +30,8 @@ class ShardedParamManager:
         self.mesh = mesh
         self.ep_mesh = mesh["ep"]
         self.ep_group = self.ep_mesh.get_group(0)
+        self.ep_rank = dist.get_rank(group=self.ep_group)
         self.ep_size = dist.get_world_size(group=self.ep_group)
-
         config = model.config
         self.model_type = config.model_type if hasattr(config, "model_type") else None
         if hasattr(self.model.config, "vision_config"):
@@ -147,25 +147,27 @@ class ShardedParamManager:
             dtype = self.param_converter.get_default_hf_dtype(clean_name)
             element_size = torch.tensor([], dtype=dtype).element_size()
             if self.param_converter.is_expert_weight1(clean_name):
-                ep_gates, ep_ups = self.param_converter.convert_expert_weight1_to_hf(clean_name, only_local_experts=True)
-                expert_params.extend(ep_gates)
-                expert_params.extend(ep_ups)
-                gates, ups = self.param_converter.convert_expert_weight1_to_hf(clean_name)
-                gate_size = self.param_converter.get_gate_weight_bytes(element_size)
-                up_size = self.param_converter.get_up_weight_bytes(element_size)
-                for gate in gates:
-                    self.param_size_map[gate] = gate_size
-                for up in ups:
-                    self.param_size_map[up] = up_size
-                assert len(ep_gates) * (gate_size + up_size) == param.numel() * element_size, "must be"
+                local_keys, size_map = (
+                    self.param_converter.get_weight1_save_entries(
+                        clean_name, element_size, self.ep_rank, self.ep_size
+                    )
+                )
+                self.param_size_map.update(size_map)
+                if self.param_converter.fused_experts:
+                    common_params.extend(local_keys)
+                else:
+                    expert_params.extend(local_keys)
             elif self.param_converter.is_expert_weight2(clean_name):
-                ep_downs = self.param_converter.convert_expert_weight2_to_hf(clean_name, only_local_experts=True)
-                expert_params.extend(ep_downs)
-                downs = self.param_converter.convert_expert_weight2_to_hf(clean_name)
-                down_size = self.param_converter.get_down_weight_bytes(element_size)
-                for down in downs:
-                    self.param_size_map[down] = down_size
-                assert len(ep_downs) * down_size == param.numel() * element_size, "must be"
+                local_keys, size_map = (
+                    self.param_converter.get_weight2_save_entries(
+                        clean_name, element_size, self.ep_rank, self.ep_size
+                    )
+                )
+                self.param_size_map.update(size_map)
+                if self.param_converter.fused_experts:
+                    common_params.extend(local_keys)
+                else:
+                    expert_params.extend(local_keys)
             elif self.param_converter.is_router_param(clean_name):
                 hf_name = self.param_converter.convert_router_param_to_hf(clean_name)
                 common_params.append(hf_name)
@@ -343,8 +345,8 @@ class ShardedParamManager:
                 file_name = f"model-{cur_start_index:05d}-of-{num_total_files:05d}.safetensors"
                 cur_start_index += 1
             for param in cur_param_group:
-                assert param in self.local_params, "must be"
-                assert param in state_dict, "must be"
+                assert param in self.local_params, f"param '{param}' not in local_params"
+                assert param in state_dict, f"param '{param}' not in state_dict"
                 shard_dict[param] = state_dict[param]
                 weight_map[param] = file_name
             if shard_dict:

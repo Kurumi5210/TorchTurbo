@@ -153,10 +153,6 @@ def ulysses_flash_attention_forward(
     """
     ########## AlltoAll for Ulysses ##########
     if sp_size > 1:
-        assert (
-            position_ids is not None
-        ), "position_ids is required for Ulysses sequence parallelism"
-
         # NOTE: repeat kv heads to be divided by sequence parallel. Instead of repeating nheads_q//nheads_k,
         # we choose to repeat sp_size//nheads_k, since flash_attention supports MQA/GQA.
         # For example:
@@ -178,14 +174,13 @@ def ulysses_flash_attention_forward(
             value_states, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
         )
 
-        # TODO: all_gather position_ids because `prepare_fa2_from_position_ids` needs it, we can eliminate
-        # this all_gather by passing cu_seq_lens_q, cu_seq_lens_k, max_length_k, max_length_q explicitly.
-        # https://github.com/huggingface/transformers/pull/33932
-
-        # (bsz, seq_len/n) -> (bsz, seq_len)
-        position_ids_list = [torch.empty_like(position_ids) for _ in range(sp_size)]
-        torch.distributed.all_gather(position_ids_list, position_ids, group=sp_group)
-        position_ids = torch.concat(position_ids_list, dim=-1)
+        # all_gather position_ids when available
+        if position_ids is not None:
+            # TODO: eliminate this all_gather by passing cu_seq_lens explicitly.
+            # https://github.com/huggingface/transformers/pull/33932
+            position_ids_list = [torch.empty_like(position_ids) for _ in range(sp_size)]
+            torch.distributed.all_gather(position_ids_list, position_ids, group=sp_group)
+            position_ids = torch.concat(position_ids_list, dim=-1)
         if query_length != query_states.size(1):
             assert query_length * sp_size == query_states.size(
                 1
@@ -299,7 +294,12 @@ def kda_attention_sp_forward(
     full_hidden_states = all_gather_sp_with_grad_reduce(
         hidden_states, dim=1, sp_group=sp_group, sp_size=sp_size
     )
-    output, *rest = origin_forward(module, full_hidden_states, *args, **kwargs)
+    result = origin_forward(module, full_hidden_states, *args, **kwargs)
+    is_tuple = isinstance(result, (tuple, list))
+    if is_tuple:
+        output, *rest = result
+    else:
+        output = result
     output = slice_input_tensor(
         output,
         dim=1,
@@ -309,7 +309,9 @@ def kda_attention_sp_forward(
     )
     if output.size(1) != local_seq_len:
         output = output[:, :local_seq_len].contiguous()
-    return (output, *rest)
+    if is_tuple:
+        return (output, *rest)
+    return output
 
 
 # copied from verl

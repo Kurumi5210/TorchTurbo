@@ -13,10 +13,40 @@
         "assistant_tag": "assistant"
     }
   },
+  "llava_1k_zh": {
+    "file_name": "/sfs_turbo/zhisan/datasets/llava-en-zh-2k/train-00000-of-00001.parquet",
+    "subset": "zh",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant"
+    }
+  },
   "wikipedia_en": {
     "file_name": "/sfs_turbo/zhisan/datasets/olm-wikipedia-data/origin/data",
     "columns": {
       "prompt": "text"
+    }
+  },
+  "security": {
+    "file_name": "/sfs_turbo/zhisan/xg/data_output_full.jsonl",
+    "columns": {
+      "prompt": "text",
+      "images": "image"
+    }
+  },
+  "sectask": {
+    "file_name": "/sfs_turbo/data/sectask/dataset/sllmworks_train.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
     }
   }
 }

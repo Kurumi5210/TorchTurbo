@@ -36,7 +36,56 @@ class TorchTurboTrainerBase:
         self._raise_if_unsupported_trainer_options(
             kwargs.get("finetuning_args", args[0] if args else None)
         )
+        self._mm_processor = kwargs.get("processor", None)
         super().__init__(*args, **kwargs)
+        self._maybe_upgrade_collator_for_mllm_pt()
+
+    def _maybe_upgrade_collator_for_mllm_pt(self) -> None:
+        """Swap to MultiModalDataCollatorForSeq2Seq for multimodal PT datasets."""
+        if self.stage != "pt":
+            return
+
+        dataset = self.train_dataset
+        if dataset is None or not hasattr(dataset, "features"):
+            return
+
+        if not any(k in dataset.features for k in ("images", "videos", "audios")):
+            return
+
+        from transformers import DataCollatorForLanguageModeling
+        if not isinstance(self.data_collator, DataCollatorForLanguageModeling):
+            return
+
+        from llamafactory.data.collator import MultiModalDataCollatorForSeq2Seq
+        from llamafactory.extras.constants import IGNORE_INDEX
+
+        # The existing data_collator was constructed with a tokenizer in run_pt.
+        # MultiModalDataCollatorForSeq2Seq needs a template — retrieve it from
+        # the engine where RunExpPatch stashed the template name.
+        engine = self._engine()
+        template_name = getattr(engine, "_lf_template_name", None)
+        if not template_name:
+            logger.warning("No template name on engine; skipping MLLM PT collator upgrade.")
+            return
+
+        from llamafactory.data.template import TEMPLATES
+        template = TEMPLATES.get(template_name)
+        if template is None:
+            logger.warning(
+                "Template %r not in registry; skipping MLLM PT collator upgrade.",
+                template_name,
+            )
+            return
+
+        self.data_collator = MultiModalDataCollatorForSeq2Seq(
+            template=template,
+            model=self.model,
+            pad_to_multiple_of=8,
+            label_pad_token_id=IGNORE_INDEX,
+            tokenizer=self.tokenizer,
+            processor=self._mm_processor,
+        )
+        logger.info("Upgraded PT collator to MultiModalDataCollatorForSeq2Seq")
 
     def _raise_if_unsupported_trainer_options(self, finetuning_args: Any) -> None:
         unsupported = self._get_unsupported_trainer_options(finetuning_args)
@@ -145,6 +194,8 @@ class TorchTurboTrainerBase:
 
     def train(self, *args, **kwargs):
         from ...engine.hooks import TrainState
+        from ...engine.args import get_torchturbo_args
+        from ...engine.profiling import start_profiling, stop_profiling
 
         engine = self._engine()
         sp_info = engine.backend.get_sp_info()
@@ -157,7 +208,17 @@ class TorchTurboTrainerBase:
             sp_info=sp_info,
         )
         engine._fire(engine.hooks, "on_train_begin", train_state)
-        return super().train(*args, **kwargs)
+
+        tt_args = get_torchturbo_args()
+        if tt_args is not None and tt_args.profiling:
+            start_profiling(self.args.output_dir)
+
+        result = super().train(*args, **kwargs)
+
+        if tt_args is not None and tt_args.profiling:
+            stop_profiling()
+
+        return result
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if self.loss_mode == "causal_lm":
@@ -230,6 +291,10 @@ class TorchTurboTrainerBase:
             outputs.loss = loss
 
         self._record_mtp_outputs(outputs)
+
+        from ...engine.profiling import step_profiling
+        step_profiling()
+
         return (loss, outputs) if return_outputs else loss
 
     def _record_mtp_outputs(self, outputs) -> None:

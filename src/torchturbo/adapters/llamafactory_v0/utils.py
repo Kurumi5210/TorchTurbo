@@ -435,3 +435,202 @@ def compute_sft_loss(
         ignore_index=-100,
     )
     return loss
+
+
+# ---------------------------------------------------------------------------
+# Vision-boundary-aware packing for multimodal pre-training
+# ---------------------------------------------------------------------------
+
+_IGNORE_INDEX = -100
+
+
+def pack_with_vision_boundaries(
+    tokenized_examples: dict[str, list[list[int]]],
+    image_list: list[list[str]],
+    cutoff_len: int,
+    vision_start_id: int,
+    vision_end_id: int,
+) -> tuple[dict[str, list[list[int]]], list[list[str]]]:
+    """Pack tokenized sequences into fixed-length blocks, keeping vision blocks intact.
+
+    A vision block is the span [vision_start_id ... vision_end_id].  If the
+    last block in a chunk window straddles the boundary, the chunk is shortened
+    to exclude it — the block appears at the start of the next chunk instead.
+    """
+    from itertools import chain
+
+    concat = {k: list(chain(*v)) for k, v in tokenized_examples.items()}
+    ids = concat["input_ids"]
+    total = len(ids)
+    if total == 0:
+        return {}, []
+
+    flat_images = list(chain(*image_list))
+    starts = [i for i, t in enumerate(ids) if t == vision_start_id]
+    ends = [i for i, t in enumerate(ids) if t == vision_end_id]
+
+    assert len(starts) == len(ends), (
+        f"Vision boundary mismatch: {len(starts)} starts vs {len(ends)} ends"
+    )
+    assert len(starts) == len(flat_images), (
+        f"Vision block count ({len(starts)}) != image count ({len(flat_images)})"
+    )
+
+    start_to_end = dict(zip(starts, ends))
+    if starts:
+        max_block = max(e - s + 1 for s, e in start_to_end.items())
+        assert max_block <= cutoff_len, (
+            f"Vision block length {max_block} exceeds cutoff_len {cutoff_len}"
+        )
+
+    result = {k: [] for k in concat}
+    packed_images: list[list[str]] = []
+    pos = 0
+    img_cursor = 0
+
+    while pos < total:
+        end = min(pos + cutoff_len, total)
+
+        window_starts = [s for s in starts if pos <= s < end]
+        if window_starts:
+            last_s = window_starts[-1]
+            if start_to_end[last_s] >= end:
+                end = last_s
+
+        n_imgs = ids[pos:end].count(vision_end_id)
+        packed_images.append(flat_images[img_cursor:img_cursor + n_imgs])
+        img_cursor += n_imgs
+
+        for k in concat:
+            result[k].append(concat[k][pos:end])
+        pos = end
+
+    assert img_cursor == len(flat_images)
+    return result, packed_images
+
+
+def preprocess_multimodal_pretrain(
+    processor_self: Any,
+    examples: dict[str, list[Any]],
+    img_examples: list,
+) -> dict[str, Any]:
+    """Multimodal pretrain preprocessing with vision-boundary-aware packing.
+
+    Called by PretrainProcessorPatch when the batch contains images.
+    """
+    import re
+
+    tokenizer = processor_self.tokenizer
+    data_args = processor_self.data_args
+    template = processor_self.template
+    mm_processor = getattr(processor_self, "processor", None)
+    cutoff_len = data_args.cutoff_len
+
+    eos_token = (
+        "<|end_of_text|>" if data_args.template == "llama3" else tokenizer.eos_token
+    )
+    text_examples = [
+        msg[0]["content"] + eos_token for msg in examples["_prompt"]
+    ]
+
+    # Validate and normalize image placeholders
+    IMAGE_PLACEHOLDER = "<image>"
+    texts, images = [], []
+    for img_ex, txt in zip(img_examples, text_examples):
+        try:
+            paths = img_ex[0].split(",")
+            if len(paths) != txt.count("<image"):
+                continue
+        except Exception:
+            continue
+        images.append(paths)
+        texts.append(re.sub(r"<image:\d+>", IMAGE_PLACEHOLDER, txt))
+
+    if not texts:
+        return {"input_ids": [], "attention_mask": [], "labels": []}
+
+    # Expand <image> → <|vision_start|>{image_pad * seqlen}<|vision_end|>
+    # Each image's seqlen depends on its resolution after processing.
+    # We must compute it by running the image through the processor.
+    vision_bos = "<|vision_start|>"
+    vision_eos = "<|vision_end|>"
+    image_token = getattr(template.mm_plugin, "image_token", None) or "<|image_pad|>"
+
+    image_processor = getattr(mm_processor, "image_processor", None)
+    merge_size = getattr(image_processor, "merge_size", 2) if image_processor else 2
+    merge_length = merge_size ** 2
+    image_max_pixels = getattr(mm_processor, "image_max_pixels", 768 * 768) if mm_processor else 768 * 768
+    image_min_pixels = getattr(mm_processor, "image_min_pixels", 32 * 32) if mm_processor else 32 * 32
+    plugin = template.mm_plugin
+
+    expanded = []
+    for txt, img_paths in zip(texts, images):
+        result_txt = txt
+        for path in img_paths:
+            if image_processor is not None:
+                from PIL import Image as PILImage
+                try:
+                    img = PILImage.open(path.strip())
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    # Use plugin's _preprocess_image for identical resize behavior
+                    img = plugin._preprocess_image(
+                        img,
+                        image_max_pixels=image_max_pixels,
+                        image_min_pixels=image_min_pixels,
+                    )
+                    processed = image_processor([img], return_tensors="pt")
+                    grid_thw = processed["image_grid_thw"][0]
+                    seqlen = int(grid_thw.prod().item()) // merge_length
+                except Exception:
+                    seqlen = 1
+            else:
+                seqlen = 1
+            replacement = f"{vision_bos}{image_token * seqlen}{vision_eos}"
+            result_txt = result_txt.replace(IMAGE_PLACEHOLDER, replacement, 1)
+        expanded.append(result_txt)
+
+    if not expanded:
+        return {"input_ids": [], "attention_mask": [], "labels": []}
+
+    # Tokenize and pack with boundary protection
+    tokenized = tokenizer(expanded, add_special_tokens=False)
+    vision_start_id = tokenizer.convert_tokens_to_ids(vision_bos)
+    vision_end_id = tokenizer.convert_tokens_to_ids(vision_eos)
+
+    packed, packed_images = pack_with_vision_boundaries(
+        tokenized, images, cutoff_len, vision_start_id, vision_end_id,
+    )
+    if not packed.get("input_ids"):
+        return {"input_ids": [], "attention_mask": [], "labels": []}
+
+    if getattr(tokenizer, "add_bos_token", False):
+        for seq in packed["input_ids"]:
+            seq[0] = tokenizer.bos_token_id
+
+    # Pad and build labels
+    batch = tokenizer.pad(
+        packed, return_tensors="pt", padding="max_length", max_length=cutoff_len
+    )
+    labels = batch["input_ids"].clone()
+
+    ignore_ids = {vision_start_id, vision_end_id}
+    if tokenizer.pad_token_id is not None:
+        ignore_ids.add(tokenizer.pad_token_id)
+    image_token_id = getattr(tokenizer, "image_token_id", None)
+    if image_token_id is not None:
+        ignore_ids.add(image_token_id)
+
+    mask = torch.zeros_like(labels, dtype=torch.bool)
+    for tid in ignore_ids:
+        mask |= (labels == tid)
+    labels[mask] = _IGNORE_INDEX
+
+    return {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "labels": labels,
+        "images": packed_images,
+        "videos": [None] * len(batch["input_ids"]),
+        "audios": [None] * len(batch["input_ids"]),
+    }

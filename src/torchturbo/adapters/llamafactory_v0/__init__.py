@@ -34,7 +34,10 @@ from .compat import is_llamafactory_v0
 from .hooks import LlamaFactoryHook
 from .patches import (
     AcceleratorPatch,
+    CollatorPatch,
     LoadModelPatch,
+    LogCallbackPatch,
+    PretrainProcessorPatch,
     RegisterAutoclassPatch,
     RunExpPatch,
     TrainerClassPatch,
@@ -103,10 +106,13 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         self._register_lf_templates()
 
         # Register patches — inner patches applied by RunExpPatch
+        self.add_patch(CollatorPatch())
         self.add_patch(LoadModelPatch())
         self.add_patch(AcceleratorPatch())
         self.add_patch(TrainerClassPatch())
         self.add_patch(RegisterAutoclassPatch())
+        self.add_patch(PretrainProcessorPatch())
+        self.add_patch(LogCallbackPatch())
 
         # RunExpPatch is special: it intercepts run_sft, builds the
         # engine, then calls self.apply_patches(engine) for the rest

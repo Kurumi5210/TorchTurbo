@@ -125,15 +125,6 @@ class DistParamLoader:
         else:
             return self.param_to_rank[name]
 
-    def _get_expert_keys(self, prefix, is_weight1):
-        keys = []
-        for i in range(self.moe_config.num_moe_experts):
-            if is_weight1:
-                keys.extend([f"{prefix}.{i}.gate_proj.weight", f"{prefix}.{i}.up_proj.weight"])
-            else:
-                keys.append(f"{prefix}.{i}.down_proj.weight")
-        return keys
-
     def _broadcast_empty_tensor(self, param, owner, ep_size):
         new_shape = (param.shape[0], param.shape[1])
         tensor = torch.empty(
@@ -155,22 +146,15 @@ class DistParamLoader:
         result = None
 
         if owner == self.rank:
-            gates, ups = self.param_converter.convert_expert_weight1_to_hf(name)
-            for i in range(ep_size):
-                num_local_experts = self.moe_config.num_moe_experts // ep_size
-                weights = []
-                for j in range(num_local_experts):
-                    index = i * num_local_experts + j
-                    gate = self.local_sd.pop(gates[index]).to(self.device).to(param.dtype)
-                    up = self.local_sd.pop(ups[index]).to(self.device).to(param.dtype)
-                    weights.append(torch.cat([gate, up]))
-
-                tensor = torch.stack(weights, dim=0)
-                tensor = tensor.permute(0, 2, 1)
-                tensor = tensor.reshape(-1, tensor.shape[-1])
+            num_local_experts = self.moe_config.num_moe_experts // ep_size
+            for i, tensor in enumerate(
+                self.param_converter.iter_load_weight1(
+                    self.local_sd, name, ep_size, num_local_experts,
+                    self.device, param.dtype,
+                )
+            ):
                 if self.rank % ep_size == i:
                     result = tensor
-                 # broadcast to ep_group
                 dist.broadcast(tensor, src=owner, async_op=False)
         else:
             result = self._broadcast_empty_tensor(param, owner, ep_size)
@@ -183,19 +167,15 @@ class DistParamLoader:
         result = None
 
         if owner == self.rank:
-            downs = self.param_converter.convert_expert_weight2_to_hf(name)
-            for i in range(ep_size):
-                num_local_experts = self.moe_config.num_moe_experts // ep_size
-                weights = []
-                for j in range(num_local_experts):
-                    index = i * num_local_experts + j
-                    down = self.local_sd.pop(downs[index]).to(self.device).to(param.dtype)
-                    weights.append(down.t())
-                tensor = torch.stack(weights, dim=0)
-                tensor = tensor.reshape(-1, tensor.shape[-1])
+            num_local_experts = self.moe_config.num_moe_experts // ep_size
+            for i, tensor in enumerate(
+                self.param_converter.iter_load_weight2(
+                    self.local_sd, name, ep_size, num_local_experts,
+                    self.device, param.dtype,
+                )
+            ):
                 if self.rank % ep_size == i:
                     result = tensor
-                 # broadcast to ep_group
                 dist.broadcast(tensor, src=owner, async_op=False)
         else:
             result = self._broadcast_empty_tensor(param, owner, ep_size)

@@ -111,8 +111,10 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
 
         # Pad or truncate to total_size
         if len(indices) < self.total_size:
-            indices += indices[: self.total_size - len(indices)]
-        indices = indices[: self.total_size]
+            # Cycle the full list until we reach total_size.
+            indices = (indices * math.ceil(self.total_size / len(indices)))[: self.total_size]
+        else:
+            indices = indices[: self.total_size]
 
         # Each iteration block has dp_size * sp_size indices laid out as:
         #   [dp0_s0, dp0_s1, ..., dp0_sp-1, dp1_s0, ..., dpN_sp-1]
@@ -342,11 +344,43 @@ class TorchTurboEngine:
         if hasattr(model, "post_weight_load"):
             model.post_weight_load()
 
+        self._apply_freeze(model)
+
         self.model = model
-        logger.info("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
-        self._log_model_info(model)
+
+        # Synchronize printing
+        if dist.is_initialized():
+            dist.barrier()
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
+            self._log_model_info(model)
 
         return model
+
+    def _apply_freeze(self, model: nn.Module) -> None:
+        from .args import get_torchturbo_args
+
+        tt_args = get_torchturbo_args()
+        if tt_args is None:
+            return
+
+        freeze_map = {
+            "freeze_vision_tower": (tt_args.freeze_vision_tower, ["visual"]),
+            "freeze_multi_modal_projector": (tt_args.freeze_multi_modal_projector, ["merger", "mm_projector"]),
+            "freeze_language_model": (tt_args.freeze_language_model, ["language_model"]),
+        }
+
+        for flag_name, (should_freeze, keywords) in freeze_map.items():
+            if not should_freeze:
+                continue
+            count = 0
+            for name, p in model.named_parameters():
+                if any(kw in name for kw in keywords):
+                    p.requires_grad_(False)
+                    count += 1
+
+            logger.info("Froze %d parameters via --%s (keywords: %s)", count, flag_name, keywords)
 
     def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
         self.backend.save_model(model, self.model_name_or_path, output_dir, **kwargs)

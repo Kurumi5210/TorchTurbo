@@ -1,5 +1,6 @@
 import os
 import functools
+from typing_extensions import override
 
 import torch
 
@@ -26,6 +27,19 @@ class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
         super().__init__(text_config, moe_config, mesh)
         self.full_config = config
 
+    def get_hf_alog_name(self):
+        return "A_log"
+
+    def get_hf_linear_attn_norm_name(self):
+        return "linear_attn.norm"
+
+    @override
+    def get_default_hf_dtype(self, param_name):
+        if self.get_hf_alog_name() in param_name:
+            return torch.float32
+        if self.get_hf_linear_attn_norm_name() in param_name:
+            return torch.float32
+        return self.dtype
 
 @register_model(
     "qwen3_5_moe",
@@ -40,15 +54,33 @@ class TurboQwen3_5MoeForConditionalGeneration(
     config_class = Qwen3_5MoeConfig
     base_model_prefix = "model"
 
+    # ---- Config dtype set / reset (VLM override) ----
+
+    @classmethod
+    def set_config_dtype_to_float32(cls, config):
+        """Override to also set text_config and vision_config dtype."""
+        state = super().set_config_dtype_to_float32(config)
+        # FSDP2 requires uniform param dtype. Qwen3.5's sub-configs may
+        # still carry bfloat16, causing mixed dtypes at construction time.
+        if hasattr(config, "text_config") and hasattr(config.text_config, 'dtype'):
+            state['text_config_dtype'] = config.text_config.dtype
+            config.text_config.dtype = torch.float32
+        if hasattr(config, "vision_config") and hasattr(config.vision_config, 'dtype'):
+            state['vision_config_dtype'] = config.vision_config.dtype
+            config.vision_config.dtype = torch.float32
+        return state
+
+    @classmethod
+    def reset_config_dtype(cls, config, state):
+        """Override to also reset text_config and vision_config dtype."""
+        if 'text_config_dtype' in state:
+            config.text_config.dtype = state['text_config_dtype']
+        if 'vision_config_dtype' in state:
+            config.vision_config.dtype = state['vision_config_dtype']
+        super().reset_config_dtype(config, state)
+
     def __init__(self, config: Qwen3_5MoeConfig) -> None:
         self._pre_init_patches()
-        # FSDP2 requires uniform param dtype. The engine sets top-level
-        # config.dtype=float32 but Qwen3.5's sub-configs may still carry
-        # bfloat16, causing mixed dtypes at construction time.
-        if hasattr(config, "text_config") and hasattr(config.text_config, "dtype"):
-            config.text_config.dtype = torch.float32
-        if hasattr(config, "vision_config") and hasattr(config.vision_config, "dtype"):
-            config.vision_config.dtype = torch.float32
         # Force vision attention to eager to prevent Ulysses from patching
         # visual encoder's flash attention (which lacks position_ids).
         if hasattr(config, "vision_config"):

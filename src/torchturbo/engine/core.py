@@ -303,13 +303,9 @@ class TorchTurboEngine:
         model_type = getattr(config, "model_type", None)
         turbo_cls = get_model(model_type) if model_type else None
 
-        # we use float32 as main param storage
-        if hasattr(config, 'dtype'):
-            orig_dtype = config.dtype
-            config.dtype = torch.float32
-        else:
-            orig_dtype = config.torch_dtype
-            config.torch_dtype = "float32"
+        if turbo_cls is not None:
+            # we use float32 as main param storage
+            dtype_state = turbo_cls.set_config_dtype_to_float32(config)
 
         logger.info("Building model on meta device: %s", model_name_or_path)
         with torch.device("meta"):
@@ -335,10 +331,8 @@ class TorchTurboEngine:
                 model.setup_sp(self.backend.get_sp_info())
 
         # reset dtype back to default for weight saving
-        if hasattr(config, 'dtype'):
-            config.dtype = orig_dtype
-        else:
-            config.torch_dtype = orig_dtype
+        if turbo_cls is not None:
+            turbo_cls.reset_config_dtype(config, dtype_state)
 
         if load_weights:
             logger.info("Loading model via %s backend", self.config.backend.value)

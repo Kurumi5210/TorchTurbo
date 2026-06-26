@@ -53,6 +53,13 @@ class ShardedParamManager:
         self.rank_to_params = [[] for _ in range(self.world_size)]
         self.sharded_param_groups = []
         self.WEIGHT_SHARD_SIZE = 5 * (1024 ** 3)
+        # Load checkpoint index for format detection (fused vs per-expert)
+        # and metadata preservation. Cached so the file is only read once.
+        self._src_weight_map, self._src_metadata = (
+            self._load_index_json(self.src_path)
+            if self.src_path is not None else ({}, {})
+        )
+        self.param_to_filename = self._src_weight_map
         self.local_params = self._build_meta_info()
         self._lora_delta_map = build_lora_delta_map(model)
         if self._lora_delta_map and self.rank == 0:
@@ -144,37 +151,15 @@ class ShardedParamManager:
             if is_peft_adapter_param(clean_name):
                 continue
 
-            dtype = self.param_converter.get_default_hf_dtype(clean_name)
-            element_size = torch.tensor([], dtype=dtype).element_size()
-            if self.param_converter.is_expert_weight1(clean_name):
-                local_keys, size_map = (
-                    self.param_converter.get_weight1_save_entries(
-                        clean_name, element_size, self.ep_rank, self.ep_size
-                    )
+            common_keys, expert_keys, size_map = (
+                self.param_converter.get_param_save_entries(
+                    clean_name, param.numel(),
+                    param_to_filename=self.param_to_filename,
                 )
-                self.param_size_map.update(size_map)
-                if self.param_converter.fused_experts:
-                    common_params.extend(local_keys)
-                else:
-                    expert_params.extend(local_keys)
-            elif self.param_converter.is_expert_weight2(clean_name):
-                local_keys, size_map = (
-                    self.param_converter.get_weight2_save_entries(
-                        clean_name, element_size, self.ep_rank, self.ep_size
-                    )
-                )
-                self.param_size_map.update(size_map)
-                if self.param_converter.fused_experts:
-                    common_params.extend(local_keys)
-                else:
-                    expert_params.extend(local_keys)
-            elif self.param_converter.is_router_param(clean_name):
-                hf_name = self.param_converter.convert_router_param_to_hf(clean_name)
-                common_params.append(hf_name)
-                self.param_size_map[hf_name] = param.numel() * element_size
-            else:
-                common_params.append(clean_name)
-                self.param_size_map[clean_name] = param.numel() * element_size
+            )
+            self.param_size_map.update(size_map)
+            common_params.extend(common_keys)
+            expert_params.extend(expert_keys)
 
         for name, buf in self.model.named_buffers():
             clean_name = strip_peft_prefix(name)
@@ -198,7 +183,7 @@ class ShardedParamManager:
             raise FileNotFoundError(f"Index file not found: {index_path}")
         with open(index_path) as f:
             index = json.load(f)
-        return index["weight_map"], index.get("metadata", {})
+        return index.get("weight_map", {}), index.get("metadata", {})
 
     def _copy_non_safetensor_files(self, src_path, dst_path):
         """Copy all non-safetensor files from source to destination."""
@@ -365,7 +350,7 @@ class ShardedParamManager:
             final_weight_map.update(cur_map)
 
         if self.rank == 0:
-            _, metadata = self._load_index_json(self.src_path)
+            metadata = self._src_metadata
             index_content = {
                 "metadata": metadata,
                 "weight_map": final_weight_map

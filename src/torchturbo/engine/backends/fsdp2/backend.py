@@ -205,7 +205,7 @@ class FSDP2Backend(BaseBackend):
         return model
 
     def _get_ignored_params(
-        self, model: nn.Module, ignored_param_names: list[str]
+        self, model: nn.Module, ignored_param_names: list[str], logging = False
     ) -> set[nn.Parameter]:
         """Collect parameters whose names match ignored-param regex patterns."""
         if not ignored_param_names:
@@ -216,6 +216,8 @@ class FSDP2Backend(BaseBackend):
         for name, param in model.named_parameters():
             if any(pattern.search(name) for pattern in ignored_patterns):
                 ignored_params.add(param)
+                if logging and self.rank == 0:
+                    logger.info(f"FSDP2 ignored param {len(ignored_params)}: {name}")
         return ignored_params
 
     def _get_ignored_param_names(self, plan: FSDPParallelPlan) -> list[str]:
@@ -363,7 +365,7 @@ class FSDP2Backend(BaseBackend):
 
         # Collect parameters matching ignored_param_names patterns into ignored_params.
         ignored_param_names = self._get_ignored_param_names(plan)
-        ignored_params = self._get_ignored_params(model, ignored_param_names)
+        ignored_params = self._get_ignored_params(model, ignored_param_names, True)
         if ignored_params:
             fsdp_kwargs["ignored_params"] = ignored_params
             # Store ignored_param_names for lazy grad hook registration after load.

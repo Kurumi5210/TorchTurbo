@@ -27,7 +27,7 @@ _root = logging.getLogger("torchturbo")
 if not _root.handlers:
     _handler = logging.StreamHandler(sys.stdout)
     _handler.setFormatter(
-        logging.Formatter("[torchturbo] %(levelname)s %(name)s: %(message)s")
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
     _root.addHandler(_handler)
     _root.setLevel(logging.DEBUG)

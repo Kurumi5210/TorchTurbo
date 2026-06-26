@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# qwen3_moe SFT training with torchturbo
+# Qwen3.5-MoE MLLM SFT with torchturbo
 # Usage:
-#   bash scripts/runs/lf_qwen3_5_moe_sft.sh
+#   bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
+#   bash scripts/runs/lf_qwen3_5_moe_mllm_sft.sh
 
 set -o pipefail
 
 set -ex
-
-rm -rf /root/.cache/
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export HCCL_CONNECT_TIMEOUT=7200
@@ -20,10 +19,37 @@ export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
-model_name_or_path=/sfs_turbo/zhisan/models/Qwen3___5-35B-A3B/
-output_dir=/sfs_turbo/zhisan/0604/lf_logs_qwen35/run_qwen3_5_moe_debug_35b_sft_mllm_sp32ep8/ckpt
+# ==============================================================================
+# TorchTurbo freeze flags
+# ==============================================================================
+#   --tt_freeze_vision_tower            Freeze visual encoder weights
+#   --tt_freeze_multi_modal_projector   Freeze vision→text projector
+#   --tt_freeze_language_model          Freeze language backbone
+# ==============================================================================
+# Supported models & max SP size
+# ==============================================================================
+#   Qwen3.5-35B-A3B        linear_num_value_heads=32      max SP=32
+#   Qwen3.5-122B-A10B      linear_num_value_heads=64      max SP=64
+#   Qwen3.5-397B-A17B      linear_num_value_heads=64      max SP=64
+# ==============================================================================
+# Test datasets
+# ==============================================================================
+#   SFT  MLLM      llava_1k_zh       visual instruction tuning
+#   SFT  TEXT      science           text-only instruction
+#   CPT  MLLM      security          multimodal continual pretraining
+#   CPT  TEXT      wikipedia_en      text-only pretraining
+# ==============================================================================
 
-seq_length=$((1024 * 16))
+if [ -z "$USER_NAME" ]; then
+    echo "Error: USER_NAME is not set"
+    exit 1
+fi
+
+model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
+
+seq_length=$((1024 * 4))
+sp_size=2
+ep_size=8
 dataset=llava_1k_zh
 packing_mode=packing_sep
 finetuning_type=full
@@ -41,6 +67,10 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 
 export ASCEND_PROCESS_LOG_PATH=$output_dir/log
+
+model_basename=$(basename "$model_name_or_path")
+seq_length_k=$((seq_length / 1024))k
+output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/${model_basename}/lf/mllm_sft_seq${seq_length_k}_sp${sp_size}ep${ep_size}_node${NNODES}/
 
 mkdir -p $output_dir
 if [ -d $output_dir ]; then
@@ -63,22 +93,29 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
-RUN_LF="$(dirname "$0")/run_lf.py"
-DATASET_DIR="$(dirname "$0")/../../dataset/"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RUN_LF="${SCRIPT_DIR}/run_lf.py"
+DATASET_DIR="${REPO_ROOT}/dataset/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
-export PYTHONPATH=/sfs_turbo/zhisan/0604/LlamaFactory/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zhisan/0604/torchturbo/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zhisan/0604/transformers_4_57_3_pure/src:$PYTHONPATH
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
-    --tt_sp_size 32 \
-    --tt_ep_size 8 \
+    --tt_sp_size $sp_size \
+    --tt_ep_size $ep_size \
     --num_train_epochs 1 \
     --report_to tensorboard \
     --logging_dir /home/admin/logs/tfevent \
     --gradient_checkpointing \
     --dataset_dir ${DATASET_DIR} \
-    --max_steps 30 \
+    --max_steps 100 \
     --trust_remote_code \
     --disable_shuffling \
     --stage sft \
@@ -111,14 +148,3 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --bf16 \
     --tt_freeze_vision_tower \
     --ddp_timeout 1800000000 2>&1 | tee -a $log_file
-
-    # --tt_freeze_vision_tower \
-    # --tt_freeze_multi_modal_projector \
-    # --tt_freeze_language_model \
-
-# 16k
-# {'loss': 1.6919, 'grad_norm': 52.59199523925781, 'learning_rate': 1.25e-05, 'epoch': 1.0}
-# {'loss': 1.1243, 'grad_norm': 4.272693634033203, 'learning_rate': 1.2465761846051709e-05, 'epoch': 2.0}
-# {'loss': 1.0078, 'grad_norm': 2.190387725830078, 'learning_rate': 1.2363422504586286e-05, 'epoch': 3.0}
-# {'loss': 0.8756, 'grad_norm': 1.5102177858352661, 'learning_rate': 1.219410322684471e-05, 'epoch': 4.0}
-# {'loss': 0.7535, 'grad_norm': 1.5444695949554443, 'learning_rate': 1.1959659110266256e-05, 'epoch': 5.0}

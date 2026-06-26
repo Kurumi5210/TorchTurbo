@@ -94,6 +94,14 @@ sh scripts/runs/npu_deps/bailing_v3_deps.sh
 sh scripts/runs/lf_bailing_v3_tiny_sft.sh
 ```
 
+### DPO
+```bash
+sh scripts/runs/npu_deps/bailing_v3_deps.sh
+# Optional when running the script outside this repo:
+# export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
+sh scripts/runs/lf_bailing_v3_tiny_dpo.sh
+```
+
 ## 和 DeepSpeed 对比
 
 对比配置：

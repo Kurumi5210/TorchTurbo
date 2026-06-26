@@ -155,6 +155,7 @@ class ModuleDivergenceResult:
 DEFAULT_TRAINER_CLASSES = {
     "sft": "llamafactory.train.sft.trainer.CustomSeq2SeqTrainer",
     "pt": "llamafactory.train.pt.workflow.CustomTrainer",
+    "dpo": "llamafactory.train.dpo.trainer.CustomDPOTrainer",
 }
 
 
@@ -183,7 +184,7 @@ def parse_args():
     )
     p.add_argument(
         "--stage",
-        choices=["sft", "pt"],
+        choices=["sft", "pt", "dpo"],
         default="sft",
         help="LlamaFactory training stage",
     )

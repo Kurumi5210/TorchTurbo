@@ -35,6 +35,7 @@ from .hooks import LlamaFactoryHook
 from .patches import (
     AcceleratorPatch,
     CollatorPatch,
+    CreateRefModelPatch,
     LoadModelPatch,
     LogCallbackPatch,
     PretrainProcessorPatch,
@@ -68,6 +69,8 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         super().__init__()
         self._active = False
         self.engine: TorchTurboEngine | None = None
+        self.stage: str | None = None
+        self.peft_config: Any | None = None
 
     def get_framework_version(self) -> str:
         """Return the LlamaFactory version string."""
@@ -107,9 +110,10 @@ class LlamaFactoryV0Adapter(BaseAdapter):
 
         # Register patches — inner patches applied by RunExpPatch
         self.add_patch(CollatorPatch())
-        self.add_patch(LoadModelPatch())
+        self.add_patch(LoadModelPatch(adapter=self))
+        self.add_patch(CreateRefModelPatch(adapter=self))
         self.add_patch(AcceleratorPatch())
-        self.add_patch(TrainerClassPatch())
+        self.add_patch(TrainerClassPatch(adapter=self))
         self.add_patch(RegisterAutoclassPatch())
         self.add_patch(PretrainProcessorPatch())
         self.add_patch(LogCallbackPatch())

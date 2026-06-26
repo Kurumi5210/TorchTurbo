@@ -57,7 +57,7 @@ def build_config_from_lf_args(
     -------
     A fully configured ``EngineConfig``.
     """
-    _raise_if_unsupported_finetuning_type(finetuning_args)
+    _raise_if_unsupported_lf_args(finetuning_args, model_args, torchturbo_args)
 
     config = _build_config_from_args(
         training_args, finetuning_args, model_args, torchturbo_args
@@ -196,11 +196,36 @@ def _build_fsdp_config(training_args: Any) -> FSDPConfig:
     )
 
 
-def _raise_if_unsupported_finetuning_type(finetuning_args: Any) -> None:
-    if getattr(finetuning_args, "finetuning_type", None) == "oft":
+def _raise_if_unsupported_lf_args(
+    finetuning_args: Any,
+    model_args: Any | None = None,
+    torchturbo_args: TorchTurboArgs | None = None,
+) -> None:
+    stage = getattr(finetuning_args, "stage", None)
+    finetuning_type = getattr(finetuning_args, "finetuning_type", None)
+    unsupported: list[str] = []
+
+    if finetuning_type == "oft":
+        unsupported.append("finetuning_type=oft")
+
+    if stage == "dpo":
+        if finetuning_type != "full":
+            unsupported.append(f"DPO with finetuning_type={finetuning_type!r}")
+        if not getattr(finetuning_args, "use_ref_model", False):
+            unsupported.append("DPO with use_ref_model=False")
+        if torchturbo_args is not None and getattr(torchturbo_args, "enable_mtp", False):
+            unsupported.append("DPO with MTP")
+        if getattr(model_args, "use_kt", False):
+            unsupported.append("DPO with use_kt=True")
+        if getattr(finetuning_args, "ref_model_adapters", None):
+            unsupported.append("DPO with ref_model_adapters")
+        if getattr(finetuning_args, "ref_model_quantization_bit", None):
+            unsupported.append("DPO with ref_model_quantization_bit")
+
+    if unsupported:
         raise NotImplementedError(
             "TorchTurbo LlamaFactory adapter does not support "
-            "finetuning_type=oft yet."
+            f"{', '.join(unsupported)} yet."
         )
 
 

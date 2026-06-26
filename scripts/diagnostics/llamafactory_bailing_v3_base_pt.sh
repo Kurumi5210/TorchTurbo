@@ -62,7 +62,7 @@ DISTRIBUTED_ARGS="
 
 export PATH=/usr/local/Ascend/tools/bishengir/bin:$PATH
 export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/flash-linear-attention/:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/v2/LLaMA-Factory/src:$PYTHONPATH
 export PYTHONPATH=/sfs_turbo/zlj/workspace/v2/torchturbo:$PYTHONPATH
 
 export TORCH_TURBO_SP_SIZE=2

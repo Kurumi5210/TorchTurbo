@@ -71,8 +71,6 @@ class FSDP2Backend(BaseBackend):
         self.device = get_device_name()
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
-        self.weight_loader = None
-        self.weight_saver = None
         self._ignored_param_names: list[str] = []
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
@@ -300,16 +298,20 @@ class FSDP2Backend(BaseBackend):
         set_moe_layer_forward_prefetch(model, outer_cls, inter_cls, outermost_cls)
 
     def load_model(self, model: nn.Module, model_name_or_path: str):
-        if self.weight_loader == None:
-            self.weight_loader = DistParamLoader(
-                model=model,
-                path=model_name_or_path,
-                rank=self.rank,
-                mesh=self._mesh,
-                world_mesh=self._world_mesh,
-                device=self.device,
-            )
-        self.weight_loader.load_weights()
+        loader = DistParamLoader(
+            model=model,
+            path=model_name_or_path,
+            rank=self.rank,
+            mesh=self._mesh,
+            world_mesh=self._world_mesh,
+            device=self.device,
+        )
+        loader.load_weights()
+        return model
+
+    def materialize_model(self, model: nn.Module):
+        model.to_empty(device=self.device)
+        return model
 
         # Register gradient all-reduce hooks for ignored_params after load_weights.
         # load_weights calls to_empty, which replaces Parameter objects.
@@ -320,15 +322,14 @@ class FSDP2Backend(BaseBackend):
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
     ):
-        if self.weight_saver is None:
-            self.weight_saver = DistParamSaver(
-                model=model,
-                rank=self.rank,
-                mesh=self._mesh,
-                path=model_name_or_path,
-                processing_class=None,
-            )
-        self.weight_saver.save_model(output_dir)
+        saver = DistParamSaver(
+            model=model,
+            rank=self.rank,
+            mesh=self._mesh,
+            path=model_name_or_path,
+            processing_class=None,
+        )
+        saver.save_model(output_dir)
 
     def _shard_model(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
         from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy

@@ -48,5 +48,15 @@
       "query": "input",
       "response": "output"
     }
+  },
+  "orca_rlhf": {
+    "file_name": "/sfs_turbo/data/orca_dpo_pairs/orca_rlhf.jsonl",
+    "ranking": true,
+    "columns": {
+      "prompt": "system",
+      "query": "question",
+      "chosen": "chosen",
+      "rejected": "rejected"
+    }
   }
 }

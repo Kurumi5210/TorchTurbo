@@ -67,25 +67,22 @@ class RunExpPatch(BasePatch):
             )
             stage = getattr(finetuning_args, "stage", None)
 
-            if stage not in {"sft", "pt"}:
-                if stage == "dpo":
-                    logger.warning(
-                        "torchturbo: DPO integration is reserved for a future "
-                        "patch. Running native LlamaFactory for now."
-                    )
-                else:
-                    logger.warning(
-                        "torchturbo: LlamaFactory stage %r is not enabled for "
-                        "TorchTurbo yet; running native LlamaFactory.",
-                        stage,
-                    )
+            if stage not in {"sft", "pt", "dpo"}:
+                logger.warning(
+                    "torchturbo: LlamaFactory stage %r is not enabled for "
+                    "TorchTurbo yet; running native LlamaFactory.",
+                    stage,
+                )
                 return self._original(args, callbacks)
 
             # Retrieve CLI-parsed torchturbo args (stashed by the entry point)
             tt_args = get_torchturbo_args()
 
             peft_config = None
-            if getattr(finetuning_args, "finetuning_type", None) == "lora":
+            if (
+                stage != "dpo"
+                and getattr(finetuning_args, "finetuning_type", None) == "lora"
+            ):
                 peft_config = build_lora_config_from_lf_args(
                     finetuning_args,
                     model_args=model_args,
@@ -117,6 +114,8 @@ class RunExpPatch(BasePatch):
             )
             engine = TorchTurboEngine(config)
             adapter.engine = engine
+            adapter.stage = stage
+            adapter.peft_config = peft_config
 
             # Stash template name for downstream use (e.g. collator upgrade)
             engine._lf_template_name = getattr(data_args, "template", None)
@@ -128,22 +127,15 @@ class RunExpPatch(BasePatch):
                 )
             )
 
-            # If LlamaFactory is using LoRA, build the peft_config and pass
-            # it to LoadModelPatch so that LoRA is applied at the right point
-            # in the model preparation pipeline (after module replacement,
-            # before FSDP2 sharding).
+            # Keep the current run's LoRA config on the adapter context.
+            # LoadModelPatch reads it when LF calls from_pretrained.
             if peft_config is not None:
-                # Find the LoadModelPatch and set its peft_config
-                for patch in adapter._patches:
-                    if isinstance(patch, LoadModelPatch):
-                        patch.set_peft_config(peft_config)
-                        logger.info(
-                            "torchturbo: LoRA config set for LoadModelPatch "
-                            "(r=%d, target_modules=%s)",
-                            peft_config.r,
-                            peft_config.target_modules,
-                        )
-                        break
+                logger.info(
+                    "torchturbo: LoRA config set for current LF run "
+                    "(r=%d, target_modules=%s)",
+                    peft_config.r,
+                    peft_config.target_modules,
+                )
 
                 # Strip LoRA CLI flags and change --finetuning_type to "full"
                 # so that LlamaFactory's own init_adapter won't try to apply
@@ -323,18 +315,10 @@ class LoadModelPatch(BasePatch):
         "AutoModelForTextToWaveform",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, adapter: Any) -> None:
+        self.adapter = adapter
         self._originals: dict[str, Any] = {}  # class_name → original from_pretrained
         self._module = None
-        self._peft_config = None  # cached LoRA config from LF args
-
-    def set_peft_config(self, peft_config: Any) -> None:
-        """Set the PEFT config to be passed to ``engine.prepare_model()``.
-
-        Called by ``RunExpPatch`` when it detects that LlamaFactory is
-        using LoRA finetuning.
-        """
-        self._peft_config = peft_config
 
     def patch(self, engine: TorchTurboEngine) -> None:
         try:
@@ -372,15 +356,12 @@ class LoadModelPatch(BasePatch):
 
                     trust_remote_code = kwargs.get("trust_remote_code", False)
 
-                    # Pass peft_config if available (LoRA finetuning)
-                    peft_config = self._peft_config
-
                     model = engine.prepare_model(
                         model_name_or_path=pretrained_model_name_or_path,
                         torch_dtype=torch_dtype,
                         trust_remote_code=trust_remote_code,
                         init_kwargs=kwargs,
-                        peft_config=peft_config,
+                        peft_config=getattr(self.adapter, "peft_config", None),
                     )
 
                     return model
@@ -409,6 +390,174 @@ class LoadModelPatch(BasePatch):
 
 
 # ---------------------------------------------------------------------------
+# CreateRefModelPatch
+# ---------------------------------------------------------------------------
+
+
+class CreateRefModelPatch(BasePatch):
+    """Patch LlamaFactory's algorithm-level reference model factory."""
+
+    name = "create_ref_model"
+    supported_versions = _LF_V0
+
+    def __init__(self, adapter: Any) -> None:
+        self.adapter = adapter
+        self._originals: list[tuple[Any, str, Any]] = []
+
+    def patch(self, engine: TorchTurboEngine) -> None:
+        def _patched_create_ref_model(
+            model_args,
+            finetuning_args,
+            *args,
+            add_valuehead: bool = False,
+            **kwargs,
+        ):
+            if add_valuehead:
+                raise NotImplementedError(
+                    "TorchTurbo DPO does not support value-head reference models."
+                )
+            if getattr(finetuning_args, "ref_model_adapters", None):
+                raise NotImplementedError(
+                    "TorchTurbo DPO does not support ref_model_adapters yet."
+                )
+            if getattr(finetuning_args, "ref_model_quantization_bit", None):
+                raise NotImplementedError(
+                    "TorchTurbo DPO does not support ref_model_quantization_bit yet."
+                )
+
+            from llamafactory.hparams import ModelArguments
+            from llamafactory.model import load_config, load_tokenizer
+            from llamafactory.model.loader import _get_init_kwargs
+            from llamafactory.model.model_utils.liger_kernel import apply_liger_kernel
+            from llamafactory.model.patcher import patch_config, patch_model
+
+            ref_path = getattr(finetuning_args, "ref_model", None)
+            if ref_path is not None:
+                ref_model_args = ModelArguments.copyfrom(
+                    model_args,
+                    model_name_or_path=ref_path,
+                    adapter_name_or_path=None,
+                    quantization_bit=None,
+                )
+            else:
+                ref_model_args = ModelArguments.copyfrom(model_args)
+
+            tokenizer = load_tokenizer(ref_model_args)["tokenizer"]
+            init_kwargs = _get_init_kwargs(ref_model_args)
+            config = load_config(ref_model_args)
+            patch_config(
+                config,
+                tokenizer,
+                ref_model_args,
+                init_kwargs,
+                is_trainable=False,
+            )
+            apply_liger_kernel(
+                config,
+                ref_model_args,
+                is_trainable=False,
+                require_logits=True,
+            )
+            init_kwargs["config"] = config
+
+            torch_dtype = getattr(ref_model_args, "compute_dtype", None)
+            if torch_dtype is None:
+                import torch
+
+                torch_dtype = torch.bfloat16
+
+            ref_model = engine.build_model(
+                model_name_or_path=ref_model_args.model_name_or_path,
+                torch_dtype=torch_dtype,
+                trust_remote_code=getattr(ref_model_args, "trust_remote_code", False),
+                init_kwargs=init_kwargs,
+                load_weights=ref_path is not None,
+            )
+            patch_model(
+                ref_model,
+                tokenizer,
+                ref_model_args,
+                is_trainable=False,
+                add_valuehead=False,
+            )
+
+            if ref_path is not None:
+                ref_model.requires_grad_(False)
+                ref_model.eval()
+                logger.info(
+                    "torchturbo: created reference model from %s",
+                    ref_model_args.model_name_or_path,
+                )
+            else:
+                logger.info(
+                    "torchturbo: created empty reference model from policy config; "
+                    "weights will be copied from the initial policy."
+                )
+
+            return ref_model
+
+        self._replace_create_ref_model(
+            "llamafactory.train.trainer_utils",
+            _patched_create_ref_model,
+            required=True,
+        )
+        self._replace_create_ref_model(
+            "llamafactory.train.dpo.workflow",
+            _patched_create_ref_model,
+            required=getattr(self.adapter, "stage", None) == "dpo",
+        )
+
+    def _replace_create_ref_model(
+        self,
+        module_path: str,
+        patched: Any,
+        *,
+        required: bool,
+    ) -> None:
+        import importlib
+
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            if required:
+                raise
+            logger.debug(
+                "torchturbo: %s not found; skipping create_ref_model patch.",
+                module_path,
+            )
+            return
+
+        if not hasattr(module, "create_ref_model"):
+            if required:
+                raise AttributeError(f"{module_path} has no create_ref_model.")
+            logger.debug(
+                "torchturbo: %s has no create_ref_model; skipping patch.",
+                module_path,
+            )
+            return
+
+        current = getattr(module, "create_ref_model")
+        original = getattr(current, "_torchturbo_original", current)
+        patched._torchturbo_original = original
+        already_recorded = any(
+            item[0] is module and item[1] == "create_ref_model"
+            for item in self._originals
+        )
+        if not already_recorded:
+            self._originals.append((module, "create_ref_model", original))
+        setattr(module, "create_ref_model", patched)
+        logger.info(
+            "torchturbo: replaced %s.create_ref_model",
+            getattr(module, "__name__", repr(module)),
+        )
+
+    def revert(self) -> None:
+        for module, attr_name, original in reversed(self._originals):
+            setattr(module, attr_name, original)
+        self._originals.clear()
+
+
+# ---------------------------------------------------------------------------
 # TrainerClassPatch — replace LF workflow trainer classes with TT subclasses
 # ---------------------------------------------------------------------------
 
@@ -419,13 +568,14 @@ class TrainerClassPatch(BasePatch):
     name = "trainer_class"
     supported_versions = _LF_V0
 
-    def __init__(self) -> None:
+    def __init__(self, adapter: Any) -> None:
+        self.adapter = adapter
         self._originals: list[tuple[Any, str, Any]] = []
 
     def patch(self, engine: TorchTurboEngine) -> None:
         self._patch_sft(engine)
         self._patch_pt(engine)
-        # TODO: wire DPO here once TorchTurbo has a preference-loss contract.
+        self._patch_dpo(engine)
 
     def _replace(self, module: Any, attr_name: str, patched_cls: type) -> None:
         from .trainer import unwrap_torchturbo_trainer_class
@@ -456,7 +606,6 @@ class TrainerClassPatch(BasePatch):
             base_cls,
             engine=engine,
             stage="sft",
-            loss_mode="causal_lm",
         )
         self._replace(sft_workflow, "CustomSeq2SeqTrainer", patched_cls)
 
@@ -476,9 +625,29 @@ class TrainerClassPatch(BasePatch):
             base_cls,
             engine=engine,
             stage="pt",
-            loss_mode="causal_lm",
         )
         self._replace(pt_workflow, "CustomTrainer", patched_cls)
+
+    def _patch_dpo(self, engine: TorchTurboEngine) -> None:
+        try:
+            from llamafactory.train.dpo import trainer as dpo_trainer
+            from .trainer import (
+                make_torchturbo_trainer,
+                unwrap_torchturbo_trainer_class,
+            )
+        except ImportError:
+            if getattr(self.adapter, "stage", None) == "dpo":
+                raise ImportError("LlamaFactory DPO trainer not found.")
+            logger.debug("LlamaFactory DPO trainer not found; skipping trainer patch.")
+            return
+
+        base_cls = unwrap_torchturbo_trainer_class(dpo_trainer.CustomDPOTrainer)
+        patched_cls = make_torchturbo_trainer(
+            base_cls,
+            engine=engine,
+            stage="dpo",
+        )
+        self._replace(dpo_trainer, "CustomDPOTrainer", patched_cls)
 
     def revert(self) -> None:
         for module, attr_name, original in reversed(self._originals):

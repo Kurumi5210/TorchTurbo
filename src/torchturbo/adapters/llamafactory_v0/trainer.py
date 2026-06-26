@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import nullcontext
 from typing import Any
+
+import torch
+import torch.nn as nn
 
 from ...logging import get_logger
 
@@ -21,7 +25,6 @@ class TorchTurboTrainerBase:
 
     engine: Any = None
     stage: str | None = None
-    loss_mode: str = "native"
     torchturbo_wrapped: bool = False
     base_trainer_cls: type | None = None
     custom_optimizer_options: tuple[str, ...] = (
@@ -157,7 +160,7 @@ class TorchTurboTrainerBase:
             self.push_to_hub(commit_message="Model save")
 
     def get_train_dataloader(self):
-        if self.loss_mode != "causal_lm":
+        if self.stage not in {"sft", "pt", "dpo"}:
             return super().get_train_dataloader()
 
         engine = self._engine()
@@ -221,15 +224,9 @@ class TorchTurboTrainerBase:
         return result
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        if self.loss_mode == "causal_lm":
+        if self.stage in {"sft", "pt"}:
             return self._compute_causal_lm_loss(
                 model, inputs, return_outputs=return_outputs, **kwargs
-            )
-
-        if self.stage == "dpo" and self._engine().get_sp_info()["sp_size"] > 1:
-            raise NotImplementedError(
-                "TorchTurbo DPO support currently keeps LlamaFactory's native "
-                "preference loss and does not support sequence parallelism yet."
             )
 
         return super().compute_loss(
@@ -316,26 +313,347 @@ class TorchTurboTrainerBase:
             mtp_log["scaled"].append(float(scaled_loss.item()))
 
 
+class TorchTurboDPOTrainer(TorchTurboTrainerBase):
+    """DPO-specific trainer behavior layered above LlamaFactory's DPO trainer."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # LlamaFactory's DPO workflow still owns the ref_model data flow:
+        # create_ref_model(...) returns it and passes it into the trainer
+        # constructor.  TorchTurbo only patches that factory; by this point
+        # the base DPO trainer has already stored it on self.ref_model.
+        self._initialize_dpo_ref_model()
+
+    def _initialize_dpo_ref_model(self) -> None:
+        ref_model = getattr(self, "ref_model", None)
+        if ref_model is None:
+            return
+        if ref_model is self.model:
+            return
+
+        if getattr(self.finetuning_args, "ref_model", None) is None:
+            self._copy_model_state(self.model, ref_model)
+            post_weight_load = getattr(ref_model, "post_weight_load", None)
+            if callable(post_weight_load):
+                post_weight_load()
+            logger.info(
+                "torchturbo: initialized DPO reference model from policy weights."
+            )
+
+        ref_model.requires_grad_(False)
+        ref_model.eval()
+
+    def _copy_model_state(self, src_model: Any, dst_model: Any) -> None:
+        src_state = dict(src_model.named_parameters(remove_duplicate=False))
+        src_state.update(self._named_persistent_buffers(src_model))
+        dst_state = dict(dst_model.named_parameters(remove_duplicate=False))
+        dst_state.update(self._named_persistent_buffers(dst_model))
+
+        src_keys = set(src_state)
+        dst_keys = set(dst_state)
+        if src_keys != dst_keys:
+            missing = sorted(src_keys - dst_keys)[:5]
+            unexpected = sorted(dst_keys - src_keys)[:5]
+            raise RuntimeError(
+                "Cannot initialize TorchTurbo DPO reference model: policy and "
+                f"reference state keys differ (missing={missing}, "
+                f"unexpected={unexpected})."
+            )
+
+        with torch.no_grad():
+            for name in sorted(src_state):
+                src = src_state[name].detach()
+                dst = dst_state[name]
+                if src.shape != dst.shape:
+                    raise RuntimeError(
+                        "Cannot initialize TorchTurbo DPO reference model: "
+                        f"{name} shape differs ({tuple(src.shape)} vs "
+                        f"{tuple(dst.shape)})."
+                    )
+                dst.copy_(src)
+
+    @staticmethod
+    def _named_persistent_buffers(model: Any) -> dict[str, torch.Tensor]:
+        buffers: dict[str, torch.Tensor] = {}
+        for module_name, module in model.named_modules():
+            non_persistent = getattr(module, "_non_persistent_buffers_set", set())
+            for name, buffer in module.named_buffers(
+                recurse=False,
+                remove_duplicate=False,
+            ):
+                if buffer is None or name in non_persistent:
+                    continue
+                full_name = f"{module_name}.{name}" if module_name else name
+                buffers[full_name] = buffer
+        return buffers
+
+    def concatenated_forward(self, model, batch, is_ref_model: bool = False):
+        if self._engine().get_sp_info()["sp_size"] <= 1:
+            return super().concatenated_forward(
+                model,
+                batch,
+                is_ref_model=is_ref_model,
+            )
+
+        from llamafactory.train.trainer_utils import nested_detach
+        from torchturbo.models.modules.attention.ulysses import slice_input_tensor
+
+        sp_info = self._engine().get_sp_info()
+        sp_group = sp_info["sp_group"]
+        sp_rank = sp_info["sp_rank"]
+
+        if getattr(self.finetuning_args, "use_ref_model", False):
+            batch = nested_detach(batch, clone=True)
+        else:
+            batch = dict(batch)
+
+        labels = batch.pop("labels")
+        all_logits = model(
+            **batch,
+            return_dict=True,
+            use_cache=False,
+        ).logits.to(torch.float32)
+
+        labels = nn.functional.pad(labels, (0, 1), value=self.label_pad_token_id)
+        labels = labels[..., 1:].contiguous()
+        labels = slice_input_tensor(
+            labels,
+            dim=1,
+            group=sp_group,
+            rank=sp_rank,
+            padding=False,
+            sp_mode="ulysses",
+        )
+
+        all_logps, valid_length = self.get_batch_logps_with_sp(
+            logits=all_logits,
+            labels=labels,
+            label_pad_token_id=self.label_pad_token_id,
+            ld_alpha=(self.ld_alpha if not is_ref_model else None),
+        )
+        if self.loss_type in ["ipo", "orpo", "simpo"]:
+            all_logps = all_logps / valid_length
+
+        batch_size = batch["input_ids"].size(0) // 2
+        chosen_logps, rejected_logps = all_logps.split(batch_size, dim=0)
+        chosen_logits, rejected_logits = all_logits.split(batch_size, dim=0)
+        chosen_length, _ = valid_length.split(batch_size, dim=0)
+        return (
+            chosen_logps,
+            rejected_logps,
+            chosen_logits,
+            rejected_logits,
+            chosen_length,
+        )
+
+    def compute_reference_log_probs(self, model, batch):
+        if not self.finetuning_args.use_ref_model:
+            return None, None
+
+        if self.ref_model is None:
+            ref_model = model
+            ref_context = self.accelerator.unwrap_model(model).disable_adapter()
+        else:
+            ref_model = self.ref_model
+            ref_context = nullcontext()
+
+        with torch.no_grad(), ref_context:
+            reference_chosen_logps, reference_rejected_logps, *_ = (
+                self.concatenated_forward(
+                    ref_model,
+                    batch,
+                    is_ref_model=True,
+                )
+            )
+
+        return reference_chosen_logps, reference_rejected_logps
+
+    def get_batch_loss_metrics(self, model, inputs, train_eval: str = "train"):
+        if self._engine().get_sp_info()["sp_size"] <= 1:
+            return super().get_batch_loss_metrics(model, inputs, train_eval=train_eval)
+
+        from torch.distributed.nn.functional import all_reduce
+        from torchturbo.models.modules.attention.ulysses import (
+            ulysses_pad,
+            ulysses_pad_and_slice_inputs,
+        )
+
+        inputs = dict(inputs)
+        sp_info = self._engine().get_sp_info()
+        sp_size = sp_info["sp_size"]
+        sp_group = sp_info["sp_group"]
+        sp_rank = sp_info["sp_rank"]
+
+        if inputs.get("position_ids", None) is None:
+            inputs["position_ids"] = torch.arange(
+                inputs["input_ids"].size(1),
+                device=inputs["input_ids"].device,
+            ).unsqueeze(0)
+
+        if getattr(model, "is_vlm", False):
+            (
+                inputs["input_ids"],
+                inputs["position_ids"],
+                _,
+                pad_size,
+            ) = ulysses_pad(
+                inputs["input_ids"],
+                position_ids_rmpad=inputs["position_ids"],
+                sp_size=sp_size,
+            )
+        else:
+            (
+                inputs["input_ids"],
+                inputs["position_ids"],
+                _,
+                pad_size,
+            ) = ulysses_pad_and_slice_inputs(
+                inputs["input_ids"],
+                position_ids_rmpad=inputs["position_ids"],
+                sp_size=sp_size,
+                sp_group=sp_group,
+                sp_rank=sp_rank,
+            )
+        inputs["attention_mask"] = None
+        if pad_size:
+            inputs["labels"] = nn.functional.pad(
+                inputs["labels"],
+                (0, pad_size),
+                value=self.label_pad_token_id,
+            )
+
+        metrics = {}
+        (
+            policy_chosen_logps,
+            policy_rejected_logps,
+            policy_chosen_logits,
+            policy_rejected_logits,
+            policy_chosen_length,
+        ) = self.concatenated_forward(model, inputs)
+
+        reference_chosen_logps, reference_rejected_logps = (
+            self.compute_reference_log_probs(model, inputs)
+        )
+
+        policy_chosen_logps = all_reduce(policy_chosen_logps, group=sp_group)
+        policy_rejected_logps = all_reduce(policy_rejected_logps, group=sp_group)
+        policy_chosen_length = all_reduce(policy_chosen_length, group=sp_group)
+        if reference_chosen_logps is not None:
+            reference_chosen_logps = all_reduce(reference_chosen_logps, group=sp_group)
+        if reference_rejected_logps is not None:
+            reference_rejected_logps = all_reduce(
+                reference_rejected_logps,
+                group=sp_group,
+            )
+
+        losses, chosen_rewards, rejected_rewards = self.compute_preference_loss(
+            policy_chosen_logps,
+            policy_rejected_logps,
+            reference_chosen_logps,
+            reference_rejected_logps,
+        )
+
+        policy_chosen_logps_avg = policy_chosen_logps / policy_chosen_length
+        sft_loss = -policy_chosen_logps_avg
+        if self.ftx_gamma > 1e-6:
+            losses += self.ftx_gamma * sft_loss
+
+        prefix = "eval_" if train_eval == "eval" else ""
+        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().item()
+        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().item()
+        metrics[f"{prefix}rewards/accuracies"] = (
+            chosen_rewards > rejected_rewards
+        ).float().mean().item()
+        metrics[f"{prefix}rewards/margins"] = (
+            chosen_rewards - rejected_rewards
+        ).mean().item()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.mean().item()
+        metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.mean().item()
+        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.mean().item()
+        metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.mean().item()
+        if self.loss_type == "orpo":
+            metrics[f"{prefix}sft_loss"] = sft_loss.mean().item()
+            metrics[f"{prefix}odds_ratio_loss"] = (
+                (losses - sft_loss) / self.beta
+            ).mean().item()
+
+        # HF Trainer divides by the expanded SP accumulation window
+        return losses.mean(), metrics
+
+    def get_batch_logps_with_sp(
+        self,
+        logits,
+        labels,
+        label_pad_token_id: int | None = None,
+        ld_alpha: float | None = None,
+    ):
+        if label_pad_token_id is None:
+            label_pad_token_id = self.label_pad_token_id
+
+        if logits.shape[:-1] != labels.shape:
+            raise ValueError(
+                "Logits (batchsize x seqlen) and labels must have the same shape."
+            )
+
+        labels = labels.clone()
+        loss_mask = labels != label_pad_token_id
+        labels[labels == label_pad_token_id] = 0
+        per_token_logps = torch.gather(
+            logits.log_softmax(-1),
+            dim=2,
+            index=labels.unsqueeze(2),
+        ).squeeze(2)
+
+        valid_length = loss_mask.sum(-1)
+        if ld_alpha is not None:
+            num_examples = labels.shape[0] // 2
+            chosen_lengths = valid_length[:num_examples]
+            rejected_lengths = valid_length[num_examples:]
+            min_lengths = torch.min(chosen_lengths, rejected_lengths)
+            start_positions = torch.argmax(loss_mask.int(), dim=1)
+            public_lengths = start_positions + torch.cat(
+                [min_lengths, min_lengths],
+                dim=0,
+            )
+
+            seq_len = labels.shape[-1]
+            position_ids = torch.arange(
+                seq_len,
+                device=per_token_logps.device,
+            ).expand_as(per_token_logps)
+
+            ld_mask = position_ids < public_lengths.unsqueeze(1)
+            front_mask = (ld_mask * loss_mask).float()
+            rear_mask = (~ld_mask * loss_mask).float()
+
+            front_logps = (per_token_logps * front_mask).sum(-1)
+            rear_logps = (per_token_logps * rear_mask).sum(-1)
+            logps = front_logps + ld_alpha * rear_logps
+        else:
+            logps = (per_token_logps * loss_mask).sum(-1)
+
+        return logps, valid_length
+
+
 def make_torchturbo_trainer(
     base_cls: type,
     *,
     engine: Any,
     stage: str,
-    loss_mode: str,
 ) -> type:
     """Create a stage/engine-bound trainer subclass."""
 
     base_cls = unwrap_torchturbo_trainer_class(base_cls)
     trainer_engine = engine
     trainer_stage = stage
-    trainer_loss_mode = loss_mode
+    wrapper_cls = TorchTurboDPOTrainer if stage == "dpo" else TorchTurboTrainerBase
 
-    class TorchTurboTrainer(TorchTurboTrainerBase, base_cls):
+    class TorchTurboTrainer(wrapper_cls, base_cls):
         engine = trainer_engine
         stage = trainer_stage
-        loss_mode = trainer_loss_mode
         torchturbo_wrapped = True
         base_trainer_cls = base_cls
+        torchturbo_wrapper_cls = wrapper_cls
 
     name = f"TorchTurbo{stage.upper()}{base_cls.__name__}"
     TorchTurboTrainer.__name__ = name
@@ -360,4 +678,3 @@ def unwrap_torchturbo_trainer_class(cls: type) -> type:
         return mro[2]
 
     return cls
-

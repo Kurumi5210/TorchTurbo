@@ -57,6 +57,12 @@ class BaseBackend(ABC):
     def load_model(self, model: nn.Module, model_name_or_path: str) -> nn.Module:
         """Load weights."""
 
+    def materialize_model(self, model: nn.Module) -> nn.Module:
+        """Materialize a sharded meta model without loading checkpoint weights."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support materialize_model()."
+        )
+
     @abstractmethod
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any

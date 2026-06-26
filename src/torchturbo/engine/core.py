@@ -212,7 +212,7 @@ class TorchTurboEngine:
     # Model preparation (meta device → shard → load weights)
     # ------------------------------------------------------------------
 
-    def prepare_model(
+    def build_model(
         self,
         model_name_or_path: str,
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -220,8 +220,9 @@ class TorchTurboEngine:
         trust_remote_code: bool = False,
         init_kwargs: dict[str, Any] | None = None,
         peft_config: Any | None = None,
+        load_weights: bool = True,
     ) -> nn.Module:
-        """Build a model on meta device, shard it, then load weights.
+        """Build a distributed model instance without registering it on the engine.
 
         Parameters
         ----------
@@ -244,17 +245,19 @@ class TorchTurboEngine:
             ``torchturbo.engine.peft`` module automatically registers a custom
             LoRA handler for ``GroupedMLP`` (MoE experts with grouped
             matmul).
+        load_weights:
+            Whether to load checkpoint weights.  When ``False``, the model is
+            still materialized onto real device storage but checkpoint I/O is
+            skipped.
 
         Returns
         -------
-        The sharded, weight-loaded model (ready for ``setup()``).
+        The sharded model instance.
         """
         from transformers import AutoConfig, AutoModelForCausalLM
 
         if init_kwargs is None:
             init_kwargs = {}
-
-        self.model_name_or_path = model_name_or_path
 
         # Load config
         if "config" in init_kwargs:
@@ -337,25 +340,17 @@ class TorchTurboEngine:
         else:
             config.torch_dtype = orig_dtype
 
-        # Load model via backend
-        logger.info("Loading model via %s backend", self.config.backend.value)
-        self.backend.load_model(model, model_name_or_path=model_name_or_path)
+        if load_weights:
+            logger.info("Loading model via %s backend", self.config.backend.value)
+            self.backend.load_model(model, model_name_or_path=model_name_or_path)
+        else:
+            logger.info("Materializing model via %s backend", self.config.backend.value)
+            self.backend.materialize_model(model)
 
-        if hasattr(model, "post_weight_load"):
+        if load_weights and hasattr(model, "post_weight_load"):
             model.post_weight_load()
 
-        self._apply_freeze(model)
-
-        self.model = model
-
-        # Synchronize printing
-        if dist.is_initialized():
-            dist.barrier()
-
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            logger.info("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
-            self._log_model_info(model)
-
+        logger.info("Model built: %s (%s)", type(model).__name__, torch_dtype)
         return model
 
     def _apply_freeze(self, model: nn.Module) -> None:
@@ -381,6 +376,41 @@ class TorchTurboEngine:
                     count += 1
 
             logger.info("Froze %d parameters via --%s (keywords: %s)", count, flag_name, keywords)
+
+    def prepare_model(
+        self,
+        model_name_or_path: str,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        model_cls: type | None = None,
+        trust_remote_code: bool = False,
+        init_kwargs: dict[str, Any] | None = None,
+        peft_config: Any | None = None,
+    ) -> nn.Module:
+        """Build and register the engine's primary training model."""
+        model = self.build_model(
+            model_name_or_path=model_name_or_path,
+            torch_dtype=torch_dtype,
+            model_cls=model_cls,
+            trust_remote_code=trust_remote_code,
+            init_kwargs=init_kwargs,
+            peft_config=peft_config,
+            load_weights=True,
+        )
+
+        self._apply_freeze(model)
+
+        self.model = model
+        self.model_name_or_path = model_name_or_path
+
+        # Synchronize printing
+        if dist.is_initialized():
+            dist.barrier()
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
+            self._log_model_info(model)
+        
+        return model
 
     def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
         self.backend.save_model(model, self.model_name_or_path, output_dir, **kwargs)
@@ -766,7 +796,7 @@ class TorchTurboEngine:
 
     def get_ep_info(self) -> dict[str, Any]:
         """Get expert-parallel rank, size and group."""
-        return self.backend.get_sp_info()
+        return self.backend.get_ep_info()
 
     def _ensure_sp_dataloader(self, dataloader_or_dataset: Any, sp_size: int) -> Any:
         """Wrap a Dataset with SP-aware sampling, or return DataLoader as-is."""

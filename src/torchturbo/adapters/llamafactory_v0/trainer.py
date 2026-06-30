@@ -237,29 +237,41 @@ class TorchTurboTrainerBase:
         )
 
     def log(self, logs, *args, **kwargs):
-        mtp_log = getattr(self, "_mtp_loss_buf", None)
-        if mtp_log and mtp_log.get("mtp"):
-            rows = mtp_log["mtp"]
-            num_layers = len(rows[0]) if rows else 0
-            if num_layers > 0:
-                by_layer = list(zip(*rows))
-                per_layer_mean = [sum(c) / len(c) for c in by_layer]
-                for i, mean_value in enumerate(per_layer_mean):
-                    logs[f"mtp_loss/{i}"] = round(mean_value, 6)
-                logs["mtp_loss/avg"] = round(
-                    sum(per_layer_mean) / num_layers, 6
-                )
-            if mtp_log.get("main"):
+        buf = getattr(self, "_mtp_loss_buf", None)
+        count = buf["count"] if buf else 0
+        if buf and count > 0 and buf["mtp"]:
+            # mirror HF Trainer's tr_loss reduction
+            grad_accum = self.args.gradient_accumulation_steps
+            opt_steps = count / grad_accum if grad_accum else count
+
+            per_layer = []
+            for acc in buf["mtp"]:
+                gathered = self._nested_gather(acc)
+                per_layer.append(gathered.mean().item() / opt_steps)
+            for i, mean_value in enumerate(per_layer):
+                logs[f"mtp_loss/{i}"] = round(mean_value, 4)
+            logs["mtp_loss/avg"] = round(
+                sum(per_layer) / len(per_layer), 4
+            )
+            if buf["main"] is not None:
                 logs["mtp_loss/main"] = round(
-                    sum(mtp_log["main"]) / len(mtp_log["main"]), 6
+                    self._nested_gather(buf["main"]).mean().item() / opt_steps,
+                    4,
                 )
-            if mtp_log.get("scaled"):
+            if buf["scaled"] is not None:
                 logs["mtp_loss/scaled"] = round(
-                    sum(mtp_log["scaled"]) / len(mtp_log["scaled"]), 6
+                    self._nested_gather(buf["scaled"]).mean().item()
+                    / opt_steps,
+                    4,
                 )
-            mtp_log["mtp"].clear()
-            mtp_log["main"].clear()
-            mtp_log["scaled"].clear()
+
+            for acc in buf["mtp"]:
+                acc.zero_()
+            if buf["main"] is not None:
+                buf["main"].zero_()
+            if buf["scaled"] is not None:
+                buf["scaled"].zero_()
+            buf["count"] = 0
 
         return super().log(logs, *args, **kwargs)
 
@@ -299,18 +311,33 @@ class TorchTurboTrainerBase:
         if not mtp_loss:
             return
 
-        mtp_log = getattr(self, "_mtp_loss_buf", None)
-        if mtp_log is None:
-            mtp_log = {"mtp": [], "main": [], "scaled": []}
-            self._mtp_loss_buf = mtp_log
+        buf = getattr(self, "_mtp_loss_buf", None)
+        if buf is None:
+            buf = {"mtp": None, "main": None, "scaled": None, "count": 0}
+            self._mtp_loss_buf = buf
 
-        mtp_log["mtp"].append([float(m.item()) for m in mtp_loss])
+        device = mtp_loss[0].device
+        if buf["mtp"] is None:
+            buf["mtp"] = [
+                torch.zeros((), device=device, dtype=torch.float32)
+                for _ in mtp_loss
+            ]
+        for acc, m in zip(buf["mtp"], mtp_loss):
+            acc.add_(m.detach().float())
+
         main_loss = getattr(outputs, "main_loss", None)
         if main_loss is not None:
-            mtp_log["main"].append(float(main_loss.item()))
+            if buf["main"] is None:
+                buf["main"] = torch.zeros((), device=device, dtype=torch.float32)
+            buf["main"].add_(main_loss.detach().float())
+
         scaled_loss = getattr(outputs, "mtp_loss_scaled", None)
         if scaled_loss is not None:
-            mtp_log["scaled"].append(float(scaled_loss.item()))
+            if buf["scaled"] is None:
+                buf["scaled"] = torch.zeros((), device=device, dtype=torch.float32)
+            buf["scaled"].add_(scaled_loss.detach().float())
+
+        buf["count"] += 1
 
 
 class TorchTurboDPOTrainer(TorchTurboTrainerBase):

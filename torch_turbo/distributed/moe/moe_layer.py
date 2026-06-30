@@ -130,7 +130,7 @@ class MoELayer(BaseMoELayer):
                 shared_expert_output = self.shared_experts(hidden_states)
                 output = output + shared_expert_output
 
-            if rank == 0 and os.environ.get('TORCH_TURBO_DEBUG', False):
+            if rank == 0 and int(os.environ.get('TORCH_TURBO_DEBUG', '0')):
                 print(f"hidden_states.shape {hidden_states.shape} hidden_states {hidden_states}")
                 print(f"dispatched_input.shape {dispatched_input.shape} dispatched_input {dispatched_input}")
                 print(f"tokens_per_expert.shape {tokens_per_expert.shape} tokens_per_expert {tokens_per_expert}")

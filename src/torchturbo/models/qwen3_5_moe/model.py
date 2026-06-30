@@ -243,37 +243,58 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
     @classmethod
     def patch_mtp_for_sp(cls, mtp_cls, sp_group, sp_size, sp_rank):
-        """Slice MTP inputs under SP (VLM path keeps input_ids full-length)."""
+        """Slice MTP inputs under SP (VLM path keeps input_ids full-length).
+        The MTP forward calls ``_roll_left_one(cur_input_ids)`` on
+        ``input_ids``, then ``embed_tokens(cur_input_ids)`` to produce
+        the "next-token" embedding.  If ``input_ids`` were sliced to
+        ``[B, T/sp]`` first, the rolled-in token at the slice boundary
+        would be ``pad_token_id`` instead of the real next token.
+        """
         from ..modules.attention.ulysses import slice_input_tensor
 
         original_forward = mtp_cls.forward
 
         def _mtp_sp_forward(self_mtp, input_ids, hidden_states, embed_tokens, **kwargs):
-            input_ids = slice_input_tensor(
-                input_ids, dim=1, group=sp_group, rank=sp_rank, padding=False
-            )
-            if "position_ids" in kwargs and kwargs["position_ids"] is not None:
-                kwargs["position_ids"] = slice_input_tensor(
-                    kwargs["position_ids"],
+            # slice position metadata for SP
+            position_embeddings = kwargs.pop("position_embeddings", None)
+            attention_mask = kwargs.pop("attention_mask", None)
+            position_ids = kwargs.pop("position_ids", None)
+            pad_token_id = int(kwargs.pop("pad_token_id", 0))
+
+            if position_ids is not None:
+                position_ids = slice_input_tensor(
+                    position_ids,
                     dim=-1,
                     group=sp_group,
                     rank=sp_rank,
                     padding=False,
                 )
-            if (
-                "position_embeddings" in kwargs
-                and kwargs["position_embeddings"] is not None
-            ):
-                cos, sin = kwargs["position_embeddings"]
-                cos = slice_input_tensor(
-                    cos, dim=1, group=sp_group, rank=sp_rank, padding=False
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                position_embeddings = (
+                    slice_input_tensor(cos, dim=1, group=sp_group, rank=sp_rank, padding=False),
+                    slice_input_tensor(sin, dim=1, group=sp_group, rank=sp_rank, padding=False),
                 )
-                sin = slice_input_tensor(
-                    sin, dim=1, group=sp_group, rank=sp_rank, padding=False
+
+            # wrap embed_tokens so fc([embeds || hidden]) stays in shape
+            def _sp_embed_tokens(ids):
+                # ids is full-length [B, T]; embed produces [B, T, H]
+                # slice back to [B, T/sp, H] to match hidden_states
+                return slice_input_tensor(
+                    embed_tokens(ids),
+                    dim=1,
+                    group=sp_group,
+                    rank=sp_rank,
+                    padding=False,
                 )
-                kwargs["position_embeddings"] = (cos, sin)
+
             return original_forward(
-                self_mtp, input_ids, hidden_states, embed_tokens, **kwargs
+                self_mtp, input_ids, hidden_states, _sp_embed_tokens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pad_token_id=pad_token_id,
+                **kwargs,
             )
 
         mtp_cls.forward = _mtp_sp_forward

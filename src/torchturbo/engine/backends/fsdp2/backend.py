@@ -5,7 +5,6 @@ import re
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-import torch
 import torch.nn as nn
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
 import torch.distributed as dist
@@ -681,6 +680,15 @@ class FSDP2Backend(BaseBackend):
                     num_items_in_batch=num_items_in_batch,
                 )
                 mtp_losses.append(mtp_loss_i)
+                if int(os.environ.get('TORCH_TURBO_DEBUG_MTP', '0')):
+                    rank = torch.distributed.get_rank()
+                    with torch.no_grad():
+                        print(
+                            f'[TORCH_TURBO_DEBUG_MTP_LOSS] rank={rank} '
+                            f'sp_rank={sp_rank} head={i} '
+                            f'raw_mtp_loss={mtp_loss_i.item():.6f}',
+                            flush=True
+                        )
 
         # Read MTP scaling straight from the CLI args.
         # Defaults to 0.1 (Megatron-LM default).

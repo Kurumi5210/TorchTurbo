@@ -490,19 +490,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         self.causal_conv1d_fn = causal_conv1d_fn
         self.causal_conv1d_update = causal_conv1d_update or torch_causal_conv1d_update
-
-        # https://gitcode.com/Ascend/MindSpeed-MM/blob/fsdp2_dev/mindspeed_mm/fsdp/models/qwen3_5/modeling_qwen3_5.py
-        # self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
-        try:
-            from .chunk_gated_delta_rule import chunk_gated_delta_rule as _triton_gdr
-            self.chunk_gated_delta_rule = _triton_gdr
-        except ImportError:
-            logger.warning_once(
-                "Triton-based chunk_gated_delta_rule is not available (missing triton kernels). "
-                "Falling back to the pure-PyTorch implementation."
-            )
-            self.chunk_gated_delta_rule = torch_chunk_gated_delta_rule
-
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:

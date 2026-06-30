@@ -71,7 +71,7 @@ DISTRIBUTED_ARGS="
     --node_rank $NODE_RANK
 "
 RUN_LF="$(dirname "$0")/run_lf.py"
-DATASET_DIR="$(dirname "$0")/../../dataset/"
+DATASET_DIR="$(dirname "$0")/../../dataset/npu"
 
 export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/opensource/LlamaFactory/src/:$PYTHONPATH
 export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/torchturbo/src:$PYTHONPATH

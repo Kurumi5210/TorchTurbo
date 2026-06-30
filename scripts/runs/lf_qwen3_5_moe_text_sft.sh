@@ -100,7 +100,7 @@ DISTRIBUTED_ARGS="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUN_LF="${SCRIPT_DIR}/run_lf.py"
-DATASET_DIR="${REPO_ROOT}/dataset/"
+DATASET_DIR="${REPO_ROOT}/dataset/npu/"
 TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
 if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then

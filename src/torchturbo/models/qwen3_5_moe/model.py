@@ -9,7 +9,6 @@ from transformers import AutoModelForImageTextToText
 from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
-from torchturbo.ops import npu_fused_ops
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.utils.device import is_npu_available, get_device_name
 
@@ -99,13 +98,9 @@ class TurboQwen3_5MoeForConditionalGeneration(
         import torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_module
 
         if is_npu_available:
-            from torchturbo.ops.npu_fused_ops import npu_rms_norm
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+            from torchturbo.ops.npu_fused_ops import fused_token_permutation_npu, fused_token_unpermutation_npu
+            MoEAlltoAllTokenDispatcher.token_permutation = fused_token_permutation_npu
+            MoEAlltoAllTokenDispatcher.token_unpermutation = fused_token_unpermutation_npu
 
     def _post_init_patches(self):
         import torch
@@ -130,6 +125,12 @@ class TurboQwen3_5MoeForConditionalGeneration(
             return original_get_rope_index(*args, **kwargs)
 
         self.model.get_rope_index = _wrapped_get_rope_index
+
+        if is_npu_available:
+            from .chunk_gated_delta_rule import chunk_gated_delta_rule as npu_gdr
+            for _, module in self.model.named_modules():
+                if hasattr(module, "chunk_gated_delta_rule"):
+                    module.chunk_gated_delta_rule = npu_gdr
 
     def setup_sp(self, sp_info):
         from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing

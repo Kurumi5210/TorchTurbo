@@ -70,7 +70,7 @@ class FSDP2Backend(BaseBackend):
         self.device = get_device_name()
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
-        self._ignored_param_names: list[str] = []
+        self.parallel_plan: FSDPParallelPlan = None
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -204,13 +204,9 @@ class FSDP2Backend(BaseBackend):
         return model
 
     def _get_ignored_params(
-        self, model: nn.Module, ignored_param_names: list[str], logging = False
+        self, model: nn.Module, plan: FSDPParallelPlan, logging = False
     ) -> set[nn.Parameter]:
-        """Collect parameters whose names match ignored-param regex patterns."""
-        if not ignored_param_names:
-            return set()
-
-        ignored_patterns = [re.compile(pattern) for pattern in ignored_param_names]
+        ignored_patterns = [re.compile(pattern) for pattern, spec in plan.plan.items() if spec.ignored]
         ignored_params = set()
         for name, param in model.named_parameters():
             if any(pattern.search(name) for pattern in ignored_patterns):
@@ -219,28 +215,16 @@ class FSDP2Backend(BaseBackend):
                     logger.info(f"FSDP2 ignored param {len(ignored_params)}: {name}")
         return ignored_params
 
-    def _get_ignored_param_names(self, plan: FSDPParallelPlan) -> list[str]:
-        ignored_param_names = []
-        for spec in plan.plan.values():
-            if isinstance(spec, FSDPPlanSpec) and spec.ignored_param_names:
-                ignored_param_names.extend(spec.ignored_param_names)
-        return ignored_param_names
-
-    def _register_ignored_params_grad_sync(
-        self, ignored_params: set[nn.Parameter]
-    ) -> None:
+    def _register_ignored_params_grad_sync(self, model: nn.Module) -> None:
         """Register post-accumulate-gradient hooks for FSDP ignored_params.
 
         FSDP does not manage gradient synchronization for ignored_params,
         so we must manually all-reduce their gradients across the DP world.
         FSDP2 uses ReduceOp.AVG by default, so we use AVG here to match.
         """
-        if not ignored_params:
-            return
-
+        ignored_params = self._get_ignored_params(model, self.parallel_plan)
         world_group = dist.group.WORLD
         for param in ignored_params:
-
             def _grad_hook(p):
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=world_group)
@@ -262,6 +246,8 @@ class FSDP2Backend(BaseBackend):
         else:
             plan = parallel_plan
 
+        self.parallel_plan = plan
+
         # Initialize DeviceMesh and SP groups
         self._init_mesh(plan)
 
@@ -276,7 +262,7 @@ class FSDP2Backend(BaseBackend):
             model = apply_peft(model, peft_config)
 
         # Phase 3: FSDP2 sharding.
-        model = self._shard_model(model, parallel_plan)
+        model = self._shard_model(model, plan)
 
         ep_size = self.get_ep_info()["ep_size"]
         if ep_size > 1:
@@ -308,17 +294,15 @@ class FSDP2Backend(BaseBackend):
             device=self.device,
         )
         loader.load_weights()
+
+        # Register gradient all-reduce hooks for ignored_params after load_weights.
+        # load_weights calls to_empty, which replaces Parameter objects.
+        self._register_ignored_params_grad_sync(model)
         return model
 
     def materialize_model(self, model: nn.Module):
         model.to_empty(device=self.device)
         return model
-
-        # Register gradient all-reduce hooks for ignored_params after load_weights.
-        # load_weights calls to_empty, which replaces Parameter objects.
-        if self._ignored_param_names:
-            ignored_params = self._get_ignored_params(model, self._ignored_param_names)
-            self._register_ignored_params_grad_sync(ignored_params)
 
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
@@ -362,13 +346,9 @@ class FSDP2Backend(BaseBackend):
         if hasattr(self, "reshard_after_forward"):
             fsdp_kwargs["reshard_after_forward"] = self.reshard_after_forward
 
-        # Collect parameters matching ignored_param_names patterns into ignored_params.
-        ignored_param_names = self._get_ignored_param_names(plan)
-        ignored_params = self._get_ignored_params(model, ignored_param_names, True)
+        ignored_params = self._get_ignored_params(model, plan, True)
         if ignored_params:
             fsdp_kwargs["ignored_params"] = ignored_params
-            # Store ignored_param_names for lazy grad hook registration after load.
-            self._ignored_param_names = list(ignored_param_names)
 
         def _wrap(mod: nn.Module, target_mesh: Any) -> None:
             kw = fsdp_kwargs.copy()

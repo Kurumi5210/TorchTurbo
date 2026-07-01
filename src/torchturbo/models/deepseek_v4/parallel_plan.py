@@ -92,9 +92,6 @@ def get_parallel_plan(sp_size: int = 2, ep_size: int = 4) -> FSDPParallelPlan:
 
     return FSDPParallelPlan(
         plan={
-            "": FSDPPlanSpec(
-                ignored_param_names=_IGNORED_PARAM_NAMES,
-            ),
             "layers.*.ffn.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
@@ -102,6 +99,7 @@ def get_parallel_plan(sp_size: int = 2, ep_size: int = 4) -> FSDPParallelPlan:
                 replace_module=_replace_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
+            **{name: FSDPPlanSpec(ignored=True) for name in _IGNORED_PARAM_NAMES},
         },
         sp_size=sp_size,
         ep_size=ep_size,

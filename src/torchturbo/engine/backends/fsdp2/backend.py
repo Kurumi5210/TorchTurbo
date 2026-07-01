@@ -23,7 +23,7 @@ from torchturbo.parallel import (
 from .config import FSDPConfig
 from .weight_loader import DistParamLoader
 from .weight_saver import DistParamSaver
-from torchturbo.utils.device import get_device_name
+from torchturbo.utils.device import get_device_name, is_npu_available, is_cuda_available
 from ...config import EngineConfig
 from torchturbo.models.modules.comm import all_gather_tensor
 from torchturbo.models.modules.attention.ulysses import (
@@ -728,11 +728,12 @@ class FSDP2Backend(BaseBackend):
         from torch.nn import CrossEntropyLoss
 
         loss_fct = CrossEntropyLoss(reduction="sum")
+        ignore_index = loss_fct.ignore_index  # -100
 
         # Shift labels by (1 + shift_extra) positions to the left.
-        labels = nn.functional.pad(labels, (0, 1 + shift_extra), value=loss_fct.ignore_index)
+        labels = nn.functional.pad(labels, (0, 1 + shift_extra), value=ignore_index)
         labels = labels[..., 1 + shift_extra :].contiguous()
-        label_num = (labels != loss_fct.ignore_index).sum()
+        label_num = (labels != ignore_index).sum()
         if sp_size > 1:
             labels = slice_input_tensor(
                 labels,
@@ -745,7 +746,29 @@ class FSDP2Backend(BaseBackend):
 
         labels = labels.view(-1).to(logits.device)
         logits = logits.view(-1, logits.size(-1))
-        loss = loss_fct(logits, labels)
+
+        if is_npu_available:
+            import torch_npu
+            loss = torch_npu.npu_cross_entropy_loss(
+                logits, labels, reduction="sum", ignore_index=ignore_index
+            )
+            if isinstance(loss, tuple):
+                loss = loss[0]
+            if loss.dim() > 0:
+                loss = loss.squeeze()
+        elif is_cuda_available:
+            try:
+                from flash_attn.ops.triton.cross_entropy import (
+                    cross_entropy_loss as fa_cross_entropy_loss,
+                )
+                loss, _ = fa_cross_entropy_loss(
+                    logits, labels, ignore_index=ignore_index
+                )
+                loss = loss.sum()
+            except ImportError:
+                loss = loss_fct(logits, labels)
+        else:
+            loss = loss_fct(logits, labels)
 
         if sp_size > 1 and sp_group is not None:
             # Keep SP loss reduction in the autograd graph.  A plain

@@ -13,6 +13,21 @@
         "assistant_tag": "assistant"
     }
   },
+  "med_debug": {
+    "file_name": "/mnt/medmm-s3/common/data/debug_data/data_0630/sampled_sft_data_count_151372_0630_fixed.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system"
+    }
+  },
   "llava_1k_zh": {
     "file_name": "/sfs_turbo/zhisan/datasets/llava-en-zh-2k/train-00000-of-00001.parquet",
     "subset": "zh",

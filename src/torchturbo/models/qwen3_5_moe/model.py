@@ -80,10 +80,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
     def __init__(self, config: Qwen3_5MoeConfig) -> None:
         self._pre_init_patches()
-        # Force vision attention to eager to prevent Ulysses from patching
-        # visual encoder's flash attention (which lacks position_ids).
         if hasattr(config, "vision_config"):
-            config.vision_config._attn_implementation = "eager"
+           config.vision_config._attn_implementation = "flash_attention_2"
         super().__init__(config)
         self._post_init_patches()
 
@@ -138,6 +136,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
+        self.patch_vision_attention_interface()
         if sp_size > 1:
             from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
                 Qwen3_5MoeTextModel,
@@ -167,6 +166,61 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 self.patch_mtp_for_sp(
                     Qwen3_5MoeMultiTokenPredictor, sp_group, sp_size, sp_rank
                 )
+
+    @classmethod
+    def patch_vision_attention_interface(cls):
+        from . import modeling_qwen3_5_moe
+        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
+        attn_cls = modeling_qwen3_5_moe.Qwen3_5MoeVisionAttention
+        origin_attr = "_torchturbo_qwen3_5_moe_vision_origin_attention_interface"
+        if getattr(attn_cls, origin_attr, None) is not None:
+            return  # already patched
+        setattr(attn_cls, origin_attr, attn_cls.attention_interface)
+
+        def sp_attention_interface(
+            module,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            *args,
+            **kwargs,
+        ):
+            call_kwargs = kwargs.copy()
+            position_ids = call_kwargs.pop("position_ids", None)
+            dropout = call_kwargs.pop("dropout", 0.0)
+            softmax_scale = call_kwargs.pop("scaling", None)
+            is_causal = call_kwargs.pop("is_causal", False)
+
+            seq_len = query_states.shape[2]
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+            # Call _flash_attention_forward directly — NOT through
+            # ulysses_flash_attention_forward. Vision attention doesn't
+            # need SP (sequence parallel), so we bypass the Ulysses
+            # all-to-all wrapper entirely. This also avoids interference
+            # from _patch_ulysses_fa_for_sp's head-repeat logic and
+            # from LlamaFactoryHook's global _flash_attention_forward
+            # monkey-patch (which routes through ulysses_fa with
+            # sp_group/sp_size from the language model).
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length=seq_len,
+                is_causal=is_causal,
+                dropout=dropout,
+                position_ids=position_ids,
+                softmax_scale=softmax_scale,
+                **call_kwargs,  # cu_seq_lens_q/k, max_length_q/k flow through
+            )
+            return attn_output, None
+
+        attn_cls.attention_interface = staticmethod(sp_attention_interface)
 
     # ------------------------------------------------------------------
     # Full Attention: sp_repeat for Q heads

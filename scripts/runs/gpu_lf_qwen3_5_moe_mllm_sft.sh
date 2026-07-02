@@ -2,7 +2,7 @@
 # Qwen3.5-MoE TEXT SFT with torchturbo
 # Usage:
 #   bash scripts/runs/gpu_deps/qwen3_5_moe_deps.sh
-#   bash scripts/runs/gpu_lf_qwen3_5_moe_text_sft.sh
+#   bash scripts/runs/gpu_lf_qwen3_5_moe_mllm_sft.sh
 
 set -o pipefail
 
@@ -14,7 +14,7 @@ export NCCL_DEBUG=WARN
 
 export VIDEO_PLACEHOLDER="<qwen3_5_video_placeholder>"
 export AUDIO_PLACEHOLDER="<qwen3_5_audio_placeholder>"
-export IMAGE_PLACEHOLDER="<qwen3_5_image_placeholder>"
+#export IMAGE_PLACEHOLDER="<qwen3_5_image_placeholder>"
 
 
 if [ -z "$USER_NAME" ]; then
@@ -22,13 +22,13 @@ if [ -z "$USER_NAME" ]; then
     exit 1
 fi
 
-# /pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
-model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
+model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
+#model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
 
-seq_length=$((1024 * 4))
-sp_size=2
-ep_size=4
-dataset=science
+seq_length=$((1024 * 32))
+sp_size=8
+ep_size=8
+dataset=med_debug
 packing_mode=packing_sep
 finetuning_type=full
 
@@ -86,12 +86,14 @@ export PYTHONPATH=/input/asystem/xiyun.wc/LLaMA-Factory/src/:$PYTHONPATH
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size $sp_size \
     --tt_ep_size $ep_size \
+    --tt_freeze_vision_tower \
+    --tt_freeze_multi_modal_projector \
     --num_train_epochs 1 \
     --report_to tensorboard \
     --logging_dir /home/admin/logs/tfevent \
     --gradient_checkpointing \
     --dataset_dir ${DATASET_DIR} \
-    --max_steps 100 \
+    --max_steps 10000 \
     --trust_remote_code \
     --disable_shuffling \
     --stage sft \
@@ -99,7 +101,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --do_train \
     --flash_attn fa2 \
     --dataset $dataset \
-    --preprocessing_num_workers 16 \
+    --preprocessing_num_workers 32 \
     --cutoff_len ${seq_length} \
     --neat_packing \
     --template qwen3_5 \

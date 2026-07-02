@@ -1060,6 +1060,8 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3_5MoeVisionAttention(nn.Module):
+    attention_interface = staticmethod(eager_attention_forward)
+
     def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
         super().__init__()
         self.dim = config.hidden_size
@@ -1092,8 +1094,8 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        attention_interface: Callable = self.attention_interface
+        if self.config._attn_implementation != "eager" and attention_interface is eager_attention_forward:
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if "flash" in self.config._attn_implementation:

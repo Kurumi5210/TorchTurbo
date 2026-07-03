@@ -127,7 +127,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --preprocessing_num_workers 16 \
     --cutoff_len ${seq_length} \
     --neat_packing \
-    --template qwen3_5_no_think \
+    --template qwen3_5_nothink \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \
     --overwrite_output_dir \

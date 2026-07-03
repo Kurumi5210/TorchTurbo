@@ -105,7 +105,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --preprocessing_num_workers 64 \
     --cutoff_len ${seq_length} \
     --neat_packing \
-    --template qwen3_5 \
+    --template qwen3_5_nothink \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \
     --overwrite_output_dir \
@@ -113,16 +113,18 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --eval_accumulation_steps 1 \
-    --lr_scheduler_type cosine \
+    --lr_scheduler_type cosine_warmup_with_min_lr \
+    --lr_scheduler_kwargs '{"min_lr":1e-7}' \
     --logging_steps 1 \
     --overwrite_cache \
     --save_strategy "steps" \
     --eval_steps 200000000 \
     --save_steps 200000000 \
-    --warmup_ratio 0.0 \
-    --learning_rate 1.25e-5 \
+    --warmup_ratio 0.05 \
+    --learning_rate 1e-5 \
     --save_total_limit 1 \
     --plot_loss \
     --seed 42 \
     --bf16 \
-    --ddp_timeout 1800000000 2>&1 | tee -a $log_file
+    --include_num_input_tokens_seen \
+    --ddp_timeout 1800000000 2>&1 | tee $log_file

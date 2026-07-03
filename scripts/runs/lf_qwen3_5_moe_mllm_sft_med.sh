@@ -133,7 +133,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --preprocessing_num_workers 32 \
     --cutoff_len ${seq_length} \
     --neat_packing \
-    --template qwen3_5_no_think \
+    --template qwen3_5_nothink \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \
     --overwrite_output_dir \
@@ -157,7 +157,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_freeze_multi_modal_projector \
     --ddp_timeout 1800000000 2>&1 | tee -a $log_file
 
-# qwen3_5_no_think 32k sp4ep16
+# qwen3_5_nothink 32k sp4ep16
 # {'loss': 2.625, 'grad_norm': 175.26144409179688, 'learning_rate': 1.25e-05, 'epoch': 0.0}
 # {'loss': 0.7847, 'grad_norm': 43.624210357666016, 'learning_rate': 1.2499999691574866e-05, 'epoch': 0.0}
 # {'loss': 0.326, 'grad_norm': 10.339645385742188, 'learning_rate': 1.2499998766299491e-05, 'epoch': 0.01}

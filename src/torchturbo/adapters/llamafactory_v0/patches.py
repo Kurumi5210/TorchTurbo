@@ -21,6 +21,86 @@ _LF_V0 = ">=0.5,<1.0"
 
 
 # ---------------------------------------------------------------------------
+# DictFieldPatch — fix dict-typed CLI args in HfArgumentParser
+# ---------------------------------------------------------------------------
+
+# Field names whose type resolves to dict in HfArgumentParser and need
+# the str→dict fix.  Append more names here as needed.
+_DICT_FIELD_NAMES = frozenset({
+    "lr_scheduler_kwargs",
+})
+
+
+class DictFieldPatch(BasePatch):
+    """Fix dict-typed CLI args in ``HfArgumentParser``.
+
+    ``HfArgumentParser._parse_dataclass_field`` resolves ``Union[dict, str]``
+    to ``type=dict``, so argparse calls ``dict(cli_string)`` which cannot
+    parse JSON and raises::
+
+        error: invalid dict value: '{min_lr:1e-7}'
+
+    Fix: for fields listed in ``_DICT_FIELD_NAMES``, temporarily set
+    ``field.type = str`` so argparse stores the raw string.  The existing
+    ``TrainingArguments.__post_init__`` pipeline
+    (``_VALID_DICT_FIELDS`` → ``json.loads`` → ``_convert_str_dict``)
+    then converts it to a proper dict.
+
+    To cover more dict-typed fields, add their names to ``_DICT_FIELD_NAMES``.
+
+    CLI usage::
+
+        --lr_scheduler_kwargs '{"min_lr":1e-7}'
+    """
+
+    name = "dict_field"
+    supported_versions = _LF_V0
+
+    def __init__(self) -> None:
+        self._original = None
+        try:
+            from transformers.hf_argparser import HfArgumentParser
+        except ImportError:
+            return
+
+        original = HfArgumentParser._parse_dataclass_field
+        self._original = original
+        field_names = _DICT_FIELD_NAMES
+
+        @staticmethod
+        def _patched(parser, field):
+            if field.name in field_names:
+                saved = field.type
+                field.type = str
+                try:
+                    original(parser, field)
+                finally:
+                    field.type = saved
+            else:
+                original(parser, field)
+
+        HfArgumentParser._parse_dataclass_field = _patched
+        logger.info(
+            "Patched HfArgumentParser for dict-typed fields: %s",
+            sorted(field_names),
+        )
+
+    def patch(self, engine: TorchTurboEngine | None = None) -> None:
+        pass  # already applied in __init__
+
+    def revert(self) -> None:
+        if self._original is None:
+            return
+        try:
+            from transformers.hf_argparser import HfArgumentParser
+        except ImportError:
+            return
+        HfArgumentParser._parse_dataclass_field = self._original
+        self._original = None
+        logger.info("Reverted HfArgumentParser dict-field patch")
+
+
+# ---------------------------------------------------------------------------
 # RunExpPatch — intercepts run_exp to build engine from LF args
 # ---------------------------------------------------------------------------
 

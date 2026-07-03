@@ -43,9 +43,9 @@ def register() -> None:
         )
         logger.debug("Registered LF template 'qwen3_5'")
 
-    if "qwen3_5_no_think" not in TEMPLATES:
+    if "qwen3_5_nothink" not in TEMPLATES:
         register_template(
-            name="qwen3_5_no_think",
+            name="qwen3_5_nothink",
             format_user=StringFormatter(
                 slots=[
                     "<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"
@@ -63,4 +63,4 @@ def register() -> None:
                 video_token="<|video_pad|>",
             ),
         )
-        logger.debug("Registered LF template 'qwen3_5_no_think'")
+        logger.debug("Registered LF template 'qwen3_5_nothink'")

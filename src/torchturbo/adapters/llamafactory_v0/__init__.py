@@ -36,6 +36,7 @@ from .patches import (
     AcceleratorPatch,
     CollatorPatch,
     CreateRefModelPatch,
+    DictFieldPatch,
     LoadModelPatch,
     LogCallbackPatch,
     PretrainProcessorPatch,
@@ -117,6 +118,11 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         self.add_patch(RegisterAutoclassPatch())
         self.add_patch(PretrainProcessorPatch())
         self.add_patch(LogCallbackPatch())
+
+        # Fix HfArgumentParser: dict-typed CLI args like --lr_scheduler_kwargs
+        # fail because argparse calls dict(cli_string).  Patch in __init__,
+        # before get_train_args is ever called.
+        self.add_patch(DictFieldPatch())
 
         # RunExpPatch is special: it intercepts run_sft, builds the
         # engine, then calls self.apply_patches(engine) for the rest

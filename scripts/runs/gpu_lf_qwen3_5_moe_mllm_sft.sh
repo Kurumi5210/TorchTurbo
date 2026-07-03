@@ -32,6 +32,11 @@ dataset=med_debug
 packing_mode=packing_sep
 finetuning_type=full
 
+if [ ! -d /mnt/medmm-s3/common/data/debug_data ]; then
+    mkdir -p /mnt/medmm-s3/common/data
+    ln -s /input/asystem/xiyun.wc/dataset/med /mnt/medmm-s3/common/data/debug_data
+fi
+
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
 export TRANSFORMERS_VERBOSITY=error
@@ -93,18 +98,16 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --logging_dir /home/admin/logs/tfevent \
     --gradient_checkpointing \
     --dataset_dir ${DATASET_DIR} \
-    --max_steps 10000 \
     --trust_remote_code \
-    --disable_shuffling \
     --stage sft \
     --model_name_or_path $model_name_or_path \
     --do_train \
     --flash_attn fa2 \
     --dataset $dataset \
-    --preprocessing_num_workers 32 \
+    --preprocessing_num_workers 64 \
     --cutoff_len ${seq_length} \
     --neat_packing \
-    --template qwen3_5 \
+    --template qwen3_5_nothink \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \
     --overwrite_output_dir \
@@ -112,16 +115,17 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --eval_accumulation_steps 1 \
-    --lr_scheduler_type cosine \
+    --lr_scheduler_type cosine_warmup_with_min_lr \
+    --lr_scheduler_kwargs '{"min_lr":1e-7}' \
     --logging_steps 1 \
     --overwrite_cache \
     --save_strategy "steps" \
     --eval_steps 200000000 \
     --save_steps 200000000 \
-    --warmup_ratio 0.0 \
-    --learning_rate 1.25e-5 \
+    --warmup_ratio 0.05 \
+    --learning_rate 1e-5 \
     --save_total_limit 1 \
     --plot_loss \
-    --seed 42 \
     --bf16 \
-    --ddp_timeout 1800000000 2>&1 | tee -a $log_file
+    --include_num_input_tokens_seen \
+    --ddp_timeout 1800000000 2>&1 | tee $log_file

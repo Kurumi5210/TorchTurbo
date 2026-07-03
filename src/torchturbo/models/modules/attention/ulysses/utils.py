@@ -119,7 +119,6 @@ def ulysses_pad(
     pad_value: int = 0,
 ):
     if position_ids_rmpad is not None:
-        assert position_ids_rmpad.size(-2) == 1
         assert input_ids_rmpad.size(-1) == position_ids_rmpad.size(
             -1
         ), f"input_ids shape: {input_ids_rmpad.shape}, position_ids shape: {position_ids_rmpad.shape}"
@@ -139,7 +138,9 @@ def ulysses_pad(
                 pad_size, device=position_ids_rmpad.device
             ).unsqueeze(0)
             if position_ids_rmpad.dim() == 3:
-                pad_pos_ids = pad_pos_ids.unsqueeze(0).repeat(3, 1, 1)
+                pad_pos_ids = pad_pos_ids.expand(
+                    *position_ids_rmpad.shape[:-1], -1
+                )
             position_ids_rmpad = torch.cat((position_ids_rmpad, pad_pos_ids), dim=-1)
         if labels is not None:
             labels = torch.nn.functional.pad(labels, (0, pad_size), value=-100)

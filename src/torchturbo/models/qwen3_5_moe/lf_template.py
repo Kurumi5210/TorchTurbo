@@ -11,7 +11,7 @@ logger = get_logger(__name__)
 
 
 def register() -> None:
-    """Register the qwen3_5 chat template with LlamaFactory."""
+    """Register the qwen3_5 chat templates with LlamaFactory."""
     from llamafactory.data.template import (
         register_template,
         TEMPLATES,
@@ -42,3 +42,25 @@ def register() -> None:
             ),
         )
         logger.debug("Registered LF template 'qwen3_5'")
+
+    if "qwen3_5_no_think" not in TEMPLATES:
+        register_template(
+            name="qwen3_5_no_think",
+            format_user=StringFormatter(
+                slots=[
+                    "<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"
+                ]
+            ),
+            format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+            format_system=StringFormatter(
+                slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]
+            ),
+            stop_words=["<|im_end|>"],
+            replace_eos=True,
+            mm_plugin=get_mm_plugin(
+                name="qwen3_vl",
+                image_token="<|image_pad|>",
+                video_token="<|video_pad|>",
+            ),
+        )
+        logger.debug("Registered LF template 'qwen3_5_no_think'")

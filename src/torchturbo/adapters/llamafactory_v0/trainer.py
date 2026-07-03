@@ -415,17 +415,11 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
         return buffers
 
     def concatenated_forward(self, model, batch, is_ref_model: bool = False):
-        if self._engine().get_sp_info()["sp_size"] <= 1:
-            return super().concatenated_forward(
-                model,
-                batch,
-                is_ref_model=is_ref_model,
-            )
-
         from llamafactory.train.trainer_utils import nested_detach
         from torchturbo.models.modules.attention.ulysses import slice_input_tensor
 
         sp_info = self._engine().get_sp_info()
+        sp_size = sp_info["sp_size"]
         sp_group = sp_info["sp_group"]
         sp_rank = sp_info["sp_rank"]
 
@@ -443,14 +437,15 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
         labels = nn.functional.pad(labels, (0, 1), value=self.label_pad_token_id)
         labels = labels[..., 1:].contiguous()
-        labels = slice_input_tensor(
-            labels,
-            dim=1,
-            group=sp_group,
-            rank=sp_rank,
-            padding=False,
-            sp_mode="ulysses",
-        )
+        if sp_size > 1:
+            labels = slice_input_tensor(
+                labels,
+                dim=1,
+                group=sp_group,
+                rank=sp_rank,
+                padding=False,
+                sp_mode="ulysses",
+            )
 
         all_logps, valid_length = self.get_batch_logps_with_sp(
             logits=all_logits,
@@ -496,9 +491,6 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
         return reference_chosen_logps, reference_rejected_logps
 
     def get_batch_loss_metrics(self, model, inputs, train_eval: str = "train"):
-        if self._engine().get_sp_info()["sp_size"] <= 1:
-            return super().get_batch_loss_metrics(model, inputs, train_eval=train_eval)
-
         from torch.distributed.nn.functional import all_reduce
         from torchturbo.models.modules.attention.ulysses import (
             ulysses_pad,
@@ -562,16 +554,17 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
             self.compute_reference_log_probs(model, inputs)
         )
 
-        policy_chosen_logps = all_reduce(policy_chosen_logps, group=sp_group)
-        policy_rejected_logps = all_reduce(policy_rejected_logps, group=sp_group)
-        policy_chosen_length = all_reduce(policy_chosen_length, group=sp_group)
-        if reference_chosen_logps is not None:
-            reference_chosen_logps = all_reduce(reference_chosen_logps, group=sp_group)
-        if reference_rejected_logps is not None:
-            reference_rejected_logps = all_reduce(
-                reference_rejected_logps,
-                group=sp_group,
-            )
+        if sp_size > 1:
+            policy_chosen_logps = all_reduce(policy_chosen_logps, group=sp_group)
+            policy_rejected_logps = all_reduce(policy_rejected_logps, group=sp_group)
+            policy_chosen_length = all_reduce(policy_chosen_length, group=sp_group)
+            if reference_chosen_logps is not None:
+                reference_chosen_logps = all_reduce(reference_chosen_logps, group=sp_group)
+            if reference_rejected_logps is not None:
+                reference_rejected_logps = all_reduce(
+                    reference_rejected_logps,
+                    group=sp_group,
+                )
 
         losses, chosen_rewards, rejected_rewards = self.compute_preference_loss(
             policy_chosen_logps,

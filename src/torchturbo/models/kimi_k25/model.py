@@ -18,14 +18,68 @@ from torchturbo.models.modules.attention.ulysses import (
 )
 
 from ..registry import register_model
-from ..weight_converter import WeightConverterMixin
+from ..weight_converter import BaseWeightConverter, WeightConverterMixin
 from transformers import AutoModelForCausalLM
+
+
+class KimiK25WeightConverter(BaseWeightConverter):
+    """Weight converter for Kimi-K2.5.
+
+    Kimi-K2.5 is a VLM whose real transformer dims live under
+    ``config.text_config`` (DeepseekV3Config), not on the top-level
+    ``KimiK25Config`` wrapper. BaseWeightConverter reads ``hidden_size`` /
+    ``moe_intermediate_size`` / ``model_type`` / dtype off ``self.config``,
+    so we re-point it at ``text_config``.
+
+    The language model is DeepSeek-V3 with per-expert checkpoint format
+    (``language_model.model.layers.N.mlp.experts.{i}.gate_proj/up_proj/
+    down_proj.weight``), so the BaseWeightConverter defaults for the
+    expert (``gate_proj``/``up_proj``/``down_proj``) and router
+    (``router`` -> ``gate``, ``gate.e_score_correction_bias``) names
+    already match; no name overrides are needed.
+    """
+
+    def __init__(self, config, moe_config, mesh):
+        text_config = config.text_config if hasattr(config, "text_config") else config
+        super().__init__(text_config, moe_config, mesh)
+        self.full_config = config
 
 
 @register_model("kimi_k25", config_cls=KimiK25Config, auto_class=AutoModelForCausalLM)
 class TurboKimiK25ForConditionalGeneration(WeightConverterMixin, KimiK25ForConditionalGeneration):
 
     is_vlm = True
+
+    # ---- Config dtype set / reset (VLM override) ----
+
+    @classmethod
+    def set_config_dtype_to_float32(cls, config):
+        """Also set text_config / vision_config dtype to float32.
+
+        FSDP2 uses float32 as main param storage and requires a uniform
+        param dtype at construction time. Kimi's sub-configs may still
+        carry bfloat16, which would create mixed dtypes on the meta device.
+        """
+        state = super().set_config_dtype_to_float32(config)
+        if hasattr(config, "text_config") and hasattr(config.text_config, "dtype"):
+            state["text_config_dtype"] = config.text_config.dtype
+            config.text_config.dtype = torch.float32
+        if hasattr(config, "vision_config") and hasattr(config.vision_config, "dtype"):
+            state["vision_config_dtype"] = config.vision_config.dtype
+            config.vision_config.dtype = torch.float32
+        return state
+
+    @classmethod
+    def reset_config_dtype(cls, config, state):
+        """Reset text_config / vision_config dtype after construction."""
+        if "text_config_dtype" in state:
+            config.text_config.dtype = state["text_config_dtype"]
+        if "vision_config_dtype" in state:
+            config.vision_config.dtype = state["vision_config_dtype"]
+        super().reset_config_dtype(config, state)
+
+    def get_weight_converter(self, mesh):
+        return KimiK25WeightConverter(self.config, self.get_moe_config(), mesh)
 
     def __init__(self, config: KimiK25Config) -> None:
         self._pre_init_patches()

@@ -26,7 +26,7 @@ model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQ
 #model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
 
 seq_length=$((1024 * 32))
-sp_size=8
+sp_size=4
 ep_size=8
 dataset=med_debug
 packing_mode=packing_sep
@@ -128,4 +128,5 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --plot_loss \
     --bf16 \
     --include_num_input_tokens_seen \
+    --torch_empty_cache_steps 10 \
     --ddp_timeout 1800000000 2>&1 | tee $log_file

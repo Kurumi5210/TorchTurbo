@@ -1844,8 +1844,19 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         video_features: torch.FloatTensor | None = None,
     ):
         """
-        Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
-        equal to the length of multimodal features. If the lengths are different, an error is raised.
+        Obtains multimodal placeholder mask from ``input_ids`` or
+        ``inputs_embeds``, and reconciles the placeholder token count
+        with the length of multimodal features.
+
+        After truncation (e.g. dataset cutoff_len), the number of
+        image/video tokens in ``input_ids`` may be **fewer** than the
+        provided features — the tail tokens were sliced away while the
+        feature lists remained intact.  In that case we trim the
+        features to match the surviving tokens so the sample degrades
+        gracefully (partial multimodal content) instead of crashing.
+
+        If there are **more** tokens than features, that indicates a
+        deeper inconsistency and we still raise an error.
         """
         if input_ids is None:
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
@@ -1863,17 +1874,35 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         n_image_tokens = special_image_mask.sum()
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if image_features is not None:
-            assert inputs_embeds[special_image_mask].numel() == image_features.numel(), (
-                f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_features.shape[0]}"
-            )
+            n_feat_tokens = image_features.shape[0]
+            if n_image_tokens == 0:
+                # No image tokens survived truncation — skip entirely.
+                image_features = None
+            elif n_image_tokens < n_feat_tokens:
+                # Tokens were truncated; trim features to match.
+                image_features = image_features[:n_image_tokens]
+            elif n_image_tokens > n_feat_tokens:
+                raise ValueError(
+                    f"Image tokens ({n_image_tokens}) exceed available features "
+                    f"({image_features.shape[0]}). This indicates a data "
+                    f"pipeline error, not a truncation mismatch."
+                )
 
         n_video_tokens = special_video_mask.sum()
         special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         if video_features is not None:
-            assert inputs_embeds[special_video_mask].numel() == video_features.numel(), (
-                f"Video features and video tokens do not match, tokens: {n_video_tokens}, features: {video_features.shape[0]}"
-            )
-        return special_image_mask, special_video_mask
+            n_feat_tokens = video_features.shape[0]
+            if n_video_tokens == 0:
+                video_features = None
+            elif n_video_tokens < n_feat_tokens:
+                video_features = video_features[:n_video_tokens]
+            elif n_video_tokens > n_feat_tokens:
+                raise ValueError(
+                    f"Video tokens ({n_video_tokens}) exceed available features "
+                    f"({video_features.shape[0]}). This indicates a data "
+                    f"pipeline error, not a truncation mismatch."
+                )
+        return special_image_mask, special_video_mask, image_features, video_features
 
     def compute_3d_position_ids(
         self,
@@ -1952,10 +1981,11 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             )
             image_embeds = image_outputs.pooler_output
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
+            image_mask, _, image_embeds, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            if image_embeds is not None:
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
             video_outputs: BaseModelOutputWithPooling = self.get_video_features(
@@ -1963,10 +1993,11 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             )
             video_embeds = video_outputs.pooler_output
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
+            _, video_mask, _, video_embeds = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            if video_embeds is not None:
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(

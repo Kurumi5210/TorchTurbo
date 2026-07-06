@@ -59,6 +59,12 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 replace_module=_replace_qwen3_5_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
+            # "model.language_model.embed_tokens": FSDPPlanSpec(
+            #     placement=FSDPPlacementSpec(Shard(0), "world"),
+            # ),
+            # "lm_head": FSDPPlanSpec(
+            #     placement=FSDPPlacementSpec(Shard(0), "world"),
+            # ),
             "mtp.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),

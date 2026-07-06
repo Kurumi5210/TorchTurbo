@@ -34,7 +34,7 @@ finetuning_type=full
 
 if [ ! -d /mnt/medmm-s3/common/data/debug_data ]; then
     mkdir -p /mnt/medmm-s3/common/data
-    ln -s /input/asystem/xiyun.wc/dataset/med /mnt/medmm-s3/common/data/debug_data
+    ln -s /input/torchturbo/stable/dataset/med /mnt/medmm-s3/common/data/debug_data
 fi
 
 export WANDB_DISABLED=True
@@ -86,7 +86,7 @@ if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
     exit 1
 fi
 
-export PYTHONPATH=/input/asystem/xiyun.wc/LLaMA-Factory/src/:$PYTHONPATH
+export PYTHONPATH=/input/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size $sp_size \

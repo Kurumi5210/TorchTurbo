@@ -23,8 +23,9 @@ pip install trl==0.24.0
 pip install matplotlib
 
 pip uninstall flash_attn -y
-pip install /input/asystem/xiyun.wc/build/h20/flash_attn-2.8.3.post1-cp312-cp312-linux_x86_64.whl --no-deps
-pip install /input/asystem/xiyun.wc/grouped_gemm/dist/nv_grouped_gemm-1.1.4.post8-cp312-cp312-linux_x86_64.whl --no-deps
+pip install /input/torchturbo/stable/h20/build/flash_attn-2.8.3.post1-cp312-cp312-linux_x86_64.whl --no-deps
+pip install /input/torchturbo/stable/h20/build/nv_grouped_gemm-1.1.4.post8-cp312-cp312-linux_x86_64.whl --no-deps
+pip install /input/torchturbo/stable/h20/build/causal_conv1d-1.6.2.post1-cp312-cp312-linux_x86_64.whl --no-deps
 
 
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

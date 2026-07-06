@@ -1,6 +1,6 @@
 {
   "science": {
-    "file_name": "/input/asystem/xiyun.wc/dataset/science.jsonl",
+    "file_name": "/input/torchturbo/stable/dataset/science.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "conversations",
@@ -29,7 +29,7 @@
     }
   },
   "llava_1k_zh": {
-    "file_name": "/input/asystem/xiyun.wc/dataset/llava-en-zh-2k/train-00000-of-00001.parquet",
+    "file_name": "/input/torchturbo/stable/dataset/llava-en-zh-2k/train-00000-of-00001.parquet",
     "subset": "zh",
     "formatting": "sharegpt",
     "columns": {
@@ -44,20 +44,20 @@
     }
   },
   "wikipedia_en": {
-    "file_name": "/input/asystem/xiyun.wc/dataset/olm-wikipedia-data/data",
+    "file_name": "/input/torchturbo/stable/dataset/olm-wikipedia-data/data",
     "columns": {
       "prompt": "text"
     }
   },
   "security": {
-    "file_name": "/input/asystem/xiyun.wc/dataset/xg/data_output_full.jsonl",
+    "file_name": "/input/torchturbo/stable/dataset/xg/data_output_full.jsonl",
     "columns": {
       "prompt": "text",
       "images": "image"
     }
   },
   "sectask": {
-    "file_name": "/input/asystem/xiyun.wc/dataset/sllmworks_train.jsonl",
+    "file_name": "/input/torchturbo/stable/dataset/sllmworks_train.jsonl",
     "columns": {
       "prompt": "instruction",
       "query": "input",
@@ -65,7 +65,7 @@
     }
   },
   "orca_rlhf": {
-    "file_name": "/input/asystem/xiyun.wc/dataset/orca_rlhf.jsonl",
+    "file_name": "/input/torchturbo/stable/dataset/orca_rlhf.jsonl",
     "ranking": true,
     "columns": {
       "prompt": "system",

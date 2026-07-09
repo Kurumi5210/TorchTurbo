@@ -4,6 +4,7 @@ from typing_extensions import override
 
 import torch
 
+
 from transformers import AutoModelForImageTextToText
 
 from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
@@ -11,11 +12,21 @@ from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeCo
 
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.utils.device import is_npu_available, get_device_name
+from torchturbo.utils.flash_attn_utils import get_unpad_data_lf
+from torchturbo.utils.functools import cache
+
 
 from ..registry import register_model
 from ..weight_converter import WeightConverterMixin, FusedExpertWeightConverter
 
-
+@cache
+def _get_cu_seqlens(attention_mask):
+    if attention_mask is not None and torch.max(attention_mask) > 1:
+        _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
+        if cu_seqlens[-1] != attention_mask.size(1):
+            cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
+        return cu_seqlens
+    return None
 class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
 
     def __init__(self, config, moe_config, mesh):
@@ -39,7 +50,6 @@ class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
         if self.get_hf_linear_attn_norm_name() in param_name:
             return torch.float32
         return self.dtype
-
 @register_model(
     "qwen3_5_moe",
     config_cls=Qwen3_5MoeConfig,
@@ -103,24 +113,125 @@ class TurboQwen3_5MoeForConditionalGeneration(
     def _post_init_patches(self):
         import torch
         import functools
+        import itertools
 
-        # Wrap get_rope_index to auto-fill mm_token_type_ids when not provided.
-        # Open-source LF collator doesn't pass this arg.
+        # Wrap get_rope_index:
+        # 1. auto-fill mm_token_type_ids when not provided (the open-source LF
+        #    collator never passes this arg);
+        # 2. support LLaMA-Factory neat packing. The upstream get_rope_index
+        #    collapses the attention_mask with .bool(), which merges packed
+        #    sub-sequences into one contiguous run and never resets positions.
+        #    Under neat packing the mask carries incrementing integers
+        #    (1, 2, 3, ... per packed sub-sequence, 0 = pad), so we detect that
+        #    (max > 1) and run a packing-aware variant here, keeping
+        #    modeling_qwen3_5_moe.py unchanged (upstream-faithful).
         original_get_rope_index = self.model.get_rope_index
+        get_vision_position_ids = self.model.get_vision_position_ids
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = getattr(self.config, "image_token_id", None)
         video_token_id = getattr(self.config, "video_token_id", None)
+
+        def _build_mm_token_type_ids(input_ids):
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            if image_token_id is not None:
+                mm_token_type_ids[input_ids == image_token_id] = 1
+            if video_token_id is not None:
+                mm_token_type_ids[input_ids == video_token_id] = 2
+            return mm_token_type_ids
 
         @functools.wraps(original_get_rope_index)
         def _wrapped_get_rope_index(*args, **kwargs):
             if "mm_token_type_ids" not in kwargs or kwargs["mm_token_type_ids"] is None:
                 input_ids = kwargs.get("input_ids")
                 if input_ids is not None:
-                    kwargs["mm_token_type_ids"] = torch.zeros_like(input_ids)
-                    if image_token_id is not None:
-                        kwargs["mm_token_type_ids"][input_ids == image_token_id] = 1
-                    if video_token_id is not None:
-                        kwargs["mm_token_type_ids"][input_ids == video_token_id] = 2
-            return original_get_rope_index(*args, **kwargs)
+                    kwargs["mm_token_type_ids"] = _build_mm_token_type_ids(input_ids)
+
+            attention_mask = kwargs.get("attention_mask")
+            # Packing-aware path only when the mask actually carries packing
+            # labels (neat packing): values > 1 distinguish packed sub-sequences.
+            # A plain 0/1 mask (or no mask) falls through to the upstream impl,
+            # so non-packed training and inference are byte-identical to before.
+            if attention_mask is None or attention_mask.numel() == 0 or torch.max(attention_mask) <= 1:
+                return original_get_rope_index(*args, **kwargs)
+
+            input_ids = kwargs["input_ids"]
+            mm_token_type_ids = kwargs["mm_token_type_ids"]
+            image_grid_thw = kwargs.get("image_grid_thw")
+            video_grid_thw = kwargs.get("video_grid_thw")
+
+            position_ids = torch.zeros(
+                3,
+                input_ids.shape[0],
+                input_ids.shape[1],
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            grid_iters = {
+                1: iter(image_grid_thw) if image_grid_thw is not None else None,
+                2: iter(video_grid_thw) if video_grid_thw is not None else None,
+            }
+
+            mrope_position_deltas = []
+            for batch_idx in range(input_ids.shape[0]):
+                row_mask = attention_mask[batch_idx]
+                input_token_type = mm_token_type_ids[batch_idx]
+
+                # Valid (non-padding) tokens and their packed-block labels.
+                nonzero_idx = row_mask != 0
+                token_types = input_token_type[nonzero_idx].tolist()
+                block_labels = row_mask[nonzero_idx].tolist()
+
+                # Group consecutive tokens by (block_label, modality): a change in
+                # EITHER the packed-block label OR the modality starts a new group,
+                # so two images in adjacent packed sequences consume two separate
+                # grid_thw entries and each block restarts positions from 0.
+                input_type_group = []
+                for (block_label, modality_type), group in itertools.groupby(
+                    range(len(token_types)),
+                    key=lambda i: (block_labels[i], token_types[i]),
+                ):
+                    grp = list(group)
+                    input_type_group.append((modality_type, grp[0], grp[-1] + 1, block_label))
+
+                current_pos = 0
+                prev_block = None
+                llm_pos_ids_list = []
+                for modality_type, start_idx, end_idx, block_label in input_type_group:
+                    # Reset position at each packed-sequence boundary.
+                    if block_label != prev_block:
+                        current_pos = 0
+                        prev_block = block_label
+                    # text == 0
+                    if modality_type == 0:
+                        text_len = end_idx - start_idx
+                        llm_pos_ids_list.append(
+                            torch.arange(text_len, device=input_ids.device)
+                            .view(1, -1)
+                            .expand(3, -1)
+                            + current_pos
+                        )
+                        current_pos += text_len
+                    # image == 1, video == 2
+                    else:
+                        grid_thw = next(grid_iters[modality_type])
+                        vision_position_ids = get_vision_position_ids(
+                            current_pos, grid_thw, 1, spatial_merge_size, device=input_ids.device
+                        )
+                        llm_pos_ids_list.append(vision_position_ids)
+                        current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
+
+                if llm_pos_ids_list:
+                    llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                    position_ids[:, batch_idx, nonzero_idx] = llm_positions.to(position_ids.device)
+                    mrope_position_deltas.append(int(llm_positions.max()) + 1 - len(token_types))
+                else:
+                    # All-padding row: nothing to assign, delta is 0.
+                    mrope_position_deltas.append(0)
+
+            mrope_position_deltas = torch.tensor(
+                mrope_position_deltas, device=input_ids.device
+            ).unsqueeze(1)
+            return position_ids, mrope_position_deltas
 
         self.model.get_rope_index = _wrapped_get_rope_index
 
@@ -389,7 +500,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
             gather_heads_scatter_seq,
         )
         from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-            apply_mask_to_padding_states,
+            naive_causal_conv1d_wrapper
         )
         import torch.nn.functional as F
 
@@ -408,9 +519,9 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
         def sp_forward(self_attn, hidden_states, **kwargs):
             # Apply mask & extract shapes
-            hidden_states = apply_mask_to_padding_states(
-                hidden_states, kwargs.get("attention_mask")
-            )
+            cu_seqlens = None
+            attention_mask = kwargs.get("attention_mask", None)
+            cu_seqlens = _get_cu_seqlens(attention_mask)
             B, local_T, _ = hidden_states.shape
 
             nk_full, nv_full = self_attn.num_k_heads, self_attn.num_v_heads
@@ -519,26 +630,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
                     dim=0,
                 )
 
-            local_conv_dim = local_qkv.shape[1]
-
-            if self_attn.causal_conv1d_fn is not None:
-                local_qkv = self_attn.causal_conv1d_fn(
-                    x=local_qkv,
-                    weight=local_conv_weight.squeeze(1),
-                    bias=local_conv_bias,
-                    activation=self_attn.activation,
-                    seq_idx=None,
-                )
-            else:
-                local_qkv = F.silu(
-                    F.conv1d(
-                        local_qkv,
-                        local_conv_weight,
-                        bias=local_conv_bias,
-                        groups=local_conv_dim,
-                        padding=self_attn.conv_kernel_size - 1,
-                    )[:, :, :T]
-                )
+            local_qkv = naive_causal_conv1d_wrapper(local_qkv, cu_seqlens, self_attn, local_conv_weight, local_conv_bias)
 
             # Split conv output → reshape to heads
             local_qkv = local_qkv.transpose(1, 2)
@@ -586,17 +678,22 @@ class TurboQwen3_5MoeForConditionalGeneration(
             dt_bias_local = _slice_param(self_attn.dt_bias, 0)
             g = -A_log_local.float().exp() * F.softplus(a.float() + dt_bias_local)
 
+            seq_len = q.shape[1]
+            valid_len = cu_seqlens[-1] if cu_seqlens != None else seq_len
             # Chunk Gated Delta Rule (core linear attention)
             out, _ = self_attn.chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
+                q=q[:, :valid_len],
+                k=k[:, :valid_len],
+                v=v[:, :valid_len],
+                g=g[:, :valid_len],
+                beta=beta[:, :valid_len],
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens = cu_seqlens,
             )
+            if out.shape[1] < seq_len:
+                out = torch.cat([out, out.new_zeros(out.shape[0], seq_len - out.shape[1], *out.shape[2:])], dim=1)
 
             # All-to-all #2: gather heads / scatter seq back
             out = gather_heads_scatter_seq(
@@ -641,5 +738,5 @@ class TurboQwen3_5MoeForConditionalGeneration(
                     torch.arange(0, vis_rope.dim, 2, dtype=torch.float)
                     / vis_rope.dim
                 )
-            )
+            ).to(device)
             vis_rope.register_buffer("inv_freq", vis_inv_freq, persistent=False)

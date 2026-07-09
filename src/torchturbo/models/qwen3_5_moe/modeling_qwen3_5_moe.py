@@ -59,6 +59,8 @@ else:
     chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
     FusedRMSNormGated = None
 
+from torch_turbo.utils.flash_attn_utils import get_unpad_data
+
 logger = logging.get_logger(__name__)
 
 
@@ -439,6 +441,45 @@ def torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+def gda_conv1d(x, self_attn, local_conv_weight, local_conv_bias):
+    if self_attn.causal_conv1d_fn is not None:
+        o = self_attn.causal_conv1d_fn(
+            x=x,
+            weight=local_conv_weight.squeeze(1),
+            bias=local_conv_bias,
+            activation=self_attn.activation,
+            seq_idx=None,
+        )
+    else:
+        T = x.shape[2]
+        o = F.silu(
+            F.conv1d(
+                x,
+                local_conv_weight,
+                bias=local_conv_bias,
+                groups=x.shape[1],
+                padding=self_attn.conv_kernel_size - 1,
+            )
+        )[:, :, :T]
+    return o
+
+def naive_causal_conv1d_wrapper(tensor, cu_seqlens, self_attn, local_conv_weight, local_conv_bias):
+    if cu_seqlens is not None:
+        N = cu_seqlens.shape[0] - 1
+        outputs = []
+        for i in range(N):
+            s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            o = gda_conv1d(tensor[:, :, s:e], self_attn, local_conv_weight, local_conv_bias)
+            outputs.append(o)
+        o = torch.cat(outputs, dim=2)
+        # Pad output back to original sequence length (padding positions excluded by cu_seqlens)
+        seq_len = tensor.shape[2]
+        if o.shape[2] < seq_len:
+            o = torch.cat([o, o.new_zeros(o.shape[0], o.shape[1], seq_len - o.shape[2])], dim=2)
+        return o
+    else:
+        return gda_conv1d(tensor, self_attn, local_conv_weight, local_conv_bias)
+
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
@@ -512,7 +553,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         cache_position: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        #hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        cu_seqlens = None
+        if attention_mask != None:
+            _, cu_seqlens, _ = get_unpad_data(attention_mask)
 
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
@@ -552,16 +596,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             if cache_params is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 cache_params.conv_states[self.layer_idx] = conv_state
-            if self.causal_conv1d_fn is not None:
-                mixed_qkv = self.causal_conv1d_fn(
-                    x=mixed_qkv,
-                    weight=self.conv1d.weight.squeeze(1),
-                    bias=self.conv1d.bias,
-                    activation=self.activation,
-                    seq_idx=None,
-                )
-            else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+            mixed_qkv = naive_causal_conv1d_wrapper(mixed_qkv, cu_seqlens, self, self.conv1d.weight, self.conv1d.bias)
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
@@ -585,29 +620,35 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
+        valid_len = cu_seqlens[-1] if cu_seqlens != None else seq_len
         if not use_precomputed_states:
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
+                q=query[:, :valid_len],
+                k=key[:, :valid_len],
+                v=value[:, :valid_len],
+                g=g[:, :valid_len],
+                beta=beta[:, :valid_len],
                 initial_state=None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens = cu_seqlens,
             )
 
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
+                q=query[:, :valid_len],
+                k=key[:, :valid_len],
+                v=value[:, :valid_len],
+                g=g[:, :valid_len],
+                beta=beta[:, :valid_len],
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens = cu_seqlens,
             )
+        if core_attn_out.shape[1] < seq_len:
+            out = core_attn_out
+            core_attn_out = torch.cat([out, out.new_zeros(out.shape[0], seq_len - out.shape[1], *out.shape[2:])], dim=1)
 
         # Update cache
         if cache_params is not None:

@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>train/infer precision compare (interactive)</title>
+<style>
+body{font:13px/1.4 -apple-system,Segoe UI,monospace;margin:0}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;height:100vh;overflow:hidden;
+  font:13px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,monospace;color:#222}
+#bar{background:linear-gradient(180deg,#fafbfd,#eef1f5);padding:10px 12px;
+  border-bottom:1px solid #d4dae3;flex:0 0 auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.picker{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+  background:#2563eb;color:#fff;border-radius:8px;cursor:pointer;font-size:12px;font-weight:500;
+  box-shadow:0 1px 2px rgba(37,99,235,.25);transition:filter .15s,transform .05s;user-select:none}
+.picker:hover{filter:brightness(1.08)}
+.picker:active{transform:translateY(1px)}
+.picker.ghost{background:#fff;color:#374151;border:1px solid #cbd5e1;box-shadow:none}
+.picker input{display:none}
+.status{color:#475569;margin-left:auto;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+#main{display:flex;flex:0 1 auto;min-height:60px;max-height:80vh}
+.panel{flex:1 1 0;min-width:0;min-height:0;overflow:auto;padding:8px 10px;background:#fff}
+#splitter{flex:0 0 6px;background:#cbd5e1;cursor:row-resize;position:relative}
+#splitter::after{content:'';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:40px;height:3px;border-radius:2px;background:#94a3b8}
+#splitter:hover{background:#2563eb} #splitter:hover::after{background:#fff}
+.panel.left{border-right:1px solid #e2e8f0;background:#fbfcfe}
+.panel h2{font-size:13px;margin:2px 0 8px;color:#1e3a8a;letter-spacing:.3px;
+  text-transform:uppercase;border-bottom:1px solid #e2e8f0;padding-bottom:4px}
+.node{cursor:pointer;padding:1px 4px;border-radius:4px;white-space:nowrap}
+.node:hover{background:#eef4ff}
+.det{display:none;margin:4px 0 4px 18px;padding:4px 8px;background:#f8fafc;border-radius:6px;border:1px solid #eef}
+.exp .det{display:block}
+.kids{margin-left:16px;border-left:1px dashed #dbe3ee;padding-left:2px}
+.node:not(.exp) > .kids{display:none}
+.node > .hd .mk::before{content:'▸';color:#94a3b8;margin-right:4px}
+.node.exp > .hd .mk::before{content:'▾';color:#475569}
+.node.leaf{white-space:normal}
+.node .nm{font-weight:500;color:#0f172a}
+.rel{font-size:10px;color:#1d4ed8;background:#eff6ff;border-radius:4px;padding:0 5px;margin-left:5px}
+.exec{font-size:10px;color:#64748b;margin-left:4px}
+.tbtn{display:inline-block;background:#2563eb;color:#fff;border-radius:5px;
+  padding:2px 8px;margin:3px 4px 3px 0;cursor:pointer;font-size:11px;transition:filter .12s}
+.tbtn:hover{filter:brightness(1.1)}
+.tbtn.off{background:#cbd5e1;cursor:default}
+.tag{font-size:10px;color:#64748b;margin-left:4px}
+#compare{display:none;flex:1 1 auto;min-height:120px;overflow:auto;background:#fff;
+  border-top:3px solid #2563eb;padding:12px 16px;box-shadow:0 -2px 8px rgba(0,0,0,.06)}
+#compare.show{display:block}
+h3{margin:8px 0 6px;color:#1e3a8a}
+table{border-collapse:collapse;margin:6px 0}
+td,th{border:1px solid #e2e8f0;padding:3px 9px;text-align:right}
+th{background:#f1f5f9;color:#334155;font-weight:600}
+.warn{background:#fef2f2;border:1px solid #dc2626;border-left:4px solid #dc2626;
+  color:#7f1d1d;padding:6px 10px;margin:8px 0;border-radius:6px}
+</style></head><body>
+<div id="bar">
+  <button class="picker" id="pickT" type="button">turbo 文件夹</button>
+  <button class="picker" id="pickV" type="button">vllm 文件夹</button>
+  <button class="picker ghost" id="swapBtn" type="button" title="交换两侧">⇄</button>
+  <div class="status" id="status">⚠️ 点 "turbo/vllm 文件夹" 选各自的目录（含 graph.json + tensors/）开始对比。</div>
+</div>
+<!-- hidden legacy file pickers for browsers without showDirectoryPicker -->
+<input type="file" id="fturbo" accept=".json,application/json" style="display:none">
+<input type="file" id="fvllm" accept=".json,application/json" style="display:none">
+<div id="main">
+  <div class="panel left"><h2>turbo</h2><div id="treeT">(未加载)</div></div>
+  <div class="panel"><h2>vllm</h2><div id="treeV">(未加载)</div></div>
+</div>
+<div id="splitter" title="拖动调整上方树与下方对比区的高度"></div>
+<div id="compare">(在两侧各点选一个 tensor 进行对比)</div>
+<script>
+//──────── decode tensors (original dtype) → Float32Array for diff ──────────────
+// tensors live in per-slot .bin files (raw bytes, original dtype) under the
+// side's directory (see graph.json `tensors_dir`). The HTML reads them on
+// demand via the File System Access API — it never loads them all at once.
+function bufToFloat(u,dtype){
+  const dv=new DataView(u.buffer,u.byteOffset,u.byteLength);
+  const le=true;
+  if(dtype.indexOf('float32')>=0){return new Float32Array(u.buffer,u.byteOffset,u.byteLength/4);}
+  if(dtype.indexOf('float16')>=0||dtype.indexOf('fp16')>=0){
+    const n=u.length/2;const f=new Float32Array(n);
+    for(let i=0;i<n;i++){const h=dv.getUint16(i*2,le);f[i]=halfToFloat(h);}return f;}
+  if(dtype.indexOf('bfloat16')>=0||dtype.indexOf('bf16')>=0){
+    const n=u.length/2;const f=new Float32Array(n);
+    for(let i=0;i<n;i++){const h=dv.getUint16(i*2,le);f[i]=bitsToFloat32(h<<16);}return f;}
+  if(dtype.indexOf('float64')>=0||dtype.indexOf('double')>=0){
+    return new Float32Array(new Float64Array(u.buffer,u.byteOffset,u.byteLength/8));}
+  // integer dtypes — match EXACTLY (int8 must not match int64). int64 has no
+  // typed-array view, so read little-endian BigInt64 and cast to Number.
+  if(dtype.indexOf('int64')>=0 || dtype.indexOf('long')>=0){
+    const n=u.length/8;const f=new Float32Array(n);
+    for(let i=0;i<n;i++)f[i]=Number(dv.getBigInt64(i*8,le));return f;}
+  if(dtype.indexOf('int32')>=0){return Float32Array.from(new Int32Array(u.buffer,u.byteOffset,u.byteLength/4));}
+  if(dtype.indexOf('int16')>=0||dtype.indexOf('short')>=0){return Float32Array.from(new Int16Array(u.buffer,u.byteOffset,u.byteLength/2));}
+  if(dtype.indexOf('int8')>=0 ||dtype.indexOf('char')>=0||dtype.indexOf('bool')>=0){return Float32Array.from(new Int8Array(u.buffer,u.byteOffset,u.byteLength));}
+  if(dtype.indexOf('uint8')>=0){return Float32Array.from(new Uint8Array(u.buffer,u.byteOffset,u.byteLength));}
+  if(dtype.indexOf('int')>=0){ // generic int fallback → int32
+    return Float32Array.from(new Int32Array(u.buffer,u.byteOffset,u.byteLength/4));}
+  return null;
+}
+// cache: stable tensor-id → decoded Float32Array (avoids re-reading on re-render)
+const _tcache={T:{},V:{}};
+// per-side directory handle (set by dir picker). Null when unavailable.
+const dirHandles={T:null,V:null};
+async function loadTensor(side,rawMeta){
+  if(!rawMeta||!rawMeta.file) return null;
+  const cache=_tcache[side];
+  if(rawMeta.file in cache) return cache[rawMeta.file];
+  const dh=dirHandles[side];
+  if(!dh){throw new Error('no directory handle for side '+side+' (use the folder picker to enable raw-tensor diff)');}
+  // rawMeta.file is relative to the dir, e.g. "tensors/000007.bin"
+  const parts=rawMeta.file.split('/'); let cur=dh;
+  for(let i=0;i<parts.length-1;i++){cur=await cur.getDirectoryHandle(parts[i]);}
+  const fh=await cur.getFileHandle(parts[parts.length-1]);
+  const buf=new Uint8Array(await (await fh.getFile()).arrayBuffer());
+  const f=bufToFloat(buf,rawMeta.dtype);
+  cache[rawMeta.file]=f;
+  return f;
+}
+// detect integer dtype → integer equality comparison, not float diff.
+function isInt(dtype){return !!dtype && (/int\d/.test(dtype)||/long|short|char|bool|uint\d/.test(dtype));}
+function halfToFloat(h){
+  const s=(h&0x8000)>>15,e=(h&0x7c00)>>10,m=h&0x03ff;
+  if(e===0)return (s?-1:1)*Math.pow(2,-14)*(m/1024);
+  if(e===31)return (s?-1:1)*(m?NaN:Infinity);
+  return (s?-1:1)*Math.pow(2,e-15)*(1+m/1024);
+}
+function bitsToFloat32(bits){const buf=new ArrayBuffer(4);new DataView(buf).setUint32(0,bits>>>0,true);return new DataView(buf).getFloat32(0,true);}
+//──────── state ─────────
+let T=null,V=null;
+let sel={T:null,V:null};
+let Tp='',Vp='';
+const _hasDirPicker = typeof window.showDirectoryPicker==='function';
+//──────── loading: graph.json (tiny, parsed in-memory) + side dir handle ────────
+// Strict JSON (the spec has no NaN/Infinity); the Python producer used to emit
+// bare NaN for NaN tensor stats, which JSON.parse rejects. Scrub those tokens
+// to null (skipping occurrences inside string literals) so already-generated
+// graph.json files still load. Newly written files are clean (allow_nan=False).
+function scrubNonFiniteJSON(txt){
+  let out=''; let i=0; const n=txt.length;
+  while(i<n){
+    const c=txt[i];
+    if(c==='"'){                       // copy a string literal verbatim
+      let j=i+1; while(j<n){ if(txt[j]==='\\'){j+=2;continue;} if(txt[j]==='"'){j++;break;} j++; }
+      out+=txt.slice(i,j); i=j; continue;
+    }
+    if(c==='-'?(txt.startsWith('-Infinity',i)):txt.startsWith('Infinity',i)||txt.startsWith('NaN',i)){
+      out+='null';
+      i+= c==='-'?9:(txt.startsWith('Infinity',i)?8:3);
+      continue;
+    }
+    out+=c; i++;
+  }
+  return out;
+}
+// Pick a DIRECTORY (turbo* and vllm* separately). We read its graph.json for the
+// structure/stats, and keep the dir handle so per-tensor .bin files can be
+// fetched ON DEMAND via the File System Access API when you click a tensor.
+async function pickDir(side){
+  try{
+    const dh=await window.showDirectoryPicker();
+    // graph.json must be at the dir root (turbo/graph.json, vllm/graph.json)
+    let fh;
+    try{fh=await dh.getFileHandle('graph.json');}catch(e){
+      setStatus(side+': 该文件夹下没有 graph.json — 选 <side>/ 目录');return;}
+    const f=await fh.getFile();
+    const txt=await f.text();
+    let obj;
+    try{ obj=JSON.parse(txt); }
+    catch(e){
+      // bare NaN/Infinity (non-strict JSON written by older producer) — scrub & retry
+      try{ obj=JSON.parse(scrubNonFiniteJSON(txt)); }
+      catch(e2){ setStatus(side+' pick failed: '+e2.message); return; }
+    }
+    dirHandles[side]=dh;
+    setGraph(obj,side,dh.name+'/graph.json');
+  }catch(e){setStatus(side+' pick failed: '+e.message);}
+}
+// Fallback for browsers without showDirectoryPicker: pick graph.json via <input>
+// (stats-only — raw-tensor diff disabled because we can't reach tensors/*.bin
+// from a bare file pick on file://).
+function loadFile(file,side){
+  const name=file&&file.name?file.name:'?';
+  const r=new FileReader();
+  r.onload=()=>{try{setGraph(JSON.parse(r.result),side,name);}catch(e){setStatus(side+' load failed: '+e.message);}};
+  r.readAsText(file);
+}
+function setGraph(obj,side,srcName){if(side==='T'){T=obj;Tp=srcName;}else{V=obj;Vp=srcName;}
+  setStatus(`✓ turbo: ${Tp||'—'} （${T&&T.nodes?Object.keys(T.nodes).length:0} nodes${dirHandles.T?'':' [stats-only]'}）   |   vllm: ${Vp||'—'} （${V&&V.nodes?Object.keys(V.nodes).length:0} nodes${dirHandles.V?'':' [stats-only]'}）`);
+  renderTree(side);}
+document.getElementById('pickT').onclick=()=>{
+  if(_hasDirPicker)pickDir('T');else document.getElementById('fturbo').click();};
+document.getElementById('pickV').onclick=()=>{
+  if(_hasDirPicker)pickDir('V');else document.getElementById('fvllm').click();};
+document.getElementById('fturbo').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0],'T');};
+document.getElementById('fvllm').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0],'V');};
+document.getElementById('swapBtn').onclick=()=>{
+  [T,V]=[V,T]; [Tp,Vp]=[Vp,Tp]; [dirHandles.T,dirHandles.V]=[dirHandles.V,dirHandles.T];
+  [_tcache.T,_tcache.V]=[_tcache.V,_tcache.T];
+  renderTree('T'); renderTree('V');
+  setStatus(`✓ turbo: ${Tp||'—'} （${T&&T.nodes?Object.keys(T.nodes).length:0} nodes${dirHandles.T?'':' [stats-only]'}）   |   vllm: ${Vp||'—'} （${V&&V.nodes?Object.keys(V.nodes).length:0} nodes${dirHandles.V?'':' [stats-only]'}）`);
+};
+function setStatus(s){document.getElementById('status').textContent=s;}
+//──────── draggable splitter between #main (trees) and #compare (diff) ────────
+(function(){
+  const sp=document.getElementById('splitter'), main=document.getElementById('main'), cmp=document.getElementById('compare');
+  let drag=false, startY=0, hMain=0;
+  sp.addEventListener('mousedown',e=>{drag=true;startY=e.clientY;hMain=main.getBoundingClientRect().height;
+    document.body.style.cursor='row-resize';e.preventDefault();});
+  window.addEventListener('mousemove',e=>{if(!drag)return;
+    const dy=e.clientY-startY; let nh=Math.min(Math.max(hMain+dy,60), window.innerHeight-160);
+    main.style.flex='0 0 '+nh+'px'; main.style.maxHeight=nh+'px';});
+  window.addEventListener('mouseup',()=>{if(drag){drag=false;document.body.style.cursor='';}});
+  // touch
+  sp.addEventListener('touchstart',e=>{drag=true;startY=e.touches[0].clientY;hMain=main.getBoundingClientRect().height;});
+  window.addEventListener('touchmove',e=>{if(!drag)return;const dy=e.touches[0].clientY-startY;
+    let nh=Math.min(Math.max(hMain+dy,60),window.innerHeight-160);main.style.flex='0 0 '+nh+'px';main.style.maxHeight=nh+'px';e.preventDefault();},{passive:false});
+  window.addEventListener('touchend',()=>{drag=false;});
+})();
+// give #main a sensible default height (≈38% of viewport) on load
+window.addEventListener('load',()=>{
+  const main=document.getElementById('main');
+  const h=Math.round(window.innerHeight*0.38);
+  main.style.flex='0 0 '+h+'px'; main.style.maxHeight=h+'px';
+});
+//──────── sort: parent before child, names lexical, digits numeric ─────────
+function sortFqns(nodes){
+  const key=fqn=>fqn.split('.').map(s=>s.match(/^\d+$/)?[1,parseInt(s,10)]:[0,s]);
+  const fqns=Object.keys(nodes);
+  fqns.sort((a,b)=>{
+    const ka=key(a),kb=key(b);
+    for(let i=0;i<Math.min(ka.length,kb.length);i++){
+      const x=ka[i],y=kb[i];
+      if(x[0]!==y[0]) return x[0]-y[0];
+      if(x[0]===0){ if(x[1]!==y[1]) return x[1]<y[1]?-1:1; }
+      else        { if(x[1]!==y[1]) return x[1]-y[1]; }
+    }
+    return ka.length-kb.length;
+  });
+  return fqns;
+}
+//──────── render a side's tree (real nesting via parent/children + exec order) ─────────
+function renderTree(side){
+  const g=side==='T'?T:V;const el=document.getElementById(side==='T'?'treeT':'treeV');
+  if(!g||!g.nodes){el.innerHTML='(未加载)';return;}
+  const nodes=g.nodes;
+  const root=g.root||'';
+  function short(fqn){ let s=fqn===root?'&lt;root&gt;':fqn;
+    if(fqn!==root && root && s.startsWith(root+'.')) s=s.slice(root.length+1); return s; }
+  function byExec(a,b){return (nodes[a]?.exec_pre??1e9)-(nodes[b]?.exec_pre??1e9);}
+  function liveKids(n){return (n.children||[]).filter(c=>nodes[c]).sort(byExec);}
+  function header(fqn, prev, next){
+    const n=nodes[fqn];
+    let s='<span class="mk"></span> <span class="nm">'+short(fqn)+'</span> '
+        +'<span class="tag">['+(n.class||'?')+']</span>'
+        +'<span class="exec"> exec#'+(n.exec_pre!=null?n.exec_pre:'?')+'</span>'
+        +'<span class="tag"> dep'+(n.call_depth!=null?n.call_depth:'?')+'</span>';
+    if(n.push_count>1) s+='<span class="rel">×'+n.push_count+'</span>';
+    if(prev) s+='<span class="rel">prev:'+short(prev)+'</span>';
+    if(next) s+='<span class="rel">next:'+short(next)+'</span>';
+    return s;
+  }
+  function det(fqn){
+    const n=nodes[fqn]; let s='<div class="det">';
+    for(const slot of ['in','out']){const slots=n[slot]||{};const paths=Object.keys(slots);
+      s+='<div><b>'+slot+':</b> ';
+      if(!paths.length)s+='<span class="tag">—</span>';
+      for(const p of paths){const e=slots[p];const has=!!(e&&e.raw&&e.raw.file);
+        s+='<span class="tbtn '+(has?'':'off')+'" onclick="selTensor(\''+side+'\',`'+fqn+'`,\''+slot+'\',`'+p+'`,event)">'+p+'</span>';}
+      s+='</div>';
+    }
+    return s+'</div>';
+  }
+  function rec(fqn, prev, next){
+    const n=nodes[fqn]; if(!n) return '';
+    const kids=liveKids(n);
+    const leaf=kids.length?'':'leaf';
+    let s='<div class="node '+leaf+'" onclick="event.stopPropagation(); '
+        +'if(!event.target.closest(\'.tbtn\')&&!event.target.closest(\'.det\'))this.classList.toggle(\'exp\')">'
+        +'<span class="hd">'+header(fqn,prev,next)+'</span>'+det(fqn);
+    if(kids.length){
+      s+='<div class="kids">';
+      for(let i=0;i<kids.length;i++){
+        s+=rec(kids[i], i>0?kids[i-1]:null, i<kids.length-1?kids[i+1]:null);
+      }
+      s+='</div>';
+    }
+    return s+'</div>';
+  }
+  const present=new Set(Object.keys(nodes));
+  const roots=Object.keys(nodes).filter(f=>{
+    const p=nodes[f].parent; return p==null || !present.has(p);
+  }).sort(byExec);
+  let h='';
+  for(let i=0;i<roots.length;i++){
+    h+=rec(roots[i], i>0?roots[i-1]:null, i<roots.length-1?roots[i+1]:null);
+  }
+  el.innerHTML=h;
+  maybeShowLogp();
+}
+//──────── tensor selection ─────────
+function selTensor(side,fqn,slot,path,ev){
+  ev.stopPropagation();
+  const g=side==='T'?T:V;if(!g)return;const e=g.nodes[fqn]&&g.nodes[fqn][slot]&&g.nodes[fqn][slot][path];
+  if(!e)return;
+  sel[side]={fqn,slot,path,entry:e};
+  renderCompare();
+}
+function relDiff(a,b){if(a==null||b==null)return null;const eps=1e-12;return Math.abs(a-b)/Math.max(Math.abs(a),Math.abs(b),eps);}
+function efmt(v){return v==null?'-':v.toExponential(2);}
+//──────── compare panel ─────────
+async function renderCompare(){
+  const a=sel.T,b=sel.V;const cp=document.getElementById('compare');cp.classList.add('show');
+  if(!a||!b){cp.innerHTML='已选: '+(a?'turbo='+a.fqn+'::'+a.slot+'::'+a.path:'turbo (无)')+'  |  '+(b?'vllm='+b.fqn+'::'+b.slot+'::'+b.path:'vllm (无)')+'<br>在左右各点选一个 tensor 进行对比';return;}
+  const ea=a.entry, eb=b.entry;
+  let h=`<h3>对比：turbo <code>${a.fqn}::${a.slot}::${a.path}</code>  &nbsp;⟷&nbsp;  vllm <code>${b.fqn}::${b.slot}::${b.path}</code></h3>`;
+  const sa=ea.stats||{},sb=eb.stats||{};
+  const da=ea.raw?ea.raw.dtype:null, db=eb.raw?eb.raw.dtype:null;
+  if(da&&db&&da!==db){h+=`<div class="warn">⚠️ <b>dtype 不同</b>: turbo=${da}  vllm=${db} → 已转 fp32 对比数值<br><span>注意：部分差异可能源自 dtype 量化本身（bf16↔fp16↔fp8 表示范围/精度差），而非算法差异。</span></div>`;}
+  else if(da&&db&&da===db){h+=`<div class="tag">dtype 相同 (${da}) → 直接对比</div>`;}
+  h+=`<table><tr><th></th><th>turbo</th><th>vllm</th></tr>`;
+  h+=`<tr><td>dtype</td><td>${da||'-'}</td><td>${db||'-'}</td></tr>`;
+  for(const k of ['shape','norm','sum','mean','max_abs']){const x=sa[k],y=sb[k];h+=`<tr><td>${k}</td><td>${Array.isArray(x)?JSON.stringify(x):(x!=null?x:'-')}</td><td>${Array.isArray(y)?JSON.stringify(y):(y!=null?y:'-')}</td></tr>`;}
+  h+='</table>';
+  // shape sanity
+  const tShapeArr=sa.shape||[], vShapeArr=sb.shape||[];
+  const tShape=JSON.stringify(tShapeArr), vShape=JSON.stringify(vShapeArr);
+  const prod=a=>a.reduce((x,y)=>x*y,1);
+  if(tShape!==vShape){
+    const strip1=s=>s.length&&s[0]===1?s.slice(1):s;
+    const cosmetic=JSON.stringify(strip1(tShapeArr))===JSON.stringify(strip1(vShapeArr));
+    h+=`<div class="warn">⚠️ <b>形状不同</b>: turbo ${tShape} vs vllm ${vShape}`
+      +(cosmetic?` <span class="tag">(仅 batch 维 [1,...] 差异，元素一致 — 可忽略)</span>`:'')
+      +`<br>element-wise diff 按 flatten 顺序逐元素比，<b>形状不同(非 batch 维)时通常无意义</b>（位置 i 在两侧对应不同语义）。`
+      +`下面的 signed/abs mean 反映"前 ${Math.min(prod(tShapeArr),prod(vShapeArr))} 个元素按序统计"，<b>不代表相似度</b>。</div>`;
+  }
+  const nr=relDiff(sa.norm,sb.norm),sr=relDiff(sa.sum,sb.sum);h+=`<div>rel diff (fp32 stats): norm=${efmt(nr)} sum=${efmt(sr)}</div>`;
+  cp.innerHTML=h; // stats render immediately; element-wise below loads .bin on demand
+  if(ea.raw&&ea.raw.file&&eb.raw.file){
+    const hStats=h;
+    cp.innerHTML=h+'<div class="tag">loading tensors/*.bin ...</div>';
+    try{
+      const fa=await loadTensor('T',ea.raw), fb=await loadTensor('V',eb.raw);
+      h=hStats; // drop the loading marker; re-append diff below
+      const n=Math.min(fa.length,fb.length);
+      if(fa.length!==fb.length) h+=`<div class="tag">元素数不同: turbo=${fa.length} vllm=${fb.length}，对比前 ${n} 个</div>`;
+      // integer tensors → equality comparison (token-id / index tensors make a
+      // float diff meaningless). Report match/mismatch counts + first diffs.
+      if(isInt(da)&&isInt(db)){
+        let match=0,mismatch=0;const diffs=[];
+        for(let i=0;i<n;i++){if(fa[i]===fb[i]){match++;}else{mismatch++;if(diffs.length<16)diffs.push([i,fa[i],fb[i]]);}}
+        h+=`<table style="margin-top:6px"><tr><th></th><th>value</th></tr>
+          <tr><td>对比元素数</td><td>${n}</td></tr>
+          <tr><td>相等 (match)</td><td>${match}</td></tr>
+          <tr><td>不等 (mismatch)</td><td>${mismatch}</td></tr>
+          <tr><td>相等率</td><td>${(match/Math.max(n,1)*100).toFixed(2)}%</td></tr></table>`;
+        if(mismatch===0){h+=`<div class="tag" style="color:#16a34a">✓ 整数张量逐元素完全相等</div>`;}
+        else{h+=`<div class="warn">⚠️ 整数张量有 ${mismatch} 个位置不相等（前 ${diffs.length} 例）：</div>
+          <table><tr><th>i</th><th>turbo</th><th>vllm</th></tr>${
+            diffs.map(d=>`<tr><td>${d[0]}</td><td>${d[1]}</td><td>${d[2]}</td></tr>`).join('')}</table>`;}
+        // skip the meaningless float signed/abs mean + histogram for ints
+        h+=`<table style="margin-top:6px"><tr><th>i</th><th>turbo</th><th>vllm</th><th>相等</th></tr>`;
+        for(let i=0;i<Math.min(16,n);i++)h+=`<tr><td>${i}</td><td>${fa[i]}</td><td>${fb[i]}</td><td>${fa[i]===fb[i]?'✓':'✗'}</td></tr>`;
+        h+='</table>';
+      } else {
+      let sumAbs=0,sumSig=0,maxAbs=0,maxSig=-1e308,minSig=1e308;
+      for(let i=0;i<n;i++){const d=fa[i]-fb[i];const ad=Math.abs(d);
+        sumAbs+=ad; if(ad>maxAbs)maxAbs=ad; sumSig+=d;
+        if(d>maxSig)maxSig=d; if(d<minSig)minSig=d;}
+      const meanAbs=n>0?sumAbs/n:0, meanSig=n>0?sumSig/n:0;
+      h+=`<table style="margin-top:6px"><tr><th></th><th>value</th></tr>
+        <tr><td>diff mean (signed)</td><td>${meanSig.toExponential(3)}</td></tr>
+        <tr><td>diff max  (signed)</td><td>${maxSig.toExponential(3)}</td></tr>
+        <tr><td>diff min  (signed)</td><td>${minSig.toExponential(3)}</td></tr>
+        <tr><td>diff abs mean</td><td>${meanAbs.toExponential(3)}</td></tr>
+        <tr><td>diff abs max </td><td>${maxAbs.toExponential(3)}</td></tr>
+        </table>`;
+      h+=`<div class="tag">note: mean/max diff 是有符号的(fa−fb)；abs 是绝对值。mean≈0 说明两侧正负偏差抵消、无系统偏置，<b>不代表相似</b>。</div>`;
+      if(n>0 && Math.abs(meanSig) < meanAbs*0.1 ){
+        h+=`<div class="warn">⚠️ <b>注意解读</b>: |signed mean| (${Math.abs(meanSig).toExponential(3)}) 远小于 abs mean (${meanAbs.toExponential(3)}) — `
+          +`正负偏差在均值里互相抵消。<b>signed mean 小 ≠ 两 tensor 相似</b>；`
+          +`abs mean (${meanAbs.toExponential(3)}) 才体现平均每个元素的偏离幅度。`
+          +`形状不同时，前 N 个元素的均值接近更可能纯属巧合。</div>`;
+      }
+      h+=renderLogHist(fa,fb,n,maxAbs);
+      h+=`<table style="margin-top:6px"><tr><th>i</th><th>turbo</th><th>vllm</th><th>abs diff</th></tr>`;
+      for(let i=0;i<Math.min(16,n);i++)h+=`<tr><td>${i}</td><td>${fa[i].toExponential(3)}</td><td>${fb[i].toExponential(3)}</td><td>${Math.abs(fa[i]-fb[i]).toExponential(3)}</td></tr>`;
+      h+='</table>';
+      } // end else (float branch)
+    }catch(err){h=hStats+`<div class="warn">元素对比失败: ${err.message}</div>`;}
+  }else{
+    h+=`<div class="tag">两侧中至少一侧无 raw 数据（被统计-only 记录），仅显示统计</div>`;
+  }
+  cp.classList.add('show');cp.innerHTML=h;
+}
+// log10 histogram of |fa[i]-fb[i]|
+function renderLogHist(fa,fb,n,maxAbs){
+  if(n<=0) return '<div class="tag">(无元素)</div>';
+  let maxPow = maxAbs>0?Math.ceil(Math.log10(maxAbs)):-1;
+  if(maxPow < -1) maxPow = -1;
+  const minPow = -12;
+  const nBuckets = maxPow - minPow + 1;
+  const counts = new Array(nBuckets).fill(0);
+  let zeros = 0;
+  for(let i=0;i<n;i++){const d=Math.abs(fa[i]-fb[i]);
+    if(d===0){zeros++; continue;}
+    let p=Math.floor(Math.log10(d));
+    if(p<minPow)p=minPow; if(p>maxPow)p=maxPow;
+    counts[p-minPow]++;}
+  const maxC = Math.max(1,...counts,zeros);
+  const PAD_L=10, PAD_R=24, H=150, BASE_Y=H-15, TOP_PAD=30, PLOT_H=BASE_Y-TOP_PAD;
+  const nCols=nBuckets+1;
+  const barW=Math.max(28, Math.floor(1100/nCols));
+  const W=PAD_L + nCols*barW + PAD_R;
+  const scale=c=>c/maxC*PLOT_H;
+  const labelY=barTopY=>barTopY-2; // sit the count just above the bar top (title sits above TOP_PAD, so the tallest bar's label still clears it)
+  let bars=`<text x="8" y="14" font-size=10>count (高=数据/最大值; 灰柱=精确相等)</text>`;
+  const z0=PAD_L, zh=scale(zeros);
+  bars+=`<rect x="${z0}" y="${BASE_Y-zh}" width="${barW-3}" height="${zh}" fill="#888"/>`;
+  bars+=`<text x="${z0}" y="${H-2}" font-size=9>=0</text>`;
+  if(zeros>0)bars+=`<text x="${z0}" y="${labelY(BASE_Y-zh)}" font-size=9>${zeros}</text>`;
+  for(let k=0;k<nBuckets;k++){const p=minPow+k;const c=counts[k];
+    const x=PAD_L+(k+1)*barW; const bh=scale(c);
+    bars+=`<rect x="${x}" y="${BASE_Y-bh}" width="${barW-3}" height="${bh}" fill="#06c"/>`;
+    bars+=`<text x="${x}" y="${H-2}" font-size=9>1e${p}</text>`;
+    if(c>0)bars+=`<text x="${x}" y="${labelY(BASE_Y-bh)}" font-size=9>${c}</text>`;
+  }
+  const axis=`<line x1="6" y1="${BASE_Y}" x2="${W-PAD_R+6}" y2="${BASE_Y}" stroke="#333"/><line x1="6" y1="${TOP_PAD}" x2="6" y2="${BASE_Y}" stroke="#333"/>`;
+  return `<div style="margin-top:6px"><b>|diff| 直方图</b> (log10 buckets, exact-zero 单列)</div>
+    <svg width="${W}" height="${H}" style="background:#fafafa;border:1px solid #ddd;max-width:100%">${axis}${bars}</svg>`;
+}
+async function maybeShowLogp(){
+  if(T&&V&&T.logp&&V.logp && T.logp.file && V.logp.file){
+    try{
+      const fa=await loadTensor('T',T.logp);
+      const fb=await loadTensor('V',V.logp);
+      let sumAbs=0,maxAbs=0,sumRel=0,maxRel=0,reln=0;const n=Math.min(fa.length,fb.length);
+      for(let i=1;i<n;i++){const d=Math.abs(fa[i]-fb[i]);sumAbs+=d;if(d>maxAbs)maxAbs=d;
+        const dn=Math.max(Math.abs(fa[i]),Math.abs(fb[i]),1e-12);const r=d/dn;sumRel+=r;if(r>maxRel)maxRel=r;reln++;}
+      const meanAbs=n>1?sumAbs/(n-1):0;
+      const meanRel=reln>0?sumRel/reln:0;
+      setStatus('logp: mean abs = '+meanAbs.toExponential(3)
+        +'  max abs = '+maxAbs.toExponential(3)
+        +'  |  mean rel = '+meanRel.toExponential(3)
+        +'  max rel = '+maxRel.toExponential(3)
+        +'   |   turbo '+Object.keys(T.nodes).length+' nodes, vllm '+Object.keys(V.nodes).length+' nodes');
+    }catch(e){ /* dir handle missing → stats-only; silent */ }
+  }
+}
+</script></body></html>

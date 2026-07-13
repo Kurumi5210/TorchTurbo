@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any
 
 import torch
@@ -9,15 +11,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...engine import EngineConfig
-from ...engine.args import TorchTurboArgs
+from ...engine.args import TorchTurboArgs, string_to_bool
 from ...engine.config import (
     ActivationCheckpointingConfig,
     CheckpointConfig,
     CommConfig,
     DistributedBackend,
+    ENV_MAP,
     MixedPrecisionPolicy,
 )
-from ...engine.backends.fsdp2.config import FSDPConfig, ShardingStrategy
+from ...engine.backends.fsdp2.config import (
+    FSDPConfig,
+    ShardingStrategy,
+)
 from ...engine.hooks import TrainState
 from ...logging import get_logger
 from torchturbo.parallel import FSDPParallelPlan
@@ -31,12 +37,12 @@ def build_config_from_lf_args(
     finetuning_args: Any = None,
     model_args: Any = None,
     torchturbo_args: TorchTurboArgs | None = None,
-    overrides: dict[str, Any] | None = None,
-) -> EngineConfig:
+    raw_args: Any = None,
+) -> tuple[EngineConfig, Any]:
     """Build an ``EngineConfig`` from LlamaFactory args.
 
     Priority (lowest → highest): defaults → LF args mapping → ``torchturbo_args``
-    → env vars(via ``EngineConfig.__post_init__``)  → ``overrides`` dict.
+    → env vars(via ``EngineConfig.__post_init__``).
 
     Parameters
     ----------
@@ -49,45 +55,28 @@ def build_config_from_lf_args(
     torchturbo_args:
         Parsed ``--tt_*`` CLI arguments.  Applied directly during
         config construction so they override LF-derived values.
-    overrides:
-        Optional dict of overrides (highest priority, applied after
-        construction).
+    raw_args:
+        Raw arguments that will be passed back into LlamaFactory's native
+        ``run_exp`` after TorchTurbo-owned fields are consumed.
 
     Returns
     -------
-    A fully configured ``EngineConfig``.
+    The configured ``EngineConfig`` and raw args with LlamaFactory gradient
+    checkpointing disabled.
     """
     _raise_if_unsupported_lf_args(finetuning_args, model_args, torchturbo_args)
 
-    config = _build_config_from_args(
-        training_args, finetuning_args, model_args, torchturbo_args
+    config, raw_args = _build_config_from_args(
+        training_args, finetuning_args, model_args, torchturbo_args, raw_args
     )
     # Note: env vars are already applied by EngineConfig.__post_init__
-
-    # Apply explicit overrides (highest priority)
-    if overrides:
-        override_config = EngineConfig.from_dict(overrides)
-        for field_name in (
-            "parallel",
-            "backend_config",
-            "activation_checkpointing",
-            "comm",
-            "checkpoint",
-        ):
-            override_val = getattr(override_config, field_name)
-            if override_val is not None:
-                setattr(config, field_name, override_val)
-        if overrides.get("backend"):
-            config.backend = override_config.backend
-        if overrides.get("mixed_precision"):
-            config.mixed_precision = override_config.mixed_precision
 
     logger.info(
         "Built EngineConfig from LlamaFactory args: backend=%s, mp=%s",
         config.backend.value,
         config.mixed_precision.value,
     )
-    return config
+    return config, raw_args
 
 
 def _build_config_from_args(
@@ -95,7 +84,8 @@ def _build_config_from_args(
     finetuning_args: Any,
     model_args: Any,
     torchturbo_args: TorchTurboArgs | None = None,
-) -> EngineConfig:
+    raw_args: Any = None,
+) -> tuple[EngineConfig, Any]:
     """Map LlamaFactory args and torchturbo CLI args to EngineConfig."""
 
     tt = torchturbo_args  # shorthand
@@ -117,18 +107,23 @@ def _build_config_from_args(
     if tt is not None and tt.mixed_precision is not None:
         mixed_precision = MixedPrecisionPolicy(tt.mixed_precision)
 
-    # --- FSDP config (from HF's fsdp / fsdp_config) ---
-    fsdp_config = _build_fsdp_config(training_args)
+    # --- FSDP config (from HF's fsdp/fsdp_config + TorchTurbo args) ---
+    fsdp_config = _build_fsdp_config(training_args, tt)
 
     # --- Activation checkpointing ---
-    ac_enabled = False
-    if training_args is not None:
-        ac_enabled = getattr(training_args, "gradient_checkpointing", False)
-
-    ac_config = ActivationCheckpointingConfig(
-        enabled=ac_enabled,
-        use_reentrant=False,  # FSDP2 requires non-reentrant
+    # HF/LF gradient checkpointing wraps model forwards after model loading.
+    # TorchTurbo owns FSDP2 wrapping, so disable LF's implementation here. When
+    # LF requested gradient checkpointing, the engine enables plan-defined AC
+    # targets; otherwise those plan targets are ignored with a warning. If the
+    # user explicitly set TorchTurbo's value, require it to agree with LF.
+    ac_enabled, raw_args = _take_over_lf_gradient_checkpointing(
+        training_args,
+        model_args,
+        raw_args,
+        tt,
     )
+
+    ac_config = ActivationCheckpointingConfig(enabled=ac_enabled)
 
     # --- Communication ---
     comm_config = CommConfig(
@@ -165,35 +160,146 @@ def _build_config_from_args(
         comm=comm_config,
         checkpoint=checkpoint_config,
         extra=extra,
+    ), raw_args
+
+
+def _build_fsdp_config(
+    training_args: Any,
+    torchturbo_args: TorchTurboArgs | None = None,
+) -> FSDPConfig:
+    """Build FSDPConfig from LF FSDP args plus TorchTurbo-owned FSDP args."""
+    fsdp_options = (
+        getattr(training_args, "fsdp", []) if training_args is not None else []
     )
 
-
-def _build_fsdp_config(training_args: Any) -> FSDPConfig:
-    """Extract FSDP settings from HF training_args.fsdp + fsdp_config."""
-    if training_args is None:
-        return FSDPConfig()
-
-    fsdp_options = getattr(training_args, "fsdp", [])
-    fsdp_config_dict = getattr(training_args, "fsdp_config", {}) or {}
-
-    # Sharding strategy
-    sharding = ShardingStrategy.FULL_SHARD
-
-    # CPU offload
     cpu_offload = False
     if isinstance(fsdp_options, (list, tuple)):
         cpu_offload = "offload" in fsdp_options
 
-    # Forward/backward prefetch from fsdp_config dict
-    forward_prefetch = fsdp_config_dict.get("forward_prefetch", False)
+    # Prefetch is TorchTurbo-owned config; LF fsdp_config is not read for it.
+    # tt prefetch fields default to "auto" / "forward_backward", never None.
+    tt_args = torchturbo_args or TorchTurboArgs()
+    torchturbo_cpu_offload = _explicit_torchturbo_bool_arg(
+        "cpu_offload",
+        torchturbo_args,
+        config_path="backend_config.cpu_offload",
+    )
+    if torchturbo_cpu_offload is not None:
+        if cpu_offload and not torchturbo_cpu_offload:
+            raise ValueError(
+                "TorchTurbo --tt_cpu_offload must not disable the adapter "
+                "FSDP offload setting: adapter=True, torchturbo=False."
+            )
+        cpu_offload = torchturbo_cpu_offload
 
     return FSDPConfig(
-        sharding_strategy=sharding,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
         reshard_after_forward=True,
-        forward_prefetch=forward_prefetch,
         cpu_offload=cpu_offload,
-        pin_memory=not cpu_offload,
+        pin_memory=True,
+        prefetch_strategy=tt_args.prefetch_strategy,
+        prefetch_direction=tt_args.prefetch_direction,
+        forward_prefetch_depth=tt_args.forward_prefetch_depth,
+        backward_prefetch_depth=tt_args.backward_prefetch_depth,
     )
+
+
+def _take_over_lf_gradient_checkpointing(
+    training_args: Any,
+    model_args: Any,
+    raw_args: Any,
+    torchturbo_args: TorchTurboArgs | None = None,
+) -> tuple[bool, Any]:
+    # LF/HF applies gradient checkpointing after model construction, which is
+    # too late for TorchTurbo's FSDP2 path: activation checkpointing must be
+    # installed before fully_shard so recompute runs inside each FSDP unit.
+    # Treat the LF flags as a request for engine-owned activation checkpointing,
+    # then force LF's own gradient checkpointing off before re-entering run_exp.
+    adapter_gc = bool(getattr(training_args, "gradient_checkpointing", False))
+    torchturbo_gradient_checkpointing = _explicit_torchturbo_bool_arg(
+        "gradient_checkpointing",
+        torchturbo_args,
+        config_path="activation_checkpointing.enabled",
+    )
+
+    if (
+        torchturbo_gradient_checkpointing is not None
+        and torchturbo_gradient_checkpointing != adapter_gc
+    ):
+        raise ValueError(
+            "TorchTurbo --tt_gradient_checkpointing must match the adapter "
+            "gradient checkpointing setting: "
+            f"adapter={adapter_gc}, torchturbo={torchturbo_gradient_checkpointing}."
+        )
+
+    if training_args is not None and hasattr(training_args, "gradient_checkpointing"):
+        training_args.gradient_checkpointing = False
+    if model_args is not None:
+        if hasattr(model_args, "disable_gradient_checkpointing"):
+            model_args.disable_gradient_checkpointing = True
+
+    if isinstance(raw_args, dict):
+        raw_args = dict(raw_args)
+        raw_args["gradient_checkpointing"] = False
+        raw_args["disable_gradient_checkpointing"] = True
+        return adapter_gc, raw_args
+
+    if not isinstance(raw_args, list):
+        return adapter_gc, raw_args
+
+    remove_flags = {
+        "--gradient_checkpointing",
+        "--disable_gradient_checkpointing",
+    }
+    result: list[Any] = []
+    i = 0
+    while i < len(raw_args):
+        item = raw_args[i]
+        item_str = str(item)
+        if item_str.startswith("--") and "=" in item_str:
+            flag = item_str.split("=", 1)[0]
+            if flag in remove_flags:
+                i += 1
+                continue
+        if item_str in remove_flags:
+            i += 1
+            if i < len(raw_args) and not str(raw_args[i]).startswith("--"):
+                i += 1
+            continue
+        result.append(item)
+        i += 1
+    result.append("--disable_gradient_checkpointing")
+    return adapter_gc, result
+
+
+def _explicit_torchturbo_bool_arg(
+    name: str,
+    torchturbo_args: TorchTurboArgs | None,
+    *,
+    config_path: str | None = None,
+) -> bool | None:
+    if config_path is not None:
+        for env_name, mapped_path in ENV_MAP.items():
+            if mapped_path != config_path:
+                continue
+            env_value = os.environ.get(env_name)
+            if env_value is not None:
+                return string_to_bool(env_value)
+            break
+
+    flag = f"--tt_{name}"
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        item = str(args[i])
+        if item.startswith(f"{flag}="):
+            return string_to_bool(item.split("=", 1)[1])
+        if item == flag:
+            if i + 1 < len(args) and not str(args[i + 1]).startswith("--"):
+                return string_to_bool(str(args[i + 1]))
+            return True
+        i += 1
+    return None
 
 
 def _raise_if_unsupported_lf_args(

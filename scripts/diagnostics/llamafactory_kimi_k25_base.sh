@@ -59,8 +59,9 @@ DISTRIBUTED_ARGS="
     --node_rank $NODE_RANK
 "
 
-export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/v2/LLaMA-Factory/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/v2/torchturbo:$PYTHONPATH
+
 export TORCH_TURBO_SP_SIZE=2
 export TORCH_TURBO_EP_SIZE=8
 
@@ -80,6 +81,6 @@ torchrun $DISTRIBUTED_ARGS compare_diagnostics.py \
     --dump_params \
     --dump_inputs \
     --dump_layer_io \
-    --rank 0 1 \
+    --rank 0 \
     --trainer_class llamafactory.train.sft.torch_turbo_trainer.TorchTurboTrainer \
-    --extra_lf_args --preprocessing_num_workers $((NNODES * 16)) --max_samples 64 --print_param_status True --trust_remote_code True --torch_turbo_enabled --torch_turbo_world_size $((NNODES * 16)) --torch_turbo_ep_size ${TORCH_TURBO_EP_SIZE} --torch_turbo_sp_size ${TORCH_TURBO_SP_SIZE} --torch_turbo_path $model_name_or_path --torch_turbo_save_path $output_dir
+    --extra_lf_args --preprocessing_num_workers $((NNODES * 16)) --max_samples 1000 --print_param_status True --trust_remote_code True --torch_turbo_enabled --torch_turbo_world_size $((NNODES * 16)) --torch_turbo_ep_size ${TORCH_TURBO_EP_SIZE} --torch_turbo_sp_size ${TORCH_TURBO_SP_SIZE} --torch_turbo_path $model_name_or_path --torch_turbo_save_path $output_dir

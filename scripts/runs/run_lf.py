@@ -7,7 +7,7 @@ from argv before forwarding to LlamaFactory.  For example::
     torchrun ... run_lf.py --tt_sp_size 2 --tt_ep_size 8 --stage sft ...
 
 The ``--tt_*`` flags replace the ``TORCH_TURBO_*`` environment variables.
-Priority (lowest → highest): defaults → LF args → env vars → ``--tt_*`` CLI args.
+Priority (lowest → highest): defaults → LF args → ``--tt_*`` CLI args → env vars.
 
 Usage:
     torchrun --nproc_per_node=8 scripts/runs/run_lf.py \\

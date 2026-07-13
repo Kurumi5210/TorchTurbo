@@ -15,9 +15,6 @@ if TYPE_CHECKING:
     from ..config import EngineConfig
 
 
-logger = get_logger(__name__)
-
-
 class BaseBackend(ABC):
     """Abstract base for a distributed backend.
 
@@ -29,6 +26,7 @@ class BaseBackend(ABC):
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
+        self.logger = get_logger(type(self).__module__)
 
     @abstractmethod
     def prepare_model(

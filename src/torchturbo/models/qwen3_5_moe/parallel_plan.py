@@ -52,6 +52,9 @@ def get_parallel_plan() -> FSDPParallelPlan:
 
     return FSDPParallelPlan(
         plan={
+            "model.language_model.layers.*": FSDPPlanSpec(
+                activation_checkpoint=True,
+            ),
             "model.language_model.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
@@ -59,14 +62,24 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 replace_module=_replace_qwen3_5_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
-            # "model.language_model.embed_tokens": FSDPPlanSpec(
-            #     placement=FSDPPlacementSpec(Shard(0), "world"),
-            # ),
-            # "lm_head": FSDPPlanSpec(
-            #     placement=FSDPPlacementSpec(Shard(0), "world"),
-            # ),
+            "model.visual": FSDPPlanSpec(
+                no_shard=True,
+            ),
+            "model.language_model.embed_tokens": FSDPPlanSpec(
+                standalone_world_shard=True,
+            ),
+            "lm_head": FSDPPlanSpec(
+                standalone_world_shard=True,
+            ),
             "mtp.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
+            ),
+            # mtp.layers is an nn.ModuleList, so the default layer-wrap policy
+            # wraps each Qwen3_5MoeMTPLayer as a standalone world-mesh unit
+            # automatically; this entry only needs to request activation
+            # checkpointing (the experts inside are carved onto edp above).
+            "mtp.layers.*": FSDPPlanSpec(
+                activation_checkpoint=True,
             ),
             "mtp.layers.*.mlp": FSDPPlanSpec(
                 replace_module=_replace_qwen3_5_moe_only,

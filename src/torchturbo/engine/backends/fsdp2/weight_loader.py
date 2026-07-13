@@ -10,7 +10,7 @@ import torch.nn as nn
 from safetensors.torch import load_file
 from torch.distributed._tensor import distribute_tensor, DTensor
 
-from torchturbo.engine.peft.naming import strip_peft_prefix, is_peft_adapter_param
+from torchturbo.engine.utils import is_peft_adapter_param, strip_peft_prefix
 from torchturbo.engine.peft.weights import get_peft_init_config, init_lora_tensor
 from torchturbo.logging import get_logger
 

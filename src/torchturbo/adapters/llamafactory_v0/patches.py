@@ -132,7 +132,7 @@ class RunExpPatch(BasePatch):
             args: dict[str, Any] | None = None,
             callbacks: list[Any] | None = None,
         ):
-            from llamafactory.hparams import get_train_args
+            from llamafactory.hparams import get_train_args, read_args
             from .utils import (
                 build_config_from_lf_args,
                 build_lora_config_from_lf_args,
@@ -142,8 +142,9 @@ class RunExpPatch(BasePatch):
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
 
+            raw_args = read_args(args)
             model_args, data_args, training_args, finetuning_args, generating_args = (
-                get_train_args(args)
+                get_train_args(raw_args)
             )
             stage = getattr(finetuning_args, "stage", None)
 
@@ -186,12 +187,14 @@ class RunExpPatch(BasePatch):
                     getattr(finetuning_args, "finetuning_type", "full"),
                 )
 
-            config = build_config_from_lf_args(
+            config, raw_args = build_config_from_lf_args(
                 training_args=training_args,
                 finetuning_args=finetuning_args,
                 model_args=model_args,
                 torchturbo_args=tt_args,
+                raw_args=raw_args,
             )
+
             engine = TorchTurboEngine(config)
             adapter.engine = engine
             adapter.stage = stage
@@ -220,7 +223,7 @@ class RunExpPatch(BasePatch):
                 # Strip LoRA CLI flags and change --finetuning_type to "full"
                 # so that LlamaFactory's own init_adapter won't try to apply
                 # LoRA again when it re-parses the args.
-                args = strip_lora_args(args)
+                raw_args = strip_lora_args(raw_args)
 
             # apply_patches checks version compat for each patch
             adapter.apply_patches(engine)
@@ -229,7 +232,7 @@ class RunExpPatch(BasePatch):
                 "torchturbo: engine ready, entering run_exp for stage: %s",
                 stage,
             )
-            return self._original(args, callbacks)
+            return self._original(raw_args, callbacks)
 
         tuner_module.run_exp = _patched_run_exp
         logger.info("Patched tuner.run_exp")

@@ -49,22 +49,36 @@ class FSDPPlanSpec:
         The parameter/tensor placement definition.
     no_shard:
         Whether to skip FSDP sharding for this module completely.
-    cpu_offload:
-        Whether to offload this module to CPU.
+    standalone_world_shard:
+        Whether to shard this module as a standalone FSDP unit on the world mesh.
+    activation_checkpoint:
+        Whether to apply whole-module activation checkpointing to this module.
     replace_module:
         A callable to replace the matched module. Signature: `(original_module, **kwargs) -> nn.Module`
     module_kwargs:
         Keyword arguments to pass to the `replace_module` callable.
-    ignored:
-        Whether matched parameters should be excluded from FSDP sharding.
     """
 
     placement: FSDPPlacementSpec | None = None
     no_shard: bool = False
-    cpu_offload: bool = False
+    standalone_world_shard: bool = False
+    activation_checkpoint: bool = False
     replace_module: Any | None = None
     module_kwargs: dict[str, Any] = field(default_factory=dict)
-    ignored: bool = False
+
+    def __post_init__(self) -> None:
+        if self.no_shard and (
+            self.standalone_world_shard or self.placement is not None
+        ):
+            raise ValueError(
+                "FSDPPlanSpec.no_shard is mutually exclusive with "
+                "standalone_world_shard and placement."
+            )
+        if self.standalone_world_shard and self.placement is not None:
+            raise ValueError(
+                "FSDPPlanSpec.standalone_world_shard is redundant with placement; "
+                "use placement for custom mesh sharding."
+            )
 
 
 @dataclass

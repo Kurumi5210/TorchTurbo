@@ -198,7 +198,6 @@ class TorchTurboTrainerBase:
     def train(self, *args, **kwargs):
         from ...engine.hooks import TrainState
         from ...engine.args import get_torchturbo_args
-        from ...engine.profiling import start_profiling, stop_profiling
 
         engine = self._engine()
         sp_info = engine.backend.get_sp_info()
@@ -213,15 +212,31 @@ class TorchTurboTrainerBase:
         engine._fire(engine.hooks, "on_train_begin", train_state)
 
         tt_args = get_torchturbo_args()
-        if tt_args is not None and tt_args.profiling:
-            start_profiling(self.args.output_dir)
+        profiling_enabled = tt_args is not None and tt_args.profiling
+        if profiling_enabled:
+            profiling_callback = self._make_torchturbo_profiling_callback()
+            self.add_callback(profiling_callback)
+            engine.start_profiling(self.args.output_dir)
 
-        result = super().train(*args, **kwargs)
+        try:
+            return super().train(*args, **kwargs)
+        finally:
+            if profiling_enabled:
+                engine.stop_profiling()
 
-        if tt_args is not None and tt_args.profiling:
-            stop_profiling()
+    def _make_torchturbo_profiling_callback(self):
+        from transformers import TrainerCallback
 
-        return result
+        engine = self._engine()
+
+        class TorchTurboProfilingCallback(TrainerCallback):
+            """Bridge HF optimizer-step boundaries to TorchTurbo profiling."""
+
+            def on_step_end(self, args, state, control, **kwargs):
+                engine.step_profiling()
+                return control
+
+        return TorchTurboProfilingCallback()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if self.stage in {"sft", "pt"}:
@@ -300,9 +315,6 @@ class TorchTurboTrainerBase:
             outputs.loss = loss
 
         self._record_mtp_outputs(outputs)
-
-        from ...engine.profiling import step_profiling
-        step_profiling()
 
         return (loss, outputs) if return_outputs else loss
 

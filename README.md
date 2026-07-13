@@ -192,6 +192,8 @@ bash scripts/runs/lf_bailing_moe_v3_sft.sh
 - torchturbo `PYTHONPATH`
 - `NNODES` / `NPUS_PER_NODE` / `MASTER_ADDR` / `MASTER_PORT`
 - `TORCH_TURBO_SP_SIZE` / `TORCH_TURBO_EP_SIZE`
+- `TORCH_TURBO_GRADIENT_CHECKPOINTING` / `--tt_gradient_checkpointing`
+- `TORCH_TURBO_CPU_OFFLOAD` / `--tt_cpu_offload`
 
 ### 运行文档
 
@@ -222,12 +224,15 @@ docs/runs/
 | `TORCH_TURBO_DISABLE=1` | 禁用 torchturbo 自动激活 |
 | `TORCH_TURBO_BACKEND=fsdp2` | 选择分布式 backend |
 | `TORCH_TURBO_MIXED_PRECISION=bf16` | 混合精度策略 |
+| `TORCH_TURBO_GRADIENT_CHECKPOINTING=true` | activation checkpointing |
 | `TORCH_TURBO_SP_SIZE=2` | Sequence Parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Expert Parallel size |
-| `TORCH_TURBO_SELECTIVE_AC_LAYERS=0,4,8` | 选择性 activation checkpoint 层 |
-| `TORCH_TURBO_CPU_OFFLOAD=1` | FSDP CPU offload |
+| `TORCH_TURBO_CPU_OFFLOAD=1` | 对所有 FSDP-wrapped units 启用 CPU offload（默认关闭） |
 | `TORCH_TURBO_RESHARD_AFTER_FWD=0` | forward 后是否 reshard |
-| `TORCH_TURBO_FORWARD_PREFETCH=1` | FSDP forward prefetch |
+| `TORCH_TURBO_PREFETCH_STRATEGY=auto` | FSDP prefetch 拓扑：`native` / `auto`（默认）/ `expert_lookahead` / `expert_with_layer` |
+| `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | prefetch 作用的 pass：`forward` / `forward_backward`（默认）|
+| `TORCH_TURBO_FORWARD_PREFETCH_DEPTH=1` | forward 每个 source 预取多少层（默认 1）|
+| `TORCH_TURBO_BACKWARD_PREFETCH_DEPTH=1` | backward 每个 source 预取多少层（默认 1，仅 forward_backward 生效）|
 | `TORCH_TURBO_DEBUG=1` | 开启 torchturbo 调试信息，未完全实现 |
 
 ## 添加新模型

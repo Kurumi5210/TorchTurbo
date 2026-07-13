@@ -15,7 +15,7 @@ Two usage paths:
     )
     from torchturbo.engine import TorchTurboEngine
 
-    config = build_config_from_lf_args(training_args, model_args=model_args)
+    config, _ = build_config_from_lf_args(training_args, model_args=model_args)
     engine = TorchTurboEngine(config)
     engine.prepare_optimizer(AdamW, lr=args.learning_rate)
     engine.fit(dataloader, compute_loss_fn=compute_sft_loss,

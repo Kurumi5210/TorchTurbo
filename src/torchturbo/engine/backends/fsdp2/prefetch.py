@@ -1,144 +1,480 @@
-from torch import nn
-from typing import Any
+"""FSDP2 prefetch.
 
+Discovers ordered decoder chains from an FSDP-wrapped model, keeping each
+chain's full layer sequence (dense layers included) but only for chains that
+contain at least one MoE layer; chains with no MoE are left to FSDP's native
+prefetching. A chosen strategy then turns each chain into forward/backward
+prefetch targets, applied through FSDP2's public
+``set_modules_to_forward_prefetch`` / ``set_modules_to_backward_prefetch``
+APIs. Importing this module does not touch any FSDP internals.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Optional, Set
+
+from torch import nn
+
+from torchturbo.logging import get_logger
 from torchturbo.utils.torch_utils import torch_version
+
+from .config import FSDPConfig, FSDPPrefetchDirection, FSDPPrefetchStrategy
 
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp._fully_shard import FSDPModule
-    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
-    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
 else:
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-    from torch.distributed._composable.fsdp._fsdp_state import FSDPState
-    from torch.distributed._composable.fsdp._fsdp_param_group import FSDPParamGroup
+
+try:
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
+except Exception:  # pragma: no cover - MoE support optional
+    MoELayer = None  # type: ignore[assignment]
 
 
-def set_moe_layer_forward_prefetch(model, layer_cls, expert_cls, model_cls):
-    model_modules = []
-    layer_modules = []
-    expert_modules = []
-    config = model.config
-    first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+@dataclass
+class PrefetchNode:
+    """One node of a chain: an outer decoder block and its optional experts."""
 
-    for _, named_module in model.named_modules():
-        if isinstance(named_module, FSDPModule) and isinstance(named_module, model_cls):
-            model_modules.append(named_module)
+    module: "FSDPModule"
+    experts: Optional["FSDPModule"] = None
 
-        if isinstance(named_module, FSDPModule) and isinstance(named_module, layer_cls):
-            layer_modules.append(named_module)
 
-        if isinstance(named_module, FSDPModule) and isinstance(
-            named_module, expert_cls
-        ):
-            expert_modules.append(named_module)
+@dataclass
+class PrefetchChain:
+    """An ordered decoder-like chain plus the dense-to-MoE prefetch source."""
 
-    assert len(model_modules) == 1
-    num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0)
-    # Validate MTP layers in assertion
-    assert (
-        len(layer_modules) + num_nextn_predict_layers
-        == len(expert_modules) + first_k_dense_replace
-    )
+    name: str
+    bootstrap: Optional["FSDPModule"]
+    nodes: List[PrefetchNode] = field(default_factory=list)
+    first_moe_index: int = 0
 
-    for i in range(len(layer_modules)):
-        # layer prefetch layer
-        # expert prefetch expert
-        cur_layer = layer_modules[i]
-        j = i - first_k_dense_replace
-        if j >= 0:
-            cur_expert = expert_modules[j]
 
-        # deal with forward
-        if i == 0:
-            if j == 0:
-                model_modules[0].set_modules_to_forward_prefetch(
-                    [cur_layer, cur_expert]
+# ---------------------------------------------------------------------------
+# MoE detection
+# ---------------------------------------------------------------------------
+def _find_experts_container(layer: nn.Module) -> Optional["FSDPModule"]:
+    """Return the FSDP-wrapped experts container inside ``layer``, or ``None``."""
+    if MoELayer is None:
+        return None
+    for submodule in layer.modules():
+        if isinstance(submodule, MoELayer):
+            experts = getattr(submodule, "experts", None)
+            if isinstance(experts, FSDPModule):
+                return experts
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Chain discovery
+# ---------------------------------------------------------------------------
+def _collect_moe_internal_ids(model: nn.Module) -> Set[int]:
+    """Ids of modules nested inside a ``MoELayer``.
+
+    Used to skip experts-internal ``nn.ModuleList``s during discovery.
+    """
+    ids: Set[int] = set()
+    if MoELayer is None:
+        return ids
+    for m in model.modules():
+        if isinstance(m, MoELayer):
+            for sub in m.modules():
+                if sub is not m:
+                    ids.add(id(sub))
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Strategy layer: turn chains into forward/backward target maps
+# ---------------------------------------------------------------------------
+def _node_layer_modules(node: PrefetchNode) -> List["FSDPModule"]:
+    """The FSDP modules of one whole logical layer (outer module + experts)."""
+    mods: List["FSDPModule"] = [node.module]
+    if node.experts is not None:
+        mods.append(node.experts)
+    return mods
+
+
+def _add_target(
+    target_map: Dict["FSDPModule", List["FSDPModule"]],
+    source: Optional["FSDPModule"],
+    targets: List["FSDPModule"],
+) -> None:
+    if source is None:
+        return
+    filtered = [t for t in targets if t is not None]
+    if not filtered:
+        return
+    target_map.setdefault(source, []).extend(filtered)
+
+
+def _dedup(mods: List["FSDPModule"]) -> List["FSDPModule"]:
+    seen: Set[int] = set()
+    out: List["FSDPModule"] = []
+    for m in mods:
+        if id(m) not in seen:
+            seen.add(id(m))
+            out.append(m)
+    return out
+
+
+def _moe_indices(nodes: List[PrefetchNode]) -> List[int]:
+    return [i for i, node in enumerate(nodes) if node.experts is not None]
+
+
+def _source_for_node(
+    chain: PrefetchChain, index: int
+) -> Optional["FSDPModule"]:
+    if index == 0 or index == chain.first_moe_index:
+        return chain.bootstrap
+    return chain.nodes[index - 1].module
+
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
+class FSDPPrefetchManager:
+    """Discovers MoE chains and applies a prefetch strategy to a wrapped model."""
+
+    def __init__(
+        self,
+        config: FSDPConfig,
+        logger: Any = None,
+    ) -> None:
+        self.config = config
+        self.logger = logger if logger is not None else get_logger(__name__)
+        self.chains: List[PrefetchChain] = []
+        self._expert_forward_prefetch_targets: Dict[
+            "FSDPModule", List["FSDPModule"]
+        ] = {}
+
+    def setup(self, model: nn.Module) -> None:
+        if model is None:
+            raise ValueError("FSDPPrefetchManager.setup() requires a model")
+
+        # set_modules_to_{forward,backward}_prefetch require torch >= 2.5.0.
+        if torch_version() < (2, 5, 0):
+            if self.config.prefetch_strategy != FSDPPrefetchStrategy.NATIVE:
+                self.logger.warning(
+                    "FSDP prefetch requires torch >= 2.5.0 for "
+                    "set_modules_to_{forward,backward}_prefetch; got %s, "
+                    "skipping prefetch.",
+                    ".".join(map(str, torch_version())),
                 )
-            else:
-                model_modules[0].set_modules_to_forward_prefetch([cur_layer])
-        else:
-            # layer_{i - 1} prefetch layer_i
-            if j == 0:
-                layer_modules[i - 1].set_modules_to_forward_prefetch(
-                    [cur_expert, cur_layer]
-                )
-            else:
-                layer_modules[i - 1].set_modules_to_forward_prefetch([cur_layer])
-
-            if j > 0:
-                expert_modules[j - 1].set_modules_to_forward_prefetch([cur_expert])
-
-        # deal with backward
-        if i > 0:
-            # layer_i prefetch layer_{i - 1}
-            layer_backward_prefetch_states = [layer_modules[i - 1]._get_fsdp_state()]
-            setattr(
-                layer_modules[i],
-                "backward_prefetch_states",
-                layer_backward_prefetch_states,
-            )
-
-        if j > 0:
-            # layer_i prefetch layer_{i - 1}
-            expert_backward_prefetch_states = [expert_modules[j - 1]._get_fsdp_state()]
-            setattr(
-                expert_modules[j],
-                "backward_prefetch_states",
-                expert_backward_prefetch_states,
-            )
-
-
-# TODO(zlj): Not used
-class BackwardPrefetchContext:
-    def __init__(self):
-        self.in_backward = False
-
-        def pre_forward_hook(state, module, args, kwargs):
-            old_prefetch_list = None
-            cur_prefetch_list = getattr(module, "backward_prefetch_states", [])
-            if self.in_backward and cur_prefetch_list != []:
-                old_prefetch_list = state._states_to_forward_prefetch
-                state._states_to_forward_prefetch = cur_prefetch_list
-
-            res = self.old_pre_forward(state, module, args, kwargs)
-
-            if old_prefetch_list is not None:
-                state._states_to_forward_prefetch = old_prefetch_list
-
-            return res
-
-        self.old_pre_forward = FSDPState._pre_forward
-        FSDPState._pre_forward = pre_forward_hook
-
-        def post_forward_hook(state, module: nn.Module, input: Any, output: Any):
-            old_mesh_info = None
-            cur_prefetch_list = getattr(module, "backward_prefetch_states", [])
-            if self.in_backward and cur_prefetch_list != []:
-                old_mesh_info = state._fsdp_param_group.post_forward_mesh_info
-                state._fsdp_param_group.post_forward_mesh_info = None
-
-            res = self.old_post_forward(state, module, input, output)
-
-            if old_mesh_info != None:
-                state._fsdp_param_group.post_forward_mesh_info = old_mesh_info
-
-            return res
-
-        self.old_post_forward = FSDPState._post_forward
-        FSDPState._post_forward = post_forward_hook
-
-        def backward_prefetch_hook(group):
             return
 
-        self.old_backward_prefetch = FSDPParamGroup._backward_prefetch
-        FSDPParamGroup._backward_prefetch = backward_prefetch_hook
+        self._clear_targets()
+        self.chains = []
+        self._expert_forward_prefetch_targets = {}
 
-    def __enter__(self):
-        self.in_backward = True
-        return self
+        if self.config.prefetch_strategy == FSDPPrefetchStrategy.NATIVE:
+            return
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.in_backward = False
+        enable_backward = (
+            self.config.prefetch_direction
+            == FSDPPrefetchDirection.FORWARD_BACKWARD
+        )
 
+        self.chains = self._discover_moe_chains(model)
+        if not self.chains:
+            if self.config.prefetch_strategy != FSDPPrefetchStrategy.AUTO:
+                self.logger.warning(
+                    "FSDP prefetch: no eligible MoE chain discovered; skipping"
+                )
+            return
+        self._log_discovery()
 
-fsdp2_backward_prefetch_manager = BackwardPrefetchContext()
+        forward_targets, backward_targets = self._build_targets()
+
+        self._flush_forward_targets(forward_targets)
+        if enable_backward:
+            self._flush_backward_targets(backward_targets)
+
+        self.logger.info(
+            "FSDP prefetch configured: strategy=%s, forward=%s, backward=%s",
+            self.config.prefetch_strategy.value,
+            True,
+            enable_backward,
+        )
+
+    def cleanup(self) -> None:
+        self._clear_targets()
+        self._expert_forward_prefetch_targets = {}
+
+    def _discover_moe_chains(self, model: nn.Module) -> List[PrefetchChain]:
+        """Discover prefetch chains from an FSDP-wrapped model.
+
+        Each ``nn.ModuleList`` keeps its full layer sequence (dense layers
+        included) so prefetch edges follow real execution order and the
+        dense-to-MoE boundary is handled naturally. A chain is dropped entirely
+        when none of its layers is MoE — those are left to FSDP's native
+        prefetching.
+        """
+        moe_internal_ids = _collect_moe_internal_ids(model)
+        chains: List[PrefetchChain] = []
+        seen_signatures: Set[tuple] = set()
+
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.ModuleList):
+                continue
+            if id(module) in moe_internal_ids:
+                continue
+
+            nodes: List[PrefetchNode] = []
+            for child in module:
+                if not isinstance(child, FSDPModule):
+                    continue
+                nodes.append(
+                    PrefetchNode(module=child, experts=_find_experts_container(child))
+                )
+            if not nodes:
+                continue
+            if not any(n.experts is not None for n in nodes):
+                continue
+
+            signature = tuple(id(n.module) for n in nodes)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+
+            first_moe_idx = next(
+                i for i, node in enumerate(nodes) if node.experts is not None
+            )
+            bootstrap = None
+            if first_moe_idx > 0:
+                bootstrap = nodes[first_moe_idx - 1].module
+            chains.append(
+                PrefetchChain(
+                    name=name or "<root>",
+                    bootstrap=bootstrap,
+                    nodes=nodes,
+                    first_moe_index=first_moe_idx,
+                )
+            )
+
+        return chains
+
+    def _build_targets(self) -> tuple[
+        Dict["FSDPModule", List["FSDPModule"]],
+        Dict["FSDPModule", List["FSDPModule"]],
+    ]:
+        forward_targets: Dict["FSDPModule", List["FSDPModule"]] = {}
+        backward_targets: Dict["FSDPModule", List["FSDPModule"]] = {}
+        for chain in self.chains:
+            if not chain.nodes:
+                continue
+            eff = self._resolve_strategy(chain)
+            if eff == FSDPPrefetchStrategy.EXPERT_WITH_LAYER:
+                self._build_expert_with_layer_targets(
+                    chain, forward_targets, backward_targets
+                )
+            elif eff == FSDPPrefetchStrategy.EXPERT_LOOKAHEAD:
+                self._build_expert_lookahead_targets(
+                    chain, forward_targets, backward_targets
+                )
+        return forward_targets, backward_targets
+
+    def _resolve_strategy(self, chain: PrefetchChain) -> FSDPPrefetchStrategy:
+        if self.config.prefetch_strategy == FSDPPrefetchStrategy.AUTO:
+            return FSDPPrefetchStrategy.EXPERT_LOOKAHEAD
+        return self.config.prefetch_strategy
+
+    def _build_expert_with_layer_targets(
+        self,
+        chain: PrefetchChain,
+        forward_targets: Dict["FSDPModule", List["FSDPModule"]],
+        backward_targets: Dict["FSDPModule", List["FSDPModule"]],
+    ) -> None:
+        nodes = chain.nodes
+        n = len(nodes)
+        fd = self.config.forward_prefetch_depth
+        bd = self.config.backward_prefetch_depth
+        forward_scheduled: Set[int] = set()
+        backward_scheduled: Set[int] = set()
+
+        for i in _moe_indices(nodes):
+            source = _source_for_node(chain, i)
+            if source is None:
+                continue
+
+            fwd: List["FSDPModule"] = []
+            for k in range(i, min(i + fd, n)):
+                for module in _node_layer_modules(nodes[k]):
+                    if id(module) in forward_scheduled:
+                        continue
+                    forward_scheduled.add(id(module))
+                    fwd.append(module)
+            _add_target(forward_targets, source, fwd)
+
+        for i in reversed(_moe_indices(nodes)):
+            if i > 0:
+                bwd: List["FSDPModule"] = []
+                for k in range(i - 1, max(i - 1 - bd, -1), -1):
+                    for module in _node_layer_modules(nodes[k]):
+                        if id(module) in backward_scheduled:
+                            continue
+                        backward_scheduled.add(id(module))
+                        bwd.append(module)
+                _add_target(backward_targets, nodes[i].module, bwd)
+
+    def _build_expert_lookahead_targets(
+        self,
+        chain: PrefetchChain,
+        forward_targets: Dict["FSDPModule", List["FSDPModule"]],
+        backward_targets: Dict["FSDPModule", List["FSDPModule"]],
+    ) -> None:
+        nodes = chain.nodes
+        n = len(nodes)
+        fd = self.config.forward_prefetch_depth
+        bd = self.config.backward_prefetch_depth
+        moe_indices = _moe_indices(nodes)
+        forward_outer_scheduled: Set[int] = set()
+        forward_experts_scheduled: Set[int] = set()
+        backward_outer_scheduled: Set[int] = set()
+        backward_experts_scheduled: Set[int] = set()
+
+        # Forward: outer chain (predecessor -> upcoming outer layers) plus a
+        # separate experts chain (each experts -> next contiguous experts).
+        # Depth > 1 is a rolling horizon: once a module has been scheduled by
+        # an earlier source, later sources only add the newly exposed horizon.
+        for i in moe_indices:
+            source = _source_for_node(chain, i)
+            prev = i - 1
+            # Doubles as the entry flag (is this the source that bootstraps a
+            # contiguous MoE run?) and the run guard: it flips to False at the
+            # first non-MoE node in the window, so the source never prefetches
+            # experts across an intervening dense layer.
+            prefetch_entry_experts = not (
+                prev >= 0 and nodes[prev].experts is not None
+            )
+            source_targets: List["FSDPModule"] = []
+            if source is not None:
+                for k in range(i, min(i + fd, n)):
+                    outer = nodes[k].module
+                    if id(outer) not in forward_outer_scheduled:
+                        forward_outer_scheduled.add(id(outer))
+                        source_targets.append(outer)
+                    if prefetch_entry_experts and nodes[k].experts is not None:
+                        experts = nodes[k].experts
+                        if id(experts) not in forward_experts_scheduled:
+                            forward_experts_scheduled.add(id(experts))
+                            source_targets.append(experts)
+                    else:
+                        prefetch_entry_experts = False
+                _add_target(forward_targets, source, source_targets)
+            expert_targets: List["FSDPModule"] = []
+            for k in range(i + 1, min(i + 1 + fd, n)):
+                if nodes[k].experts is None:
+                    break
+                experts = nodes[k].experts
+                if id(experts) in forward_experts_scheduled:
+                    continue
+                forward_experts_scheduled.add(id(experts))
+                expert_targets.append(experts)
+            _add_target(forward_targets, nodes[i].experts, expert_targets)
+
+        # Backward: outer chain (layer -> previous outer layers) plus experts
+        # chain (experts -> previous contiguous experts). Sources fire from
+        # high layer index to low layer index, so rolling state is tracked in
+        # that order.
+        for i in reversed(moe_indices):
+            prev_idxs = range(i - 1, max(i - 1 - bd, -1), -1)  # i-1, ..., i-bd
+            if i > 0:
+                outer_targets: List["FSDPModule"] = []
+                for k in prev_idxs:
+                    outer = nodes[k].module
+                    if id(outer) in backward_outer_scheduled:
+                        continue
+                    backward_outer_scheduled.add(id(outer))
+                    outer_targets.append(outer)
+                _add_target(
+                    backward_targets,
+                    nodes[i].module,
+                    outer_targets,
+                )
+            expert_targets: List["FSDPModule"] = []
+            for k in prev_idxs:
+                if nodes[k].experts is None:
+                    break
+                experts = nodes[k].experts
+                if id(experts) in backward_experts_scheduled:
+                    continue
+                backward_experts_scheduled.add(id(experts))
+                expert_targets.append(experts)
+            _add_target(backward_targets, nodes[i].experts, expert_targets)
+
+    def _flush_forward_targets(
+        self, forward_targets: Dict["FSDPModule", List["FSDPModule"]]
+    ) -> None:
+        expert_source_ids = {
+            id(node.experts)
+            for chain in self.chains
+            for node in chain.nodes
+            if node.experts is not None
+        }
+        self._expert_forward_prefetch_targets = {}
+        for source, targets in forward_targets.items():
+            deduped_targets = _dedup(targets)
+            source.set_modules_to_forward_prefetch(deduped_targets)
+            if id(source) in expert_source_ids:
+                self._expert_forward_prefetch_targets[source] = deduped_targets
+
+    @contextmanager
+    def suspend_expert_forward_prefetch(self) -> Iterator[None]:
+        """Temporarily disable expert-source forward prefetch.
+
+        Used by activation-checkpoint recompute only. Normal forward still keeps
+        expert lookahead; during backward recompute, nested expert FSDP units can
+        still look like a normal forward and would otherwise prefetch later
+        experts at the wrong time.
+        """
+        saved_targets = list(self._expert_forward_prefetch_targets.items())
+        if not saved_targets:
+            yield
+            return
+
+        try:
+            for source, _ in saved_targets:
+                source.set_modules_to_forward_prefetch([])
+            yield
+        finally:
+            for source, targets in saved_targets:
+                source.set_modules_to_forward_prefetch(list(targets))
+
+    def _flush_backward_targets(
+        self, backward_targets: Dict["FSDPModule", List["FSDPModule"]]
+    ) -> None:
+        for source, targets in backward_targets.items():
+            source.set_modules_to_backward_prefetch(_dedup(targets))
+
+    def _clear_targets(self) -> None:
+        for module in self._collect_chain_modules():
+            module.set_modules_to_forward_prefetch([])
+            module.set_modules_to_backward_prefetch([])
+
+    def _collect_chain_modules(self) -> List["FSDPModule"]:
+        modules: List["FSDPModule"] = []
+        for chain in self.chains:
+            if chain.bootstrap is not None:
+                modules.append(chain.bootstrap)
+            for node in chain.nodes:
+                modules.append(node.module)
+                if node.experts is not None:
+                    modules.append(node.experts)
+        return _dedup(modules)
+
+    def _log_discovery(self) -> None:
+        self.logger.info("FSDP prefetch discovered %d chain(s):", len(self.chains))
+        for chain in self.chains:
+            n_experts = sum(1 for n in chain.nodes if n.experts is not None)
+            self.logger.info(
+                "- %s: nodes=%d, experts=%d, bootstrap=%s",
+                chain.name,
+                len(chain.nodes),
+                n_experts,
+                "yes" if chain.bootstrap is not None else "no",
+            )

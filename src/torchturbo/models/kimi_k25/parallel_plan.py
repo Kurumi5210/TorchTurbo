@@ -70,6 +70,9 @@ def get_parallel_plan() -> FSDPParallelPlan:
 
     return FSDPParallelPlan(
         plan={
+            "language_model.model.layers.*": FSDPPlanSpec(
+                activation_checkpoint=True,
+            ),
             "language_model.model.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
@@ -79,6 +82,15 @@ def get_parallel_plan() -> FSDPParallelPlan:
             ),
             "language_model.model.layers.*.self_attn": FSDPPlanSpec(
                 replace_module=_replace_self_attn,
+            ),
+            # "vision_tower": FSDPPlanSpec(
+            #     no_shard=True,
+            # ),
+            "language_model.model.embed_tokens": FSDPPlanSpec(
+                standalone_world_shard=True,
+            ),
+            "language_model.lm_head": FSDPPlanSpec(
+                standalone_world_shard=True,
             ),
         },
         sp_size=2,

@@ -241,9 +241,8 @@ class TorchTurboEngine:
         peft_config:
             Optional PEFT/LoRA configuration (``LoraConfig`` or ``dict``).
             When provided, LoRA adapters are applied **after** module
-            replacement but **before** FSDP2 sharding.  The
-            ``torchturbo.engine.peft`` module automatically registers a custom
-            LoRA handler for ``GroupedMLP`` (MoE experts with grouped
+            replacement but **before** FSDP2 sharding.  Applying LoRA registers
+            a custom handler for ``GroupedMLP`` (MoE experts with grouped
             matmul).
         load_weights:
             Whether to load checkpoint weights.  When ``False``, the model is
@@ -526,6 +525,28 @@ class TorchTurboEngine:
     def add_hooks(self, hooks: list[TrainHook]) -> None:
         """Register multiple training hooks."""
         self.hooks.extend(hooks)
+
+    # ------------------------------------------------------------------
+    # Profiling
+    # ------------------------------------------------------------------
+
+    def start_profiling(self, output_dir: str) -> None:
+        """Start TorchTurbo profiling under ``output_dir``."""
+        from .profiling import start_profiling
+
+        start_profiling(output_dir)
+
+    def step_profiling(self) -> None:
+        """Advance TorchTurbo profiling by one optimizer step."""
+        from .profiling import step_profiling
+
+        step_profiling()
+
+    def stop_profiling(self) -> None:
+        """Stop TorchTurbo profiling and flush traces."""
+        from .profiling import stop_profiling
+
+        stop_profiling()
 
     # ------------------------------------------------------------------
     # Data loading (SP-aware)

@@ -59,7 +59,9 @@ DISTRIBUTED_ARGS="
     --node_rank $NODE_RANK
 "
 
-export PYTHONPATH=/sfs_turbo/zlj/LLaMA-Factory/src:$PYTHONPATH
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src:$PYTHONPATH
+export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
+
 export TORCH_TURBO_SP_SIZE=2
 export TORCH_TURBO_EP_SIZE=8
 
@@ -67,6 +69,7 @@ torchrun $DISTRIBUTED_ARGS compare_diagnostics.py \
     --mode torchturbo \
     --model_name_or_path $model_name_or_path \
     --flash_attn fa2 \
+    --dataset_dir /sfs_turbo/zlj/workspace/torchturbo/dataset/npu/ \
     --dataset $dataset \
     --cutoff_len ${seq_length} \
     --template kimi_k25 \
@@ -79,5 +82,5 @@ torchrun $DISTRIBUTED_ARGS compare_diagnostics.py \
     --dump_params \
     --dump_inputs \
     --dump_layer_io \
-    --rank 0 1 \
-    --extra_lf_args --preprocessing_num_workers $((NNODES * 16)) --max_samples 64 --print_param_status True --trust_remote_code True
+    --rank 0 \
+    --extra_lf_args --preprocessing_num_workers $((NNODES * 16)) --max_samples 1000 --print_param_status True --trust_remote_code True

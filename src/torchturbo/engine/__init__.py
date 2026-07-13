@@ -20,7 +20,13 @@ Structure::
 
 # Import backends first so they auto-register
 from . import backends  # noqa: F401
-from .args import TorchTurboArgs, get_torchturbo_args, parse_torchturbo_args, set_torchturbo_args
+from .args import (
+    TorchTurboArgs,
+    get_torchturbo_args,
+    parse_torchturbo_args,
+    set_torchturbo_args,
+    string_to_bool,
+)
 from .backend_registry import get_available_backends, get_backend, register_backend
 from .backends.fsdp2 import FSDP2Backend, FSDPConfig
 from .backends.base import BaseBackend
@@ -33,7 +39,6 @@ from .config import (
     MixedPrecisionPolicy,
 )
 from .core import TorchTurboEngine
-from . import peft  # noqa: F401
 from .hooks import TrainHook, TrainState
 
 
@@ -43,6 +48,7 @@ __all__ = [
     "get_torchturbo_args",
     "parse_torchturbo_args",
     "set_torchturbo_args",
+    "string_to_bool",
     # Common config
     "ActivationCheckpointingConfig",
     "CheckpointConfig",

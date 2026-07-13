@@ -8,6 +8,7 @@ Output goes to ``{output_dir}/profiling/``.
 from __future__ import annotations
 
 import os
+import socket
 from typing import Any
 
 from ..logging import get_logger
@@ -23,6 +24,21 @@ def start_profiling(output_dir: str) -> None:
 
     profiling_dir = os.path.join(output_dir, "profiling")
     os.makedirs(profiling_dir, exist_ok=True)
+
+    # Name each rank's trace subdir by global rank + hostname
+    # (e.g. ``rank0_myhost_*_ascend_pt``) so it can be identified directly,
+    # instead of the default host/pid naming that requires opening
+    # ``profiler_info_{rank}.json``. Rank is the prefix for easy sorting; the
+    # hostname is kept for multi-node debugging.
+    rank = int(os.environ.get("RANK", 0))
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+    except Exception:
+        pass
+    worker_name = f"rank{rank}_{socket.gethostname()}"
 
     try:
         import torch_npu
@@ -47,7 +63,9 @@ def start_profiling(output_dir: str) -> None:
             schedule=torch_npu.profiler.schedule(
                 wait=0, warmup=0, active=1, repeat=1, skip_first=1
             ),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profiling_dir),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                profiling_dir, worker_name=worker_name
+            ),
             record_shapes=False,
             profile_memory=False,
             with_stack=False,
@@ -69,7 +87,9 @@ def start_profiling(output_dir: str) -> None:
             schedule=torch.profiler.schedule(
                 wait=0, warmup=0, active=1, repeat=1, skip_first=1
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(profiling_dir),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                profiling_dir, worker_name=worker_name
+            ),
             record_shapes=False,
             profile_memory=False,
             with_stack=False,

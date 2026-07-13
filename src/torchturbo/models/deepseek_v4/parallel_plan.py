@@ -6,7 +6,7 @@ from ...parallel import FSDPParallelPlan, FSDPPlacementSpec, FSDPPlanSpec
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.moe.moe_layer import MoEConfig, MoELayer, MoESubmodules
 
-_IGNORED_PARAM_NAMES = [
+_NO_SHARD_PARAM_NAMES = [
     "hc_head_fn",
     "hc_head_base",
     "hc_head_scale",
@@ -99,7 +99,11 @@ def get_parallel_plan(sp_size: int = 2, ep_size: int = 4) -> FSDPParallelPlan:
                 replace_module=_replace_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
-            **{name: FSDPPlanSpec(ignored=True) for name in _IGNORED_PARAM_NAMES},
+            **{name: FSDPPlanSpec(no_shard=True) for name in _NO_SHARD_PARAM_NAMES},
+            **{
+                f"**.{name}": FSDPPlanSpec(no_shard=True)
+                for name in _NO_SHARD_PARAM_NAMES
+            },
         },
         sp_size=sp_size,
         ep_size=ep_size,

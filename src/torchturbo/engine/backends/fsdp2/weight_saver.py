@@ -12,7 +12,7 @@ from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
 
 from torchturbo.engine.peft.weights import apply_lora_delta, build_lora_delta_map
-from torchturbo.engine.peft.naming import strip_peft_prefix, is_peft_adapter_param
+from torchturbo.engine.utils import is_peft_adapter_param, strip_peft_prefix
 
 class ShardedParamManager:
     def __init__(

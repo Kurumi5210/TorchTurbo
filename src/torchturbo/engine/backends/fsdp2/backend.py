@@ -1,40 +1,42 @@
 """FSDP2 distributed backend — ``torch.distributed.fsdp.fully_shard``."""
 
+import functools
 import os
-import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+import torch.distributed as dist
 import torch
 import torch.nn as nn
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
-import torch.distributed as dist
 
-from torchturbo.logging import get_logger
-from torchturbo.utils.flash_attn_utils import get_unpad_data
-from torchturbo.engine.peft.naming import strip_peft_prefix
-from ..base import BaseBackend
-from ...backend_registry import register_backend
+from torchturbo.models.modules.attention.ulysses import (
+    slice_input_tensor,
+    ulysses_pad,
+    ulysses_pad_and_slice_inputs,
+)
+from torchturbo.models.modules.comm import all_gather_tensor
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
-    FSDPPlacementSpec,
     ParallelPlan,
 )
-from .config import FSDPConfig
-from .weight_loader import DistParamLoader
-from .weight_saver import DistParamSaver
-from torchturbo.utils.device import get_device_name, is_npu_available, is_cuda_available
+from torchturbo.engine.utils import strip_peft_prefix
+from torchturbo.utils.device import get_device_name, is_cuda_available, is_npu_available
+from torchturbo.utils.flash_attn_utils import get_unpad_data
+
+from ...backend_registry import register_backend
 from ...config import EngineConfig
-from torchturbo.models.modules.comm import all_gather_tensor
-from torchturbo.models.modules.attention.ulysses import (
-    slice_input_tensor,
-    ulysses_pad_and_slice_inputs,
-    ulysses_pad,
-)
-from .prefetch import set_moe_layer_forward_prefetch
+from ..base import BaseBackend
+from .config import FSDPConfig
+from .prefetch import FSDPPrefetchManager
 
 
-logger = get_logger(__name__)
+@dataclass
+class _FSDPUnit:
+    modules: list[nn.Module]
+    mesh: Any
+    reshard_after_forward: bool | None = None
 
 
 class FSDP2Backend(BaseBackend):
@@ -51,13 +53,16 @@ class FSDP2Backend(BaseBackend):
 
     def __init__(self, config: EngineConfig) -> None:
         super().__init__(config)
-        fsdp: FSDPConfig = config.backend_config
+        self.fsdp_config: FSDPConfig = config.backend_config
+        fsdp_config = self.fsdp_config
         self.mixed_precision = config.mixed_precision
-        self.sharding_strategy = fsdp.sharding_strategy
-        self.reshard_after_forward = fsdp.reshard_after_forward
-        self.forward_prefetch = fsdp.forward_prefetch
-        self.cpu_offload = fsdp.cpu_offload
-        self.pin_memory = fsdp.pin_memory
+        self.sharding_strategy = fsdp_config.sharding_strategy
+        self.reshard_after_forward = fsdp_config.reshard_after_forward
+
+        self.prefetch_manager = FSDPPrefetchManager(
+            config=self.fsdp_config,
+            logger=self.logger,
+        )
 
         # Sequence parallel process group and device mesh
         self.rank = dist.get_rank()
@@ -81,7 +86,7 @@ class FSDP2Backend(BaseBackend):
           group 1: [4, 5, 6, 7]
         """
         if not dist.is_initialized():
-            logger.warning(
+            self.logger.warning(
                 "torch.distributed not initialized — skipping SP group creation. "
                 "SP groups will be created lazily when needed."
             )
@@ -105,7 +110,7 @@ class FSDP2Backend(BaseBackend):
                 sp_group = group
         sp_rank = dist.get_rank(sp_group)
 
-        logger.info(
+        self.logger.info(
             "Created SP process group: sp_size=%d, rank=%d, " "group_ranks=%s",
             sp_size,
             rank,
@@ -146,7 +151,7 @@ class FSDP2Backend(BaseBackend):
             device_name, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
         )
 
-        logger.info("Created DeviceMesh")
+        self.logger.info("Created DeviceMesh")
 
         self._create_sp_group(sp_size)
 
@@ -193,38 +198,30 @@ class FSDP2Backend(BaseBackend):
                         parent_fqn, _, name = fqn.rpartition(".")
                         parent = model.get_submodule(parent_fqn)
                         setattr(parent, name, new_module)
-                        logger.info(
+                        self.logger.info(
                             "FSDP2Backend replaced module %s with %s",
                             fqn,
                             type(new_module).__name__,
                         )
                     else:
-                        logger.info("FSDP2Backend patched module %s in-place", fqn)
+                        self.logger.info("FSDP2Backend patched module %s in-place", fqn)
 
         return model
 
-    def _get_ignored_params(
-        self, model: nn.Module, plan: FSDPParallelPlan, logging = False
-    ) -> set[nn.Parameter]:
-        ignored_patterns = [re.compile(pattern) for pattern, spec in plan.plan.items() if spec.ignored]
-        ignored_params = set()
-        for name, param in model.named_parameters():
-            if any(pattern.search(name) for pattern in ignored_patterns):
-                ignored_params.add(param)
-                if logging and self.rank == 0:
-                    logger.info(f"FSDP2 ignored param {len(ignored_params)}: {name}")
-        return ignored_params
+    def _register_no_shard_params_grad_sync(self, model: nn.Module) -> None:
+        """Synchronize gradients for ``no_shard`` parameters.
 
-    def _register_ignored_params_grad_sync(self, model: nn.Module) -> None:
-        """Register post-accumulate-gradient hooks for FSDP ignored_params.
-
-        FSDP does not manage gradient synchronization for ignored_params,
-        so we must manually all-reduce their gradients across the DP world.
-        FSDP2 uses ReduceOp.AVG by default, so we use AVG here to match.
+        FSDP receives these parameters as ``ignored_params`` and therefore does
+        not reduce their gradients. FSDP2 uses ReduceOp.AVG by default, so the
+        manual synchronization uses AVG as well.
         """
-        ignored_params = self._get_ignored_params(model, self.parallel_plan)
+        no_shard_params, _ = self._collect_no_shard(model, self.parallel_plan)
+
         world_group = dist.group.WORLD
-        for param in ignored_params:
+        for param in no_shard_params:
+            if not param.requires_grad:
+                continue
+
             def _grad_hook(p):
                 if p.grad is not None:
                     dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=world_group)
@@ -258,11 +255,18 @@ class FSDP2Backend(BaseBackend):
         if peft_config is not None:
             from ...peft import apply_peft
 
-            logger.info("Applying PEFT LoRA to model")
+            self.logger.info("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
 
-        # Phase 3: FSDP2 sharding.
+        # Phase 3: Activation checkpointing must be applied before FSDP2 so
+        # checkpoint recompute runs inside the FSDP unit, not around it. Targets
+        # are explicit in the parallel plan and patch module.forward directly, so
+        # FQNs stay stable for later sharding/prefetch/weight logic.
+        model = self._apply_activation_checkpointing(model, plan)
+
+        # Phase 4: FSDP2 sharding.
         model = self._shard_model(model, plan)
+        self.prefetch_manager.setup(model)
 
         ep_size = self.get_ep_info()["ep_size"]
         if ep_size > 1:
@@ -272,19 +276,9 @@ class FSDP2Backend(BaseBackend):
 
         return model
 
-    # TODO(zlj): Not used yet
-    def _set_prefetch(self, model):
-        outer_cls = model.model.layers[0].__class__
-        if hasattr(model.config, "first_k_dense_replace"):
-            inter_cls = model.model.layers[
-                model.config.first_k_dense_replace
-            ].mlp.experts.__class__
-        else:
-            inter_cls = model.model.layers[0].mlp.experts.__class__
-        outermost_cls = model.__class__
-        set_moe_layer_forward_prefetch(model, outer_cls, inter_cls, outermost_cls)
-
     def load_model(self, model: nn.Module, model_name_or_path: str):
+        from .weight_loader import DistParamLoader
+
         loader = DistParamLoader(
             model=model,
             path=model_name_or_path,
@@ -295,9 +289,9 @@ class FSDP2Backend(BaseBackend):
         )
         loader.load_weights()
 
-        # Register gradient all-reduce hooks for ignored_params after load_weights.
+        # Register gradient all-reduce hooks for no_shard params after load_weights.
         # load_weights calls to_empty, which replaces Parameter objects.
-        self._register_ignored_params_grad_sync(model)
+        self._register_no_shard_params_grad_sync(model)
         return model
 
     def materialize_model(self, model: nn.Module):
@@ -307,6 +301,8 @@ class FSDP2Backend(BaseBackend):
     def save_model(
         self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
     ):
+        from .weight_saver import DistParamSaver
+
         saver = DistParamSaver(
             model=model,
             rank=self.rank,
@@ -316,14 +312,11 @@ class FSDP2Backend(BaseBackend):
         )
         saver.save_model(output_dir)
 
-    def _shard_model(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
-        from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-
-        has_plan = plan.plan and isinstance(plan.plan, dict) and self._mesh is not None
-
-        applied = 0
-        cpu_offloaded = 0
-        skip_fqns: set[str] = set()
+    def _build_fsdp_kwargs(
+        self,
+        ignored_params: set[nn.Parameter],
+    ) -> dict[str, Any]:
+        from torch.distributed.fsdp import MixedPrecisionPolicy
 
         fsdp_kwargs = {}
 
@@ -346,93 +339,425 @@ class FSDP2Backend(BaseBackend):
         if hasattr(self, "reshard_after_forward"):
             fsdp_kwargs["reshard_after_forward"] = self.reshard_after_forward
 
-        ignored_params = self._get_ignored_params(model, plan, True)
         if ignored_params:
             fsdp_kwargs["ignored_params"] = ignored_params
 
-        def _wrap(mod: nn.Module, target_mesh: Any) -> None:
-            kw = fsdp_kwargs.copy()
-            if hasattr(mod, "_fsdp_cpu_offload"):
-                kw["offload_policy"] = mod._fsdp_cpu_offload
-            fully_shard(mod, mesh=target_mesh, **kw)
+        if self.fsdp_config.cpu_offload:
+            from torch.distributed.fsdp import CPUOffloadPolicy
 
-        if has_plan:
-            # Module-level specifications (offload, no_shard)
-            for fqn, submodule in model.named_modules():
-                clean_fqn = strip_peft_prefix(fqn)
-                spec = plan.match(clean_fqn)
+            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(
+                pin_memory=self.fsdp_config.pin_memory
+            )
 
-                # Check for module-specific offload, OR global config offload
-                should_offload = getattr(self, "cpu_offload", False)
-                if isinstance(spec, FSDPPlanSpec):
-                    if spec.cpu_offload:
-                        should_offload = True
+        return fsdp_kwargs
 
-                if should_offload:
-                    try:
-                        from torch.distributed.fsdp.wrap import CPUOffloadPolicy
+    def _apply_fsdp(
+        self,
+        model: nn.Module,
+        units: list[_FSDPUnit],
+        fsdp_kwargs: dict[str, Any],
+    ) -> None:
+        from torch.distributed.fsdp import fully_shard
 
-                        policy = CPUOffloadPolicy(
-                            pin_memory=getattr(self, "pin_memory", True)
-                        )
-                        setattr(submodule, "_fsdp_cpu_offload", policy)
-                        cpu_offloaded += 1
-                    except ImportError:
-                        pass
+        unit_by_module_id: dict[int, tuple[int, _FSDPUnit]] = {}
+        for idx, unit in enumerate(units):
+            for module in unit.modules:
+                unit_by_module_id[id(module)] = (idx, unit)
 
-                    if isinstance(spec, FSDPPlanSpec) and spec.no_shard:
-                        # Future-proofing for actual FSDP wrapping logic skipping
-                        setattr(submodule, "_fsdp_no_shard", True)
+        applied: set[int] = set()
 
-            # Module-level Placements
-            for fqn, submodule in reversed(list(model.named_modules())):
-                clean_fqn = strip_peft_prefix(fqn)
-                spec = plan.match(clean_fqn)
-                placement_spec = None
+        for _, module in reversed(list(model.named_modules())):
+            item = unit_by_module_id.get(id(module))
+            if item is None:
+                continue
+            unit_idx, unit = item
+            if unit_idx in applied:
+                continue
 
-                if isinstance(spec, FSDPPlanSpec) and spec.placement is not None:
-                    placement_spec = spec.placement
-                elif isinstance(spec, FSDPPlacementSpec):
-                    placement_spec = spec
+            target_fsdp_kwargs = fsdp_kwargs
+            if unit.reshard_after_forward is not None:
+                target_fsdp_kwargs = fsdp_kwargs.copy()
+                target_fsdp_kwargs["reshard_after_forward"] = (
+                    unit.reshard_after_forward
+                )
 
-                if not placement_spec:
-                    continue
+            fully_shard(unit.modules, mesh=unit.mesh, **target_fsdp_kwargs)
+            applied.add(unit_idx)
 
-                target_mesh = self._world_mesh
-                if (
-                    hasattr(placement_spec, "mesh_dim")
-                    and placement_spec.mesh_dim is not None
-                ):
-                    if placement_spec.mesh_dim == "world":
-                        target_mesh = self._world_mesh
-                    else:
-                        target_mesh = self._mesh[placement_spec.mesh_dim]
+        if len(applied) != len(units):
+            raise RuntimeError(
+                "Some FSDP units were not found in model.named_modules(); "
+                "FSDP units must only contain registered model submodules."
+            )
 
-                fully_shard(submodule, mesh=target_mesh, **fsdp_kwargs)
-                applied += 1
+    def _optimize_fsdp_units(
+        self,
+        model: nn.Module,
+        units: list[_FSDPUnit],
+    ) -> list[_FSDPUnit]:
+        """Return optimized FSDP units before ``fully_shard``.
 
-        logger.info(
-            "FSDP2Backend: applied parallel plan placements to %d modules, %d modules offloaded",
-            applied,
-            cpu_offloaded,
+        This is a deterministic unit transform following Accelerate's FSDP2
+        layout: carve input embeddings, merge the final norm with the output
+        embedding tail, and keep root/tail params resident because their
+        backward all-gather cannot be hidden behind useful compute.
+        """
+        # Start from explicit/default FSDP units collected by _shard_model.
+        # The optimizer only appends or merges deterministic auto units.
+        optimized = list(units)
+
+        # Direct lookup for modules that are already FSDP unit anchors. This is
+        # used to merge final_norm into an explicitly configured output embed
+        # unit instead of creating a second tail unit.
+        unit_by_module_id = {
+            id(module): unit for unit in optimized for module in unit.modules
+        }
+
+        # Full subtree coverage from existing units. Auto units must not split
+        # inside an explicit unit or default layer unit.
+        covered_module_ids = {
+            id(child)
+            for unit in optimized
+            for module in unit.modules
+            for child in module.modules()
+        }
+
+        # Auto units are only added for real, registered modules that are not
+        # already covered by a base unit and are not marked no_shard.
+        def can_add_auto_unit(module: Any) -> bool:
+            return (
+                isinstance(module, nn.Module)
+                and id(module) not in covered_module_ids
+                and not getattr(module, "_fsdp_no_shard", False)
+            )
+
+        # Accelerate-style input embedding discovery; absent/unsupported APIs
+        # simply mean there is no input embed auto unit to add.
+        input_embed = None
+        get_input_embeddings = getattr(model, "get_input_embeddings", None)
+        if callable(get_input_embeddings):
+            try:
+                input_embed = get_input_embeddings()
+            except (NotImplementedError, AttributeError):
+                pass
+
+        # Accelerate-style output embedding discovery. We do not guess an
+        # lm_head attribute; models must expose it through this HF API.
+        output_embed = None
+        get_output_embeddings = getattr(model, "get_output_embeddings", None)
+        if callable(get_output_embeddings):
+            try:
+                output_embed = get_output_embeddings()
+            except (NotImplementedError, AttributeError):
+                pass
+
+        # Tied embeddings share the same weight object. In that case the tail
+        # resident unit should be the input embedding, not a separate output
+        # embedding module.
+        input_weight = getattr(input_embed, "weight", None)
+        output_weight = getattr(output_embed, "weight", None)
+        is_tied = input_weight is not None and input_weight is output_weight
+        tail_embed = input_embed if is_tied else output_embed
+
+        # Final norm is merged with the tail unit when possible so the last
+        # small parameters stay resident with lm_head/output embedding.
+        final_norm = self._find_final_norm(model)
+
+        if not is_tied and can_add_auto_unit(input_embed):
+            optimized.append(_FSDPUnit(modules=[input_embed], mesh=self._world_mesh))
+
+        # If output/tied embedding is already an explicit unit, extend that unit
+        # with final_norm. Otherwise, create one auto tail unit from the
+        # available final_norm/output embedding modules.
+        tail_embed_unit = (
+            unit_by_module_id.get(id(tail_embed))
+            if isinstance(tail_embed, nn.Module)
+            else None
         )
+        if tail_embed_unit is not None:
+            if can_add_auto_unit(final_norm):
+                tail_embed_unit.modules = [final_norm] + tail_embed_unit.modules
+            tail_embed_unit.reshard_after_forward = False
+        else:
+            tail_modules = [
+                module
+                for module in (final_norm, tail_embed)
+                if can_add_auto_unit(module)
+            ]
+            if tail_modules:
+                optimized.append(
+                    _FSDPUnit(
+                        modules=tail_modules,
+                        mesh=self._world_mesh,
+                        reshard_after_forward=False,
+                    )
+                )
 
-        for fqn, m in model.named_modules():
-            clean_fqn = strip_peft_prefix(fqn)
-            if isinstance(m, nn.ModuleList):
-                for child in m:
-                    if not getattr(child, "_fsdp_no_shard", False):
-                        _wrap(child, self._world_mesh)
+        if can_add_auto_unit(model):
+            optimized.append(
+                _FSDPUnit(
+                    modules=[model],
+                    mesh=self._world_mesh,
+                    reshard_after_forward=False,
+                )
+            )
 
-        _wrap(model, self._world_mesh)
+        # Root and tail units are kept resident after forward. Their backward
+        # all-gathers happen at the step edges, where there is little useful
+        # compute to hide them.
+        resident_module_ids = {
+            id(module)
+            for module in (model, final_norm, tail_embed)
+            if isinstance(module, nn.Module)
+        }
+        for unit in optimized:
+            if any(id(module) in resident_module_ids for module in unit.modules):
+                unit.reshard_after_forward = False
 
-        # Apply prefetch policies if configured
-        if hasattr(self, "forward_prefetch") and self.forward_prefetch:
-            from torch.distributed.fsdp import register_fsdp_forward_method
+        return optimized
 
-            register_fsdp_forward_method(model, "forward")
+    def _apply_activation_checkpointing(
+        self, model: nn.Module, plan: FSDPParallelPlan
+    ) -> nn.Module:
+        from contextlib import nullcontext
+        from torch.utils.checkpoint import checkpoint
+
+        target_modules: list[tuple[str, nn.Module]] = []
+        for fqn, submodule in model.named_modules():
+            spec = plan.match(strip_peft_prefix(fqn))
+            if isinstance(spec, FSDPPlanSpec) and spec.activation_checkpoint:
+                target_modules.append((fqn, submodule))
+
+        if not target_modules:
+            return model
+
+        if not self.config.activation_checkpointing.enabled:
+            target_fqns = [fqn or "<root>" for fqn, _ in target_modules]
+            if self.rank == 0:
+                self.logger.warning(
+                    "Activation checkpoint targets are configured in the "
+                    "parallel plan, but activation_checkpointing.enabled is "
+                    "False; skipping activation checkpointing for %s.",
+                    target_fqns,
+                )
+            return model
+
+        # TorchTurbo owns activation checkpointing here. Make sure HF's own
+        # GradientCheckpointingLayer base class does not ALSO checkpoint its
+        # __call__: that would double-checkpoint and, worse, re-enter the FSDP
+        # forward hooks during recompute (the forward-prefetch leak).
+        for module in model.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = False
+            # Match HF/LF gradient checkpointing behavior. Some parent forwards
+            # read config.use_cache before calling the checkpointed layers.
+            config = getattr(module, "config", None)
+            if config is not None and hasattr(config, "use_cache"):
+                config.use_cache = False
+
+        def checkpoint_context_fn():
+            # The recompute context is active only in backward. Expert containers
+            # can be nested FSDP units under the checkpointed layer, and their
+            # PRE_BACKWARD hook may not have fired yet when recompute calls
+            # experts.forward(). Without this guard, expert forward-prefetch
+            # edges can leak into backward.
+            return (
+                nullcontext(),
+                self.prefetch_manager.suspend_expert_forward_prefetch(),
+            )
+
+        def make_checkpointed_forward(module: nn.Module):
+            original_forward = module.forward
+
+            @functools.wraps(original_forward)
+            def checkpointed_forward(*args, **kwargs):
+                if not module.training:
+                    return original_forward(*args, **kwargs)
+
+                checkpoint_kwargs = kwargs
+                for cache_key in (
+                    "past_key_value",
+                    "past_key_values",
+                    "layer_past",
+                ):
+                    if checkpoint_kwargs.get(cache_key) is not None:
+                        checkpoint_kwargs = dict(checkpoint_kwargs)
+                        checkpoint_kwargs[cache_key] = None
+                if checkpoint_kwargs.get("use_cache", False):
+                    checkpoint_kwargs = dict(checkpoint_kwargs)
+                    checkpoint_kwargs["use_cache"] = False
+
+                return checkpoint(
+                    functools.partial(original_forward, **checkpoint_kwargs),
+                    *args,
+                    use_reentrant=False,
+                    context_fn=checkpoint_context_fn,
+                )
+
+            return checkpointed_forward
+
+        for fqn, submodule in target_modules:
+            if hasattr(submodule, "_tt_original_forward"):
+                continue
+            submodule._tt_original_forward = submodule.forward
+            submodule.forward = make_checkpointed_forward(submodule)
 
         return model
+
+    def _collect_no_shard(
+        self, model: nn.Module, plan: FSDPParallelPlan
+    ) -> tuple[set[nn.Parameter], list[nn.Module]]:
+        """Identify ``no_shard`` params and module-level subtrees from *plan*.
+
+        Two matching modes, both driven by ``FSDPPlanSpec.no_shard``:
+
+        - module-level: a spec matching a module FQN selects the whole subtree,
+          so every parameter under it is collected (e.g. replicating a small
+          vision tower).
+        - param-level: a spec matching a parameter name selects only that
+          parameter (e.g. deepseek_v4 ``hc_*``/``attn_sink`` scalars); the
+          owning module is still sharded normally.
+
+        Pure identification with no side effects; callers decide what to do with
+        the result (mark ``_fsdp_no_shard``, feed FSDP ``ignored_params``, or
+        register grad-sync hooks). ``_shard_model`` and
+        ``_register_no_shard_params_grad_sync`` share this so the two never
+        disagree on which params are no_shard.
+
+        Returns ``(no_shard_params, no_shard_modules)``.
+        """
+        no_shard_params: set[nn.Parameter] = set()
+        no_shard_modules: list[nn.Module] = []
+
+        for fqn, submodule in model.named_modules():
+            spec = plan.match(strip_peft_prefix(fqn))
+            if not isinstance(spec, FSDPPlanSpec) or not spec.no_shard:
+                continue
+            no_shard_modules.append(submodule)
+            for name, param in submodule.named_parameters(recurse=True):
+                if param in no_shard_params:
+                    continue
+                no_shard_params.add(param)
+
+        for name, param in model.named_parameters():
+            if param in no_shard_params:
+                continue
+            spec = plan.match(strip_peft_prefix(name))
+            if isinstance(spec, FSDPPlanSpec) and spec.no_shard:
+                no_shard_params.add(param)
+
+        return no_shard_params, no_shard_modules
+
+    def _shard_model(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
+        named_modules = list(model.named_modules())
+
+        # no_shard identification is shared with _register_no_shard_params_grad_sync
+        # via _collect_no_shard so both stay in sync. Module-level matches replicate
+        # a whole subtree: mark _fsdp_no_shard so the wrap passes below skip it.
+        # Param-level matches (e.g. deepseek_v4 hc_*/attn_sink) keep their owning
+        # module sharded and only route the matched params to ignored_params.
+        no_shard_params, no_shard_modules = self._collect_no_shard(model, plan)
+        for submodule in no_shard_modules:
+            for child in submodule.modules():
+                setattr(child, "_fsdp_no_shard", True)
+
+        fsdp_kwargs = self._build_fsdp_kwargs(no_shard_params)
+
+        # Collect base FSDP units from explicit plan entries and the default
+        # ModuleList policy. Automatic carve/merge optimizations happen later.
+        units: list[_FSDPUnit] = []
+        wrapped_modules: set[int] = set()
+        explicit_subtree_modules: set[int] = set()
+
+        def _add_unit(
+            modules: nn.Module | list[nn.Module],
+            mesh: Any,
+            reshard_after_forward: bool | None = None,
+        ) -> None:
+            modules = modules if isinstance(modules, list) else [modules]
+            unit_ids = {id(module) for module in modules}
+            if unit_ids & wrapped_modules:
+                return
+            units.append(
+                _FSDPUnit(
+                    modules=modules,
+                    mesh=mesh,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            )
+            wrapped_modules.update(unit_ids)
+
+        # Explicit sharding specs first, bottom-up.
+        for fqn, submodule in reversed(named_modules):
+            if fqn == "" or getattr(submodule, "_fsdp_no_shard", False):
+                continue
+
+            clean_fqn = strip_peft_prefix(fqn)
+            spec = plan.match(clean_fqn)
+            if not isinstance(spec, FSDPPlanSpec):
+                continue
+
+            if spec.placement is None and not spec.standalone_world_shard:
+                continue
+
+            if spec.placement is not None:
+                mesh_dim = spec.placement.mesh_dim
+                if mesh_dim is None or mesh_dim == "world":
+                    target_mesh = self._world_mesh
+                else:
+                    target_mesh = self._mesh[mesh_dim]
+            else:
+                target_mesh = self._world_mesh
+
+            explicit_subtree_modules.update(
+                id(child) for child in submodule.modules()
+            )
+            _add_unit(submodule, target_mesh)
+
+        # Default policy: each ModuleList child is a world-mesh FSDP unit.
+        # Iterate reversed: named_modules() is a pre-order DFS (ancestors before
+        # descendants), so reversing makes descendants wrap first.
+        for fqn, submodule in reversed(named_modules):
+            if getattr(submodule, "_fsdp_no_shard", False):
+                continue
+            if not isinstance(submodule, nn.ModuleList):
+                continue
+            for idx, child in enumerate(submodule):
+                if getattr(child, "_fsdp_no_shard", False):
+                    continue
+                if id(child) in wrapped_modules:
+                    continue
+                # An explicit plan entry (placement or standalone_world_shard)
+                # defines an FSDP boundary. The default ModuleList policy does not
+                # split ModuleList children inside that explicitly wrapped subtree.
+                if id(child) in explicit_subtree_modules:
+                    continue
+                _add_unit(child, self._world_mesh)
+
+        units = self._optimize_fsdp_units(model, units)
+        self._apply_fsdp(model=model, units=units, fsdp_kwargs=fsdp_kwargs)
+
+        return model
+
+    @staticmethod
+    def _find_final_norm(model: nn.Module) -> Optional[nn.Module]:
+        """Find the final normalization layer, mirroring Accelerate's heuristic.
+
+        Scans the direct children of the model's base module
+        (``base_model_prefix``) and returns the last child whose class name
+        contains ``"Norm"``. Returns ``None`` when the base model is absent or
+        has no norm among its direct children (e.g. deeply nested VLMs), in
+        which case the norm simply stays in the root unit.
+        """
+        base_prefix = getattr(model, "base_model_prefix", "")
+        base_model = getattr(model, base_prefix, None) if base_prefix else model
+        if not isinstance(base_model, nn.Module):
+            return None
+        final_norm: Optional[nn.Module] = None
+        for _, module in base_model.named_children():
+            if "Norm" in type(module).__name__:
+                final_norm = module
+        return final_norm
 
     def get_dp_info(self) -> dict[str, Any]:
         """Compute data-parallel rank and size, accounting for SP.

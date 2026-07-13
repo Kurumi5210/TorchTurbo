@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from torch.distributed._tensor import DTensor
 
-from torchturbo.engine.peft.naming import strip_peft_prefix
+from torchturbo.engine.utils import strip_peft_prefix
 
 
 # ---------------------------------------------------------------------------

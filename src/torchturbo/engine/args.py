@@ -14,18 +14,24 @@ The parsed args can later be retrieved::
     from torchturbo.engine.args import get_torchturbo_args
 
     tt_args = get_torchturbo_args()
-    overrides = tt_args.to_overrides_dict()
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Any
 
 from ..logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def string_to_bool(value: str | bool) -> bool:
+    """Parse bool values with the same semantics as Transformers."""
+    from transformers.hf_argparser import string_to_bool as hf_string_to_bool
+
+    return hf_string_to_bool(value)
+
 
 # ---------------------------------------------------------------------------
 # Module-level context for stashing parsed args (single-process training)
@@ -54,9 +60,8 @@ def get_torchturbo_args() -> TorchTurboArgs | None:
 class TorchTurboArgs:
     """CLI arguments for torchturbo.
 
-    All fields default to ``None`` meaning "not specified" — only explicitly
-    provided values take effect.  When converted to overrides via
-    :meth:`to_overrides_dict`, only non-None fields are included.
+    Optional integration fields use ``None`` to mean "not specified" when they
+    should not override values from other sources.
 
     Attributes
     ----------
@@ -68,6 +73,12 @@ class TorchTurboArgs:
         Sequence parallelism group size.
     ep_size:
         Expert parallelism group size.
+    gradient_checkpointing:
+        Whether TorchTurbo should enable engine-owned activation
+        checkpointing. Defaults to ``True``.
+    cpu_offload:
+        Whether CPU offload is applied to FSDP-wrapped units. Defaults to
+        ``False``.
     enable_mtp:
         Whether to build Multi-Token-Prediction (MTP) layers.  ``True``
         opts in: build MTP heads, load their weights, run forward, compute
@@ -84,33 +95,18 @@ class TorchTurboArgs:
     mixed_precision: str | None = None
     sp_size: int | None = None
     ep_size: int | None = None
+    gradient_checkpointing: bool = True
+    cpu_offload: bool = False
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
     freeze_vision_tower: bool = False
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
     profiling: bool = False
-
-    def to_overrides_dict(self) -> dict[str, Any]:
-        """Convert to a flat dict suitable for ``EngineConfig.from_dict()``.
-
-        Only fields that were explicitly set (non-None) are included, so
-        unspecified arguments do not override values from other sources.
-        """
-        d: dict[str, Any] = {}
-        if self.backend is not None:
-            d["backend"] = self.backend
-        if self.mixed_precision is not None:
-            d["mixed_precision"] = self.mixed_precision
-        if self.sp_size is not None:
-            d["sp_size"] = self.sp_size
-        if self.ep_size is not None:
-            d["ep_size"] = self.ep_size
-        if self.enable_mtp is not None:
-            d["enable_mtp"] = self.enable_mtp
-        if self.mtp_loss_scaling_factor is not None:
-            d["mtp_loss_scaling_factor"] = self.mtp_loss_scaling_factor
-        return d
+    prefetch_strategy: str = "auto"
+    prefetch_direction: str = "forward_backward"
+    forward_prefetch_depth: int = 1
+    backward_prefetch_depth: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +149,60 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SIZE",
         help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
+    )
+    parser.add_argument(
+        "--tt_gradient_checkpointing",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="BOOL",
+        help="Enable or disable TorchTurbo-owned activation checkpointing. "
+        "Replaces TORCH_TURBO_GRADIENT_CHECKPOINTING.",
+    )
+    parser.add_argument(
+        "--tt_cpu_offload",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Enable or disable FSDP CPU offload for wrapped units. "
+        "Replaces TORCH_TURBO_CPU_OFFLOAD.",
+    )
+    parser.add_argument(
+        "--tt_prefetch_strategy",
+        type=str,
+        default="auto",
+        metavar="STRATEGY",
+        help="FSDP prefetch strategy: native|auto|expert_with_layer|expert_lookahead. "
+        "Replaces TORCH_TURBO_PREFETCH_STRATEGY.",
+    )
+    parser.add_argument(
+        "--tt_prefetch_direction",
+        type=str,
+        default="forward_backward",
+        metavar="DIRECTION",
+        help="Prefetch direction: forward|forward_backward. "
+        "Replaces TORCH_TURBO_PREFETCH_DIRECTION.",
+    )
+    parser.add_argument(
+        "--tt_forward_prefetch_depth",
+        type=int,
+        default=1,
+        metavar="N",
+        help="How many upcoming layers each source prefetches in forward "
+        "(1 = next layer only). Higher trades peak memory for more overlap. "
+        "Replaces TORCH_TURBO_FORWARD_PREFETCH_DEPTH.",
+    )
+    parser.add_argument(
+        "--tt_backward_prefetch_depth",
+        type=int,
+        default=1,
+        metavar="N",
+        help="How many previous layers each layer prefetches in backward "
+        "(1 = previous layer only). Only used with forward_backward direction. "
+        "Replaces TORCH_TURBO_BACKWARD_PREFETCH_DEPTH.",
     )
     parser.add_argument(
         "--tt_enable_mtp",
@@ -220,12 +270,18 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         mixed_precision=parsed.tt_mixed_precision,
         sp_size=parsed.tt_sp_size,
         ep_size=parsed.tt_ep_size,
+        gradient_checkpointing=parsed.tt_gradient_checkpointing,
+        cpu_offload=parsed.tt_cpu_offload,
         enable_mtp=parsed.tt_enable_mtp,
         mtp_loss_scaling_factor=parsed.tt_mtp_loss_scaling_factor,
         freeze_vision_tower=parsed.tt_freeze_vision_tower,
         freeze_multi_modal_projector=parsed.tt_freeze_multi_modal_projector,
         freeze_language_model=parsed.tt_freeze_language_model,
         profiling=parsed.tt_profiling,
+        prefetch_strategy=parsed.tt_prefetch_strategy,
+        prefetch_direction=parsed.tt_prefetch_direction,
+        forward_prefetch_depth=parsed.tt_forward_prefetch_depth,
+        backward_prefetch_depth=parsed.tt_backward_prefetch_depth,
     )
 
     if any(

@@ -49,6 +49,12 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 replace_module=QWen3MoeLayerWrapper,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
+            "model.embed_tokens": FSDPPlanSpec(
+                standalone_world_shard=True,
+            ),
+            "lm_head": FSDPPlanSpec(
+                standalone_world_shard=True,
+            ),
         },
         sp_size=2,
         ep_size=4,

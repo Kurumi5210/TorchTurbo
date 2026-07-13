@@ -9,7 +9,7 @@ patch ``run_sft`` to use the engine with optimal FSDP settings.
 
 Extra engine config via env vars::
 
-    TORCH_TURBO_COMM_OVERLAP=1 TORCH_TURBO_SELECTIVE_AC_LAYERS=0,4,8 \\
+    TORCH_TURBO_PREFETCH_STRATEGY=auto TORCH_TURBO_FORWARD_PREFETCH_DEPTH=2 \\
         llamafactory-cli train config.yaml
 """
 

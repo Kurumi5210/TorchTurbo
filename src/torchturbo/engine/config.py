@@ -17,21 +17,27 @@ Usage::
 from __future__ import annotations
 
 import os
+from argparse import ArgumentTypeError
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from .args import string_to_bool
 
 
 # ---------------------------------------------------------------------------
 # Env var overrides — applies to ALL adapters and direct usage
 # ---------------------------------------------------------------------------
 
-_ENV_MAP: dict[str, str] = {
+ENV_MAP: dict[str, str] = {
     "TORCH_TURBO_BACKEND": "backend",
     "TORCH_TURBO_MIXED_PRECISION": "mixed_precision",
-    "TORCH_TURBO_SELECTIVE_AC_LAYERS": "activation_checkpointing.selective_layers",
+    "TORCH_TURBO_GRADIENT_CHECKPOINTING": "activation_checkpointing.enabled",
     "TORCH_TURBO_RESHARD_AFTER_FWD": "backend_config.reshard_after_forward",
-    "TORCH_TURBO_FORWARD_PREFETCH": "backend_config.forward_prefetch",
+    "TORCH_TURBO_PREFETCH_STRATEGY": "backend_config.prefetch_strategy",
+    "TORCH_TURBO_PREFETCH_DIRECTION": "backend_config.prefetch_direction",
+    "TORCH_TURBO_FORWARD_PREFETCH_DEPTH": "backend_config.forward_prefetch_depth",
+    "TORCH_TURBO_BACKWARD_PREFETCH_DEPTH": "backend_config.backward_prefetch_depth",
     "TORCH_TURBO_CPU_OFFLOAD": "backend_config.cpu_offload",
     "TORCH_TURBO_SP_SIZE": "parallel",
     "TORCH_TURBO_EP_SIZE": "parallel",
@@ -40,14 +46,18 @@ _ENV_MAP: dict[str, str] = {
 
 def _set_field(obj: Any, field_name: str, value: str) -> None:
     """Set a field on a config object, coercing the string value to the right type."""
-    if field_name == "selective_layers":
-        setattr(obj, field_name, [int(x.strip()) for x in value.split(",")])
-    elif value.lower() in ("1", "true", "yes"):
-        setattr(obj, field_name, True)
-    elif value.lower() in ("0", "false", "no"):
-        setattr(obj, field_name, False)
+    current = getattr(obj, field_name, None)
+    if isinstance(current, Enum):
+        setattr(obj, field_name, type(current)(value))
+    elif isinstance(current, int) and not isinstance(current, bool):
+        setattr(obj, field_name, int(value))
+    elif isinstance(current, bool):
+        setattr(obj, field_name, string_to_bool(value))
     else:
-        setattr(obj, field_name, value)
+        try:
+            setattr(obj, field_name, string_to_bool(value))
+        except ArgumentTypeError:
+            setattr(obj, field_name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -96,13 +106,10 @@ class ActivationCheckpointingConfig:
 
     Example::
 
-        ActivationCheckpointingConfig(enabled=True, selective_layers=[0, 4, 8])
+        ActivationCheckpointingConfig(enabled=True)
     """
 
     enabled: bool = True
-    selective_layers: list[int] | None = None
-    use_reentrant: bool = False
-    cpu_offload: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +181,7 @@ class EngineConfig:
             backend=DistributedBackend.FSDP2,
             mixed_precision=MixedPrecisionPolicy.BF16,
             backend_config=FSDPConfig(reshard_after_forward=True),
-            activation_checkpointing=ActivationCheckpointingConfig(
-                selective_layers=[0, 4, 8, 12],
-            ),
+            activation_checkpointing=ActivationCheckpointingConfig(enabled=True),
             comm=CommConfig(overlap_comm_compute=True),
         )
     """
@@ -227,7 +232,7 @@ class EngineConfig:
 
     def apply_env_overrides(self) -> None:
         """Apply ``TORCH_TURBO_*`` env vars to this config."""
-        for env_key, config_path in _ENV_MAP.items():
+        for env_key, config_path in ENV_MAP.items():
             value = os.environ.get(env_key)
             if value is None:
                 continue
@@ -248,6 +253,10 @@ class EngineConfig:
                 obj = getattr(self, parts[0], None)
                 if obj is not None:
                     _set_field(obj, parts[1], value)
+
+        post_init = getattr(self.backend_config, "__post_init__", None)
+        if callable(post_init):
+            post_init()
 
     def _default_backend_config(self) -> Any:
         """Create the default config for the selected backend."""
@@ -284,8 +293,13 @@ class EngineConfig:
 
         # Backend-specific config
         backend_config = d.get("backend_config", None)
+        if isinstance(backend_config, dict) and backend == DistributedBackend.FSDP2:
+            from .backends.fsdp2.config import FSDPConfig
+
+            backend_config = FSDPConfig(**backend_config)
+
         if backend_config is None and backend == DistributedBackend.FSDP2:
-            from .backends.fsdp2.config import FSDPConfig, ShardingStrategy
+            from .backends.fsdp2.config import FSDPConfig
 
             fsdp_d = d.get("fsdp", {})
             if not fsdp_d:
@@ -294,28 +308,20 @@ class EngineConfig:
                     for k in (
                         "sharding_strategy",
                         "reshard_after_forward",
-                        "forward_prefetch",
+                        "prefetch_strategy",
+                        "prefetch_direction",
+                        "forward_prefetch_depth",
+                        "backward_prefetch_depth",
                         "cpu_offload",
                         "pin_memory",
                     )
                     if k in d
                 }
-            if "sharding_strategy" in fsdp_d and isinstance(
-                fsdp_d["sharding_strategy"], str
-            ):
-                fsdp_d["sharding_strategy"] = ShardingStrategy(
-                    fsdp_d["sharding_strategy"]
-                )
+            # FSDPConfig.__post_init__ coerces str values to the right enums.
             backend_config = FSDPConfig(**fsdp_d) if fsdp_d else FSDPConfig()
 
         # Activation checkpointing
         ac_d = d.get("activation_checkpointing", {})
-        if not ac_d:
-            ac_d = {}
-            if "selective_ac_layers" in d:
-                ac_d["selective_layers"] = d["selective_ac_layers"]
-            if "use_reentrant" in d:
-                ac_d["use_reentrant"] = d["use_reentrant"]
         ac = ActivationCheckpointingConfig(**ac_d)
 
         # Communication
@@ -350,13 +356,13 @@ class EngineConfig:
             "sp_size",
             "sharding_strategy",
             "reshard_after_forward",
-            "forward_prefetch",
-            "backward_prefetch",
+            "prefetch_strategy",
+            "prefetch_direction",
+            "forward_prefetch_depth",
+            "backward_prefetch_depth",
             "cpu_offload",
             "pin_memory",
             "sync_module_states",
-            "selective_ac_layers",
-            "use_reentrant",
             "comm_overlap",
             "dcp_path",
             "hf_model_path",

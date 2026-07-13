@@ -43,7 +43,6 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
-from transformers.utils.generic import OutputRecorder, check_model_inputs
 from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeTextConfig, Qwen3_5MoeVisionConfig
 
@@ -54,15 +53,27 @@ else:
 
 if is_flash_linear_attention_available():
     from fla.modules import FusedRMSNormGated
+    from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 else:
     chunk_gated_delta_rule, fused_recurrent_gated_delta_rule = None, None
     FusedRMSNormGated = None
+    fla_causal_conv1d = None
 
-from torch_turbo.utils.flash_attn_utils import get_unpad_data
+from torch_turbo.utils.flash_attn_utils import get_unpad_data_lf
+from torchturbo.utils.functools import cache
 
 logger = logging.get_logger(__name__)
 
+
+@cache
+def _get_cu_seqlens(attention_mask):
+    if attention_mask is not None and torch.max(attention_mask) > 1:
+        _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
+        if cu_seqlens[-1] != attention_mask.size(1):
+            cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
+        return cu_seqlens
+    return None
 
 class Qwen3_5MoeVisionRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
@@ -554,9 +565,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ):
         #hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        cu_seqlens = None
-        if attention_mask != None:
-            _, cu_seqlens, _ = get_unpad_data(attention_mask)
+        cu_seqlens = _get_cu_seqlens(attention_mask)
 
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
@@ -574,7 +583,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             recurrent_state = cache_params.recurrent_states[self.layer_idx]
 
         mixed_qkv = self.in_proj_qkv(hidden_states)
-        mixed_qkv = mixed_qkv.transpose(1, 2)
 
         z = self.in_proj_z(hidden_states)
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -583,6 +591,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         a = self.in_proj_a(hidden_states)
 
         if use_precomputed_states:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
             # 2. Convolution sequence transformation
             # NOTE: the conv state is updated in `causal_conv1d_update`
             mixed_qkv = self.causal_conv1d_update(
@@ -592,13 +601,26 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 self.conv1d.bias,
                 self.activation,
             )
+            mixed_qkv = mixed_qkv.transpose(1, 2)
         else:
             if cache_params is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
                 cache_params.conv_states[self.layer_idx] = conv_state
-            mixed_qkv = naive_causal_conv1d_wrapper(mixed_qkv, cu_seqlens, self, self.conv1d.weight, self.conv1d.bias)
+            if fla_causal_conv1d != None:
+                mixed_qkv, _ = fla_causal_conv1d(
+                    x=mixed_qkv,  # FLA conv1d accepts [b, s, d] format input
+                    weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens,
+                )
+            else:
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+                mixed_qkv = naive_causal_conv1d_wrapper(mixed_qkv, cu_seqlens, self, self.conv1d.weight, self.conv1d.bias)
+                mixed_qkv = mixed_qkv.transpose(1, 2)
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
             mixed_qkv,
             [
@@ -1014,7 +1036,6 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModel):
     _supports_sdpa = True
     _keys_to_ignore_on_load_unexpected = []
     _can_record_outputs = {
-        "router_logits": OutputRecorder(Qwen3_5MoeTopKRouter, index=0),
         "hidden_states": Qwen3_5MoeDecoderLayer,
         "attentions": Qwen3_5MoeAttention,
     }
@@ -1350,7 +1371,6 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
         patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
         return patch_pos_embeds
 
-    @check_model_inputs()
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Args:
@@ -1570,7 +1590,6 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,

@@ -47,6 +47,16 @@ import re
 import sys
 from typing import Any
 
+# torch is only needed by the runners (gen_input/turbo/vllm/megatron/compare),
+# so it's imported lazily inside each mode. A module-level name is provided so
+# the megatron helper functions (which compare ``dtype == torch.bfloat16``) parse
+# cleanly; it's overwritten with the real torch on first use.
+try:
+    import torch as _torch_mod  # noqa: F401
+    torch = _torch_mod
+except Exception:  # noqa: BLE001
+    torch = None  # type: ignore[assignment]
+
 
 # ─────────────────────────────── CLI ────────────────────────────────
 
@@ -56,8 +66,8 @@ def parse_args() -> argparse.Namespace:
         description="torchturbo vs vLLM train/infer precision comparison",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--mode", choices=["gen_input", "turbo", "vllm", "compare",
-                                  "pt2json"],
+    p.add_argument("--mode", choices=["gen_input", "turbo", "vllm", "megatron",
+                                  "compare", "pt2json"],
                    required=True, help="Run mode.")
     p.add_argument("--model_path", type=str, default=None,
                    help="HF model path (required for gen_input / turbo / vllm).")
@@ -90,6 +100,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpu_id", type=int, default=0, help="CUDA device id (turbo/vllm).")
     p.add_argument("--dtype", type=str, default="bfloat16",
                    choices=["bfloat16", "float16", "float32"], help="Compute dtype.")
+    # ── megatron (mbridge) runner ──
+    p.add_argument("--megatron_tp", type=int, default=1,
+                   help="[megatron] Tensor-parallel size (single-GPU compare = 1).")
+    p.add_argument("--megatron_pp", type=int, default=1,
+                   help="[megatron] Pipeline-parallel size (single-stage compare = 1).")
+    p.add_argument("--megatron_ep", type=int, default=1,
+                   help="[megatron] Expert-parallel size (MoE; single-GPU compare = 1).")
+    p.add_argument("--megatron_etp", type=int, default=1,
+                   help="[megatron] Expert tensor-parallel size (MoE).")
+    p.add_argument("--megatron_attn_backend", type=str, default=None,
+                   help="[megatron] Override MCore attention backend name (e.g. flash, fused, "
+                        "local). Default = provider default (the qwen3.5 hybrid GDN variant uses "
+                        "TE/flash internally). Pass only if the default errors out.")
+    p.add_argument("--megatron_keep_mtp", action="store_true",
+                   help="[megatron] Keep the multi-token-prediction (MTP) head active. By default "
+                        "MTP is disabled for the forward (so logits == main LM head only, matching "
+                        "the HF/turbo side which returns the non-MTP head).")
+    p.add_argument("--megatron_sequence_parallel", action="store_true",
+                   help="[megatron] Enable MCore sequence_parallel. Off by default for a single-GPU "
+                        "compare (matches the HF/turbo SPLIT=0 forward).")
     # ── hook scope / recording (turbo / vllm) ──
     p.add_argument("--hook_root", type=str, default=None,
                    help="[turbo/vllm] Attribute path (relative to the model) to recurse "
@@ -101,6 +131,12 @@ def parse_args() -> argparse.Namespace:
     # NOTE: every matching tensor is stored in full (original dtype, on CPU);
     # there is no per-tensor or cumulative size cap — record everything.
     # ── compare ──
+    p.add_argument("--side_a", type=str, default="turbo",
+                   help="[compare] First side subdirectory under --out_dir (default turbo). "
+                        "Set to e.g. turbo to compare against --side_b.")
+    p.add_argument("--side_b", type=str, default="vllm",
+                   help="[compare] Second side subdirectory under --out_dir (default vllm). "
+                        "Set to megatron to compare turbo against the mbridge/Megatron run.")
     p.add_argument("--logp_mean_threshold", type=float, default=1e-3,
                    help="Pass threshold for logp mean abs diff (千分位).")
     p.add_argument("--onset_threshold", type=float, default=1e-3,
@@ -235,6 +271,18 @@ class InputBuilder:
 
     def vllm_prompt(self, spec: InputSpec):
         """A vLLM prompt object (list[int] for text, dict for mm)."""
+        raise NotImplementedError
+
+    def megatron_kwargs(self, spec: InputSpec, device) -> dict:
+        """Forward kwargs for the Megatron (mbridge) GPTModel.forward.
+
+        Mirrors ``turbo_kwargs`` but for MCore's batch-first contract
+        (``input_ids``/``position_ids`` are ``[batch, seq]``) and the flash/TE
+        attention backend, where ``attention_mask=None`` is the correct
+        fully-attended prefill form. Compute dtype is set on the provider, so
+        this returns no dtype. Default impl is text-only; arches that can drive
+        a Megatron VLM override this.
+        """
         raise NotImplementedError
 
     def default_hook_root(self, spec: InputSpec) -> str | None:
@@ -430,6 +478,58 @@ class Qwen3_5InputBuilder(InputBuilder):
             "prompt": prompt_text,
             "multi_modal_data": {"image": pils if len(pils) > 1 else pils[0]},
         }
+
+    def megatron_kwargs(self, spec: InputSpec, device) -> dict:
+        """Forward kwargs for the mbridge/MCore qwen3.5 model (text *and* VLM).
+
+        ``AutoBridge.from_hf_pretrained`` auto-routes to the right mbridge
+        provider from the HF checkpoint's architecture:
+
+          * text-only LM (``Qwen3_5MoeForCausalLM``) → ``Qwen35MoEBridge`` →
+            mcore ``GPTModel`` (language model only);
+          * VLM (``Qwen3_5MoeForConditionalGeneration``) → ``Qwen35VLMoEBridge``
+            → ``Qwen35VLMoEModelProvider`` → mcore ``Qwen3VLModel`` (vision
+            encoder + merger + hybrid GDN/attention LM + mrope).
+
+        Both MCore forwards are batch-first (``[batch, seq]``), and for a single
+        no-padding prefill the flash/TE backend takes ``attention_mask=None``
+        (it builds the causal mask internally) — same convention as
+        ``GPTModelInferenceWrapper._build_attention_mask_and_position_ids``.
+
+        image_text: pass the HF-expanded ``input_ids`` (image tokens already
+        expanded by the patch grid, exactly what turbo's HF forward sees) plus
+        ``pixel_values`` / ``image_grid_thw`` from the shared InputSpec, with
+        ``position_ids=None`` so MCore computes its own mrope from ``input_ids``
+        + the visual grids — the VLM forward explicitly ignores ordinary 2-D
+        position ids and derives mrope internally, matching the turbo side's
+        ``position_ids=None`` + mm_token_type_ids path. ``reorganize_inputs``
+        derives the image mask from ``input_ids == image_token_id`` itself, so
+        no ``image_input_mask`` / ``attention_mask`` is needed for the vision
+        path. This keeps the megatron VLM forward symmetric with turbo's.
+        """
+        import torch
+        ids = torch.as_tensor(spec.token_ids, dtype=torch.long,
+                              device=device).unsqueeze(0)              # [1, seq]
+        seq_len = ids.shape[1]
+        kw: dict = {"input_ids": ids, "attention_mask": None, "labels": None}
+        if spec.mode == "image_text":
+            # position_ids=None ⇒ MCore VLM computes mrope from input_ids +
+            # image_grid_thw (it ignores plain 2-D ids), matching turbo. Pixel
+            # values are fed as-is (fp32, HF-processor output) on GPU — the same
+            # tensor turbo's vision tower receives — so both sides' vision paths
+            # start from byte-identical pixels (see InputSpec).
+            kw["position_ids"] = None
+            if spec.pixel_values is not None:
+                kw["pixel_values"] = _to_device(spec.pixel_values, device)
+            if spec.image_grid_thw is not None:
+                kw["image_grid_thw"] = _to_device(spec.image_grid_thw, device)
+            # No video inputs in this harness; MCore accepts the omitted kwargs.
+        else:
+            # text-only: a plain 1-D arange broadcast to [batch, seq], matching
+            # the HF text-side 1-D rope (GPTModel text path consumes 2-D ids).
+            kw["position_ids"] = (torch.arange(seq_len, device=device)
+                                  .unsqueeze(0).expand_as(ids).contiguous())
+        return kw
 
 
 def _to_device(t, device):
@@ -1146,10 +1246,210 @@ def mode_vllm(args: argparse.Namespace) -> None:
                      max_raw_bytes=args.max_raw_bytes)
 
 
+# ─────────────────────────── megatron (mbridge) runner ──────────────
+
+
+def _ensure_megatron_on_path() -> bool:
+    """Best-effort import check for the Megatron-Bridge (mbridge) stack.
+
+    The GPU compare box installs ``megatron-bridge`` (which pulls
+    ``megatron-lm``/MCore) under an importable ``megatron`` namespace; this Mac
+    dev env has neither. We only ``print`` guidance here and let the real import
+    in ``mode_megatron`` raise the authoritative error.
+    """
+    import importlib
+    try:
+        importlib.import_module("megatron.bridge")  # noqa: F401
+        importlib.import_module("megatron.core")    # noqa: F401
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[megatron] NOTE: megatron.bridge / megatron.core not importable in "
+              f"this env ({e.__class__.__name__}). The megatron mode requires the "
+              f"mbridge + MCore stack on the GPU box.")
+        return False
+
+
+def _apply_mbridge_parallelism(provider, *, tp, pp, ep, etp,
+                               sequence_parallel, dtype, attention_backend):
+    """Mirror of ``Megatron-Bridge/.../text_generation._apply_provider_parallelism``,
+    written against the provider's public attributes so we don't import the
+    private inference helper (which itself only ``setattr``s the same fields)."""
+    from megatron.core.transformer.enums import AttnBackend
+    setattr(provider, "tensor_model_parallel_size", tp)
+    setattr(provider, "pipeline_model_parallel_size", pp)
+    setattr(provider, "expert_model_parallel_size", ep)
+    setattr(provider, "expert_tensor_parallel_size", etp)
+    setattr(provider, "sequence_parallel", sequence_parallel)
+    setattr(provider, "params_dtype", dtype)
+    setattr(provider, "pipeline_dtype", dtype)
+    setattr(provider, "bf16", dtype == torch.bfloat16)
+    setattr(provider, "fp16", dtype == torch.float16)
+    if attention_backend is not None:
+        setattr(provider, "attention_backend", AttnBackend[attention_backend])
+
+
+def _build_mbridge_model(model_path: str, dtype, args):
+    """Build the mbridge/MCore model for qwen3.5 — text LM *or* VLM.
+
+    ``AutoBridge.from_hf_pretrained`` auto-routes by the HF checkpoint's
+    architecture: a text-only checkpoint → ``Qwen35MoEBridge`` → mcore
+    ``GPTModel``; a VLM checkpoint (``Qwen3_5MoeForConditionalGeneration``) →
+    ``Qwen35VLMoEBridge`` → ``Qwen35VLMoEModelProvider`` → mcore
+    ``Qwen3VLModel`` (vision encoder + merger + hybrid GDN/attention LM + mrope)
+    — the same provider swift/ms launches qwen3.5 megatron training through.
+
+    Follows the canonical Megatron-Bridge standalone build in
+    ``megatron.bridge.inference.text_generation.load_bridge_model``, with
+    TP=PP=EP=1 defaults so a single-GPU prefill is identical-by-contract to the
+    turbo run (same params, same bf16 compute). VLM weights are converted from
+    the HF safetensors in-process (load_weights=True) — no separate megatron
+    checkpoint dir needed.
+    """
+    from megatron.bridge import AutoBridge
+    from megatron.bridge.utils.common_utils import (
+        maybe_initialize_distributed, disable_mtp_for_inference)
+
+    maybe_initialize_distributed(timeout_minutes=60)
+
+    bridge = AutoBridge.from_hf_pretrained(
+        model_path, torch_dtype=dtype, trust_remote_code=True)
+    # load_weights=True ⇒ the provider gets a pre_wrap hook that converts the HF
+    # safetensors into MCore layout in-process (no separate megatron ckpt dir).
+    provider = bridge.to_megatron_provider(load_weights=True)
+    _apply_mbridge_parallelism(
+        provider, tp=args.megatron_tp, pp=args.megatron_pp,
+        ep=args.megatron_ep, etp=args.megatron_etp,
+        sequence_parallel=bool(args.megatron_sequence_parallel),
+        dtype=dtype, attention_backend=args.megatron_attn_backend)
+    # For the text GPTModel, parallel_output=False gathers the full vocab.
+    # The Qwen3VL language-model spec hardcodes parallel_output=True, so for the
+    # VLM we rely on runtime_gather_output=True at forward time instead (set in
+    # mode_megatron). Setting it here is harmless for the VLM.
+    setattr(provider, "parallel_output", False)
+    provider.finalize()
+    provider.initialize_model_parallel(seed=0)
+    model_list = provider.provide_distributed_model(wrap_with_ddp=False)
+    if len(model_list) != 1:
+        # VP>1: a compare run is single-stage; surface that early.
+        sys.exit(f"[megatron] expected 1 model stage, got {len(model_list)} "
+                 f"(virtual_pipeline_model_parallel_size>1 not supported for compare).")
+    model = model_list[0].cuda()
+    model.eval()
+    if not args.megatron_keep_mtp:
+        # MTP is a training-only head; disabling it makes ``forward`` return the
+        # main LM-head logits (matching the HF/turbo side, which also returns the
+        # non-MTP head). It also prevents NCCL collective hangs on single-GPU.
+        disable_mtp_for_inference(model)
+    if hasattr(model, "config"):
+        model.config.grad_scale_func = None
+    return model
+
+
+def mode_megatron(args: argparse.Namespace) -> None:
+    import numpy as np
+    import torch
+    if not args.model_path:
+        sys.exit("--model_path is required for megatron mode")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    if not _ensure_megatron_on_path():
+        sys.exit("[megatron] aborting — megatron.bridge/megatron.core not importable.")
+
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16,
+                 "float32": torch.float32}
+    compute_dtype = dtype_map[args.dtype]
+    if args.megatron_pp > 1:
+        sys.exit("[megatron] pipeline_parallel_size>1 is not supported for the "
+                 "compare forward (need a single stage that owns the lm_head). "
+                 "Use --megatron_pp 1.")
+    torch.cuda.set_device(0)
+
+    print(f"[megatron] building mbridge/MCore model (tp={args.megatron_tp} "
+          f"pp={args.megatron_pp} ep={args.megatron_ep}, dtype={args.dtype}) …")
+    model = _build_mbridge_model(args.model_path, compute_dtype, args)
+    unwrap = model.module if hasattr(model, "module") else model
+
+    # Load the shared input spec + builder; build MCore forward kwargs. AutoBridge
+    # routes text→GPTModel and image_text→Qwen3VLModel (qwen3.5 VLM) automatically.
+    spec = InputSpec.load(os.path.join(args.out_dir, "input_spec.pt"))
+    builder = _resolve_builder(args.model_path, args.arch)
+    if not hasattr(builder, "megatron_kwargs"):
+        sys.exit(f"[megatron] builder {builder.name} has no megatron_kwargs(); "
+                 "only qwen3.5 is supported this iteration.")
+    fwd_kwargs = builder.megatron_kwargs(spec, device="cuda")
+    fwd_kwargs.pop("runtime_gather_output", None)  # set per-forward below
+    ids = fwd_kwargs["input_ids"]
+    seq_len = ids.shape[1]
+    n_imgs = len(spec.image_paths) if spec.mode == "image_text" else 0
+    print(f"[megatron] input mode={spec.mode} seq_len={seq_len}"
+          + (f" n_images={n_imgs}" if spec.mode == "image_text" else ""))
+
+    # Hook root: the GPTModel itself (so embedding, decoder layers, and the
+    # output_layer/lm_head are all captured as a top-level box-diagram). The
+    # recorder's stack-driven parent links mirror the MCore module tree exactly.
+    hook_root_mod = unwrap
+    hook_root_name = ""
+
+    rec = GraphRecorder(hook_filter=args.hook_filter)
+    rec.register(hook_root_mod, root_name=hook_root_name)
+
+    # No extra autocast — MCore runs in the provider's autocast_dtype (bf16) via
+    # its own Float16Module/TE path, matching the turbo side's precision env.
+    # ``**fwd_kwargs`` carries input_ids/position_ids/attention_mask/labels and,
+    # for image_text, pixel_values/image_grid_thw — the exact set
+    # ``Qwen3VLModel.forward`` / ``GPTModel.forward`` accept.
+    fwd_kwargs["runtime_gather_output"] = True  # gather full-vocab logits on this stage
+    with torch.no_grad():
+        out = model(**fwd_kwargs)
+    rec.remove()
+
+    logits = out
+    # text: GPTModel.forward(labels=None) → logits [b, s, vocab].
+    # VLM:  Qwen3VLModel.forward(labels=None, PP last stage) → logits [b, s, vocab]
+    #       (CP>1 only would return (output, loss_mask); we run CP=1). Upcast fp32.
+    if isinstance(logits, (tuple, list)):
+        logits = logits[0]
+    logits = logits.float()
+    print(f"[megatron] logits {tuple(logits.shape)}; captured {len(rec.nodes)} nodes")
+
+    # Per-token logp (same convention as turbo) aligned to the shared token_ids.
+    tok_ids = ids[0]
+    log_probs = torch.log_softmax(logits, dim=-1)
+    tgt = tok_ids[1:]
+    gathered = log_probs[0, :-1, :].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+    logp = torch.zeros(seq_len, dtype=torch.float32)
+    logp[1:] = gathered.detach().float().cpu()
+
+    out_dir = os.path.join(args.out_dir, "megatron")
+    os.makedirs(out_dir, exist_ok=True)
+    np.save(os.path.join(out_dir, "logp.npy"), logp.numpy())
+    param_dtype = next((str(p.dtype) for _, p in unwrap.named_parameters()
+                        if p.numel() > 0), None)
+    rec.save(os.path.join(out_dir, "graph.pt"), {
+        "backend": "megatron-mcore-via-mbridge", "seq_len": int(seq_len),
+        "hook_root": hook_root_name, "param_dtype_sample": param_dtype,
+        "compute_dtype": str(compute_dtype), "hook_filter": args.hook_filter,
+        "tp": args.megatron_tp, "pp": args.megatron_pp,
+        "ep": args.megatron_ep, "etp": args.megatron_etp,
+        "keep_mtp": bool(args.megatron_keep_mtp),
+    })
+    write_graph_json(_load_graph(os.path.join(out_dir, "graph.pt")),
+                     os.path.join(out_dir, "graph.json"), logp=logp.numpy(),
+                     max_raw_bytes=args.max_raw_bytes)
+
+
+# (heavyweight MCore/mbridge imports live inside mode_megatron so importing this
+#  module on a non-GPU box — e.g. for --mode compare — doesn't require MCore.)
+
+
 # ─────────────────────────── alignment ──────────────────────────────
 
 
-_DROP_WRAP = {"model", "language_model"}
+# Module-name segments stripped when aligning FQNs across sides, so that e.g.
+# HF ``model.language_model.layers.0`` and MCore ``decoder.layers.0`` both
+# reduce to ``layers.0``. (Fine-grained sub-module names — self_attn vs
+# self_attention, q_proj vs linear_qproj — still don't pair and show up as
+# structural diffs, which is itself the diagnostic; use --select for those.)
+_DROP_WRAP = {"model", "language_model", "decoder"}
 
 
 def _suffix(fqn: str) -> str:
@@ -1251,11 +1551,16 @@ def _fmt(v, w=12):
 
 def mode_compare(args: argparse.Namespace) -> None:
     import numpy as np
-    tdir = os.path.join(args.out_dir, "turbo")
-    vdir = os.path.join(args.out_dir, "vllm")
+    # Which two <side>/ subdirectories to diff. Defaults keep the original
+    # turbo-vs-vllm behavior; pass --side_b megatron (or --side_a megatron) to
+    # compare against the mbridge/Megatron run. ``A``/``B`` carry the labels
+    # into the printed report so a megatron compare isn't mislabeled "vllm".
+    A, B = args.side_a, args.side_b
+    tdir = os.path.join(args.out_dir, A)
+    vdir = os.path.join(args.out_dir, B)
     for d in (tdir, vdir):
         if not os.path.exists(os.path.join(d, "graph.pt")):
-            sys.exit(f"[compare] missing {d}/graph.pt — run --mode turbo/--mode vllm first")
+            sys.exit(f"[compare] missing {d}/graph.pt — run --mode {A} and --mode {B} first")
     tg = _load_graph(os.path.join(tdir, "graph.pt"))
     vg = _load_graph(os.path.join(vdir, "graph.pt"))
     t_nodes, v_nodes = tg["nodes"], vg["nodes"]
@@ -1265,23 +1570,25 @@ def mode_compare(args: argparse.Namespace) -> None:
 
     pairs, only_t, only_v = _build_pairs(t_nodes, v_nodes)
 
-    report: dict[str, Any] = {"meta": {"turbo": t_meta, "vllm": v_meta},
+    report: dict[str, Any] = {"meta": {A: t_meta, B: v_meta},
+                              "sides": {"a": A, "b": B},
                               "struct": {}, "pairs": [], "logp": {}}
 
     print("\n" + "=" * 96)
-    print("  STRUCTURAL CHECK (paired vs structural-diff boxes)")
+    print(f"  STRUCTURAL CHECK ({A} vs {B}) — paired vs structural-diff boxes")
     print("=" * 96)
-    print(f"  turbo nodes={len(t_nodes)}  vllm nodes={len(v_nodes)}  paired={len(pairs)}")
-    report["struct"] = {"turbo_n": len(t_nodes), "vllm_n": len(v_nodes),
-                        "paired": len(pairs), "only_turbo": only_t, "only_vllm": only_v}
+    print(f"  {A} nodes={len(t_nodes)}  {B} nodes={len(v_nodes)}  paired={len(pairs)}")
+    report["struct"] = {f"{A}_n": len(t_nodes), f"{B}_n": len(v_nodes),
+                        "paired": len(pairs),
+                        f"only_{A}": only_t, f"only_{B}": only_v}
     if only_t:
-        print(f"  ⚠️  {len(only_t)} boxes only in turbo (operator exists only on turbo side):")
+        print(f"  ⚠️  {len(only_t)} boxes only in {A} (operator exists only on {A} side):")
         for f in only_t[:15]:
-            print(f"        turbo: {f}  [{t_nodes[f].get('class')}]")
+            print(f"        {A}: {f}  [{t_nodes[f].get('class')}]")
     if only_v:
-        print(f"  ⚠️  {len(only_v)} boxes only in vllm (operator exists only on vLLM side):")
+        print(f"  ⚠️  {len(only_v)} boxes only in {B} (operator exists only on {B} side):")
         for f in only_v[:15]:
-            print(f"        vllm:  {f}  [{v_nodes[f].get('class')}]")
+            print(f"        {B}:  {f}  [{v_nodes[f].get('class')}]")
 
     # ── per-pair diff + onset ──
     pair_rows = []
@@ -1322,7 +1629,7 @@ def mode_compare(args: argparse.Namespace) -> None:
 
     if dtype_mismatches:
         report["dtype_mismatches"] = [list(m) for m in dtype_mismatches]
-        print(f"  ⚠️  {len(dtype_mismatches)} tensor(s) with differing turbo/vllm dtype "
+        print(f"  ⚠️  {len(dtype_mismatches)} tensor(s) with differing {A}/{B} dtype "
               f"(dtype is itself a divergence source):")
         for suf, slot, path, d in dtype_mismatches[:15]:
             print(f"        {suf} :: {slot} :: {path}  ({d})")
@@ -1335,8 +1642,8 @@ def mode_compare(args: argparse.Namespace) -> None:
     elif first_internal is not None:
         r = first_internal
         print(f"  📍 First INTERNAL divergence (this box broke; its input aligned):")
-        print(f"     turbo : {r['turbo']}  [{r['class']}]")
-        print(f"     vllm  : {r['vllm']}")
+        print(f"     {A:<6}: {r['turbo']}  [{r['class']}]")
+        print(f"     {B:<6}: {r['vllm']}")
         print(f"     input  rel : {_fmt(r['in_rel'])}    output rel : {_fmt(r['out_rel'])}")
         rel = _relationships(t_nodes, v_nodes, r["turbo"])
         print(f"     parent        : {rel['parent']}")
@@ -1345,14 +1652,14 @@ def mode_compare(args: argparse.Namespace) -> None:
         print(f"     children      : {', '.join(rel['children']) or '(none)'}")
         print(f"     exec_pre/post : {rel['exec_pre']} / {rel['exec_post']}")
         print(f"     → investigate this box's operators / op order.")
-        report["first_internal"] = {k: r[k] for k in ("turbo", "vllm", "class",
-                                                        "in_rel", "out_rel")}
+        report["first_internal"] = {A: r["turbo"], B: r["vllm"], "class": r["class"],
+                                    "in_rel": r["in_rel"], "out_rel": r["out_rel"]}
         report["first_internal"].update(rel)
     else:
         r = first_any
         print(f"  🌊 First divergence is INHERITED (input already differs):")
-        print(f"     turbo : {r['turbo']}  [{r['class']}]")
-        print(f"     vllm  : {r['vllm']}")
+        print(f"     {A:<6}: {r['turbo']}  [{r['class']}]")
+        print(f"     {B:<6}: {r['vllm']}")
         print(f"     input  rel : {_fmt(r['in_rel'])}    output rel : {_fmt(r['out_rel'])}")
         print(f"     → diff is upstream; walk earlier boxes.")
 
@@ -1370,11 +1677,11 @@ def mode_compare(args: argparse.Namespace) -> None:
 
     # ── explicit select: print one node's full relationship + per-tensor stats ──
     if args.select:
-        _cli_select(args.select, tdir, vdir, t_nodes, v_nodes, pairs)
+        _cli_select(args.select, tdir, vdir, t_nodes, v_nodes, pairs, A, B)
 
     # ── tree ──
     if args.show_tree:
-        _cli_tree(t_nodes, v_nodes, pair_rows, args)
+        _cli_tree(t_nodes, v_nodes, pair_rows, args, A, B)
 
     # ── logp ──
     print("\n" + "=" * 96)
@@ -1388,8 +1695,8 @@ def mode_compare(args: argparse.Namespace) -> None:
     denom = np.where(denom < 1e-12, 1e-12, denom)
     within = float((ad <= args.logp_mean_threshold).mean())
     print(f"  positions compared: {len(a)} (1..{n-1})")
-    print(f"  turbo logp[1:6]: {t_logp[1:6].tolist()}")
-    print(f"  vllm  logp[1:6]: {v_logp[1:6].tolist()}")
+    print(f"  {A:<6} logp[1:6]: {t_logp[1:6].tolist()}")
+    print(f"  {B:<6} logp[1:6]: {v_logp[1:6].tolist()}")
     print(f"  mean abs logp diff : {mean_abs:.6e}")
     print(f"  max  abs logp diff : {float(ad.max()):.6e}")
     print(f"  frac positions ≤ {args.logp_mean_threshold:.0e}: {within*100:.1f}%")
@@ -1405,7 +1712,7 @@ def mode_compare(args: argparse.Namespace) -> None:
     print("=" * 96)
     fi = report.get("first_internal")
     print(f"  logp mean abs diff      : {mean_abs:.6e}  ({status})")
-    print(f"  first internal divergence: {fi['turbo'] if fi else 'none'}")
+    print(f"  first internal divergence: {fi[A] if fi else 'none'}")
     overall = passed
     report["overall_pass"] = bool(overall)
     print(f"  Overall: {'✅ PASS' if overall else '❌ FAIL'}")
@@ -1424,7 +1731,7 @@ def mode_compare(args: argparse.Namespace) -> None:
 
 
 def _cli_select(spec: str, tdir: str, vdir: str, t_nodes: dict, v_nodes: dict,
-                pairs: list) -> None:
+                pairs: list, A: str = "turbo", B: str = "vllm") -> None:
     import numpy as np
     import torch
     # resolve turbo fqn (accept full or suffix)
@@ -1442,27 +1749,28 @@ def _cli_select(spec: str, tdir: str, vdir: str, t_nodes: dict, v_nodes: dict,
     print("\n" + "=" * 96)
     print(f"  SELECTED BOX")
     print("=" * 96)
-    print(f"  turbo : {t_f}  [{type_name(t_nodes.get(t_f, {}).get('class'))}]")
-    print(f"  vllm  : {v_f}  [{type_name(v_nodes.get(v_f, {}).get('class'))}]")
+    print(f"  {A:<6}: {t_f}  [{type_name(t_nodes.get(t_f, {}).get('class'))}]")
+    print(f"  {B:<6}: {v_f}  [{type_name(v_nodes.get(v_f, {}).get('class'))}]")
     if t_f:
         rel = _relationships(t_nodes, v_nodes, t_f)
         print(f"  parent={rel['parent']}  prev_sib={rel['prev_sibling']}  "
               f"next_sib={rel['next_sibling']}")
         print(f"  children={rel['children']}  exec_pre/post={rel['exec_pre']}/{rel['exec_post']}")
     # per-tensor detail + raw element-wise diff
-    _print_slots(t_nodes.get(t_f, {}), v_nodes.get(v_f, {}), "in")
-    _print_slots(t_nodes.get(t_f, {}), v_nodes.get(v_f, {}), "out")
+    _print_slots(t_nodes.get(t_f, {}), v_nodes.get(v_f, {}), "in", A, B)
+    _print_slots(t_nodes.get(t_f, {}), v_nodes.get(v_f, {}), "out", A, B)
 
 
-def _print_slots(tn: dict, vn: dict, slot: str) -> None:
+def _print_slots(tn: dict, vn: dict, slot: str, A: str = "turbo",
+                 B: str = "vllm") -> None:
     ts, vs = tn.get(slot, {}), vn.get(slot, {})
     print(f"\n  ── {slot} tensors ──")
     for path in sorted(set(ts) | set(vs)):
         te, ve = ts.get(path), vs.get(path)
         print(f"   [{path}]")
-        print(f"     turbo: {te['stats'] if te else '—'}"
+        print(f"     {A:<6}: {te['stats'] if te else '—'}"
               f"  (raw {'yes' if te and te.get('raw') is not None else 'no'})")
-        print(f"     vllm : {ve['stats'] if ve else '—'}"
+        print(f"     {B:<6}: {ve['stats'] if ve else '—'}"
               f"  (raw {'yes' if ve and ve.get('raw') is not None else 'no'})")
         if te and ve:
             r = _slot_rel(te, ve)
@@ -1482,20 +1790,21 @@ def _print_slots(tn: dict, vn: dict, slot: str) -> None:
                     print(f"     dtype 相同 ({dtype_a}) → 直接对比")
                     af, bf = a.float(), b.float()
                 else:
-                    print(f"     ⚠️ dtype 不同: turbo={dtype_a}  vllm={dtype_b} "
+                    print(f"     ⚠️ dtype 不同: {A}={dtype_a}  {B}={dtype_b} "
                           f"→ 转 fp32 对比 (注意：部分差异可能源自 dtype 量化本身)")
                     af, bf = a.float(), b.float()
                 d = (af - bf).abs()
                 print(f"     element-wise: mean_abs={d.mean():.3e} max_abs={d.max():.3e}")
             elif te and ve and te["stats"]["dtype"] != ve["stats"]["dtype"]:
-                print(f"     ⚠️ dtype 不同: turbo={te['stats']['dtype']} "
-                      f"vllm={ve['stats']['dtype']} (无 raw，仅统计可见)")
+                print(f"     ⚠️ dtype 不同: {A}={te['stats']['dtype']} "
+                      f"{B}={ve['stats']['dtype']} (无 raw，仅统计可见)")
 
 
-def _cli_tree(t_nodes, v_nodes, pair_rows, args) -> None:
+def _cli_tree(t_nodes, v_nodes, pair_rows, args, A: str = "turbo",
+              B: str = "vllm") -> None:
     by_t = {p["turbo"]: p for p in pair_rows}
     print("\n" + "=" * 96)
-    print("  MODULE RELATIONSHIP TREE (turbo, with aligned vLLM box + output rel)")
+    print(f"  MODULE RELATIONSHIP TREE ({A}, with aligned {B} box + output rel)")
     print("  ● aligned  ◆ internal onset  ○ inherited / structural-only")
     print("=" * 96)
     for fqn in sorted(t_nodes.keys(), key=_node_sort_key):
@@ -1504,7 +1813,7 @@ def _cli_tree(t_nodes, v_nodes, pair_rows, args) -> None:
         indent = "  " + "  " * min(depth, 24)
         pr = by_t.get(fqn)
         if pr is None:
-            mark, vq, d = "○", "(no vllm pair)", ""
+            mark, vq, d = "○", f"(no {B} pair)", ""
         elif pr["internal_onset"]:
             mark, vq = "◆", pr["vllm"]
             d = f" out_rel={_fmt(pr['out_rel'],10)} in_rel={_fmt(pr['in_rel'],10)}"
@@ -1514,7 +1823,7 @@ def _cli_tree(t_nodes, v_nodes, pair_rows, args) -> None:
             vq, d = pr["vllm"], (f" out_rel={_fmt(pr['out_rel'],10)}"
                                  if pr["out_rel"] is not None else "")
         print(f"  {mark} {indent}{fqn or '<root>'}  [{n.get('class')}]")
-        print(f"        ↳ vllm: {vq}{d}")
+        print(f"        ↳ {B}: {vq}{d}")
 
 
 def _depth(fqn: str) -> int:
@@ -1607,6 +1916,8 @@ def main() -> None:
         mode_turbo(args)
     elif args.mode == "vllm":
         mode_vllm(args)
+    elif args.mode == "megatron":
+        mode_megatron(args)
     elif args.mode == "compare":
         mode_compare(args)
     elif args.mode == "pt2json":

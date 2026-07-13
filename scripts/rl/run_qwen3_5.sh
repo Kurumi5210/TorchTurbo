@@ -25,6 +25,12 @@
 #   FAKE_IMAGE_COUNT  number of fake images (default 1)
 #   IMAGES            real image path(s) PATH[,PATH] — used only when
 #                     INPUT_MODE=image_text and FAKE_IMAGE=0
+#   RUN_MEGATRON      1 to also run the Megatron (mbridge/MCore) side and emit a
+#                     turbo-vs-megatron compare report (report_megatron.json). Works
+#                     for both INPUT_MODE=text and image_text: (AutoBridge routes
+#                     text→GPTModel, image_text→Qwen3VLModel). and reads the same
+#                     input_spec.pt turbo/vllm do.MEGATRON_TP / MEGATRON_EP override its
+#                     parallelism (default 1).
 
 set -euo pipefail
 
@@ -91,6 +97,21 @@ python "$MAIN" --mode turbo --model_path "$MODEL" --out_dir "$OUT" \
 echo "==[3/4] vllm=="
 python "$MAIN" --mode vllm --model_path "$MODEL" --out_dir "$OUT" \
     --gpu_id "$GPU_ID" --dtype bfloat16
+
+# Optional: also run the Megatron (mbridge/MCore) side and compare turbo vs megatron.
+# Enable with RUN_MEGATRON=1. AutoBridge routes text→GPTModel and image_text→Qwen3VLModel
+# (qwen3.5 VLM: vision encoder + merger + hybrid GDN/attention LM + mrope) automatically,
+# so the megatron leg runs for BOTH INPUT_MODE=text and INPUT_MODE=image_text — it reads
+# the same input_spec.pt turbo/vllm do (shared tokens +, for mm, pixel_values/grid).
+if [ "${RUN_MEGATRON:-0}" = "1" ]; then
+    echo "==[3.5/4] megatron (mbridge)=="
+    python "$MAIN" --mode megatron --model_path "$MODEL" --out_dir "$OUT" \
+        --gpu_id "$GPU_ID" --dtype bfloat16 \
+        --megatron_tp "${MEGATRON_TP:-1}" --megatron_ep "${MEGATRON_EP:-1}"
+    # Report turbo-vs-megatron alongside the default turbo-vs-vllm compare.
+    python "$MAIN" --mode compare --out_dir "$OUT" --side_a turbo --side_b megatron \
+        --show_tree --export_json "$OUT/report_megatron.json" || true
+fi
 
 echo "==[4/4] compare=="
 # --show_tree prints the full module relationship tree so, when logp doesn't

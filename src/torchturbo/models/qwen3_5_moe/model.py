@@ -12,21 +12,11 @@ from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeCo
 
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.utils.device import is_npu_available, get_device_name
-from torchturbo.utils.flash_attn_utils import get_unpad_data_lf
-from torchturbo.utils.functools import cache
-
 
 from ..registry import register_model
 from ..weight_converter import WeightConverterMixin, FusedExpertWeightConverter
 
-@cache
-def _get_cu_seqlens(attention_mask):
-    if attention_mask is not None and torch.max(attention_mask) > 1:
-        _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
-        if cu_seqlens[-1] != attention_mask.size(1):
-            cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
-        return cu_seqlens
-    return None
+
 class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
 
     def __init__(self, config, moe_config, mesh):
@@ -499,9 +489,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
             gather_seq_scatter_heads,
             gather_heads_scatter_seq,
         )
-        from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-            naive_causal_conv1d_wrapper
-        )
+        from .modeling_qwen3_5_moe import _get_cu_seqlens
+        from fla.modules.convolution import causal_conv1d
         import torch.nn.functional as F
 
         def _slice_param(weight, dim):
@@ -591,7 +580,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
                     v_raw.reshape(B, T, nv * dv),
                 ],
                 dim=-1,
-            ).transpose(1, 2)
+            )
 
             w = self_attn.conv1d.weight  # [conv_dim, 1, kernel]
             wq, wk, wv = torch.split(
@@ -630,10 +619,16 @@ class TurboQwen3_5MoeForConditionalGeneration(
                     dim=0,
                 )
 
-            local_qkv = naive_causal_conv1d_wrapper(local_qkv, cu_seqlens, self_attn, local_conv_weight, local_conv_bias)
+            local_qkv, _ = causal_conv1d(
+                x=local_qkv,  # FLA conv1d accepts [b, s, d] format input
+                weight=local_conv_weight.squeeze(1),  # d, 1, w -> d, w
+                bias=local_conv_bias,
+                activation=self_attn.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+            )
 
-            # Split conv output → reshape to heads
-            local_qkv = local_qkv.transpose(1, 2)
             q, k, v = torch.split(
                 local_qkv, [nk * dk, nk * dk, nv * dv], dim=-1
             )
@@ -678,22 +673,18 @@ class TurboQwen3_5MoeForConditionalGeneration(
             dt_bias_local = _slice_param(self_attn.dt_bias, 0)
             g = -A_log_local.float().exp() * F.softplus(a.float() + dt_bias_local)
 
-            seq_len = q.shape[1]
-            valid_len = cu_seqlens[-1] if cu_seqlens != None else seq_len
             # Chunk Gated Delta Rule (core linear attention)
             out, _ = self_attn.chunk_gated_delta_rule(
-                q=q[:, :valid_len],
-                k=k[:, :valid_len],
-                v=v[:, :valid_len],
-                g=g[:, :valid_len],
-                beta=beta[:, :valid_len],
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens = cu_seqlens,
             )
-            if out.shape[1] < seq_len:
-                out = torch.cat([out, out.new_zeros(out.shape[0], seq_len - out.shape[1], *out.shape[2:])], dim=1)
 
             # All-to-all #2: gather heads / scatter seq back
             out = gather_heads_scatter_seq(

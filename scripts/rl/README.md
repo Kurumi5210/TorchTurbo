@@ -113,6 +113,56 @@ python scripts/rl/compare_train_infer.py --mode compare --out_dir $OUT \
     --select layers.0.self_attn.o_proj
 ```
 
+### Megatron side (`--mode megatron`) — turbo vs Megatron precision
+
+In addition to vLLM, the harness can run the **real Megatron-Core** model via
+**Megatron-Bridge (`mbridge`, `megatron.bridge.AutoBridge`)** — the same qwen3.5
+provider (`Qwen35VLMoEModelProvider` / `Qwen3VLModel`) that swift's megatron
+training uses. This diffs turbo's training-side modeling against Megatron's,
+operator by operator, for both text and image+text inputs.
+
+```bash
+python scripts/rl/compare_train_infer.py --mode megatron --model_path $MODEL \
+    --out_dir $OUT --gpu_id 0 --dtype bfloat16
+python scripts/rl/compare_train_infer.py --mode compare --out_dir $OUT \
+    --side_a turbo --side_b megatron --show_tree
+```
+
+- Builds the MCore `GPTModel` from the **HF checkpoint** in-process
+  (`AutoBridge.from_hf_pretrained` → `to_megatron_provider(load_weights=True)` →
+  `provide_distributed_model(wrap_with_ddp=False)`), the canonical standalone
+  flow from `megatron.bridge.inference.text_generation.load_bridge_model`.
+  TP/PP/EP default to **1** so a single-GPU prefill is identical-by-contract to
+  the turbo run (same params, same bf16 compute). Override with
+  `--megatron_tp/--megatron_pp/--megatron_ep`.
+- `AutoBridge.from_hf_pretrained` auto-routes by the HF checkpoint's
+  architecture: a **text-only** checkpoint (`Qwen3_5MoeForCausalLM`) →
+  `Qwen35MoEBridge` → MCore `GPTModel`; a **VLM** checkpoint
+  (`Qwen3_5MoeForConditionalGeneration`) → `Qwen35VLMoEBridge` →
+  `Qwen35VLMoEModelProvider` → MCore `Qwen3VLModel` (vision encoder + merger +
+  hybrid GDN/attention LM + mrope) — the same qwen3.5-VL mbridge provider swift
+  launches Megatron training through. So `--mode megatron` supports **both**
+  `--input_mode text` and `--input_mode image_text`.
+- image_text: the megatron side feeds the exact same `input_ids` (HF-expanded
+  image tokens), `pixel_values`, `image_grid_thw` from the shared `input_spec.pt`
+  that turbo does, with `position_ids=None` so MCore computes its own mrope from
+  `input_ids` + the visual grids — symmetric with turbo's `position_ids=None` +
+  `mm_token_type_ids` path. `reorganize_inputs` derives the image mask from
+  `input_ids == image_token_id`, so no `attention_mask`/`image_input_mask` is
+  needed (flash/TE builds the causal mask internally, as in text mode).
+- MTP (multi-token-prediction) head is disabled by default for the forward
+  (`disable_mtp_for_inference`), so `--mode megatron` returns the main LM-head
+  logits — matching the HF/turbo side. `--megatron_keep_mtp` keeps it on.
+- `--side_a/--side_b` name the two `<side>/` subdirectories `--mode compare`
+  diffs (default `turbo`/`vllm`); `megatron` writes to `$OUT/megatron/`, so
+  `--side_b megatron` compares turbo against Megatron.
+- Cross-arch module pairing: the `decoder.` MCore wrapper is also dropped when
+  aligning FQNs, so MCore `decoder.layers.0` aligns with HF
+  `model.language_model.layers.0` → both `layers.0`. Fine-grained sub-module
+  names (`self_attention.linear_qproj` vs `self_attn.q_proj`, MCore MoE vs HF
+  `SparseMoeBlock`) still won't suffix-pair and surface as structural diffs —
+  use `--select` on the layer-level box for those.
+
 ## Interactive viewer (`scripts/rl/report.html`)
 
 `scripts/rl/report.html` is a **standalone, self-contained HTML** — no server, no

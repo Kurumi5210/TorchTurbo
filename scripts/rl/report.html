@@ -42,6 +42,8 @@ body{display:flex;flex-direction:column;height:100vh;overflow:hidden;
 .tbtn:hover{filter:brightness(1.1)}
 .tbtn.off{background:#cbd5e1;cursor:default}
 .tag{font-size:10px;color:#64748b;margin-left:4px}
+.sideTag{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
+  border-radius:50%;background:#1e3a8a;color:#fff;font-size:11px;font-weight:700}
 #compare{display:none;flex:1 1 auto;min-height:120px;overflow:auto;background:#fff;
   border-top:3px solid #2563eb;padding:12px 16px;box-shadow:0 -2px 8px rgba(0,0,0,.06)}
 #compare.show{display:block}
@@ -53,17 +55,19 @@ th{background:#f1f5f9;color:#334155;font-weight:600}
   color:#7f1d1d;padding:6px 10px;margin:8px 0;border-radius:6px}
 </style></head><body>
 <div id="bar">
-  <button class="picker" id="pickT" type="button">turbo 文件夹</button>
-  <button class="picker" id="pickV" type="button">vllm 文件夹</button>
-  <button class="picker ghost" id="swapBtn" type="button" title="交换两侧">⇄</button>
-  <div class="status" id="status">⚠️ 点 "turbo/vllm 文件夹" 选各自的目录（含 graph.json + tensors/）开始对比。</div>
+  <span class="sideTag" id="tagT">A</span>
+  <button class="picker" id="pickT" type="button"><span id="pickTLabel">A（turbo）</span> 文件夹</button>
+  <span class="sideTag" id="tagV">B</span>
+  <button class="picker" id="pickV" type="button"><span id="pickVLabel">B（vllm）</span> 文件夹</button>
+  <button class="picker ghost" id="swapBtn" type="button" title="交换左右两侧">⇄ 交换</button>
+  <div class="status" id="status">⚠️ 点 "A 文件夹"/"B 文件夹" 选任意两个目录（含 graph.json + tensors/）做精度对比。默认 A=turbo、B=vllm，也可选 megatron 等。</div>
 </div>
 <!-- hidden legacy file pickers for browsers without showDirectoryPicker -->
 <input type="file" id="fturbo" accept=".json,application/json" style="display:none">
 <input type="file" id="fvllm" accept=".json,application/json" style="display:none">
 <div id="main">
-  <div class="panel left"><h2>turbo</h2><div id="treeT">(未加载)</div></div>
-  <div class="panel"><h2>vllm</h2><div id="treeV">(未加载)</div></div>
+  <div class="panel left"><h2 id="h2T">A（turbo）</h2><div id="treeT">(未加载)</div></div>
+  <div class="panel"><h2 id="h2V">B（vllm）</h2><div id="treeV">(未加载)</div></div>
 </div>
 <div id="splitter" title="拖动调整上方树与下方对比区的高度"></div>
 <div id="compare">(在两侧各点选一个 tensor 进行对比)</div>
@@ -76,12 +80,17 @@ function bufToFloat(u,dtype){
   const dv=new DataView(u.buffer,u.byteOffset,u.byteLength);
   const le=true;
   if(dtype.indexOf('float32')>=0){return new Float32Array(u.buffer,u.byteOffset,u.byteLength/4);}
-  if(dtype.indexOf('float16')>=0||dtype.indexOf('fp16')>=0){
-    const n=u.length/2;const f=new Float32Array(n);
-    for(let i=0;i<n;i++){const h=dv.getUint16(i*2,le);f[i]=halfToFloat(h);}return f;}
-  if(dtype.indexOf('bfloat16')>=0||dtype.indexOf('bf16')>=0){
+  // ⚠ check bf16 BEFORE fp16: the dtype string "torch.bfloat16" contains the
+  // substring "float16", so a naive `indexOf('float16')` matches bf16 and mines
+  // it as fp16 → bytes 80 bf (bf16 -1.0) decode as fp16 -1.875, fabricating a
+  // ~0.875 per-element "diff" that isn't real. Must reject bf16 from the fp16 arm.
+  const isBf16 = dtype.indexOf('bfloat16')>=0||dtype.indexOf('bf16')>=0;
+  if(isBf16){
     const n=u.length/2;const f=new Float32Array(n);
     for(let i=0;i<n;i++){const h=dv.getUint16(i*2,le);f[i]=bitsToFloat32(h<<16);}return f;}
+  if(!isBf16 && (dtype.indexOf('float16')>=0||dtype.indexOf('fp16')>=0)){
+    const n=u.length/2;const f=new Float32Array(n);
+    for(let i=0;i<n;i++){const h=dv.getUint16(i*2,le);f[i]=halfToFloat(h);}return f;}
   if(dtype.indexOf('float64')>=0||dtype.indexOf('double')>=0){
     return new Float32Array(new Float64Array(u.buffer,u.byteOffset,u.byteLength/8));}
   // integer dtypes — match EXACTLY (int8 must not match int64). int64 has no
@@ -129,7 +138,23 @@ function bitsToFloat32(bits){const buf=new ArrayBuffer(4);new DataView(buf).setU
 let T=null,V=null;
 let sel={T:null,V:null};
 let Tp='',Vp='';
+// Side labels (shown on the buttons / panel headers / compare table). They start
+// as the conventional turbo/vllm defaults so the page reads sensibly before a
+// folder is picked, then update to the *picked directory name* on load — so any
+// two <side>/ dirs (turbo, vllm, megatron, …) can be compared, not just those two.
+const LP={T:'turbo',V:'vllm'};   // human label per internal side key (T=left, V=right)
+const AB ={T:'A',V:'B'};         // fixed A/B pos tags (left/right)
 const _hasDirPicker = typeof window.showDirectoryPicker==='function';
+function syncChrome(){
+  // buttons + panel headers reflect current labels (A/B fixed; name = picked dir)
+  document.getElementById('pickTLabel').textContent=AB.T+'（'+LP.T+'）';
+  document.getElementById('pickVLabel').textContent=AB.V+'（'+LP.V+'）';
+  document.getElementById('h2T').textContent=AB.T+'（'+LP.T+'）';
+  document.getElementById('h2V').textContent=AB.V+'（'+LP.V+'）';
+  document.getElementById('tagT').textContent=AB.T;
+  document.getElementById('tagV').textContent=AB.V;
+}
+syncChrome();
 //──────── loading: graph.json (tiny, parsed in-memory) + side dir handle ────────
 // Strict JSON (the spec has no NaN/Infinity); the Python producer used to emit
 // bare NaN for NaN tensor stats, which JSON.parse rejects. Scrub those tokens
@@ -172,7 +197,7 @@ async function pickDir(side){
       catch(e2){ setStatus(side+' pick failed: '+e2.message); return; }
     }
     dirHandles[side]=dh;
-    setGraph(obj,side,dh.name+'/graph.json');
+    setGraph(obj,side,dh.name+'/graph.json',dh.name);
   }catch(e){setStatus(side+' pick failed: '+e.message);}
 }
 // Fallback for browsers without showDirectoryPicker: pick graph.json via <input>
@@ -180,12 +205,15 @@ async function pickDir(side){
 // from a bare file pick on file://).
 function loadFile(file,side){
   const name=file&&file.name?file.name:'?';
+  const label=name.replace(/\.json$/i,'')||side;
   const r=new FileReader();
-  r.onload=()=>{try{setGraph(JSON.parse(r.result),side,name);}catch(e){setStatus(side+' load failed: '+e.message);}};
+  r.onload=()=>{try{setGraph(JSON.parse(r.result),side,name,label);}catch(e){setStatus(side+' load failed: '+e.message);}};
   r.readAsText(file);
 }
-function setGraph(obj,side,srcName){if(side==='T'){T=obj;Tp=srcName;}else{V=obj;Vp=srcName;}
-  setStatus(`✓ turbo: ${Tp||'—'} （${T&&T.nodes?Object.keys(T.nodes).length:0} nodes${dirHandles.T?'':' [stats-only]'}）   |   vllm: ${Vp||'—'} （${V&&V.nodes?Object.keys(V.nodes).length:0} nodes${dirHandles.V?'':' [stats-only]'}）`);
+function setGraph(obj,side,srcName,label){if(side==='T'){T=obj;Tp=srcName;}else{V=obj;Vp=srcName;}
+  if(label)LP[side]=label;
+  syncChrome();
+  setStatus(`✓ ${AB.T} (${LP.T}): ${Tp||'—'} （${T&&T.nodes?Object.keys(T.nodes).length:0} nodes${dirHandles.T?'':' [stats-only]'}）   |   ${AB.V} (${LP.V}): ${Vp||'—'} （${V&&V.nodes?Object.keys(V.nodes).length:0} nodes${dirHandles.V?'':' [stats-only]'}）`);
   renderTree(side);}
 document.getElementById('pickT').onclick=()=>{
   if(_hasDirPicker)pickDir('T');else document.getElementById('fturbo').click();};
@@ -195,9 +223,10 @@ document.getElementById('fturbo').onchange=e=>{if(e.target.files[0])loadFile(e.t
 document.getElementById('fvllm').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0],'V');};
 document.getElementById('swapBtn').onclick=()=>{
   [T,V]=[V,T]; [Tp,Vp]=[Vp,Tp]; [dirHandles.T,dirHandles.V]=[dirHandles.V,dirHandles.T];
-  [_tcache.T,_tcache.V]=[_tcache.V,_tcache.T];
-  renderTree('T'); renderTree('V');
-  setStatus(`✓ turbo: ${Tp||'—'} （${T&&T.nodes?Object.keys(T.nodes).length:0} nodes${dirHandles.T?'':' [stats-only]'}）   |   vllm: ${Vp||'—'} （${V&&V.nodes?Object.keys(V.nodes).length:0} nodes${dirHandles.V?'':' [stats-only]'}）`);
+  [_tcache.T,_tcache.V]=[_tcache.V,_tcache.T]; [sel.T,sel.V]=[sel.V,sel.T]; [LP.T,LP.V]=[LP.V,LP.T];
+  syncChrome();
+  renderTree('T'); renderTree('V'); renderCompare();
+  setStatus(`✓ ${AB.T} (${LP.T}): ${Tp||'—'} （${T&&T.nodes?Object.keys(T.nodes).length:0} nodes${dirHandles.T?'':' [stats-only]'}）   |   ${AB.V} (${LP.V}): ${Vp||'—'} （${V&&V.nodes?Object.keys(V.nodes).length:0} nodes${dirHandles.V?'':' [stats-only]'}）`);
 };
 function setStatus(s){document.getElementById('status').textContent=s;}
 //──────── draggable splitter between #main (trees) and #compare (diff) ────────
@@ -310,14 +339,15 @@ function efmt(v){return v==null?'-':v.toExponential(2);}
 //──────── compare panel ─────────
 async function renderCompare(){
   const a=sel.T,b=sel.V;const cp=document.getElementById('compare');cp.classList.add('show');
-  if(!a||!b){cp.innerHTML='已选: '+(a?'turbo='+a.fqn+'::'+a.slot+'::'+a.path:'turbo (无)')+'  |  '+(b?'vllm='+b.fqn+'::'+b.slot+'::'+b.path:'vllm (无)')+'<br>在左右各点选一个 tensor 进行对比';return;}
+  const la=AB.T+' ('+LP.T+')', lb=AB.V+' ('+LP.V+')';
+  if(!a||!b){cp.innerHTML='已选: '+(a?la+'='+a.fqn+'::'+a.slot+'::'+a.path:la+' (无)')+'  |  '+(b?lb+'='+b.fqn+'::'+b.slot+'::'+b.path:lb+' (无)')+'<br>在左右各点选一个 tensor 进行对比';return;}
   const ea=a.entry, eb=b.entry;
-  let h=`<h3>对比：turbo <code>${a.fqn}::${a.slot}::${a.path}</code>  &nbsp;⟷&nbsp;  vllm <code>${b.fqn}::${b.slot}::${b.path}</code></h3>`;
+  let h=`<h3>对比：${la} <code>${a.fqn}::${a.slot}::${a.path}</code>  &nbsp;⟷&nbsp;  ${lb} <code>${b.fqn}::${b.slot}::${b.path}</code></h3>`;
   const sa=ea.stats||{},sb=eb.stats||{};
   const da=ea.raw?ea.raw.dtype:null, db=eb.raw?eb.raw.dtype:null;
-  if(da&&db&&da!==db){h+=`<div class="warn">⚠️ <b>dtype 不同</b>: turbo=${da}  vllm=${db} → 已转 fp32 对比数值<br><span>注意：部分差异可能源自 dtype 量化本身（bf16↔fp16↔fp8 表示范围/精度差），而非算法差异。</span></div>`;}
+  if(da&&db&&da!==db){h+=`<div class="warn">⚠️ <b>dtype 不同</b>: ${la}=${da}  ${lb}=${db} → 已转 fp32 对比数值<br><span>注意：部分差异可能源自 dtype 量化本身（bf16↔fp16↔fp8 表示范围/精度差），而非算法差异。</span></div>`;}
   else if(da&&db&&da===db){h+=`<div class="tag">dtype 相同 (${da}) → 直接对比</div>`;}
-  h+=`<table><tr><th></th><th>turbo</th><th>vllm</th></tr>`;
+  h+=`<table><tr><th></th><th>${la}</th><th>${lb}</th></tr>`;
   h+=`<tr><td>dtype</td><td>${da||'-'}</td><td>${db||'-'}</td></tr>`;
   for(const k of ['shape','norm','sum','mean','max_abs']){const x=sa[k],y=sb[k];h+=`<tr><td>${k}</td><td>${Array.isArray(x)?JSON.stringify(x):(x!=null?x:'-')}</td><td>${Array.isArray(y)?JSON.stringify(y):(y!=null?y:'-')}</td></tr>`;}
   h+='</table>';
@@ -328,7 +358,7 @@ async function renderCompare(){
   if(tShape!==vShape){
     const strip1=s=>s.length&&s[0]===1?s.slice(1):s;
     const cosmetic=JSON.stringify(strip1(tShapeArr))===JSON.stringify(strip1(vShapeArr));
-    h+=`<div class="warn">⚠️ <b>形状不同</b>: turbo ${tShape} vs vllm ${vShape}`
+    h+=`<div class="warn">⚠️ <b>形状不同</b>: ${la} ${tShape} vs ${lb} ${vShape}`
       +(cosmetic?` <span class="tag">(仅 batch 维 [1,...] 差异，元素一致 — 可忽略)</span>`:'')
       +`<br>element-wise diff 按 flatten 顺序逐元素比，<b>形状不同(非 batch 维)时通常无意义</b>（位置 i 在两侧对应不同语义）。`
       +`下面的 signed/abs mean 反映"前 ${Math.min(prod(tShapeArr),prod(vShapeArr))} 个元素按序统计"，<b>不代表相似度</b>。</div>`;
@@ -342,7 +372,7 @@ async function renderCompare(){
       const fa=await loadTensor('T',ea.raw), fb=await loadTensor('V',eb.raw);
       h=hStats; // drop the loading marker; re-append diff below
       const n=Math.min(fa.length,fb.length);
-      if(fa.length!==fb.length) h+=`<div class="tag">元素数不同: turbo=${fa.length} vllm=${fb.length}，对比前 ${n} 个</div>`;
+      if(fa.length!==fb.length) h+=`<div class="tag">元素数不同: ${la}=${fa.length} ${lb}=${fb.length}，对比前 ${n} 个</div>`;
       // integer tensors → equality comparison (token-id / index tensors make a
       // float diff meaningless). Report match/mismatch counts + first diffs.
       if(isInt(da)&&isInt(db)){
@@ -355,10 +385,10 @@ async function renderCompare(){
           <tr><td>相等率</td><td>${(match/Math.max(n,1)*100).toFixed(2)}%</td></tr></table>`;
         if(mismatch===0){h+=`<div class="tag" style="color:#16a34a">✓ 整数张量逐元素完全相等</div>`;}
         else{h+=`<div class="warn">⚠️ 整数张量有 ${mismatch} 个位置不相等（前 ${diffs.length} 例）：</div>
-          <table><tr><th>i</th><th>turbo</th><th>vllm</th></tr>${
+          <table><tr><th>i</th><th>${la}</th><th>${lb}</th></tr>${
             diffs.map(d=>`<tr><td>${d[0]}</td><td>${d[1]}</td><td>${d[2]}</td></tr>`).join('')}</table>`;}
         // skip the meaningless float signed/abs mean + histogram for ints
-        h+=`<table style="margin-top:6px"><tr><th>i</th><th>turbo</th><th>vllm</th><th>相等</th></tr>`;
+        h+=`<table style="margin-top:6px"><tr><th>i</th><th>${la}</th><th>${lb}</th><th>相等</th></tr>`;
         for(let i=0;i<Math.min(16,n);i++)h+=`<tr><td>${i}</td><td>${fa[i]}</td><td>${fb[i]}</td><td>${fa[i]===fb[i]?'✓':'✗'}</td></tr>`;
         h+='</table>';
       } else {
@@ -374,7 +404,7 @@ async function renderCompare(){
         <tr><td>diff abs mean</td><td>${meanAbs.toExponential(3)}</td></tr>
         <tr><td>diff abs max </td><td>${maxAbs.toExponential(3)}</td></tr>
         </table>`;
-      h+=`<div class="tag">note: mean/max diff 是有符号的(fa−fb)；abs 是绝对值。mean≈0 说明两侧正负偏差抵消、无系统偏置，<b>不代表相似</b>。</div>`;
+      h+=`<div class="tag">note: mean/max diff 是有符号的(fa−fb，${la}−${lb})；abs 是绝对值。mean≈0 说明两侧正负偏差抵消、无系统偏置，<b>不代表相似</b>。</div>`;
       if(n>0 && Math.abs(meanSig) < meanAbs*0.1 ){
         h+=`<div class="warn">⚠️ <b>注意解读</b>: |signed mean| (${Math.abs(meanSig).toExponential(3)}) 远小于 abs mean (${meanAbs.toExponential(3)}) — `
           +`正负偏差在均值里互相抵消。<b>signed mean 小 ≠ 两 tensor 相似</b>；`
@@ -382,7 +412,7 @@ async function renderCompare(){
           +`形状不同时，前 N 个元素的均值接近更可能纯属巧合。</div>`;
       }
       h+=renderLogHist(fa,fb,n,maxAbs);
-      h+=`<table style="margin-top:6px"><tr><th>i</th><th>turbo</th><th>vllm</th><th>abs diff</th></tr>`;
+      h+=`<table style="margin-top:6px"><tr><th>i</th><th>${la}</th><th>${lb}</th><th>abs diff</th></tr>`;
       for(let i=0;i<Math.min(16,n);i++)h+=`<tr><td>${i}</td><td>${fa[i].toExponential(3)}</td><td>${fb[i].toExponential(3)}</td><td>${Math.abs(fa[i]-fb[i]).toExponential(3)}</td></tr>`;
       h+='</table>';
       } // end else (float branch)
@@ -442,7 +472,7 @@ async function maybeShowLogp(){
         +'  max abs = '+maxAbs.toExponential(3)
         +'  |  mean rel = '+meanRel.toExponential(3)
         +'  max rel = '+maxRel.toExponential(3)
-        +'   |   turbo '+Object.keys(T.nodes).length+' nodes, vllm '+Object.keys(V.nodes).length+' nodes');
+        +'   |   '+AB.T+' ('+LP.T+') '+Object.keys(T.nodes).length+' nodes, '+AB.V+' ('+LP.V+') '+Object.keys(V.nodes).length+' nodes');
     }catch(e){ /* dir handle missing → stats-only; silent */ }
   }
 }

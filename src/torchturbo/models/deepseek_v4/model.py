@@ -9,8 +9,9 @@ from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispa
 from torchturbo.ops import npu_fused_ops
 from torchturbo.utils.device import is_npu_available
 
+from ..base import TurboModel
 from ..registry import register_model
-from ..weight_converter import BaseWeightConverter, WeightConverterMixin
+from ..weight_converter import BaseWeightConverter
 from .configuration_deepseek_v4 import DeepseekV4Config
 from .modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
@@ -78,7 +79,7 @@ class DeepseekV4WeightConverter(BaseWeightConverter):
 @register_model(
     "deepseek_v4", config_cls=DeepseekV4Config, auto_class=AutoModelForCausalLM
 )
-class TurboDeepseekV4ForCausalLM(WeightConverterMixin, DeepseekV4ForCausalLM):
+class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
     config_class = DeepseekV4Config
     base_model_prefix = ""
 
@@ -88,13 +89,13 @@ class TurboDeepseekV4ForCausalLM(WeightConverterMixin, DeepseekV4ForCausalLM):
         self._post_init_patches()
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls, **kwargs):
         from .parallel_plan import get_parallel_plan
 
         return get_parallel_plan(**kwargs)
 
-    def get_weight_converter(self, mesh):
-        return DeepseekV4WeightConverter(self.config, self.get_moe_config(), mesh)
+    def get_weight_converter(self, parallel_context):
+        return DeepseekV4WeightConverter(self, parallel_context)
 
     @staticmethod
     def _pre_init_patches(config):
@@ -128,7 +129,7 @@ class TurboDeepseekV4ForCausalLM(WeightConverterMixin, DeepseekV4ForCausalLM):
         self._use_flash_attention_2 = True
         self.config._attn_implementation = "flash_attention_2"
 
-    def post_weight_load(self):
+    def on_materialized(self):
         """Rebuild runtime buffers cleared by FSDP2 meta-device loading."""
         from . import modeling_deepseek_v4 as dsv4
 
@@ -161,7 +162,8 @@ class TurboDeepseekV4ForCausalLM(WeightConverterMixin, DeepseekV4ForCausalLM):
             else:
                 attn.hadamard_mat = None
 
-    def setup_sp(self, sp_info):
+    def on_parallelized(self, parallel_context):
+        sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]

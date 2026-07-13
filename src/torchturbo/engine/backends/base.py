@@ -52,7 +52,12 @@ class BaseBackend(ABC):
         """
 
     @abstractmethod
-    def load_model(self, model: nn.Module, model_name_or_path: str) -> nn.Module:
+    def load_model(
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        parallel_context: dict[str, Any],
+    ) -> nn.Module:
         """Load weights."""
 
     def materialize_model(self, model: nn.Module) -> nn.Module:
@@ -63,7 +68,12 @@ class BaseBackend(ABC):
 
     @abstractmethod
     def save_model(
-        self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        output_dir: str,
+        parallel_context: dict[str, Any],
+        **kwargs: Any,
     ) -> None:
         """Save weights."""
 

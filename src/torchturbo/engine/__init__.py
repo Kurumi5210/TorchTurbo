@@ -36,7 +36,10 @@ from .config import (
     CommConfig,
     DistributedBackend,
     EngineConfig,
+    FreezePolicy,
     MixedPrecisionPolicy,
+    MTPConfig,
+    ParameterGroup,
 )
 from .core import TorchTurboEngine
 from .hooks import TrainHook, TrainState
@@ -55,7 +58,10 @@ __all__ = [
     "CommConfig",
     "DistributedBackend",
     "EngineConfig",
+    "FreezePolicy",
     "MixedPrecisionPolicy",
+    "MTPConfig",
+    "ParameterGroup",
     # Engine
     "BaseBackend",
     "FSDP2Backend",

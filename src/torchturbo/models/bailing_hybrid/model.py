@@ -23,7 +23,8 @@ from torchturbo.models.modules.attention.ulysses.ulysses import (
 )
 
 from ..registry import register_model
-from ..weight_converter import BaseWeightConverter, WeightConverterMixin
+from ..base import TurboModel
+from ..weight_converter import BaseWeightConverter
 from .configuration_bailing_moe_v3 import BailingMoeV3Config
 from .modeling_bailing_moe_v3 import BailingMoeV3ForCausalLM
 
@@ -61,26 +62,27 @@ def _get_cu_seqlens(attention_mask):
 @register_model(
     "bailing_hybrid", config_cls=BailingMoeV3Config, auto_class=AutoModelForCausalLM
 )
-class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM):
+class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
     config_class = BailingMoeV3Config
     base_model_prefix = "model"
     _supports_flash_attn_2 = True
 
     @override
-    def get_weight_converter(self, mesh):
-        return BailingV3WeightConverter(self.config, self.get_moe_config(), mesh)
+    def get_weight_converter(self, parallel_context):
+        return BailingV3WeightConverter(self, parallel_context)
 
     def __init__(self, config: BailingMoeV3Config) -> None:
         self._pre_init_patches(config)
         super().__init__(config)
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls, **kwargs):
         from .parallel_plan import get_parallel_plan
 
         return get_parallel_plan(**kwargs)
 
-    def setup_sp(self, sp_info):
+    def on_parallelized(self, parallel_context):
+        sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
@@ -360,7 +362,7 @@ class TurboBailingMoeV3ForCausalLM(WeightConverterMixin, BailingMoeV3ForCausalLM
                 npu_fused_ops.fused_token_unpermutation_npu
             )
 
-    def post_weight_load(self):
+    def on_materialized(self):
         """Initialize runtime buffers after weights are on the real device."""
 
         device = get_device_name()

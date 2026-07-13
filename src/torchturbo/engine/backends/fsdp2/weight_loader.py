@@ -49,6 +49,7 @@ class DistParamLoader:
         mesh,
         world_mesh,
         device,
+        weight_converter,
     ):
         self.model = model
         self.hf_config = model.config
@@ -70,7 +71,7 @@ class DistParamLoader:
         current_ep_idx = mesh.get_local_rank("ep")
         self.edp_ranks = mesh.mesh[:, current_ep_idx].tolist()
 
-        self.param_converter = model.get_weight_converter(mesh)
+        self.param_converter = weight_converter
         self.moe_config = self.param_converter.moe_config
 
         # Assignment data structures (mirrors weight_saver)

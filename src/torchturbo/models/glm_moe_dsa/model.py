@@ -14,8 +14,8 @@ from .configuration_glm_moe_dsa import GlmMoeDsaConfig
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 
+from ..base import TurboModel
 from ..registry import register_model
-from ..weight_converter import WeightConverterMixin
 from transformers import AutoModelForCausalLM
 
 import transformers
@@ -47,7 +47,7 @@ if not hasattr(transformers, "TokenizersBackend"):
 @register_model(
     "glm_moe_dsa", config_cls=GlmMoeDsaConfig, auto_class=AutoModelForCausalLM
 )
-class TurboGlmMoeDsaForCausalLM(WeightConverterMixin, GlmMoeDsaForCausalLM):
+class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
     _supports_flash_attn_2 = True
 
     def __init__(self, config: GlmMoeDsaConfig) -> None:
@@ -56,7 +56,7 @@ class TurboGlmMoeDsaForCausalLM(WeightConverterMixin, GlmMoeDsaForCausalLM):
         self._post_init_patches()
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls, **kwargs):
         """Return the default parallel plan for this model."""
         from .parallel_plan import get_parallel_plan
 
@@ -94,7 +94,8 @@ class TurboGlmMoeDsaForCausalLM(WeightConverterMixin, GlmMoeDsaForCausalLM):
         self.model._use_flash_attention_2 = True
         self.config._attn_implementation = "flash_attention_2"
 
-    def setup_sp(self, sp_info):
+    def on_parallelized(self, parallel_context):
+        sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
 

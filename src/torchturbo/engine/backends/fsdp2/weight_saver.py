@@ -20,6 +20,7 @@ class ShardedParamManager:
         model,
         rank,
         mesh,
+        weight_converter,
         path=None,
         processing_class=None,
     ):
@@ -46,7 +47,7 @@ class ShardedParamManager:
         self.processing_class = processing_class
         self.src_path = Path(path) if path else None
         self.model_type = model.config.model_type
-        self.param_converter = model.get_weight_converter(mesh)
+        self.param_converter = weight_converter
         self.param_size_map = {}
         self.param_to_rank = {}
         self.rank_shard_bytes = {}

@@ -18,7 +18,10 @@ from ...engine.config import (
     CommConfig,
     DistributedBackend,
     ENV_MAP,
+    FreezePolicy,
     MixedPrecisionPolicy,
+    MTPConfig,
+    ParameterGroup,
 )
 from ...engine.backends.fsdp2.config import (
     FSDPConfig,
@@ -146,10 +149,14 @@ def _build_config_from_args(
     ep_size = tt.ep_size if (tt is not None and tt.ep_size is not None) else 1
     parallel_plan = FSDPParallelPlan(sp_size=sp_size, ep_size=ep_size)
 
-    # --- Extra: carry through MTP scaling so backend / patches can read it ---
+    # --- Freeze policy ---
+    freeze_policy = _build_freeze_policy(tt)
+
+    # --- MTP ---
+    mtp_config = _build_mtp_config(tt)
+
+    # --- Extra ---
     extra: dict[str, Any] = {}
-    if tt is not None:
-        extra["enable_mtp"] = bool(tt.enable_mtp)
 
     return EngineConfig(
         backend=backend,
@@ -159,8 +166,39 @@ def _build_config_from_args(
         activation_checkpointing=ac_config,
         comm=comm_config,
         checkpoint=checkpoint_config,
+        mtp=mtp_config,
+        freeze_policy=freeze_policy,
         extra=extra,
     ), raw_args
+
+
+def _build_mtp_config(torchturbo_args: TorchTurboArgs | None) -> MTPConfig:
+    if torchturbo_args is None:
+        return MTPConfig()
+
+    loss_scaling_factor = (
+        torchturbo_args.mtp_loss_scaling_factor
+        if torchturbo_args.mtp_loss_scaling_factor is not None
+        else MTPConfig().loss_scaling_factor
+    )
+    return MTPConfig(
+        enabled=bool(torchturbo_args.enable_mtp),
+        loss_scaling_factor=float(loss_scaling_factor),
+    )
+
+
+def _build_freeze_policy(torchturbo_args: TorchTurboArgs | None) -> FreezePolicy:
+    if torchturbo_args is None:
+        return FreezePolicy()
+
+    groups: list[ParameterGroup] = []
+    if torchturbo_args.freeze_vision_tower:
+        groups.append(ParameterGroup.VISION_TOWER)
+    if torchturbo_args.freeze_multi_modal_projector:
+        groups.append(ParameterGroup.MULTI_MODAL_PROJECTOR)
+    if torchturbo_args.freeze_language_model:
+        groups.append(ParameterGroup.LANGUAGE_MODEL)
+    return FreezePolicy(parameter_groups=tuple(groups))
 
 
 def _build_fsdp_config(

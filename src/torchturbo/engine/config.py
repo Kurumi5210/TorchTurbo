@@ -20,7 +20,7 @@ import os
 from argparse import ArgumentTypeError
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Iterable
 
 from .args import string_to_bool
 
@@ -71,6 +71,15 @@ class DistributedBackend(str, Enum):
     FSDP2 = "fsdp2"
     # Future:
     # MEGATRON = "megatron"
+
+
+class ParameterGroup(str, Enum):
+    """Semantic model parameter groups understood by engine policies."""
+
+    ALL = "all"
+    VISION_TOWER = "vision_tower"
+    MULTI_MODAL_PROJECTOR = "multi_modal_projector"
+    LANGUAGE_MODEL = "language_model"
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +169,57 @@ class CheckpointConfig:
     save_format: str = "dcp"
 
 
+@dataclass
+class MTPConfig:
+    """Multi-Token-Prediction configuration."""
+
+    enabled: bool = False
+    loss_scaling_factor: float = 0.1
+
+    def __post_init__(self) -> None:
+        if isinstance(self.enabled, str):
+            self.enabled = string_to_bool(self.enabled)
+        else:
+            self.enabled = bool(self.enabled)
+        self.loss_scaling_factor = float(self.loss_scaling_factor)
+
+
+@dataclass(frozen=True)
+class FreezePolicy:
+    """Engine config for freezing semantic model parameter groups."""
+
+    parameter_groups: tuple[ParameterGroup, ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.parameter_groups)
+
+    @classmethod
+    def from_list(
+        cls,
+        groups: Iterable[ParameterGroup | str] | ParameterGroup | str | None,
+    ) -> FreezePolicy:
+        if groups is None:
+            return cls()
+        if isinstance(groups, (ParameterGroup, str)):
+            groups = (groups,)
+        normalized = []
+        seen = set()
+        for group in groups:
+            parameter_group = cls._coerce_group(group)
+            if parameter_group in seen:
+                continue
+            normalized.append(parameter_group)
+            seen.add(parameter_group)
+        return cls(tuple(normalized))
+
+    @staticmethod
+    def _coerce_group(group: ParameterGroup | str) -> ParameterGroup:
+        if isinstance(group, ParameterGroup):
+            return group
+        return ParameterGroup(group)
+
+
 # ---------------------------------------------------------------------------
 # Top-level engine config
 # ---------------------------------------------------------------------------
@@ -210,6 +270,12 @@ class EngineConfig:
 
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     """Checkpoint loading / saving settings."""
+
+    mtp: MTPConfig = field(default_factory=MTPConfig)
+    """Multi-Token-Prediction settings."""
+
+    freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
+    """Policy for freezing semantic model parameter groups."""
 
     extra: dict[str, Any] = field(default_factory=dict)
     """Catch-all for user-defined settings."""
@@ -339,6 +405,12 @@ class EngineConfig:
             }
         ckpt = CheckpointConfig(**ckpt_d)
 
+        # MTP
+        mtp_config = cls._parse_mtp_config(d)
+
+        # Freeze policy
+        freeze_policy = cls._parse_freeze_policy(d.get("freeze_policy", {}))
+
         # Extra
         known_keys = {
             "backend",
@@ -367,6 +439,10 @@ class EngineConfig:
             "dcp_path",
             "hf_model_path",
             "save_format",
+            "mtp",
+            "enable_mtp",
+            "mtp_loss_scaling_factor",
+            "freeze_policy",
         }
         extra = {k: v for k, v in d.items() if k not in known_keys}
 
@@ -378,8 +454,48 @@ class EngineConfig:
             activation_checkpointing=ac,
             comm=comm,
             checkpoint=ckpt,
+            mtp=mtp_config,
+            freeze_policy=freeze_policy,
             extra=extra,
         )
+
+    @staticmethod
+    def _parse_mtp_config(d: dict[str, Any]) -> MTPConfig:
+        mtp_d = d.get("mtp", {})
+        if isinstance(mtp_d, MTPConfig):
+            return mtp_d
+        if mtp_d is None:
+            mtp_d = {}
+        if not isinstance(mtp_d, dict):
+            raise TypeError("mtp must be a dict or MTPConfig.")
+
+        mtp_d = dict(mtp_d)
+        if "enable_mtp" in d:
+            mtp_d["enabled"] = d["enable_mtp"]
+        if "mtp_loss_scaling_factor" in d:
+            mtp_d["loss_scaling_factor"] = d["mtp_loss_scaling_factor"]
+        if mtp_d.get("loss_scaling_factor") is None:
+            mtp_d["loss_scaling_factor"] = 0.1
+        return MTPConfig(**mtp_d)
+
+    @staticmethod
+    def _parse_freeze_policy(value: Any) -> FreezePolicy:
+        if isinstance(value, FreezePolicy):
+            return value
+        if value is None or value == {}:
+            return FreezePolicy()
+        if not isinstance(value, dict):
+            raise TypeError("freeze_policy must be a dict or FreezePolicy.")
+
+        allowed_keys = {"parameter_groups"}
+        unknown_keys = set(value) - allowed_keys
+        if unknown_keys:
+            keys = ", ".join(sorted(unknown_keys))
+            raise ValueError(f"Unknown freeze_policy field(s): {keys}.")
+        if "parameter_groups" not in value:
+            raise ValueError("freeze_policy requires 'parameter_groups'.")
+
+        return FreezePolicy.from_list(value["parameter_groups"])
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize back to a dict (for logging, etc.)."""

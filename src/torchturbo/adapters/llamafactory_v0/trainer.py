@@ -196,8 +196,8 @@ class TorchTurboTrainerBase:
         )
 
     def train(self, *args, **kwargs):
-        from ...engine.hooks import TrainState
         from ...engine.args import get_torchturbo_args
+        from ...engine.hooks import TrainState
 
         engine = self._engine()
         sp_info = engine.backend.get_sp_info()
@@ -372,9 +372,6 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
         if getattr(self.finetuning_args, "ref_model", None) is None:
             self._copy_model_state(self.model, ref_model)
-            post_weight_load = getattr(ref_model, "post_weight_load", None)
-            if callable(post_weight_load):
-                post_weight_load()
             logger.info(
                 "torchturbo: initialized DPO reference model from policy weights."
             )
@@ -521,7 +518,10 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                 device=inputs["input_ids"].device,
             ).unsqueeze(0)
 
-        if getattr(model, "is_vlm", False):
+        from ...models.base import SequenceParallelInputMode
+
+        input_mode = model.get_sequence_parallel_input_mode()
+        if input_mode == SequenceParallelInputMode.POST_EMBEDDING:
             (
                 inputs["input_ids"],
                 inputs["position_ids"],

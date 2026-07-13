@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import math
 import torch
@@ -13,7 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 from ..logging import get_logger
 from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
-from .config import EngineConfig
+from .config import EngineConfig, FreezePolicy
 from .hooks import TrainHook, TrainState
 
 from torchturbo.utils.device import is_npu_available
@@ -267,7 +267,7 @@ class TorchTurboEngine:
                 trust_remote_code=trust_remote_code,
             )
 
-        if self.config.extra.get("enable_mtp"):
+        if self.config.mtp.enabled:
             n_mtp = getattr(config, "num_nextn_predict_layers", 0)
             if n_mtp > 0:
                 logger.info("MTP enabled: %d MTP layer(s) will be built", n_mtp)
@@ -296,79 +296,106 @@ class TorchTurboEngine:
         # This bypasses AutoModelForCausalLM.from_config entirely, avoiding
         # the type(config) mismatch that occurs when the config object was
         # created from a remote config class (e.g. via trust_remote_code).
+        from ..models.base import TurboModel
         from ..models.registry import get_model
         from transformers import PreTrainedModel
 
         model_type = getattr(config, "model_type", None)
         turbo_cls = get_model(model_type) if model_type else None
 
-        if turbo_cls is not None:
-            # we use float32 as main param storage
-            dtype_state = turbo_cls.set_config_dtype_to_float32(config)
-
-        logger.info("Building model on meta device: %s", model_name_or_path)
-        with torch.device("meta"):
-            if turbo_cls is not None and issubclass(turbo_cls, PreTrainedModel):
-                logger.info("Using torchturbo model class: %s", turbo_cls.__name__)
-                model = turbo_cls._from_config(config)
-            else:
-                model = model_cls.from_config(
-                    config, trust_remote_code=trust_remote_code
-                )
-
-            # Resolve parallel plan
-            parallel_plan = self._resolve_parallel_plan(model)
-
-            # Prepare model via backend (module replacement → LoRA → sharding).
-            logger.info("Sharding model via %s backend", self.config.backend.value)
-            model = self.backend.prepare_model(
-                model, parallel_plan=parallel_plan, peft_config=peft_config
+        turbo_model_cls = turbo_cls if turbo_cls is not None else model_cls
+        if not isinstance(turbo_model_cls, type) or not issubclass(
+            turbo_model_cls, TurboModel
+        ):
+            raise TypeError(
+                "TorchTurboEngine requires a TurboModel subclass. "
+                f"Got {getattr(turbo_model_cls, '__name__', turbo_model_cls)!r} "
+                f"for model_type={model_type!r}."
+            )
+        if not issubclass(turbo_model_cls, PreTrainedModel):
+            raise TypeError(
+                "TorchTurboModel classes must also inherit transformers.PreTrainedModel. "
+                f"Got {turbo_model_cls.__name__}."
             )
 
-            setup_sp = getattr(model, "setup_sp", None)
-            if setup_sp and callable(setup_sp):
-                model.setup_sp(self.backend.get_sp_info())
+        with turbo_model_cls.init_context(config):
+            logger.info("Building model on meta device: %s", model_name_or_path)
+            with torch.device("meta"):
+                logger.info(
+                    "Using torchturbo model class: %s", turbo_model_cls.__name__
+                )
+                model = turbo_model_cls._from_config(config)
 
-        # reset dtype back to default for weight saving
-        if turbo_cls is not None:
-            turbo_cls.reset_config_dtype(config, dtype_state)
+                # Resolve parallel plan
+                parallel_plan = self._resolve_parallel_plan(model)
+
+                # Prepare model via backend (module replacement → LoRA → sharding).
+                logger.info("Sharding model via %s backend", self.config.backend.value)
+                model = self.backend.prepare_model(
+                    model, parallel_plan=parallel_plan, peft_config=peft_config
+                )
+
+                parallel_context = self._get_parallel_context()
+                model.on_parallelized(parallel_context)
 
         if load_weights:
             logger.info("Loading model via %s backend", self.config.backend.value)
-            self.backend.load_model(model, model_name_or_path=model_name_or_path)
+            self.backend.load_model(
+                model,
+                model_name_or_path=model_name_or_path,
+                parallel_context=parallel_context,
+            )
         else:
             logger.info("Materializing model via %s backend", self.config.backend.value)
             self.backend.materialize_model(model)
 
-        if load_weights and hasattr(model, "post_weight_load"):
-            model.post_weight_load()
+        model.on_materialized()
 
         logger.info("Model built: %s (%s)", type(model).__name__, torch_dtype)
         return model
 
-    def _apply_freeze(self, model: nn.Module) -> None:
-        from .args import get_torchturbo_args
-
-        tt_args = get_torchturbo_args()
-        if tt_args is None:
+    def _apply_freeze_policy(self, model: nn.Module, policy: FreezePolicy) -> None:
+        if not policy.enabled:
             return
 
-        freeze_map = {
-            "freeze_vision_tower": (tt_args.freeze_vision_tower, ["visual"]),
-            "freeze_multi_modal_projector": (tt_args.freeze_multi_modal_projector, ["merger", "mm_projector"]),
-            "freeze_language_model": (tt_args.freeze_language_model, ["language_model"]),
-        }
+        get_parameter_groups = getattr(model, "get_parameter_groups", None)
+        if not callable(get_parameter_groups):
+            raise TypeError(
+                "FreezePolicy requires models to expose get_parameter_groups(). "
+                f"Got {type(model).__name__}."
+            )
 
-        for flag_name, (should_freeze, keywords) in freeze_map.items():
-            if not should_freeze:
-                continue
-            count = 0
-            for name, p in model.named_parameters():
-                if any(kw in name for kw in keywords):
-                    p.requires_grad_(False)
-                    count += 1
+        parameter_groups = get_parameter_groups()
+        available_groups = ", ".join(group.value for group in parameter_groups)
 
-            logger.info("Froze %d parameters via --%s (keywords: %s)", count, flag_name, keywords)
+        for group in policy.parameter_groups:
+            parameters = parameter_groups.get(group)
+            if parameters is None:
+                raise ValueError(
+                    f"FreezePolicy requested unsupported parameter group "
+                    f"{group.value!r} for {type(model).__name__}. "
+                    f"Available groups: {available_groups or '<none>'}."
+                )
+
+            tensor_count = 0
+            element_count = 0
+            for _, param in parameters:
+                param.requires_grad_(False)
+                tensor_count += 1
+                element_count += param.numel()
+
+            if tensor_count == 0:
+                raise ValueError(
+                    f"FreezePolicy group {group.value!r} matched no parameters "
+                    f"in {type(model).__name__}."
+                )
+
+            logger.info(
+                "Froze %d parameter tensors (%d elements) in group %s",
+                tensor_count,
+                element_count,
+                group.value,
+            )
 
     def prepare_model(
         self,
@@ -390,7 +417,7 @@ class TorchTurboEngine:
             load_weights=True,
         )
 
-        self._apply_freeze(model)
+        self._apply_freeze_policy(model, self.config.freeze_policy)
 
         self.model = model
         self.model_name_or_path = model_name_or_path
@@ -406,10 +433,23 @@ class TorchTurboEngine:
         return model
 
     def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
-        self.backend.save_model(model, self.model_name_or_path, output_dir, **kwargs)
+        self.backend.save_model(
+            model,
+            self.model_name_or_path,
+            output_dir,
+            parallel_context=self._get_parallel_context(),
+            **kwargs,
+        )
         logger.info(
             "Model saved in %s via %s backend", output_dir, self.config.backend.value
         )
+
+    def _get_parallel_context(self) -> dict[str, Any]:
+        return {
+            "dp": self.get_dp_info(),
+            "sp": self.get_sp_info(),
+            "ep": self.get_ep_info(),
+        }
 
     # ------------------------------------------------------------------
     # Optimizer & LR scheduler
@@ -476,21 +516,23 @@ class TorchTurboEngine:
 
     def _resolve_parallel_plan(self, model: nn.Module):
         """Resolve the parallel plan for a model."""
-        from ..parallel import FSDPParallelPlan
+        from ..models.base import TurboModel
 
-        get_plan = getattr(type(model), "get_parallel_plan", None)
-        if callable(get_plan):
-            plan = get_plan()
-            logger.info(
-                "Auto-discovered parallel plan from %s (plan_keys=%d, sp=%d, ep=%d)",
-                type(model).__name__,
-                len(getattr(plan, "plan", {})),
-                getattr(plan, "sp_size", 1),
-                getattr(plan, "ep_size", 1),
+        if not isinstance(model, TurboModel):
+            raise TypeError(
+                "TorchTurboEngine requires prepared models to inherit TurboModel. "
+                f"Got {type(model).__name__}."
             )
-        else:
-            logger.info("No parallel plan found, using standard FSDP sharding")
-            plan = FSDPParallelPlan()
+
+        plan = type(model).get_default_parallel_plan()
+        logger.info(
+            "Auto-discovered default parallel plan from %s "
+            "(plan_keys=%d, sp=%d, ep=%d)",
+            type(model).__name__,
+            len(getattr(plan, "plan", {})),
+            getattr(plan, "sp_size", 1),
+            getattr(plan, "ep_size", 1),
+        )
 
         if self.config.parallel_plan is not None:
             logger.info("Overriding parallel plan with engine config")

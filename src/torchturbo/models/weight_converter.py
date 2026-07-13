@@ -3,61 +3,26 @@ import torch.distributed as dist
 
 from torchturbo.models.modules.moe.moe_layer import BaseMoELayer
 
-class WeightConverterMixin:
-    def get_moe_config(self):
-        for _, module in self.named_modules():
-            if isinstance(module, BaseMoELayer):
-                moe_config = module.config
-                return moe_config
-        return None
-
-    def get_weight_converter(self, mesh):
-        return BaseWeightConverter(self.config, self.get_moe_config(), mesh)
-
-    # ---- Config dtype set / reset (class methods) ----
-
-    @classmethod
-    def set_config_dtype_to_float32(cls, config):
-        """Set config dtype to float32 for model construction on meta device.
-
-        Returns an opaque state dict that should be passed to reset_config_dtype.
-        Subclasses can override to handle nested configs (e.g. text_config, vision_config).
-        """
-        state = {}
-        # top-level config
-        if hasattr(config, 'dtype'):
-            state['dtype'] = config.dtype
-            config.dtype = torch.float32
-        elif hasattr(config, 'torch_dtype'):
-            state['torch_dtype'] = config.torch_dtype
-            config.torch_dtype = "float32"
-        return state
-
-    @classmethod
-    def reset_config_dtype(cls, config, state):
-        """Reset config dtype back to original values after model construction.
-
-        Subclasses can override to handle nested configs.
-        """
-        if 'dtype' in state:
-            config.dtype = state['dtype']
-        elif 'torch_dtype' in state:
-            config.torch_dtype = state['torch_dtype']
-
 
 class BaseWeightConverter:
-    def __init__(self, config, moe_config, mesh):
+    def __init__(self, model, parallel_context):
+        config = model.config
+        ep_info = parallel_context["ep"]
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        self.world_mesh = mesh
-        self.ep_mesh = mesh["ep"]
-        self.ep_group = self.ep_mesh.get_group()
-        self.ep_rank = dist.get_rank(group=self.ep_group)
-        self.ep_size = dist.get_world_size(group=self.ep_group)
-        self.moe_config = moe_config
+        self.ep_group = ep_info["ep_group"]
+        self.ep_rank = ep_info["ep_rank"]
+        self.ep_size = ep_info["ep_size"]
+        self.moe_config = self.get_moe_config(model)
         self.config = config
         self.model_type = config.model_type
         self.dtype = self.get_save_dtype(config)
+
+    def get_moe_config(self, model):
+        for _, module in model.named_modules():
+            if isinstance(module, BaseMoELayer):
+                return module.config
+        return None
 
     def get_save_dtype(self, config):
         if hasattr(config, 'dtype'):
@@ -464,8 +429,8 @@ class FusedExpertWeightConverter(BaseWeightConverter):
 
     VIRTUAL_KEY_DELIMITER = "__ep"
 
-    def __init__(self, config, moe_config, mesh):
-        super().__init__(config, moe_config, mesh)
+    def __init__(self, model, parallel_context):
+        super().__init__(model, parallel_context)
         # Model param names where the checkpoint uses per-expert format
         # (not fused). Filled by get_weight1/2_load_entries when the
         # fused key is absent from param_to_filename.

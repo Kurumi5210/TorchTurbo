@@ -1,5 +1,3 @@
-from typing import Any
-
 try:
     from typing import override  # Python 3.12+
 except ImportError:
@@ -13,12 +11,10 @@ from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .configuration_kimi_k25 import KimiK25Config
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.models.modules.moe.moe_layer import MoELayer
-from torchturbo.models.modules.attention.ulysses import (
-    patch_vlm_for_ulysses_input_slicing,
-)
 
+from ..base import TurboVLMModel
 from ..registry import register_model
-from ..weight_converter import BaseWeightConverter, WeightConverterMixin
+from ..weight_converter import BaseWeightConverter
 from transformers import AutoModelForCausalLM
 
 
@@ -39,47 +35,22 @@ class KimiK25WeightConverter(BaseWeightConverter):
     already match; no name overrides are needed.
     """
 
-    def __init__(self, config, moe_config, mesh):
-        text_config = config.text_config if hasattr(config, "text_config") else config
-        super().__init__(text_config, moe_config, mesh)
-        self.full_config = config
+    def __init__(self, model, parallel_context):
+        super().__init__(model, parallel_context)
+        config = self.config
+        if hasattr(config, "text_config"):
+            self.config = config.text_config
+            self.model_type = self.config.model_type
+            self.dtype = self.get_save_dtype(self.config)
 
 
 @register_model("kimi_k25", config_cls=KimiK25Config, auto_class=AutoModelForCausalLM)
-class TurboKimiK25ForConditionalGeneration(WeightConverterMixin, KimiK25ForConditionalGeneration):
+class TurboKimiK25ForConditionalGeneration(
+    TurboVLMModel, KimiK25ForConditionalGeneration
+):
 
-    is_vlm = True
-
-    # ---- Config dtype set / reset (VLM override) ----
-
-    @classmethod
-    def set_config_dtype_to_float32(cls, config):
-        """Also set text_config / vision_config dtype to float32.
-
-        FSDP2 uses float32 as main param storage and requires a uniform
-        param dtype at construction time. Kimi's sub-configs may still
-        carry bfloat16, which would create mixed dtypes on the meta device.
-        """
-        state = super().set_config_dtype_to_float32(config)
-        if hasattr(config, "text_config") and hasattr(config.text_config, "dtype"):
-            state["text_config_dtype"] = config.text_config.dtype
-            config.text_config.dtype = torch.float32
-        if hasattr(config, "vision_config") and hasattr(config.vision_config, "dtype"):
-            state["vision_config_dtype"] = config.vision_config.dtype
-            config.vision_config.dtype = torch.float32
-        return state
-
-    @classmethod
-    def reset_config_dtype(cls, config, state):
-        """Reset text_config / vision_config dtype after construction."""
-        if "text_config_dtype" in state:
-            config.text_config.dtype = state["text_config_dtype"]
-        if "vision_config_dtype" in state:
-            config.vision_config.dtype = state["vision_config_dtype"]
-        super().reset_config_dtype(config, state)
-
-    def get_weight_converter(self, mesh):
-        return KimiK25WeightConverter(self.config, self.get_moe_config(), mesh)
+    def get_weight_converter(self, parallel_context):
+        return KimiK25WeightConverter(self, parallel_context)
 
     def __init__(self, config: KimiK25Config) -> None:
         self._pre_init_patches()
@@ -87,7 +58,7 @@ class TurboKimiK25ForConditionalGeneration(WeightConverterMixin, KimiK25ForCondi
         self._post_init_patches()
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls, **kwargs):
         """Return the default parallel plan for this model."""
         from .parallel_plan import get_parallel_plan
 
@@ -119,15 +90,16 @@ class TurboKimiK25ForConditionalGeneration(WeightConverterMixin, KimiK25ForCondi
     def _post_init_patches(self):
         pass
 
-    def setup_sp(self, sp_info):
+    def on_parallelized(self, parallel_context):
         from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing
 
+        sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         cls = type(self.language_model)
         patch_forward_for_sp_input_slicing(cls, sp_group, sp_size)
 
-    def post_weight_load(self):
+    def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""
 
         device = get_device_name()

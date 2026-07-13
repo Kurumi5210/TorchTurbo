@@ -138,10 +138,10 @@ sh scripts/runs/lf_deepseek_v4_sft.sh
 DeepSeekV4 额外提供模块级对齐入口：
 
 ```bash
-python tests/deepseek_v4/run_alignment.py --mode all
-python tests/deepseek_v4/run_alignment.py --mode ops
-python tests/deepseek_v4/run_alignment.py --mode modeling-vs-infer
-python tests/deepseek_v4/run_alignment.py --mode turbo-vs-modeling
+python tests/models/deepseek_v4/run_alignment.py --mode all
+python tests/models/deepseek_v4/run_alignment.py --mode ops
+python tests/models/deepseek_v4/run_alignment.py --mode modeling-vs-infer
+python tests/models/deepseek_v4/run_alignment.py --mode turbo-vs-modeling
 ```
 
 ## 原始数据

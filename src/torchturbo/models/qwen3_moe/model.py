@@ -9,8 +9,8 @@ from torchturbo.ops import npu_fused_ops
 from torchturbo.utils.device import is_npu_available, get_device_name
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.models.modules.attention.ulysses.utils import create_causal_mask
+from ..base import TurboModel
 from ..registry import register_model
-from ..weight_converter import WeightConverterMixin
 from transformers import AutoModelForCausalLM
 
 
@@ -29,7 +29,7 @@ class TurboQwen3MoeRotaryEmbedding(Qwen3MoeRotaryEmbedding):
 
 
 @register_model("qwen3_moe", config_cls=Qwen3MoeConfig, auto_class=AutoModelForCausalLM)
-class TurboQwen3MoeForCausalLM(WeightConverterMixin, Qwen3MoeForCausalLM):
+class TurboQwen3MoeForCausalLM(TurboModel, Qwen3MoeForCausalLM):
 
     config_class = Qwen3MoeConfig
     base_model_prefix = "model"
@@ -40,7 +40,7 @@ class TurboQwen3MoeForCausalLM(WeightConverterMixin, Qwen3MoeForCausalLM):
         self._post_init_patches()
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls, **kwargs):
         """Return the default parallel plan for this model."""
         from .parallel_plan import get_parallel_plan
 
@@ -77,7 +77,7 @@ class TurboQwen3MoeForCausalLM(WeightConverterMixin, Qwen3MoeForCausalLM):
     def _post_init_patches(self):
         pass
 
-    def post_weight_load(self):
+    def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""
 
         # patch to rotary_emb

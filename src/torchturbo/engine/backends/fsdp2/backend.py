@@ -16,6 +16,7 @@ from torchturbo.models.modules.attention.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from torchturbo.models.modules.comm import all_gather_tensor
+from torchturbo.models.base import SequenceParallelInputMode
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
@@ -276,9 +277,15 @@ class FSDP2Backend(BaseBackend):
 
         return model
 
-    def load_model(self, model: nn.Module, model_name_or_path: str):
+    def load_model(
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        parallel_context: dict[str, Any],
+    ):
         from .weight_loader import DistParamLoader
 
+        weight_converter = model.get_weight_converter(parallel_context)
         loader = DistParamLoader(
             model=model,
             path=model_name_or_path,
@@ -286,6 +293,7 @@ class FSDP2Backend(BaseBackend):
             mesh=self._mesh,
             world_mesh=self._world_mesh,
             device=self.device,
+            weight_converter=weight_converter,
         )
         loader.load_weights()
 
@@ -299,16 +307,23 @@ class FSDP2Backend(BaseBackend):
         return model
 
     def save_model(
-        self, model: nn.Module, model_name_or_path: str, output_dir: str, **kwargs: Any
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        output_dir: str,
+        parallel_context: dict[str, Any],
+        **kwargs: Any,
     ):
         from .weight_saver import DistParamSaver
 
+        weight_converter = model.get_weight_converter(parallel_context)
         saver = DistParamSaver(
             model=model,
             rank=self.rank,
             mesh=self._mesh,
             path=model_name_or_path,
             processing_class=None,
+            weight_converter=weight_converter,
         )
         saver.save_model(output_dir)
 
@@ -933,8 +948,8 @@ class FSDP2Backend(BaseBackend):
         # # Repeated calculation in SP group
         # num_items_in_batch = num_items_in_batch // sp_size
 
-        is_vlm = getattr(model, "is_vlm", False)
-        if is_vlm:
+        input_mode = model.get_sequence_parallel_input_mode()
+        if input_mode == SequenceParallelInputMode.POST_EMBEDDING:
             # vlm model's inputs will be sliced after embedding
             inputs["input_ids"], inputs["position_ids"], _, pad_size = ulysses_pad(
                 inputs["input_ids"],
@@ -971,7 +986,7 @@ class FSDP2Backend(BaseBackend):
         # use the same SP-aware CE helper as the main path.
         mtp_logits_list = getattr(outputs, "mtp_logits", None)
         mtp_losses: list[torch.Tensor] = []
-        if mtp_logits_list:
+        if self.config.mtp.enabled and mtp_logits_list:
             for i, mtp_logits in enumerate(mtp_logits_list):
                 # i-th MTP head predicts token_{t + i + 2}, so shift labels
                 # (i + 1) extra positions vs the main path.
@@ -995,16 +1010,7 @@ class FSDP2Backend(BaseBackend):
                             flush=True
                         )
 
-        # Read MTP scaling straight from the CLI args.
-        # Defaults to 0.1 (Megatron-LM default).
-        from torchturbo.engine.args import get_torchturbo_args
-
-        tt_args = get_torchturbo_args()
-        scaling = float(
-            tt_args.mtp_loss_scaling_factor
-            if tt_args is not None and tt_args.mtp_loss_scaling_factor is not None
-            else 0.1
-        )
+        scaling = float(self.config.mtp.loss_scaling_factor)
         scaled_mtp_total = None
 
         if mtp_losses and scaling > 0.0:

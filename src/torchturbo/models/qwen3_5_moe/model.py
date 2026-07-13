@@ -1,4 +1,3 @@
-import os
 import functools
 from typing_extensions import override
 
@@ -13,19 +12,21 @@ from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeCo
 from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.utils.device import is_npu_available, get_device_name
 
+from ...engine.config import ParameterGroup
+from ..base import TurboVLMModel
 from ..registry import register_model
-from ..weight_converter import WeightConverterMixin, FusedExpertWeightConverter
+from ..weight_converter import FusedExpertWeightConverter
 
 
 class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
 
-    def __init__(self, config, moe_config, mesh):
+    def __init__(self, model, parallel_context):
+        super().__init__(model, parallel_context)
+        config = self.config
         if hasattr(config, "text_config"):
-            text_config = config.text_config
-        else:
-            text_config = config
-        super().__init__(text_config, moe_config, mesh)
-        self.full_config = config
+            self.config = config.text_config
+            self.model_type = self.config.model_type
+            self.dtype = self.get_save_dtype(self.config)
 
     def get_hf_alog_name(self):
         return "A_log"
@@ -46,55 +47,39 @@ class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
     auto_class=AutoModelForImageTextToText,
 )
 class TurboQwen3_5MoeForConditionalGeneration(
-    WeightConverterMixin, Qwen3_5MoeForConditionalGeneration
+    TurboVLMModel, Qwen3_5MoeForConditionalGeneration
 ):
 
-    is_vlm = True
     config_class = Qwen3_5MoeConfig
     base_model_prefix = "model"
+    multi_modal_projector_module_names = ("model.visual.merger",)
+    language_model_module_names = ("model.language_model",)
 
-    # ---- Config dtype set / reset (VLM override) ----
-
-    @classmethod
-    def set_config_dtype_to_float32(cls, config):
-        """Override to also set text_config and vision_config dtype."""
-        state = super().set_config_dtype_to_float32(config)
-        # FSDP2 requires uniform param dtype. Qwen3.5's sub-configs may
-        # still carry bfloat16, causing mixed dtypes at construction time.
-        if hasattr(config, "text_config") and hasattr(config.text_config, 'dtype'):
-            state['text_config_dtype'] = config.text_config.dtype
-            config.text_config.dtype = torch.float32
-        if hasattr(config, "vision_config") and hasattr(config.vision_config, 'dtype'):
-            state['vision_config_dtype'] = config.vision_config.dtype
-            config.vision_config.dtype = torch.float32
-        return state
-
-    @classmethod
-    def reset_config_dtype(cls, config, state):
-        """Override to also reset text_config and vision_config dtype."""
-        if 'text_config_dtype' in state:
-            config.text_config.dtype = state['text_config_dtype']
-        if 'vision_config_dtype' in state:
-            config.vision_config.dtype = state['vision_config_dtype']
-        super().reset_config_dtype(config, state)
+    def get_parameter_groups(self):
+        groups = super().get_parameter_groups()
+        groups[ParameterGroup.VISION_TOWER] = (
+            (name, param)
+            for name, param in self.model.visual.named_parameters(prefix="model.visual")
+            if name != "model.visual.merger"
+            and not name.startswith("model.visual.merger.")
+        )
+        return groups
 
     def __init__(self, config: Qwen3_5MoeConfig) -> None:
         self._pre_init_patches()
         if hasattr(config, "vision_config"):
-           config.vision_config._attn_implementation = "flash_attention_2"
+            config.vision_config._attn_implementation = "flash_attention_2"
         super().__init__(config)
         self._post_init_patches()
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls, **kwargs):
         from .parallel_plan import get_parallel_plan
 
         return get_parallel_plan(**kwargs)
 
     @staticmethod
     def _pre_init_patches():
-        import torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_module
-
         if is_npu_available:
             from torchturbo.ops.npu_fused_ops import fused_token_permutation_npu, fused_token_unpermutation_npu
             MoEAlltoAllTokenDispatcher.token_permutation = fused_token_permutation_npu
@@ -231,9 +216,10 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 if hasattr(module, "chunk_gated_delta_rule"):
                     module.chunk_gated_delta_rule = npu_gdr
 
-    def setup_sp(self, sp_info):
+    def on_parallelized(self, parallel_context):
         from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing
 
+        sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
@@ -700,12 +686,10 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
         attn_cls.forward = sp_forward
 
-    def get_weight_converter(self, mesh):
-        return Qwen3_5MoeWeightConverter(
-            self.config, self.get_moe_config(), mesh
-        )
+    def get_weight_converter(self, parallel_context):
+        return Qwen3_5MoeWeightConverter(self, parallel_context)
 
-    def post_weight_load(self):
+    def on_materialized(self):
         device = get_device_name()
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 

@@ -25,7 +25,7 @@ pip install trl==0.24.0
 pip install matplotlib
 
 # install packages related to npu triton
-pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/triton_ascend-3.2.0.dev20260315-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl --no-deps
-pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/flash_linear_attention-0.4.2-py3-none-any.whl --no-deps
+pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl --no-deps
+pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/flash_linear_attention-0.5.2-py3-none-any.whl --no-deps
 
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

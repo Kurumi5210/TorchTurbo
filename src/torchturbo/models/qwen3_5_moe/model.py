@@ -211,10 +211,10 @@ class TurboQwen3_5MoeForConditionalGeneration(
         self.model.get_rope_index = _wrapped_get_rope_index
 
         if is_npu_available:
-            from .chunk_gated_delta_rule import chunk_gated_delta_rule as npu_gdr
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_gdr
             for _, module in self.model.named_modules():
                 if hasattr(module, "chunk_gated_delta_rule"):
-                    module.chunk_gated_delta_rule = npu_gdr
+                    module.chunk_gated_delta_rule = fla_gdr
 
     def on_parallelized(self, parallel_context):
         from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing

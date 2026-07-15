@@ -25,8 +25,8 @@ fi
 #model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
 model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
 
-seq_length=$((1024 * 32))
-sp_size=2
+seq_length=$((1024 * 8))
+sp_size=1
 ep_size=8
 dataset=med_debug
 packing_mode=packing_sep
@@ -105,7 +105,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --preprocessing_num_workers 64 \
     --cutoff_len ${seq_length} \
     --neat_packing \
-    --template qwen3_5_nothink \
+    --template qwen3_5 \
     --finetuning_type ${finetuning_type} \
     --output_dir $output_dir \
     --overwrite_output_dir \

@@ -194,6 +194,18 @@ class GroupedMLP(torch.nn.Module):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        # `tokens_per_expert` is the per-expert token count used as the grouped-GEMM
+        # `batch_sizes`. The grouped_gemm C++ kernel hard-requires it on CPU
+        # (`assert batch_sizes.is_cpu()`). During normal forward the AlltoAll token
+        # dispatcher moves it to CPU via an async side-stream + sync point; but under
+        # activation-checkpoint recompute (driven by autograd in backward) that side
+        # stream/sync timing is not reliably hit, so the GPU tensor can leak through
+        # and trip the is_cpu() assert. Pin it to CPU here at the call site instead of
+        # relying on the dispatcher's async DtoH, so forward and recompute behave the
+        # same. (The TE branch already does the equivalent via .tolist() below.)
+        if isinstance(tokens_per_expert, torch.Tensor) and tokens_per_expert.is_cuda:
+            tokens_per_expert = tokens_per_expert.cpu()
+
         if permuted_local_hidden_states.nelement() != 0:
 
             if transformer_engine_is_available() and self.use_te:

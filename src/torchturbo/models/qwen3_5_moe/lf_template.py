@@ -48,7 +48,7 @@ def register() -> None:
             name="qwen3_5_nothink",
             format_user=StringFormatter(
                 slots=[
-                    "<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n<think></think>\n"
+                    "<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"
                 ]
             ),
             format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),

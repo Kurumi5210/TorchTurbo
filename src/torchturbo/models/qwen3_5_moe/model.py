@@ -126,7 +126,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
             # labels (neat packing): values > 1 distinguish packed sub-sequences.
             # A plain 0/1 mask (or no mask) falls through to the upstream impl,
             # so non-packed training and inference are byte-identical to before.
-            if attention_mask is None or attention_mask.numel() == 0 or torch.max(attention_mask) <= 1:
+            if attention_mask is None or attention_mask.numel() == 0:
                 return original_get_rope_index(*args, **kwargs)
 
             input_ids = kwargs["input_ids"]
@@ -192,6 +192,28 @@ class TurboQwen3_5MoeForConditionalGeneration(
                         vision_position_ids = get_vision_position_ids(
                             current_pos, grid_thw, 1, spatial_merge_size, device=input_ids.device
                         )
+                        # Packing can truncate the image placeholder span at a block
+                        # boundary while image_grid_thw still describes the full image.
+                        # Surviving tokens are the patch prefix -> align positions to them.
+                        placeholder_len = end_idx - start_idx
+                        grid_len = int(vision_position_ids.shape[1])
+                        if grid_len != placeholder_len:
+                            if grid_len > placeholder_len:
+                                vision_position_ids = vision_position_ids[:, :placeholder_len]
+                            else:
+                                last = vision_position_ids[:, -1:].expand(3, placeholder_len - grid_len)
+                                vision_position_ids = torch.cat([vision_position_ids, last], dim=1)
+                            import warnings as _warnings
+
+                            _warnings.warn(
+                                f"[qwen3_5_mrope packing] batch_idx={batch_idx} group "
+                                f"modality={'image' if modality_type == 1 else 'video'}: start_idx {start_idx},  end_idx {end_idx} "
+                                f"placeholder_len={placeholder_len} != grid_len={grid_len} "
+                                f"(grid_thw={grid_thw.tolist()}, spatial_merge_size="
+                                f"{spatial_merge_size}). Truncated/aligned to {placeholder_len}; "
+                                f"neat packing likely cut image tokens at a block boundary.",
+                                stacklevel=2,
+                            )
                         llm_pos_ids_list.append(vision_position_ids)
                         current_pos += max(grid_thw[1], grid_thw[2]) // spatial_merge_size
 

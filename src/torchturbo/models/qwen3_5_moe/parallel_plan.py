@@ -55,6 +55,9 @@ def get_parallel_plan() -> FSDPParallelPlan:
             "model.language_model.layers.*": FSDPPlanSpec(
                 activation_checkpoint=True,
             ),
+            "model.visual.blocks.*": FSDPPlanSpec(
+                activation_checkpoint=True,
+            ),
             "model.language_model.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
@@ -63,7 +66,7 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
             "model.visual": FSDPPlanSpec(
-                no_shard=True,
+                standalone_world_shard=True,
             ),
             "model.language_model.embed_tokens": FSDPPlanSpec(
                 standalone_world_shard=True,

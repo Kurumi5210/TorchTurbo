@@ -6,7 +6,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from safetensors.torch import load_file
 from torch.distributed._tensor import distribute_tensor, DTensor
 
@@ -21,15 +20,16 @@ class _PendingTask:
     """Holds state for an async broadcast that needs to be awaited and processed.
 
     After handle.wait(), the full_tensor contains valid data and can be
-    distributed into the model parameter via distribute_tensor + copy_.
+    distributed into the model state dict via distribute_tensor + assign.
     """
-    __slots__ = ('handle', 'full_tensor', 'param', 'mesh', 'target_dtype')
+    __slots__ = ('handle', 'full_tensor', 'param', 'mesh', 'key', 'target_dtype')
 
-    def __init__(self, handle, full_tensor, param, mesh, target_dtype=None):
+    def __init__(self, handle, full_tensor, param, mesh, key, target_dtype=None):
         self.handle = handle
         self.full_tensor = full_tensor
         self.param = param
         self.mesh = mesh
+        self.key = key
         self.target_dtype = target_dtype
 
 
@@ -49,11 +49,13 @@ class DistParamLoader:
         mesh,
         world_mesh,
         device,
+        is_cpu_offload,
         weight_converter,
     ):
         self.model = model
         self.hf_config = model.config
         self.device = device
+        self.is_cpu_offload = is_cpu_offload
         self.path = Path(path)
         self.mesh = mesh
         self.world_mesh = world_mesh
@@ -433,11 +435,11 @@ class DistParamLoader:
 
     # ── Flush Pending Tasks ────────────────────────────────────────
 
-    def _flush_pending_tasks(self, tasks):
-        """Wait for async broadcasts, convert dtype, distribute and copy into params.
+    def _flush_pending_tasks(self, tasks, sharded_sd):
+        """Wait for async broadcasts, convert dtype, distribute and store in state dict.
 
         For each task: wait handle → convert broadcast dtype to target dtype
-        (e.g., bf16→fp32) if needed → distribute_tensor (if DTensor) → copy_.
+        (e.g., bf16→fp32) if needed → distribute_tensor (if DTensor) → assign.
         """
         for task in tasks:
             task.handle.wait()
@@ -450,11 +452,15 @@ class DistParamLoader:
                 sharded_tensor = distribute_tensor(
                     task.full_tensor, task.mesh, task.param.placements, src_data_rank=None
                 )
+                # Only FSDP-managed (DTensor) params are CPU-offloaded. Ignored
+                # no_shard params are plain tensors, not managed by CPUOffloadPolicy,
+                # so they must stay on the compute device.
+                if self.is_cpu_offload:
+                    sharded_tensor = sharded_tensor.to("cpu")
             else:
                 sharded_tensor = task.full_tensor
 
-            with torch.no_grad():
-                task.param.copy_(nn.Parameter(sharded_tensor))
+            sharded_sd[task.key] = sharded_tensor
             del task.full_tensor
 
         del tasks
@@ -474,24 +480,8 @@ class DistParamLoader:
 
     # ── Buffer Handling ────────────────────────────────────────────
 
-    def _fix_buffer_dtype(self):
-        for name, submodule in self.model.named_modules():
-            for buf_name, buf in submodule.named_buffers(recurse=False):
-                full_name = f"{name}.{buf_name}" if name else buf_name
-                clean_name = strip_peft_prefix(full_name)
-                if not self.param_converter.is_persist_buffer(clean_name):
-                    continue
-                hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
-                hf_dtype = self.param_converter.get_default_hf_dtype(hf_buffer_name)
-                old_dtype = buf.dtype
-                if old_dtype != hf_dtype:
-                    new_buf = buf.detach().to(hf_dtype)
-                    submodule.register_buffer(buf_name, new_buf)
-                    logger.info(f"Converted {name}.{buf_name}: {old_dtype} -> {hf_dtype}")
-
-    def _broadcast_buffers(self):
-        """Broadcast buffers synchronously (they are typically small biases)."""
-        self._fix_buffer_dtype()
+    def _broadcast_buffers(self, sharded_sd):
+        """Broadcast persistent buffers synchronously into the state dict."""
         for name, buf in self.model.named_buffers():
             clean_name = strip_peft_prefix(name)
             if self.param_converter.is_persist_buffer(clean_name):
@@ -505,18 +495,17 @@ class DistParamLoader:
                         logger.info(f"[Weight Loader] SKIP buffer (not assigned): {clean_name} (original: {name})")
                     continue
                 owner = self.param_to_rank[hf_buffer_name]
+                hf_dtype = self.param_converter.get_default_hf_dtype(hf_buffer_name)
                 if self.rank == owner:
-                    full = self.local_sd[hf_buffer_name].to(self.device, dtype=buf.dtype)
+                    full = self.local_sd[hf_buffer_name].to(self.device, dtype=hf_dtype)
                 else:
-                    full = torch.empty(buf.shape, device=self.device, dtype=buf.dtype)
+                    full = torch.empty(buf.shape, device=self.device, dtype=hf_dtype)
                 dist.broadcast(full, src=owner, async_op=False)
-                with torch.no_grad():
-                    buf.copy_(full)
-                del full
+                sharded_sd[name] = full
 
     # ── Broadcast All Params ───────────────────────────────────────
 
-    def _broadcast_params(self):
+    def _broadcast_params(self, sharded_sd):
         pending = []
         pending_bytes = 0
         num_params = len(list(self.model.parameters()))
@@ -556,18 +545,18 @@ class DistParamLoader:
 
             # Flush existing pending if adding this tensor would exceed the memory budget
             if pending and pending_bytes + tensor_bytes > budget_bytes:
-                self._flush_pending_tasks(pending)
+                self._flush_pending_tasks(pending, sharded_sd)
                 pending = []
                 pending_bytes = 0
                 if self.rank == 0:
                     logger.info(f"[Broadcast] {processed}/{num_params} params")
 
-            pending.append(_PendingTask(handle, full, param, mesh, target_dtype))
+            pending.append(_PendingTask(handle, full, param, mesh, name, target_dtype))
             pending_bytes += tensor_bytes
             processed += 1
 
         if pending:
-            self._flush_pending_tasks(pending)
+            self._flush_pending_tasks(pending, sharded_sd)
 
         self._sync_log_rank0(f"[Rank {self.rank}] Broadcast {processed}/{num_params} params done")
 
@@ -583,15 +572,20 @@ class DistParamLoader:
     # ── Public API ─────────────────────────────────────────────────
 
     def load_weights(self):
-        self.model.to_empty(device=self.device)
         self.local_sd = self._load_local_shards()
 
+        sharded_sd = {}
+
         # buffers (small, kept synchronous)
-        self._broadcast_buffers()
+        self._broadcast_buffers(sharded_sd)
         self._sync_log_rank0(f"[Rank {self.rank}] broadcast buffers")
 
         # parameters (pipelined async broadcasts)
-        self._broadcast_params()
+        self._broadcast_params(sharded_sd)
+        self.model.load_state_dict(sharded_sd, assign=True, strict=False)
+        if hasattr(self.model, "tie_weights"):
+            self.model.tie_weights()
+        del sharded_sd
         self._sync_log_rank0(f"[Rank {self.rank}] Broadcast/sharding done")
 
         self._cleanup()

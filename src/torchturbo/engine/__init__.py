@@ -42,6 +42,7 @@ from .config import (
     ParameterGroup,
 )
 from .core import TorchTurboEngine
+from .distributed import init_process_group_if_needed
 from .hooks import TrainHook, TrainState
 
 
@@ -73,4 +74,6 @@ __all__ = [
     "get_available_backends",
     "get_backend",
     "register_backend",
+    # Distributed
+    "init_process_group_if_needed",
 ]

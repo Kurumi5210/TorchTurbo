@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch.distributed as dist
 import torch
 import torch.nn as nn
-from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+try:
+    from torch.nn.utils import clip_grads_with_norm_, get_total_norm
+except ImportError:  # pragma: no cover - torch<2.9 compatibility
+    from torch.nn.utils.clip_grad import (  # type: ignore[attr-defined]
+        _clip_grads_with_norm_ as clip_grads_with_norm_,
+        _get_total_norm as get_total_norm,
+    )
 
 from torchturbo.models.modules.attention.ulysses import (
     slice_input_tensor,
@@ -282,29 +288,62 @@ class FSDP2Backend(BaseBackend):
         model: nn.Module,
         model_name_or_path: str,
         parallel_context: dict[str, Any],
+        load_weights: bool = True,
     ):
-        from .weight_loader import DistParamLoader
+        if load_weights:
+            from .weight_loader import DistParamLoader
 
-        weight_converter = model.get_weight_converter(parallel_context)
-        loader = DistParamLoader(
-            model=model,
-            path=model_name_or_path,
-            rank=self.rank,
-            mesh=self._mesh,
-            world_mesh=self._world_mesh,
-            device=self.device,
-            weight_converter=weight_converter,
-        )
-        loader.load_weights()
+            weight_converter = model.get_weight_converter(parallel_context)
+            loader = DistParamLoader(
+                model=model,
+                path=model_name_or_path,
+                rank=self.rank,
+                mesh=self._mesh,
+                world_mesh=self._world_mesh,
+                device=self.device,
+                is_cpu_offload=self.fsdp_config.cpu_offload,
+                weight_converter=weight_converter,
+            )
+            loader.load_weights()
+        else:
+            device = torch.device("cpu") if self.fsdp_config.cpu_offload else self.device
+            model.to_empty(device=device)
+            if self.fsdp_config.cpu_offload:
+                self._keep_non_offloaded_on_device(model)
 
-        # Register gradient all-reduce hooks for no_shard params after load_weights.
-        # load_weights calls to_empty, which replaces Parameter objects.
+        # Register gradient all-reduce hooks for no_shard params after the
+        # model is loaded or materialized.
         self._register_no_shard_params_grad_sync(model)
         return model
 
-    def materialize_model(self, model: nn.Module):
-        model.to_empty(device=self.device)
-        return model
+    def _keep_non_offloaded_on_device(self, model: nn.Module) -> None:
+        """Keep FSDP-unmanaged tensors on the compute device under CPU offload.
+
+        CPUOffloadPolicy offloads only sharded (DTensor) params. Buffers and
+        ignored no_shard params (plain tensors) are not managed by FSDP, so they
+        must stay on the compute device for forward/backward to work.
+        """
+        target = (
+            torch.device(self.device) if isinstance(self.device, str) else self.device
+        )
+        for _, submodule in model.named_modules():
+            for buf_name, buf in list(submodule.named_buffers(recurse=False)):
+                if buf is None or buf.device.type == target.type:
+                    continue
+                persistent = buf_name not in submodule._non_persistent_buffers_set
+                submodule.register_buffer(
+                    buf_name, buf.detach().to(target), persistent=persistent
+                )
+            for param in submodule.parameters(recurse=False):
+                # DTensor (device_mesh) params are FSDP-managed / offloaded; only
+                # ignored no_shard plain params need moving back to the device.
+                if (
+                    param is None
+                    or hasattr(param, "device_mesh")
+                    or param.device.type == target.type
+                ):
+                    continue
+                param.data = param.data.to(target)
 
     def save_model(
         self,
@@ -917,7 +956,7 @@ class FSDP2Backend(BaseBackend):
         edp_total_norm_list = []
         if moe_params:
             self._scale_moe_gradient(moe_params)
-            edp_total_norm = _get_total_norm(moe_grads, norm_type=norm_type)
+            edp_total_norm = get_total_norm(moe_grads, norm_type=norm_type)
             edp_total_norm = edp_total_norm.full_tensor().unsqueeze(0)
             edp_total_norm = all_gather_tensor(
                 edp_total_norm, self.get_ep_info()["ep_group"]
@@ -929,21 +968,30 @@ class FSDP2Backend(BaseBackend):
 
         all_norms = edp_total_norm_list
         if grads:
-            dp_total_norm = _get_total_norm(grads, norm_type=norm_type)
+            dp_total_norm = get_total_norm(grads, norm_type=norm_type)
             dp_total_norm = dp_total_norm.full_tensor().unsqueeze(0)
             all_norms.append(dp_total_norm)
         # Compute norm for non-DTensor ignored grads separately.
         if ignored_grads:
-            ignored_total_norm = _get_total_norm(ignored_grads, norm_type=norm_type)
+            ignored_total_norm = get_total_norm(ignored_grads, norm_type=norm_type)
             all_norms.append(ignored_total_norm.unsqueeze(0))
-        total_norm = torch.linalg.vector_norm(torch.cat(all_norms), norm_type)
+        # Under CPU offload the sharded-grad norms come back on CPU (full_tensor /
+        # all_gather run over a gloo-capable PG), while no_shard/ignored grads stay
+        # on the compute device — so all_norms can span CPU and the device. Move
+        # every group norm onto one device before concatenating. total_norm's own
+        # device is irrelevant to clip_grads_with_norm_, which re-homes the clip
+        # coefficient per grad device.
+        ref_device = all_norms[0].device
+        total_norm = torch.linalg.vector_norm(
+            torch.cat([norm.to(ref_device) for norm in all_norms]), norm_type
+        )
 
         if moe_params:
-            _clip_grads_with_norm_(moe_params, max_norm, total_norm)
+            clip_grads_with_norm_(moe_params, max_norm, total_norm)
         if params:
-            _clip_grads_with_norm_(params, max_norm, total_norm)
+            clip_grads_with_norm_(params, max_norm, total_norm)
         if ignored_params:
-            _clip_grads_with_norm_(ignored_params, max_norm, total_norm)
+            clip_grads_with_norm_(ignored_params, max_norm, total_norm)
 
         return total_norm
 

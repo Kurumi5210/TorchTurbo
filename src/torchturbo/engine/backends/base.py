@@ -57,14 +57,9 @@ class BaseBackend(ABC):
         model: nn.Module,
         model_name_or_path: str,
         parallel_context: dict[str, Any],
+        load_weights: bool = True,
     ) -> nn.Module:
-        """Load weights."""
-
-    def materialize_model(self, model: nn.Module) -> nn.Module:
-        """Materialize a sharded meta model without loading checkpoint weights."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support materialize_model()."
-        )
+        """Load weights or materialize the model without checkpoint I/O."""
 
     @abstractmethod
     def save_model(
@@ -116,6 +111,15 @@ class BaseBackend(ABC):
 
         Override in subclass for distributed backends.
         """
+
+    def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
+        """Clip the gradient norm of ``parameters`` in place; return the total norm.
+
+        Default delegates to :func:`torch.nn.utils.clip_grad_norm_`. Distributed
+        backends (e.g. FSDP2 with DTensor / expert-parallel grads) override this
+        with a sharding-aware implementation.
+        """
+        return nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=norm_type)
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}>"

@@ -15,6 +15,7 @@ from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
 from .hooks import TrainHook, TrainState
+from .utils import has_meta_tensor
 
 from torchturbo.utils.device import is_npu_available
 
@@ -338,18 +339,26 @@ class TorchTurboEngine:
                 parallel_context = self._get_parallel_context()
                 model.on_parallelized(parallel_context)
 
-        if load_weights:
-            logger.info("Loading model via %s backend", self.config.backend.value)
-            self.backend.load_model(
-                model,
-                model_name_or_path=model_name_or_path,
-                parallel_context=parallel_context,
-            )
-        else:
-            logger.info("Materializing model via %s backend", self.config.backend.value)
-            self.backend.materialize_model(model)
+        logger.info(
+            "%s model via %s backend",
+            "Loading" if load_weights else "Materializing",
+            self.config.backend.value,
+        )
+        self.backend.load_model(
+            model,
+            model_name_or_path=model_name_or_path,
+            parallel_context=parallel_context,
+            load_weights=load_weights,
+        )
 
         model.on_materialized()
+        if has_meta_tensor(model):
+            raise RuntimeError(
+                "Model still has meta tensors after backend load/materialization "
+                "and on_materialized(). Checkpoint loading must assign all "
+                "parameters and persistent buffers; runtime buffers should be "
+                "rebuilt in the model's on_materialized() hook."
+            )
 
         logger.info("Model built: %s (%s)", type(model).__name__, torch_dtype)
         return model
@@ -727,8 +736,8 @@ class TorchTurboEngine:
             raise RuntimeError("Call engine.prepare_optimizer() before engine.fit()")
 
         # --- Auto-detect SP from parallel plan ---
-        sp_size = self.get_sp_info()
-        if num_items_in_batch is None and sp_size > 1:
+        sp_size = self.get_sp_info()["sp_size"]
+        if sp_size > 1:
             original_grad_accum = gradient_accumulation_steps
             gradient_accumulation_steps *= sp_size
             logger.info(
@@ -809,7 +818,7 @@ class TorchTurboEngine:
                 self._fire(all_hooks, "before_optimizer_step", state)
 
                 if max_grad_norm is not None:
-                    state.grad_norm = torch.nn.utils.clip_grad_norm_(
+                    state.grad_norm = self.backend.clip_grad_norm_(
                         self.model.parameters(), max_grad_norm
                     ).item()
                     if not torch.isfinite(torch.tensor(state.grad_norm)):

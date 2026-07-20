@@ -213,25 +213,13 @@ def _build_fsdp_config(
         getattr(training_args, "fsdp", []) if training_args is not None else []
     )
 
-    cpu_offload = False
-    if isinstance(fsdp_options, (list, tuple)):
-        cpu_offload = "offload" in fsdp_options
+    # Single source of truth for CPU-offload determination — shared with the
+    # early process-group init in the adapter patch so the two never diverge.
+    cpu_offload = resolve_cpu_offload(fsdp_options, torchturbo_args, strict=True)
 
     # Prefetch is TorchTurbo-owned config; LF fsdp_config is not read for it.
     # tt prefetch fields default to "auto" / "forward_backward", never None.
     tt_args = torchturbo_args or TorchTurboArgs()
-    torchturbo_cpu_offload = _explicit_torchturbo_bool_arg(
-        "cpu_offload",
-        torchturbo_args,
-        config_path="backend_config.cpu_offload",
-    )
-    if torchturbo_cpu_offload is not None:
-        if cpu_offload and not torchturbo_cpu_offload:
-            raise ValueError(
-                "TorchTurbo --tt_cpu_offload must not disable the adapter "
-                "FSDP offload setting: adapter=True, torchturbo=False."
-            )
-        cpu_offload = torchturbo_cpu_offload
 
     return FSDPConfig(
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -341,6 +329,77 @@ def _explicit_torchturbo_bool_arg(
             return True
         i += 1
     return None
+
+
+def fsdp_options_from_raw_args(raw_args: Any) -> Any:
+    """Peek the LF ``--fsdp`` value from raw (pre-parse) args (dict or argv list).
+
+    Lets the process group be initialized (with a CPU gloo backend for offload)
+    before ``get_train_args`` parses the arguments.
+    """
+    if isinstance(raw_args, dict):
+        return raw_args.get("fsdp")
+    if isinstance(raw_args, (list, tuple)):
+        items = [str(a) for a in raw_args]
+        for i, item in enumerate(items):
+            if item.startswith("--fsdp="):
+                return item.split("=", 1)[1]
+            if item == "--fsdp" and i + 1 < len(items):
+                values = []
+                j = i + 1
+                while j < len(items) and not items[j].startswith("--"):
+                    values.append(items[j])
+                    j += 1
+                return values
+    return None
+
+
+def resolve_cpu_offload(
+    fsdp_options: Any,
+    torchturbo_args: TorchTurboArgs | None = None,
+    *,
+    strict: bool = True,
+) -> bool:
+    """Resolve CPU offload from LF ``fsdp`` options plus ``--tt_cpu_offload``.
+
+    Single source of truth shared by ``_build_fsdp_config`` (which sets
+    ``EngineConfig.backend_config.cpu_offload``) and by early process-group
+    initialization, so the gloo-backend decision and the engine config can never
+    diverge. ``fsdp_options`` may be the parsed list (``training_args.fsdp``) or
+    the raw string from :func:`fsdp_options_from_raw_args`.
+
+    With ``strict=True`` (config path) an explicit ``--tt_cpu_offload=false`` that
+    would disable an adapter-requested offload raises. Early PG init uses
+    ``strict=False`` — it only needs the boolean and must not move where that
+    validation surfaces.
+    """
+    if isinstance(fsdp_options, str):
+        fsdp_tokens = fsdp_options.replace(",", " ").split()
+    elif isinstance(fsdp_options, (list, tuple)):
+        fsdp_tokens = []
+        for item in fsdp_options:
+            if isinstance(item, str):
+                fsdp_tokens.extend(item.replace(",", " ").split())
+            else:
+                fsdp_tokens.append(str(item))
+    else:
+        fsdp_tokens = []
+
+    cpu_offload = "offload" in fsdp_tokens
+
+    torchturbo_cpu_offload = _explicit_torchturbo_bool_arg(
+        "cpu_offload",
+        torchturbo_args,
+        config_path="backend_config.cpu_offload",
+    )
+    if torchturbo_cpu_offload is not None:
+        if strict and cpu_offload and not torchturbo_cpu_offload:
+            raise ValueError(
+                "TorchTurbo --tt_cpu_offload must not disable the adapter "
+                "FSDP offload setting: adapter=True, torchturbo=False."
+            )
+        cpu_offload = torchturbo_cpu_offload
+    return cpu_offload
 
 
 def _raise_if_unsupported_lf_args(

@@ -43,6 +43,10 @@ class TorchTurboTrainerBase:
         super().__init__(*args, **kwargs)
         self._maybe_upgrade_collator_for_mllm_pt()
 
+    def _move_model_to_device(self, model, _device):
+        # TorchTurbo already materializes and shards the model before Trainer init.
+        return model
+
     def _maybe_upgrade_collator_for_mllm_pt(self) -> None:
         """Swap to MultiModalDataCollatorForSeq2Seq for multimodal PT datasets."""
         if self.stage != "pt":

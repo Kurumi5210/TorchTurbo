@@ -136,13 +136,36 @@ class RunExpPatch(BasePatch):
             from .utils import (
                 build_config_from_lf_args,
                 build_lora_config_from_lf_args,
+                fsdp_options_from_raw_args,
+                resolve_cpu_offload,
                 strip_lora_args,
             )
             from .hooks import LlamaFactoryHook
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
+            from ...engine.distributed import init_process_group_if_needed
 
             raw_args = read_args(args)
+
+            # Retrieve CLI-parsed torchturbo args (stashed by the entry point).
+            tt_args = get_torchturbo_args()
+
+            # Initialize the process group *before* get_train_args — that call
+            # triggers transformers/accelerate to create the default group with a
+            # device-only backend (nccl/hccl). Doing it first lets us register a
+            # CPU (gloo) backend for FSDP CPU-offload collectives; accelerate then
+            # detects the existing group and reuses it. The offload decision reuses
+            # the same resolver as EngineConfig.backend_config.cpu_offload
+            # (strict=False here so config building stays the single place that
+            # validates adapter/tt offload conflicts).
+            init_process_group_if_needed(
+                enable_cpu_backend=resolve_cpu_offload(
+                    fsdp_options_from_raw_args(raw_args),
+                    tt_args,
+                    strict=False,
+                )
+            )
+
             model_args, data_args, training_args, finetuning_args, generating_args = (
                 get_train_args(raw_args)
             )
@@ -155,9 +178,6 @@ class RunExpPatch(BasePatch):
                     stage,
                 )
                 return self._original(args, callbacks)
-
-            # Retrieve CLI-parsed torchturbo args (stashed by the entry point)
-            tt_args = get_torchturbo_args()
 
             peft_config = None
             if (
@@ -858,16 +878,15 @@ class AcceleratorPatch(BasePatch):
         Accelerator.prepare_model = _patched_prepare_model
 
         # ---- 3. Patch clip_grad_norm_ if backend supports it ----
-        if hasattr(engine.backend, "clip_grad_norm_"):
-            self._orig_clip_grad_norm = Accelerator.clip_grad_norm_
+        self._orig_clip_grad_norm = Accelerator.clip_grad_norm_
 
-            def _patched_clip_grad_norm(accel_self, parameters, max_norm, norm_type=2):
-                return engine.backend.clip_grad_norm_(parameters, max_norm, norm_type)
+        def _patched_clip_grad_norm(accel_self, parameters, max_norm, norm_type=2):
+            return engine.backend.clip_grad_norm_(parameters, max_norm, norm_type)
 
-            Accelerator.clip_grad_norm_ = _patched_clip_grad_norm
-            logger.info(
-                "torchturbo: Patched Accelerator.clip_grad_norm_ to use backend's implementation"
-            )
+        Accelerator.clip_grad_norm_ = _patched_clip_grad_norm
+        logger.info(
+            "torchturbo: Patched Accelerator.clip_grad_norm_ to use backend's implementation"
+        )
 
         # ---- 4. Patch backward ----
         self._orig_backward = Accelerator.backward

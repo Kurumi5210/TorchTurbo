@@ -33,6 +33,7 @@ ENV_MAP: dict[str, str] = {
     "TORCH_TURBO_BACKEND": "backend",
     "TORCH_TURBO_MIXED_PRECISION": "mixed_precision",
     "TORCH_TURBO_GRADIENT_CHECKPOINTING": "activation_checkpointing.enabled",
+    "TORCH_TURBO_AC_USE_REENTRANT": "activation_checkpointing.use_reentrant",
     "TORCH_TURBO_RESHARD_AFTER_FWD": "backend_config.reshard_after_forward",
     "TORCH_TURBO_PREFETCH_STRATEGY": "backend_config.prefetch_strategy",
     "TORCH_TURBO_PREFETCH_DIRECTION": "backend_config.prefetch_direction",
@@ -119,6 +120,7 @@ class ActivationCheckpointingConfig:
     """
 
     enabled: bool = True
+    use_reentrant: bool = False
 
 
 # ---------------------------------------------------------------------------

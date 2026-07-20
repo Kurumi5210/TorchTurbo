@@ -534,6 +534,7 @@ class FSDP2Backend(BaseBackend):
     def _apply_activation_checkpointing(
         self, model: nn.Module, plan: FSDPParallelPlan
     ) -> nn.Module:
+        from contextlib import nullcontext
         from torch.utils.checkpoint import checkpoint
 
         target_modules: list[tuple[str, nn.Module]] = []
@@ -569,24 +570,23 @@ class FSDP2Backend(BaseBackend):
             if config is not None and hasattr(config, "use_cache"):
                 config.use_cache = False
 
+        def checkpoint_context_fn():
+            # The recompute context is active only in backward. Expert containers
+            # can be nested FSDP units under the checkpointed layer, and their
+            # PRE_BACKWARD hook may not have fired yet when recompute calls
+            # experts.forward(). Without this guard, expert forward-prefetch
+            # edges can leak into backward.
+            return (
+                nullcontext(),
+                self.prefetch_manager.suspend_expert_forward_prefetch(),
+            )
+
         def make_checkpointed_forward(module: nn.Module):
             original_forward = module.forward
 
-            # We use the *reentrant* checkpoint implementation deliberately.
-            # The non-reentrant implementation (use_reentrant=False) attaches the
-            # recomputed subgraph to the main backward graph via saved_tensors_hooks;
-            # that recomputed graph's SavedVariables are owned by Python `PyNode`s
-            # whose deallocation is GIL-deferred, so large MoE / linear-attention
-            # intermediates freed at the end of backward are not actually released
-            # until the main thread runs Python again (i.e. the *next* forward),
-            # inflating the cross-step allocation peak. The reentrant
-            # CheckpointFunction.backward re-runs the forward *and* backward inside
-            # a single autograd call, so the recomputed graph and its intermediates
-            # are torn down synchronously at the end of that call, within the same
-            # step. (See commit 6305a89b which introduced use_reentrant=False along
-            # with MoE prefetch; the non-reentrant path was needed there only for
-            # context_fn, which we replace with a grad-guard below.)
-            suspend_prefetch = self.prefetch_manager.suspend_expert_forward_prefetch
+            use_reentrant = bool(
+                getattr(self.config.activation_checkpointing, "use_reentrant", False)
+            )
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -608,14 +608,16 @@ class FSDP2Backend(BaseBackend):
 
                 base_fn = functools.partial(original_forward, **checkpoint_kwargs)
 
+                if not use_reentrant:
+                    return checkpoint(
+                        base_fn,
+                        *args,
+                        use_reentrant=False,
+                        context_fn=checkpoint_context_fn,
+                    )
+
+                suspend_prefetch = self.prefetch_manager.suspend_expert_forward_prefetch
                 def run_fn(*a, **kw):
-                    # Reentrant semantics: CheckpointFunction.forward runs the
-                    # callable under no_grad (grad disabled); backward re-runs it
-                    # under enable_grad (recompute). We suspend expert
-                    # forward-prefetch ONLY during recompute — mirroring the
-                    # non-reentrant context_fn behavior, so normal forward keeps
-                    # expert lookahead and only backward recompute avoids the
-                    # prefetch leak.
                     if torch.is_grad_enabled():
                         with suspend_prefetch():
                             return base_fn(*a, **kw)

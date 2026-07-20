@@ -126,7 +126,10 @@ def _build_config_from_args(
         tt,
     )
 
-    ac_config = ActivationCheckpointingConfig(enabled=ac_enabled)
+    ac_config = ActivationCheckpointingConfig(
+        enabled=ac_enabled,
+        use_reentrant=bool(getattr(tt, "ac_use_reentrant", False)) if tt else False,
+    )
 
     # --- Communication ---
     comm_config = CommConfig(

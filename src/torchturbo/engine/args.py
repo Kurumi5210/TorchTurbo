@@ -96,6 +96,7 @@ class TorchTurboArgs:
     sp_size: int | None = None
     ep_size: int | None = None
     gradient_checkpointing: bool = True
+    ac_use_reentrant: bool = False
     cpu_offload: bool = False
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
@@ -159,6 +160,19 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="BOOL",
         help="Enable or disable TorchTurbo-owned activation checkpointing. "
         "Replaces TORCH_TURBO_GRADIENT_CHECKPOINTING.",
+    )
+    parser.add_argument(
+        "--tt_ac_use_reentrant",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Use reentrant activation checkpointing (use_reentrant=True) "
+        "instead of the default non-reentrant implementation. Reentrant "
+        "checkpointing tears down recomputed intermediates synchronously "
+        "within a step, reducing cross-step allocation peak for MoE/linear-"
+        "attention workloads. Replaces TORCH_TURBO_AC_USE_REENTRANT.",
     )
     parser.add_argument(
         "--tt_cpu_offload",
@@ -271,6 +285,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         sp_size=parsed.tt_sp_size,
         ep_size=parsed.tt_ep_size,
         gradient_checkpointing=parsed.tt_gradient_checkpointing,
+        ac_use_reentrant=parsed.tt_ac_use_reentrant,
         cpu_offload=parsed.tt_cpu_offload,
         enable_mtp=parsed.tt_enable_mtp,
         mtp_loss_scaling_factor=parsed.tt_mtp_loss_scaling_factor,

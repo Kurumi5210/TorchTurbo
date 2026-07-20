@@ -93,6 +93,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_ep_size $ep_size \
     --tt_freeze_vision_tower \
     --tt_freeze_multi_modal_projector \
+    --tt_ac_use_reentrant true \
     --num_train_epochs 1 \
     --report_to tensorboard \
     --logging_dir /home/admin/logs/tfevent \

@@ -26,10 +26,11 @@ def update_pypai():
 
 def torch_train():
     update_pypai()
-    a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-antfinix-sfs")
-    a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-aicompiler-sfs")
+    a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-02-aidc-antfinix-sfs")
+    a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
     km_conf = KMConf(
-        image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:15100125-20251212112959_aarch64"
+        # qwen3_moe image
+        image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64"
     )
 
     labels={
@@ -44,20 +45,9 @@ def torch_train():
     node_gpu_num = 16
     node_num = 1
 
-    command = ''
-    command += 'conda env list && conda init && source /root/.bashrc && conda activate sftenv && conda info --envs && '
-    command += f'export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && '
-    command += "pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && \
-        pip install pynvml --trusted-host repo.huaweicloud.com && \
-        wget  https://gpu-wulanchabu-aistudiocode.oss-cn-wulanchabu.aliyuncs.com/040846/dlrover-0.6.0rc730-py3-none-any.whl && \
-        pip install dlrover-0.6.0rc730-py3-none-any.whl --trusted-host repo.huaweicloud.com && \
-        pip install grpcio --trusted-host repo.huaweicloud.com && \
-        cd /sfs_turbo/zlj/LLaMA-Factory && \
-        pip install -r requirements.txt && \
-        pip install deepspeed==0.16.0 && \
-        pip install transformers==4.57.3 && \
-        ls /home/ma-user/anaconda3/envs/ && \
-        pip list && "
+    command = ""
+    command += f"export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && "
+    command += f"pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && "
 
     command += ' sleep inf'
     name = 'qwen3_moe_env'
@@ -93,7 +83,7 @@ if __name__ == "__main__":
 ## 运行方式
 
 ```bash
-conda activate sftenv
+sh scripts/runs/npu_deps/qwen3_moe_deps.sh
 sh scripts/runs/lf_qwen3_moe_sft.sh
 ```
 

@@ -19,12 +19,19 @@ export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
 model_name_or_path=/sfs_turbo/pretrained_models/Kimi-K2.5-bf16-new/
-output_dir=/sfs_turbo/zlj/output
+output_dir=/sfs_turbo/${USER_NAME}/sft/ckpt/kimi_k25/lf/
 
 seq_length=$((1024 * 4))
 dataset=llava_1k_zh
 packing_mode=packing_sep
 finetuning_type=full
+
+# # Deterministic computation
+# export HCCL_DETERMINISTIC=True
+# export LCCL_DETERMINISTIC=1
+# export CLOSE_MATMUL_K_SHIFT=1
+# export ATB_MATMUL_SHUFFLE_K_ENABLE=0
+# export ATB_LLM_LCOC_ENABLE=0
 
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True

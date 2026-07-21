@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # qwen3_moe SFT training with torchturbo
 # Usage:
-#   bash scripts/runs/lf_qwen3_moe_sft.sh
+# bash scripts/runs/lf_qwen3_moe_sft.sh
 
 set -o pipefail
 
@@ -19,12 +19,19 @@ export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
 model_name_or_path=/sfs_turbo/pretrained_models/Qwen3-30B-A3B
-output_dir=/sfs_turbo/zlj/output
+output_dir=/sfs_turbo/${USER_NAME}/sft/ckpt/qwen3_moe/lf/
 
 seq_length=$((1024 * 4))
 dataset=science
 packing_mode=packing_sep
 finetuning_type=full
+
+# # Deterministic computation
+# export HCCL_DETERMINISTIC=True
+# export LCCL_DETERMINISTIC=1
+# export CLOSE_MATMUL_K_SHIFT=1
+# export ATB_MATMUL_SHUFFLE_K_ENABLE=0
+# export ATB_LLM_LCOC_ENABLE=0
 
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
@@ -61,10 +68,20 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
-RUN_LF="$(dirname "$0")/run_lf.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RUN_LF="${SCRIPT_DIR}/run_lf.py"
+DATASET_DIR="${REPO_ROOT}/dataset/npu/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
-export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/LLaMA-Factory/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zlj/workspace/glm5/v3/torchturbo/src:$PYTHONPATH
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size 2 \
@@ -75,6 +92,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --do_train \
     --val_size 0 \
     --flash_attn fa2 \
+    --dataset_dir ${DATASET_DIR} \
     --dataset $dataset \
     --preprocessing_num_workers $((NNODES * 16)) \
     --cutoff_len ${seq_length} \

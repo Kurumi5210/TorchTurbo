@@ -8,99 +8,74 @@
 
 ```python
 import os
-
-from aistudio_common.openapi.models import DataStore
-from pypai.conf import AlertConf
-from pypai.conf import ExecConf
-from pypai.conf import GpuType
-from pypai.conf import KMConf
 from pypai.job import PythonJobBuilder
-
+from pypai.conf import ExecConf
+from pypai.conf import KMConf
+from pypai.conf import GpuType
+from pypai.conf import AlertConf
+from aistudio_common.openapi.models import DataStore
 
 def update_pypai():
     # install dependencies
     import subprocess
-
     try:
         subprocess.run(["pip", "install", "--upgrade", "aii-pypai"], check=True)
         print("pip executes succeeded!")
     except subprocess.CalledProcessError as e:
         print(f"pip executes failed with code {e.returncode}")
 
-
 def torch_train():
     update_pypai()
-    a3_sfs = DataStore(mount_point="/sfs_turbo", store_name="wl02-antfinix-sfs")
-    mnt_sfs = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-aicompiler-sfs")
-    storage_sfs = DataStore(mount_point="/storage", store_name="wl02-aicompiler-sfs")
-    a3_pcache = DataStore(store_name="ais-pcache-a3-common-antfinix2", mount_point="/mnt/antfinix2-a3/common")
+    a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-02-aidc-antfinix-sfs")
+    a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
+    a3_storage_sfs = DataStore(mount_point="/storage", store_name="wl02-02-aidc-aicompiler-sfs")
     km_conf = KMConf(
-        # image="hcr.meta-wulan01.hw-wulan.local/atorch/atorch-dev-ascend_alios:huawei-unify-all-fdea6dcd-20251126172336"
-        # image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:15100125-20260106162315_aarch64"
-        # image="hcr.meta-wulan01.hw-wulan.local/atorch/atorch-dev-ascend_alios:deepseek-3.2-cann850-91c52d4d-20260121175052"
+        # deepseek v4
         image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64"
-        # image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64"
     )
 
-    labels = {
-        "\"sigma.ali/rack-group-num\"": "1",
+    labels={
+        "\"sigma.ali/rack-group-num\"":"1",
+    }
+    edl_job_args = "--critical_worker_index=0:2 --relaunch_always=false --relaunch_count 0"
+
+    annotations = {
+        "ELASTICDL_MASTER_CONFIGURATION": '{"cpu": 4, "memory": 2048, "image":"hcr.meta-wulan01.hw-wulan.local/kubemaker/elasticdl:test-aarch64-bc4298b59706f305893044af221fa99880ae2210"}'
     }
 
     node_gpu_num = 16
     node_num = 1
 
-    custom_cmd = "bash /mnt/sfs_turbo/xiyun.wc/demo.sh"
-    # custom_cmd = "cd /sfs_turbo/xiyun/sft/LLaMA-Factory && bash run_glm5_sp8.sh"
-    # custom_cmd = "cd /sfs_turbo/zhisan/1201/LLaMA-Factory/ && bash run_dpo_e2e.sh"
-
     command = ""
-    command += "source /root/.bashrc && "
-    command += (
-        "pip config set global.index-url https://pypi.antfin-inc.com/simple/ && "
-        f"export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && "
-        "pip config set global.index-url https://pypi.antfin-inc.com/simple/ && "
-    )
-    # command += "bash /sfs_turbo/xiyun/sft/cann-ops-transformer-custom_linux-aarch64.run && \
-    #     pip config set global.index-url https://pypi.antfin-inc.com/simple/ && \
-    #     cd /sfs_turbo/xiyun/sft/LLaMA-Factory && \
-    #     pip install -r requirements.txt"
-    # command += f"pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && \
-    #     pip install pynvml --trusted-host repo.huaweicloud.com && \
-    #     wget  https://gpu-wulanchabu-aistudiocode.oss-cn-wulanchabu.aliyuncs.com/040846/dlrover-0.6.0rc730-py3-none-any.whl && \
-    #     pip install dlrover-0.6.0rc730-py3-none-any.whl --trusted-host repo.huaweicloud.com && \
-    #     pip install grpcio --trusted-host repo.huaweicloud.com && \
-    #     ls /home/ma-user/anaconda3/envs/ && \
-    #     pip list && \
-    #     {custom_cmd}"
-    command += (
-        "pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && "
-        "echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && "
-        f"{custom_cmd}"
-    )
+    command += f"export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && "
+    command += f"pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && "
 
-    master = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
-    worker = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=node_num - 1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
-    job = PythonJobBuilder(
-        source_root="./",
-        main_file="",
-        km_conf=km_conf,
-        command=command,
-        platform="kubemaker",
-        k8s_app_name="hpuopt",
-        k8s_priority="high",
-        distribution_strategy="AllreduceStrategy",
-        master=master,
-        worker=worker,
-        runtime="pytorch",
-        name="deepseek_v4_old_image",
-        tag="type=SFT/DPO, basemodel=deepseek_v4",
-        data_stores=[a3_sfs, mnt_sfs, a3_pcache, storage_sfs],
-        host_network=True,
-        labels=labels,
-    )
+    command += ' sleep inf'
+    name = 'deepseek_v4_env'
+
+    master= ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
+    worker = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=node_num-1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
+    # worker = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=node_num, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
+    job = PythonJobBuilder(# source_root="./",
+                           main_file="", #命令模式必填空，详情参考：https://yuque.antfin-inc.com/aii/aistudio/gpu-job#y3tRY
+                           km_conf=km_conf,
+                           command=command,
+                           platform="kubemaker",
+                           k8s_app_name="hpuopt",
+                           k8s_priority="high",
+                           distribution_strategy="AllreduceStrategy",
+                           master=master,
+                           worker=worker,
+                           runtime="pytorch",
+                           name=name,
+                           tag="type=SFT,basemodel=ling25",
+                           data_stores = [a3_sfs_old, a3_sfs_new, a3_storage_sfs],
+                           host_network=False,
+                           labels=labels,
+                           edl_job_args = edl_job_args,)
+                          #  annotations=annotations,
 
     job.run()
-
 
 if __name__ == "__main__":
     torch_train()
@@ -109,6 +84,7 @@ if __name__ == "__main__":
 ## 运行方式
 
 ```bash
+sh scripts/runs/npu_deps/deepseek_v4_deps.sh
 sh scripts/runs/lf_deepseek_v4_sft.sh
 ```
 

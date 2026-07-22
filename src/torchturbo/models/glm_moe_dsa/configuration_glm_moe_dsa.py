@@ -49,6 +49,11 @@ class GlmMoeDsaConfig(PretrainedConfig):
         index_topk=2048,
         index_head_dim=128,
         index_n_heads=32,
+        indexer_types=None,
+        index_topk_pattern=None,
+        index_topk_freq=1,
+        index_skip_topk_offset=2,
+        index_share_for_mtp_iteration=False,
         **kwargs,
     ):
         # ===== 基础字段 =====
@@ -109,6 +114,35 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
+
+        # ===== DSA Indexer 类型（index share）=====
+        # `"full"` 该层自己跑 indexer 产出 top-k；`"shared"` 复用上一个 full 层的 top-k。
+        # 与 GLM 5.2 的 index share 技术对应。
+        if indexer_types is None:
+            if index_topk_pattern is not None:
+                indexer_types = [{"F": "full", "S": "shared"}[c] for c in index_topk_pattern]
+            else:
+                freq = max(index_topk_freq, 1)
+                offset = index_skip_topk_offset
+                indexer_types = [
+                    "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
+                    for i in range(num_hidden_layers)
+                ]
+
+        if len(indexer_types) != num_hidden_layers:
+            raise ValueError(
+                "`indexer_types` length must equal `num_hidden_layers`, "
+                f"but got {len(indexer_types)} and {num_hidden_layers}"
+            )
+
+        for item in indexer_types:
+            if item not in ("full", "shared"):
+                raise ValueError(
+                    "`indexer_types` items must be either 'full' or 'shared', "
+                    f"but got {item}"
+                )
+        self.indexer_types = indexer_types
+        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
         # ===== MLP layer types =====
         # 官方逻辑：first 3 dense, rest sparse

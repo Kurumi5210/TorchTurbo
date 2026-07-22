@@ -980,6 +980,7 @@ def npu_fused_dsa_attn_forward(
     output_attentions: bool = False,
     sp_group: ProcessGroup = None,
     sp_size: int = None,
+    prev_topk_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """
@@ -1007,6 +1008,9 @@ def npu_fused_dsa_attn_forward(
 
     Returns:
         attn_output: [batch_size, seq_len/sp_size, hidden_size] (with SP)
+        attn_weights: None (output_attentions not supported)
+        present_key_value: None (training only, no KV cache)
+        topk_indices: sparse indices for index-share relay (reused by shared layers)
     """
     # Training only - no KV cache support
     assert (
@@ -1033,17 +1037,26 @@ def npu_fused_dsa_attn_forward(
 
     # =====================================================================
     # 4. Compute sparse indices using npu_lightning_indexer
+    #    index share: full 层自己跑 indexer 产出 top-k；shared 层复用上一个 full 层的 top-k。
     # =====================================================================
-    topk_indices, query_index, key_index, weights_indexer = _npu_compute_sparse_indices(
-        self,
-        hidden_states,
-        q_resid,
-        position_embeddings,
-        attention_mask,
-        sp_enabled,
-        sp_group,
-        sp_size,
-    )
+    if self.indexer is not None:
+        topk_indices, query_index, key_index, weights_indexer = _npu_compute_sparse_indices(
+            self,
+            hidden_states,
+            q_resid,
+            position_embeddings,
+            attention_mask,
+            sp_enabled,
+            sp_group,
+            sp_size,
+        )
+    else:
+        if prev_topk_indices is None:
+            raise ValueError(
+                "Shared DSA layers require top-k indices from a previous full indexer layer."
+            )
+        topk_indices = prev_topk_indices
+        query_index = key_index = weights_indexer = None
 
     # =====================================================================
     # 5. SP communication before attention
@@ -1084,7 +1097,7 @@ def npu_fused_dsa_attn_forward(
         key = k_lat.view(-1, 1, self.kv_lora_rank)[kv_start:kv_end]
         value = v_lat.view(-1, 1, self.kv_lora_rank)[kv_start:kv_end]
         key_rope = k_pe.view(-1, 1, self.qk_rope_head_dim)[kv_start:kv_end]
-        sparse_indices = topk_indices.view(-1, 1, self.indexer.index_topk)
+        sparse_indices = topk_indices.view(-1, 1, topk_indices.size(-1))
     else:
         # BSND to TND
         query = q_nope_absorbed.contiguous().view(-1, num_heads, self.kv_lora_rank)
@@ -1094,7 +1107,7 @@ def npu_fused_dsa_attn_forward(
         key_rope = (
             k_pe[:, kv_start:kv_end].contiguous().view(-1, 1, self.qk_rope_head_dim)
         )
-        sparse_indices = topk_indices.view(-1, 1, self.indexer.index_topk)
+        sparse_indices = topk_indices.view(-1, 1, topk_indices.size(-1))
 
     # Call npu_sparse_flash_attention with TND layout
     attn_output, softmax_max, softmax_sum, *_ = torch_npu.npu_sparse_flash_attention(
@@ -1122,7 +1135,7 @@ def npu_fused_dsa_attn_forward(
     # =====================================================================
     loss = None
     indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.01)
-    if self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0:
+    if self.indexer is not None and self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0:
         if mode == "TND":
             query_index_for_loss = query_index.view(
                 -1, query_index.size(-2), query_index.size(-1)
@@ -1195,4 +1208,4 @@ def npu_fused_dsa_attn_forward(
     if loss is not None:
         attn_output = DSAIndexerLossAutoScaler.apply(attn_output, loss)
 
-    return attn_output, None, None
+    return attn_output, None, None, topk_indices

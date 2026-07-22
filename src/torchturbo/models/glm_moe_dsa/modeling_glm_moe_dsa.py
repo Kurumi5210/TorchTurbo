@@ -234,7 +234,9 @@ class GlmMoeDsaAttention(nn.Module):
         )
 
         self.scaling = self.qk_head_dim ** (-0.5)
-        self.indexer = GlmMoeDsaIndexer(config, layer_idx)
+        # index share: `"shared"` 层不跑 indexer，复用上一个 full 层的 top-k。
+        self.skip_topk = config.indexer_types[layer_idx] == "shared"
+        self.indexer = None if self.skip_topk else GlmMoeDsaIndexer(config, layer_idx)
 
     def forward(
         self,
@@ -244,6 +246,7 @@ class GlmMoeDsaAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
+        prev_topk_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         batch_size, seq_length = hidden_states.shape[:-1]
@@ -294,18 +297,24 @@ class GlmMoeDsaAttention(nn.Module):
 
         present_key_value = (key_states, value_states) if use_cache else None
 
-        indexer_mask = (
-            attention_mask[:, 0, :, :]
-            if attention_mask is not None and attention_mask.dim() == 4
-            else attention_mask.unsqueeze(1) if attention_mask is not None else None
-        )
-        topk_indices = self.indexer(
-            hidden_states,
-            q_resid,
-            position_embeddings,
-            indexer_mask,
-            use_cache=use_cache,
-        )
+        # DSA: full 层自己跑 indexer 产出 top-k；shared 层复用上一个 full 层的 top-k。
+        if self.indexer is not None:
+            indexer_mask = (
+                attention_mask[:, 0, :, :]
+                if attention_mask is not None and attention_mask.dim() == 4
+                else attention_mask.unsqueeze(1) if attention_mask is not None else None
+            )
+            topk_indices = self.indexer(
+                hidden_states,
+                q_resid,
+                position_embeddings,
+                indexer_mask,
+                use_cache=use_cache,
+            )
+        else:
+            if prev_topk_indices is None:
+                raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
+            topk_indices = prev_topk_indices
 
         total_len = key_states.shape[2]
         index_mask = torch.full(
@@ -346,7 +355,7 @@ class GlmMoeDsaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        return attn_output, attn_weights, present_key_value
+        return attn_output, attn_weights, present_key_value, topk_indices
 
 
 class GlmMoeDsaMLP(nn.Module):
@@ -519,17 +528,19 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, topk_indices = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
             position_embeddings=position_embeddings,
+            prev_topk_indices=prev_topk_indices,
         )
         hidden_states = residual + hidden_states
 
@@ -543,6 +554,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
         if use_cache:
             outputs += (present_key_value,)
+        outputs += (topk_indices,)  # 始终置于元组末尾，供层循环接力
         return outputs
 
 
@@ -731,6 +743,8 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        # index share: top-k 在层间接力传递，full 层产出，shared 层复用。
+        topk_indices = None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -752,6 +766,7 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
                     use_cache,
                     output_attentions,
                     position_embeddings,
+                    topk_indices,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -762,9 +777,11 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
                     past_key_value=past_key_value,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    prev_topk_indices=topk_indices,
                 )
 
             hidden_states = layer_outputs[0]
+            topk_indices = layer_outputs[-1]
 
             output_offset = 1
             if output_attentions:

@@ -352,12 +352,15 @@ class TorchTurboEngine:
         )
 
         model.on_materialized()
-        if has_meta_tensor(model):
+        meta_tensor_names = has_meta_tensor(model)
+        if meta_tensor_names:
             raise RuntimeError(
                 "Model still has meta tensors after backend load/materialization "
                 "and on_materialized(). Checkpoint loading must assign all "
-                "parameters and persistent buffers; runtime buffers should be "
-                "rebuilt in the model's on_materialized() hook."
+                "parameters and persistent buffers; runtime buffers must be "
+                "rebuilt after materialization or registered lazily with a real "
+                "tensor on first use. Meta tensors: "
+                f"{', '.join(meta_tensor_names)}"
             )
 
         logger.info("Model built: %s (%s)", type(model).__name__, torch_dtype)

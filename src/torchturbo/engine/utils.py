@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import chain
+
 import torch
 import torch.nn as nn
 
@@ -41,18 +43,7 @@ def _is_meta_tensor(tensor: torch.Tensor) -> bool:
     return False
 
 
-def has_meta_tensor(model: nn.Module) -> bool:
-    """Return True if any parameter or persistent buffer is still on meta."""
-    for _, param in model.named_parameters():
-        if _is_meta_tensor(param):
-            return True
-
-    for module in model.modules():
-        non_persistent = getattr(module, "_non_persistent_buffers_set", set())
-        for buf_name, buf in module.named_buffers(recurse=False):
-            if buf is None or buf_name in non_persistent:
-                continue
-            if _is_meta_tensor(buf):
-                return True
-
-    return False
+def has_meta_tensor(model: nn.Module) -> list[str]:
+    """Return the fully qualified names of parameters and buffers on meta."""
+    named_tensors = chain(model.named_parameters(), model.named_buffers())
+    return [name for name, tensor in named_tensors if _is_meta_tensor(tensor)]

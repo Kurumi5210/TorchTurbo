@@ -73,16 +73,10 @@ class TopKRouter(Router):
         )
         if self.enable_expert_bias:
             self.register_buffer(
-                "local_tokens_per_expert",
-                torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
-                persistent=False,
-            )
-            self.register_buffer(
                 "expert_bias",
                 torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
 
         if self.use_hash_routing:
@@ -151,7 +145,14 @@ class TopKRouter(Router):
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                tokens_per_expert = routing_map.sum(dim=0).to(torch.float32)
+                if not hasattr(self, "local_tokens_per_expert"):
+                    self.register_buffer(
+                        "local_tokens_per_expert",
+                        torch.zeros_like(tokens_per_expert),
+                        persistent=False,
+                    )
+                self.local_tokens_per_expert.add_(tokens_per_expert)
 
         return scores, routing_map
 

@@ -62,6 +62,6 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
         },
-        sp_size=2,
-        ep_size=4,
+        sp_size=1,
+        ep_size=1,
     )

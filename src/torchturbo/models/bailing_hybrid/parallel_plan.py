@@ -55,7 +55,7 @@ def _replace_moe_only(
     return moe_layer
 
 
-def get_parallel_plan(sp_size: int = 2, ep_size: int = 4) -> FSDPParallelPlan:
+def get_parallel_plan() -> FSDPParallelPlan:
     from torch.distributed._tensor import Shard
     from ..modules.moe.experts import GroupedMLP
     from ..modules.moe.module import ModuleSpec
@@ -72,6 +72,6 @@ def get_parallel_plan(sp_size: int = 2, ep_size: int = 4) -> FSDPParallelPlan:
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
         },
-        sp_size=sp_size,
-        ep_size=ep_size,
+        sp_size=1,
+        ep_size=1,
     )

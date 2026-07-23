@@ -90,5 +90,5 @@ def get_parallel_plan() -> FSDPParallelPlan:
             ),
         },
         sp_size=1,
-        ep_size=8,
+        ep_size=1,
     )

@@ -73,5 +73,18 @@
       "chosen": "chosen",
       "rejected": "rejected"
     }
+  },
+  "gsm8k_bd": {
+    "file_name": "/sfs_turbo/data/data/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant"
+    }
   }
 }

@@ -244,6 +244,18 @@ class TorchTurboTrainerBase:
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if self.stage in {"sft", "pt"}:
+            from ...models.registry import get_model
+
+            turbo_cls = get_model(getattr(model.config, "model_type", None))
+            is_diff = (
+                bool(getattr(turbo_cls, "is_diffusion_model", False))
+                if turbo_cls is not None
+                else False
+            )
+            if is_diff:
+                return self._compute_bd_loss(
+                    model, inputs, return_outputs=return_outputs, **kwargs
+                )
             return self._compute_causal_lm_loss(
                 model, inputs, return_outputs=return_outputs, **kwargs
             )
@@ -320,6 +332,25 @@ class TorchTurboTrainerBase:
 
         self._record_mtp_outputs(outputs)
 
+        return (loss, outputs) if return_outputs else loss
+
+    def _compute_bd_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Block-diffusion loss path — delegates to ``backend.compute_bd_loss``.
+
+        Routed around ``_compute_causal_lm_loss`` (see ``compute_loss``) so BD never
+        hits the shifted-CE ``* sp_size`` rescale, replicating the old wholesale
+        monkeypatch of ``_compute_causal_lm_loss``. The batch is built by
+        ``BDDataset``; here we only forward + compute loss.
+        """
+        engine = self._engine()
+        ga = getattr(self.args, "gradient_accumulation_steps", 1) or 1
+        loss, outputs = engine.backend.compute_bd_loss(
+            model, inputs, ga=ga, return_outputs=True, **kwargs
+        )
+        self._record_mtp_outputs(outputs)  # no-op for BD (no mtp_loss attr)
+        from ...engine.profiling import step_profiling
+
+        step_profiling()
         return (loss, outputs) if return_outputs else loss
 
     def _record_mtp_outputs(self, outputs) -> None:

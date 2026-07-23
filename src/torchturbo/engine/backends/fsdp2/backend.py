@@ -46,6 +46,31 @@ class _FSDPUnit:
     reshard_after_forward: bool | None = None
 
 
+def _confidence_entropy_sum(logits: torch.Tensor, labels: torch.Tensor,
+                            ignore_index: int = -100):
+    """CAP / DPARALLEL confidence term.
+
+    Returns ``(entropy_sum_over_correct_tokens, num_correct_tokens)`` — both
+    summable so they can be all-reduced under SP and divided globally, mirroring
+    how the CE term is summed + all-reduced + /n_valid.
+
+    Entropy is only summed over ``correct`` rows, so we compute
+    ``log_softmax`` strictly on the correct-row slice of ``logits`` rather than
+    on the full ``[T, V]`` tensor.
+    """
+    valid = labels != ignore_index
+    pred = torch.argmax(logits, dim=-1)
+    correct = (pred == labels) & valid
+    num_correct = correct.sum()
+    if num_correct.item() == 0:
+        return logits.float().sum() * 0.0, num_correct
+    # Slice to correct rows before log_softmax — sees only [n_correct, V].
+    logits_c = logits[correct]
+    log_probs = nn.functional.log_softmax(logits_c.float(), dim=-1)
+    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    return entropy.sum(), num_correct
+
+
 class FSDP2Backend(BaseBackend):
     """FSDP2 backend using ``torch.distributed.fsdp.fully_shard``.
 
@@ -1199,6 +1224,99 @@ class FSDP2Backend(BaseBackend):
             loss /= sp_size
 
         return loss
+
+    def compute_bd_loss(self, model, inputs, ga: int = 1, return_outputs: bool = False, **kwargs):
+        """LLaDA2 block-diffusion loss — unshifted masked CE over ``[noisy | clean]``.
+
+        Relocated verbatim (numerically) from the former ``run_lf_llada2._llada_bd_loss``.
+        Consumes the BD batch produced by ``BDDataset``:
+
+        - ``input_ids``: ``[1, 2T]`` = ``cat([noisy, clean])``
+        - ``attention_mask``: ``[1, 1, 2T, 2T]`` additive block mask
+        - ``position_ids``: ``[1, 2T]`` (two independent ``arange(T)``)
+        - ``labels``: ``[1, 2T]`` (noisy half supervised, clean half = -100)
+
+        Under SP>1 the sequence is sliced to the local shard (block mask stays full);
+        loss is summed locally, all-reduced across the SP group, then divided by the
+        global valid count and by ``ga``. ``ga`` must include torchturbo's SP factor
+        (``gradient_accumulation_steps`` is already multiplied by ``sp_size`` upstream).
+        """
+        inputs = dict(inputs)
+        inputs["use_cache"] = False
+        labels = inputs.pop("labels")  # [1, 2T], clean half = -100
+
+        # CAP/DPARALLEL confidence weight (0 = disabled → behavior unchanged)
+        try:
+            from ...args import get_torchturbo_args
+            cap_lambda = float(getattr(get_torchturbo_args(), "cap_lambda", 0.0) or 0.0)
+        except Exception:
+            cap_lambda = 0.0
+
+        from torch.nn import CrossEntropyLoss
+        ignore_index = CrossEntropyLoss().ignore_index  # -100
+
+        sp_info = self.get_sp_info()
+        sp_size = sp_info["sp_size"]
+        sp_group = sp_info["sp_group"]
+        sp_rank = sp_info["sp_rank"]
+
+        block_mask = inputs["attention_mask"]
+
+        if sp_size > 1 and sp_group is not None:
+            # SP: slice the 2T sequence to the local shard; block mask stays full.
+            n_valid = int((labels != ignore_index).sum().item())
+            full_local = slice_input_tensor(inputs["input_ids"], dim=1, group=sp_group, rank=sp_rank)
+            pos_local = slice_input_tensor(inputs["position_ids"], dim=1, group=sp_group, rank=sp_rank)
+            labels_local = slice_input_tensor(labels, dim=1, group=sp_group, rank=sp_rank)
+
+            outputs = model(
+                input_ids=full_local,
+                attention_mask=block_mask,
+                position_ids=pos_local,
+                use_cache=False,
+            )
+            loss_local = nn.functional.cross_entropy(
+                outputs.logits.view(-1, outputs.logits.size(-1)),
+                labels_local.view(-1),
+                ignore_index=ignore_index,
+                reduction="sum",
+            )
+            # SP all-reduce (kept in autograd graph), then /global valid count → SP=1 mean.
+            loss_sum = torch.distributed.nn.all_reduce(
+                loss_local, op=dist.ReduceOp.SUM, group=sp_group
+            )
+            loss = loss_sum / float(n_valid) if n_valid > 0 else loss_sum * 0.0
+
+            # --- CAP confidence term (global mean via all-reduce of sum + count) ---
+            if cap_lambda > 0:
+                ent_local, nc_local = _confidence_entropy_sum(
+                    outputs.logits, labels_local, ignore_index=ignore_index
+                )
+                ent_sum = torch.distributed.nn.all_reduce(ent_local, op=dist.ReduceOp.SUM, group=sp_group)
+                nc = nc_local.clone()
+                dist.all_reduce(nc, op=dist.ReduceOp.SUM, group=sp_group)  # count: no grad
+                loss = loss + cap_lambda * (ent_sum / nc.clamp_min(1))
+        else:
+            outputs = model(**inputs)
+            T = labels.size(1)
+            noisy_logits = outputs.logits[:, :T].contiguous()  # [1, T, V]
+            noisy_labels = labels[:, :T].contiguous()
+            loss = nn.functional.cross_entropy(
+                noisy_logits.view(-1, noisy_logits.size(-1)),
+                noisy_labels.view(-1),
+                ignore_index=ignore_index,
+            )  # default mean over masked positions (== SP>1 sum/n_valid)
+
+            # --- CAP confidence term ---
+            if cap_lambda > 0:
+                ent_sum, nc = _confidence_entropy_sum(
+                    noisy_logits, noisy_labels, ignore_index=ignore_index
+                )
+                loss = loss + cap_lambda * (ent_sum / nc.clamp_min(1))
+
+        loss = loss / ga  # align with HF Trainer's grad-accum normalization
+        outputs.loss = loss
+        return (loss, outputs) if return_outputs else loss
 
     def _scale_moe_gradient(self, params):
         if len(params) < 1:

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# verified in image 'hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64'
+# verified in image 'hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-6968dbd2-20260612130916'
 
 
 pip config set global.index-url https://pypi.antfin-inc.com/simple/

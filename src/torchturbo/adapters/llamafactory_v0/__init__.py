@@ -37,6 +37,7 @@ from .patches import (
     CollatorPatch,
     CreateRefModelPatch,
     DictFieldPatch,
+    Llada2BDDataloaderPatch,
     LoadModelPatch,
     LogCallbackPatch,
     PretrainProcessorPatch,
@@ -111,6 +112,7 @@ class LlamaFactoryV0Adapter(BaseAdapter):
 
         # Register patches — inner patches applied by RunExpPatch
         self.add_patch(CollatorPatch())
+        self.add_patch(Llada2BDDataloaderPatch())
         self.add_patch(LoadModelPatch(adapter=self))
         self.add_patch(CreateRefModelPatch(adapter=self))
         self.add_patch(AcceleratorPatch())

@@ -93,6 +93,6 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 standalone_world_shard=True,
             ),
         },
-        sp_size=2,
-        ep_size=4,
+        sp_size=1,
+        ep_size=1,
     )

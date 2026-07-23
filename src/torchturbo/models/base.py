@@ -20,6 +20,7 @@ class TurboModel:
     """Base contract between TorchTurboEngine and TorchTurbo models."""
 
     sequence_parallel_input_mode = SequenceParallelInputMode.PRE_EMBEDDING
+    is_diffusion_model = False  # Set to True for subclasses to indicate a diffusion model (uses block-diffusion loss).
 
     @classmethod
     @contextmanager

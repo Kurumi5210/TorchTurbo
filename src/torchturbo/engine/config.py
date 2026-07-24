@@ -186,6 +186,32 @@ class MTPConfig:
         self.loss_scaling_factor = float(self.loss_scaling_factor)
 
 
+@dataclass
+class DiffusionConfig:
+    """Configuration for block-diffusion (BD) training.
+
+    Consumed by ``FSDP2Backend.compute_diffusion_loss`` (CAP weight) and by
+    the engine's BD dataloader (per-sample noise range). Gated by the model's
+    ``is_diffusion_model`` class attribute — these fields are inert for
+    non-diffusion models.
+    """
+
+    cap_lambda: float = 0.0
+    """CAP/DPARALLEL confidence-loss weight (entropy on correct tokens).
+    0 = disabled, behavior unchanged. Recommended: 2.0."""
+
+    bd_mask_low: float = 0.3
+    """Per-sample noise ratio sigma lower bound (``sigma ~ U[low, high]``)."""
+
+    bd_mask_high: float = 0.8
+    """Per-sample noise ratio sigma upper bound."""
+
+    def __post_init__(self) -> None:
+        self.cap_lambda = float(self.cap_lambda)
+        self.bd_mask_low = float(self.bd_mask_low)
+        self.bd_mask_high = float(self.bd_mask_high)
+
+
 @dataclass(frozen=True)
 class FreezePolicy:
     """Engine config for freezing semantic model parameter groups."""
@@ -279,6 +305,9 @@ class EngineConfig:
     freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
     """Policy for freezing semantic model parameter groups."""
 
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    """Block-diffusion training settings (only active for ``is_diffusion_model`` models)."""
+
     extra: dict[str, Any] = field(default_factory=dict)
     """Catch-all for user-defined settings."""
 
@@ -346,18 +375,16 @@ class EngineConfig:
 
         # Parallel Plan (parse sp, ep, tp sizes)
         parallel_d = d.get("parallel", {})
-        parallel_plan = None
 
         sp_size = parallel_d.get("sp_size", d.get("sp_size", 1))
         ep_size = parallel_d.get("ep_size", d.get("ep_size", 1))
 
-        if sp_size > 1 or ep_size > 1 or parallel_d:
-            from torchturbo.parallel import FSDPParallelPlan
+        from torchturbo.parallel import FSDPParallelPlan
 
-            parallel_plan = FSDPParallelPlan(
-                sp_size=sp_size,
-                ep_size=ep_size,
-            )
+        parallel_plan = FSDPParallelPlan(
+            sp_size=sp_size,
+            ep_size=ep_size,
+        )
 
         # Backend-specific config
         backend_config = d.get("backend_config", None)

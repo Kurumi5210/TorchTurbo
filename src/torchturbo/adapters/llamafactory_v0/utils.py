@@ -16,6 +16,7 @@ from ...engine.config import (
     ActivationCheckpointingConfig,
     CheckpointConfig,
     CommConfig,
+    DiffusionConfig,
     DistributedBackend,
     ENV_MAP,
     FreezePolicy,
@@ -158,6 +159,9 @@ def _build_config_from_args(
     # --- MTP ---
     mtp_config = _build_mtp_config(tt)
 
+    # --- Diffusion (BD/CAP; inert for non-diffusion models) ---
+    diffusion_config = _build_diffusion_config(tt)
+
     # --- Extra ---
     extra: dict[str, Any] = {}
 
@@ -171,6 +175,7 @@ def _build_config_from_args(
         checkpoint=checkpoint_config,
         mtp=mtp_config,
         freeze_policy=freeze_policy,
+        diffusion=diffusion_config,
         extra=extra,
     ), raw_args
 
@@ -187,6 +192,16 @@ def _build_mtp_config(torchturbo_args: TorchTurboArgs | None) -> MTPConfig:
     return MTPConfig(
         enabled=bool(torchturbo_args.enable_mtp),
         loss_scaling_factor=float(loss_scaling_factor),
+    )
+
+
+def _build_diffusion_config(torchturbo_args: TorchTurboArgs | None) -> DiffusionConfig:
+    if torchturbo_args is None:
+        return DiffusionConfig()
+    return DiffusionConfig(
+        cap_lambda=float(torchturbo_args.cap_lambda or 0.0),
+        bd_mask_low=float(torchturbo_args.bd_mask_low),
+        bd_mask_high=float(torchturbo_args.bd_mask_high),
     )
 
 

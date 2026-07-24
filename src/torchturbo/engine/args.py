@@ -110,8 +110,8 @@ class TorchTurboArgs:
     freeze_language_model: bool = False
     profiling: bool = False
 
-    # LLaDA2-specific fields (consumed via get_torchturbo_args() in backend.compute_bd_loss,
-    # not threaded through EngineConfig — kept orthogonal to the mainline args).
+    # Block-diffusion (BD) fields — threaded into EngineConfig.diffusion by
+    # build_config_from_lf_args(); only active for is_diffusion_model models.
     cap_lambda: float = 0.0  # CAP/DPARALLEL confidence loss weight (entropy on correct tokens). 0 = disabled.
     bd_mask_low: float = 0.3  # LLaDA2 BD per-sample sigma lower bound.
     bd_mask_high: float = 0.8  # LLaDA2 BD per-sample sigma upper bound.

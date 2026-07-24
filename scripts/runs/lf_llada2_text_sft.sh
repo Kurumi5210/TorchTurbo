@@ -39,6 +39,7 @@ dataset=gsm8k_bd
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
 export TRANSFORMERS_VERBOSITY=error
+export SWANLAB_MODE=disabled
 
 export NNODES=${NNODES:-1}
 export NPUS_PER_NODE=${NPUS_PER_NODE:-16}

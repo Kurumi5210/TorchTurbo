@@ -167,6 +167,11 @@ class TorchTurboTrainerBase:
         if self.stage not in {"sft", "pt", "dpo"}:
             return super().get_train_dataloader()
 
+        # Diffusion (BD) models have their own per-sample dataset (BDDataset),
+        # built from the LF data/model args the engine stashed at run_exp time.
+        if self.model.is_diffusion_model:
+            return self._get_bd_train_dataloader()
+
         engine = self._engine()
         args = self.args
         sp_size = engine.get_sp_info()["sp_size"]
@@ -197,6 +202,76 @@ class TorchTurboTrainerBase:
             pin_memory=args.dataloader_pin_memory,
             drop_last=args.dataloader_drop_last,
             shuffle=not disable_shuffling,
+        )
+
+    def _get_bd_train_dataloader(self):
+        """Build the SP-aware DataLoader for block-diffusion (``BDDataset``).
+
+        BD needs per-sample ``[noisy|clean]`` beams + a 4D block mask, so it
+        cannot use LlamaFactory's tokenized dataset. Noise range comes from
+        ``engine.config.diffusion``; the rest (cutoff_len, data file, model path,
+        block_diag_attn) is read from the LF args the engine stashed at run_exp
+        time. SP folds ``gradient_accumulation_steps *= sp_size`` so the backend's
+        ``compute_diffusion_loss`` ``/ ga`` lands on the right scale.
+        """
+        from ...models.llada2_moe import bd
+
+        engine = self._engine()
+        args = self.args
+        sp_size = engine.get_sp_info()["sp_size"]
+        diff = engine.config.diffusion
+
+        data_args = getattr(engine, "_lf_data_args", None)
+        model_args = getattr(engine, "_lf_model_args", None)
+        if data_args is None or model_args is None:
+            raise RuntimeError(
+                "BD dataloader needs the LF data/model args; engine has none. "
+                "Ensure RunExpPatch stashed them (engine._lf_data_args/_lf_model_args)."
+            )
+
+        cutoff_len = getattr(data_args, "cutoff_len", None)
+        if cutoff_len:
+            # Undo LF neat_packing's `cutoff_len -= 1` and ceil to a BLOCK_SIZE multiple.
+            cutoff_len = bd._align_cutoff_to_block(cutoff_len)
+            beam_len = 2 * cutoff_len
+            if sp_size > 1 and beam_len % sp_size != 0:
+                raise ValueError(
+                    f"BD beam_len=2*cutoff_len={beam_len} must be divisible by "
+                    f"sp_size={sp_size} (SP slices the beam, see "
+                    "backend.compute_diffusion_loss). "
+                    f"Adjust --cutoff_len (aligned value {cutoff_len})."
+                )
+
+        bd_data_file, bd_columns, bd_tags = bd.resolve_bd_data_file(data_args)
+        dataset = bd.BDDataset(
+            getattr(model_args, "model_name_or_path", None),
+            bd_data_file,
+            block_diag_attn=bool(getattr(model_args, "block_diag_attn", False)),
+            cutoff_len=cutoff_len,
+            mask_low=diff.bd_mask_low,
+            mask_high=diff.bd_mask_high,
+            columns=bd_columns,
+            tags=bd_tags,
+        )
+
+        # ga *= sp_size must run — compute_diffusion_loss does /ga expecting the SP factor.
+        if sp_size > 1 and not getattr(args, "_torchturbo_sp_adjusted", False):
+            orig_ga = args.gradient_accumulation_steps
+            args.gradient_accumulation_steps = orig_ga * sp_size
+            args._torchturbo_sp_adjusted = True
+            logger.info(
+                "BD SP=%d: gradient_accumulation_steps %d -> %d",
+                sp_size, orig_ga, args.gradient_accumulation_steps,
+            )
+
+        return engine.create_dataloader(
+            dataset=dataset,
+            batch_size=1,
+            collate_fn=lambda feats: feats[0],
+            num_workers=args.dataloader_num_workers,
+            pin_memory=args.dataloader_pin_memory,
+            drop_last=args.dataloader_drop_last,
+            shuffle=False,
         )
 
     def train(self, *args, **kwargs):
@@ -244,16 +319,13 @@ class TorchTurboTrainerBase:
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if self.stage in {"sft", "pt"}:
-            from ...models.registry import get_model
-
-            turbo_cls = get_model(getattr(model.config, "model_type", None))
-            is_diff = (
-                bool(getattr(turbo_cls, "is_diffusion_model", False))
-                if turbo_cls is not None
-                else False
-            )
-            if is_diff:
-                return self._compute_bd_loss(
+            if not hasattr(model, "is_diffusion_model"):
+                raise AttributeError(
+                    f"{type(model).__name__} is not a TurboModel — "
+                    "is_diffusion_model is required (TurboModel default = False)."
+                )
+            if model.is_diffusion_model:
+                return self._compute_diffusion_loss(
                     model, inputs, return_outputs=return_outputs, **kwargs
                 )
             return self._compute_causal_lm_loss(
@@ -334,17 +406,16 @@ class TorchTurboTrainerBase:
 
         return (loss, outputs) if return_outputs else loss
 
-    def _compute_bd_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Block-diffusion loss path — delegates to ``backend.compute_bd_loss``.
+    def _compute_diffusion_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Diffusion loss path — delegates to ``engine.compute_diffusion_loss``.
 
         Routed around ``_compute_causal_lm_loss`` (see ``compute_loss``) so BD never
-        hits the shifted-CE ``* sp_size`` rescale, replicating the old wholesale
-        monkeypatch of ``_compute_causal_lm_loss``. The batch is built by
-        ``BDDataset``; here we only forward + compute loss.
+        hits the shifted-CE ``* sp_size`` rescale. The batch is built by the engine's
+        BD dataloader (``BDDataset``); here we only forward + compute loss.
         """
         engine = self._engine()
         ga = getattr(self.args, "gradient_accumulation_steps", 1) or 1
-        loss, outputs = engine.backend.compute_bd_loss(
+        loss, outputs = engine.compute_diffusion_loss(
             model, inputs, ga=ga, return_outputs=True, **kwargs
         )
         self._record_mtp_outputs(outputs)  # no-op for BD (no mtp_loss attr)

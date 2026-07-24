@@ -886,6 +886,24 @@ class TorchTurboEngine:
         """Compute the scalar loss for a single micro-batch."""
         return self.backend.compute_loss(model, inputs, return_outputs, **kwargs)
 
+    def compute_diffusion_loss(
+        self,
+        model: nn.Module,
+        inputs: Any,
+        ga: int = 1,
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        """Compute block-diffusion loss for an ``is_diffusion_model`` model.
+
+        ``ga`` is the effective gradient-accumulation steps (already SP-adjusted
+        by the dataloader); the backend divides the loss by it to match HF's
+        grad-accum normalization.
+        """
+        return self.backend.compute_diffusion_loss(
+            model, inputs, ga=ga, return_outputs=return_outputs, **kwargs
+        )
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

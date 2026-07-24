@@ -112,6 +112,25 @@ class BaseBackend(ABC):
         Override in subclass for distributed backends.
         """
 
+    def compute_diffusion_loss(
+        self,
+        model: nn.Module,
+        inputs: Any,
+        ga: int = 1,
+        return_outputs: bool = False,
+        **kwargs,
+    ):
+        """Compute block-diffusion loss for ``is_diffusion_model`` models.
+
+        Default is unsupported; a backend opts in by overriding this. The engine
+        routes here only when ``model.is_diffusion_model`` is True, so a backend
+        that never trains diffusion models can leave the default.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support diffusion training "
+            "(compute_diffusion_loss). Use a backend that implements it, e.g. FSDP2."
+        )
+
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
         """Clip the gradient norm of ``parameters`` in place; return the total norm.
 

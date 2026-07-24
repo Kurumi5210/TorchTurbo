@@ -1225,8 +1225,8 @@ class FSDP2Backend(BaseBackend):
 
         return loss
 
-    def compute_bd_loss(self, model, inputs, ga: int = 1, return_outputs: bool = False, **kwargs):
-        """LLaDA2 block-diffusion loss — unshifted masked CE over ``[noisy | clean]``.
+    def compute_diffusion_loss(self, model, inputs, ga: int = 1, return_outputs: bool = False, **kwargs):
+        """Block-diffusion loss — unshifted masked CE over ``[noisy | clean]``.
 
         Relocated verbatim (numerically) from the former ``run_lf_llada2._llada_bd_loss``.
         Consumes the BD batch produced by ``BDDataset``:
@@ -1236,21 +1236,18 @@ class FSDP2Backend(BaseBackend):
         - ``position_ids``: ``[1, 2T]`` (two independent ``arange(T)``)
         - ``labels``: ``[1, 2T]`` (noisy half supervised, clean half = -100)
 
-        Under SP>1 the sequence is sliced to the local shard (block mask stays full);
-        loss is summed locally, all-reduced across the SP group, then divided by the
-        global valid count and by ``ga``. ``ga`` must include torchturbo's SP factor
-        (``gradient_accumulation_steps`` is already multiplied by ``sp_size`` upstream).
+        ``cap_lambda`` (CAP confidence-loss weight) comes from ``self.config.diffusion``,
+        not a global getter. Under SP>1 the sequence is sliced to the local shard (block
+        mask stays full); loss is summed locally, all-reduced across the SP group, then
+        divided by the global valid count and by ``ga``. ``ga`` must include torchturbo's
+        SP factor (``gradient_accumulation_steps`` is already multiplied by ``sp_size``
+        upstream).
         """
         inputs = dict(inputs)
         inputs["use_cache"] = False
         labels = inputs.pop("labels")  # [1, 2T], clean half = -100
 
-        # CAP/DPARALLEL confidence weight (0 = disabled → behavior unchanged)
-        try:
-            from ...args import get_torchturbo_args
-            cap_lambda = float(getattr(get_torchturbo_args(), "cap_lambda", 0.0) or 0.0)
-        except Exception:
-            cap_lambda = 0.0
+        cap_lambda = float(self.config.diffusion.cap_lambda)  # 0 = CAP disabled
 
         from torch.nn import CrossEntropyLoss
         ignore_index = CrossEntropyLoss().ignore_index  # -100

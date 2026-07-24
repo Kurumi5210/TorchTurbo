@@ -1,9 +1,10 @@
 """LLaDA2 block-diffusion (BD) data helpers.
 
 Each ``BDDataset.__getitem__`` returns one complete CPU BD batch
-(``[noisy|clean]`` + 4D block mask + labels); the trainer's ``_prepare_inputs``
-moves it to device. The BD loss math lives in
-``engine/backends/fsdp2/backend.py`` (``compute_bd_loss``).
+(``[noisy|clean]`` + 4D block mask + labels). The dataloader is built by
+``TorchTurboTrainerBase._get_bd_train_dataloader``; the BD loss math lives in
+``FSDP2Backend.compute_diffusion_loss``. Both paths are routed by the model's
+``is_diffusion_model`` attribute, not by a model-type string switch.
 
 Highlights
 ----------
@@ -13,11 +14,11 @@ Highlights
   ``--tt_bd_mask_low/high``), ``noise_seed = int(index)``. Same index -> same noise, so
   every SP rank in a group (same index via the SP-aware sampler) gets identical noise.
 - LLaDA2 is a diffusion model; BD is its intrinsic training path (gated by
-  ``model_type == "llada2_moe"``, no switch).
+  ``is_diffusion_model`` on the TurboModel subclass, no switch).
 - Length derivation: per-sample real truncation limit = LF ``--cutoff_len`` (e.g. 8K);
   total beam length = ``2 * cutoff_len`` (noisy half + clean half, e.g. 16K). Injected via
-  ``BDDataset(cutoff_len=...)`` (threaded from ``engine._lf_data_args.cutoff_len`` by
-  ``patches.py``). Falls back to module defaults (``BEAM_LEN`` / ``MAX_SEQ_LEN_PACKED``)
+  ``BDDataset(cutoff_len=...)`` (threaded from ``engine._lf_data_args.cutoff_len`` by the
+  trainer). Falls back to module defaults (``BEAM_LEN`` / ``MAX_SEQ_LEN_PACKED``)
   when ``cutoff_len`` is None.
 - ``block_diag_attn`` (neat_packing): FFD-packs multiple short samples into one beam;
   cross-sample isolation via the block mask; padding excluded from noise/labels.
@@ -59,23 +60,6 @@ MAX_SEQ_LEN_PACKED = BEAM_LEN // 2  # 4096 — default per-sample truncation lim
 
 # Segment markers for the block mask (internal, not user-facing).
 SEG_NOISY, SEG_CLEAN, SEG_PAD = 0, 1, 2
-
-LLADA2_MODEL_TYPE = "llada2_moe"
-
-
-# ---------------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------------
-
-def is_llada2(config_or_model: Any) -> bool:
-    """True if the given model/config is LLaDA2-MoE (always trains via block-diffusion).
-
-    ``trainer.py:compute_loss`` and ``patches.py:get_train_dataloader`` route LLaDA2 to the BD
-    data/loss path on this check; other models take the standard causal-LM path.
-    """
-    cfg = getattr(config_or_model, "config", config_or_model)
-    return getattr(cfg, "model_type", None) == LLADA2_MODEL_TYPE
-
 
 def _align_cutoff_to_block(cutoff_len: int, block_size: int = BLOCK_SIZE) -> int:
     """Ceil ``cutoff_len`` up to a multiple of ``block_size``.
@@ -409,7 +393,7 @@ def bd_build_batch(tensor_padded: torch.Tensor, prompt_length: int, L_real: int,
     is taken from ``tensor_padded.shape[0]`` (= cutoff_len in the non-packing path, injected by
     BDDataset).
 
-    Returns dict consumed by ``FSDP2Backend.compute_bd_loss``:
+    Returns dict consumed by ``FSDP2Backend.compute_diffusion_loss``:
     - ``input_ids``:      ``[1, 2T]`` = ``cat([noisy, clean])``
     - ``attention_mask``: ``[1, 1, 2T, 2T]`` additive block mask
     - ``position_ids``:   ``[1, 2T]``

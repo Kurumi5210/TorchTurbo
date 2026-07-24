@@ -494,14 +494,22 @@ class SPAllGather(Function):
     Supports input shapes:
       - [seq_len]                -> gather on dim=0
       - [bs, seq_len, ...]       -> gather on dim=1
+
+    When ``grad_scaler=True``, the backward pass multiplies each rank's local
+    slice by ``sp_size`` before returning it. This is the gradient-equivalent of a
+    reduce-scatter when the gathered tensor is consumed identically on every SP
+    rank (i.e. every rank produces the same ``grad_output``), replacing the
+    cross-rank sum of reduce_scatter with a local scaling factor and thus saving
+    one collective.
     """
 
     @staticmethod
-    def forward(ctx, input_tensor, seq_dim, sp_group, sp_size):
+    def forward(ctx, input_tensor, seq_dim, sp_group, sp_size, grad_scaler=False):
         ctx.sp_group = sp_group
         ctx.sp_size = sp_size
         ctx.input_shape = input_tensor.shape
         ctx.seq_dim = seq_dim
+        ctx.grad_scaler = grad_scaler
 
         # Save original shape and flatten non-sequence dims for stability
         orig_size = input_tensor.size()
@@ -530,6 +538,10 @@ class SPAllGather(Function):
         rank = dist.get_rank(ctx.sp_group)
         seq_dim = ctx.seq_dim
 
+        if ctx.grad_scaler:
+            # Equivalent to a reduce-scatter when every rank's grad_output is identical
+            grad_output = grad_output * ctx.sp_size
+
         # Split along sequence dimension
         chunks = torch.chunk(grad_output, ctx.sp_size, dim=seq_dim)
         grad_input = chunks[rank].contiguous()
@@ -537,11 +549,15 @@ class SPAllGather(Function):
         # Reshape back to original input shape
         grad_input = grad_input.view(ctx.input_shape)
 
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 def all_gather_sp(
-    tensor: Tensor, dim: int, sp_group: ProcessGroup, sp_size: int
+    tensor: Tensor,
+    dim: int,
+    sp_group: ProcessGroup,
+    sp_size: int,
+    grad_scaler: bool = False,
 ) -> Tensor:
     """All-gather tensor in SP group and concatenate along specified dimension.
 
@@ -550,11 +566,14 @@ def all_gather_sp(
         dim: Dimension to concatenate along
         sp_group: Process group for SP
         sp_size: SP size
+        grad_scaler: If True, scale each rank's local backward gradient by
+            ``sp_size``. Use only when the gathered tensor is consumed
+            identically on every SP rank (replicated downstream computation).
 
     Returns:
         Gathered tensor with shape expanded along `dim`
     """
-    return SPAllGather.apply(tensor, dim, sp_group, sp_size)
+    return SPAllGather.apply(tensor, dim, sp_group, sp_size, grad_scaler)
 
 
 def all_gather_sp_with_grad_reduce(

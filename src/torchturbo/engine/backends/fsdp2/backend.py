@@ -104,6 +104,12 @@ class FSDP2Backend(BaseBackend):
         self._sp_group: dist.ProcessGroup = None
         self._sp_rank: int = 0
 
+        # Data parallel process group.
+        # exposed through :`get_dp_info`.
+        self._dp_group: dist.ProcessGroup = None
+        self._dp_rank: int = 0
+        self._dp_size: int = 1
+
         self.device = get_device_name()
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
@@ -153,6 +159,59 @@ class FSDP2Backend(BaseBackend):
         self._sp_group = sp_group
         self._sp_rank = sp_rank
 
+    def _create_dp_group(self) -> dist.ProcessGroup | None:
+        """Create data parallel process group for Ulysses SP.
+
+        E.g. ``world_size=16, sp_size=2`` -> mesh ``(8, 2)`` ::
+            r 0 -> (0,0)  dpg=[0,2,4,6,8,10,12,14]   spg=[0,1]
+            r 1 -> (0,1)  dpg=[1,3,5,7,9,11,13,15]   spg=[0,1]
+            r 2 -> (1,0)  dpg=[0,2,4,6,8,10,12,14]   spg=[2,3]
+        """
+        if not dist.is_initialized():
+            self.logger.warning(
+                "torch.distributed not initialized — skipping DP group creation."
+            )
+            return None
+
+        world_size = dist.get_world_size()
+        if self._sp_size <= 1:
+            self._dp_group = dist.group.WORLD
+            self._dp_rank = self.rank
+            self._dp_size = world_size
+            print(f"sp_size <= 1, _dp_group={self._dp_group}")
+            return self._dp_group
+
+        if world_size % self._sp_size != 0:
+            raise ValueError(
+                f"World size ({world_size}) must be divisible by "
+                f"sp_size ({self._sp_size}) for data parallelism under SP."
+            )
+
+        dp_size = world_size // self._sp_size
+
+        # DP (data) replication set for rank r = ranks sharing the same SP
+        # offset: [r%sp, r%sp+sp, r%sp+2*sp, ...] (a "column" of the
+        # (dp_size, sp_size) row-major layout). All ranks must call
+        # dist.new_group, exactly as in :meth:`_create_sp_group`.
+        dp_group = None
+        for j in range(self._sp_size):
+            ranks = list(range(j, world_size, self._sp_size))
+            group = dist.new_group(ranks)
+            if self.rank in ranks:
+                dp_group = group
+        self._dp_group = dp_group
+        self._dp_rank = dist.get_rank(group=dp_group)
+        self._dp_size = dp_size
+
+        self.logger.info(
+            "Created DP process group (via new_group, no extra mesh): "
+            "dp_size=%d, dp_rank=%d, sp=%d",
+            self._dp_size,
+            self._dp_rank,
+            self._sp_size,
+        )
+        return self._dp_group
+
     def _init_mesh(self, plan: Any) -> Any | None:
         """Create an N-dimensional DeviceMesh based on the parallel plan."""
         if self._mesh is not None:
@@ -186,6 +245,7 @@ class FSDP2Backend(BaseBackend):
         self.logger.info("Created DeviceMesh")
 
         self._create_sp_group(sp_size)
+        self._create_dp_group()
 
     def _patch_transformers(self):
         # currently assume packing or normal attention mask
@@ -864,29 +924,15 @@ class FSDP2Backend(BaseBackend):
         When SP is active, ranks in the same SP group process the same
         data. The effective DP size = world_size / sp_size.
 
-        Returns ``{"dp_rank": ..., "dp_size": ...}``.
+        Returns ``{"dp_rank": ..., "dp_size": ..., "dp_group": ...}``.
         """
         if not dist.is_initialized():
             raise ValueError("Distributed not initialized")
 
-        # If DeviceMesh is initialized, extract DP dimension directly
-        if self._mesh is not None and "dp" in self._mesh.mesh_dim_names:
-            dp_mesh = self._mesh["dp"]
-            return {
-                "dp_rank": dp_mesh.get_local_rank(),
-                "dp_size": dp_mesh.size(),
-            }
-
-        world_size = dist.get_world_size()
-        rank = self.rank
-
-        sp_size = self._sp_size if self._sp_size else 1
-        dp_size = world_size // sp_size
-        dp_rank = rank // sp_size  # ranks in same SP group share dp_rank
-
         return {
-            "dp_rank": dp_rank,
-            "dp_size": dp_size,
+            "dp_rank": self._dp_rank,
+            "dp_size": self._dp_size,
+            "dp_group": self._dp_group,
         }
 
     def get_sp_info(self) -> dict[str, Any]:

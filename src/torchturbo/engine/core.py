@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import math
 import torch
@@ -18,6 +18,12 @@ from .hooks import TrainHook, TrainState
 from .utils import has_meta_tensor
 
 from torchturbo.utils.device import is_npu_available
+from torchturbo.adapters.rl.packed import (
+    gather_logprobs_entropy,
+    get_packed_mb_orig,
+    prepare_packed_mb_inputs,
+    shifted_packed_tensor,
+)
 
 if is_npu_available:
     from torch_npu.contrib import transfer_to_npu as _
@@ -903,6 +909,276 @@ class TorchTurboEngine:
         return self.backend.compute_diffusion_loss(
             model, inputs, ga=ga, return_outputs=return_outputs, **kwargs
         )
+
+    # ------------------------------------------------------------------
+    # forward / backward API for RL
+    # ------------------------------------------------------------------
+
+    def prepare_packed_micro_batch(
+        self,
+        mb: dict[str, Any],
+        seqlens: list[int],
+    ) -> dict[str, Any]:
+        """Create padded model inputs from a packed micro-batch.
+
+        This is the packed-token counterpart of the SFT ``compute_loss`` input
+        preparation.  The engine owns SP state and uses Ulysses helpers when
+        sequence parallelism is active.
+        """
+
+        input_ids = mb["input_ids"]
+        total_len = input_ids.shape[0]
+        cu_seqlens = mb["cu_seqlens"]
+
+        position_ids = torch.zeros_like(input_ids)
+        for i, seq_len in enumerate(seqlens):
+            start = int(cu_seqlens[i].item())
+            position_ids[start : start + seq_len] = torch.arange(
+                seq_len, device=input_ids.device
+            )
+
+        padded_input_ids = input_ids.unsqueeze(0)
+        padded_position_ids = position_ids.unsqueeze(0)
+        attention_mask = mb.get("attention_mask", None)
+        sp_info = self.get_sp_info()
+        sp_size = int(sp_info.get("sp_size", 1))
+
+        sp_pad_size = 0
+        input_ids_rolled = None
+        if sp_size > 1:
+            from torchturbo.adapters.rl.sp import pad_and_slice_packed_inputs
+
+            (
+                padded_input_ids,
+                padded_position_ids,
+                attention_mask,
+                sp_pad_size,
+                input_ids_rolled,
+            ) = pad_and_slice_packed_inputs(
+                padded_input_ids,
+                padded_position_ids,
+                attention_mask,
+                sp_info,
+            )
+
+        max_seqlen = max(seqlens) if seqlens else total_len
+        result = {
+            "input_ids": padded_input_ids,
+            "position_ids": padded_position_ids,
+            "use_cache": False,
+            "cu_seqlens": cu_seqlens,
+            "cu_seq_lens_q": cu_seqlens,
+            "cu_seq_lens_k": cu_seqlens,
+            "max_length_q": max_seqlen,
+            "max_length_k": max_seqlen,
+            "max_seqlen": max_seqlen,
+            "attention_mask": attention_mask,
+            "_pad_length": 0,
+            "_sp_pad_size": sp_pad_size,
+        }
+        if input_ids_rolled is not None:
+            result["_input_ids_rolled"] = input_ids_rolled.squeeze(0)
+        return result
+
+    def forward_backward_batch(
+        self,
+        mb_list: list[Any],
+        process_fn: Callable[..., torch.Tensor],
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        temperature: float = 1.0,
+        forward_only: bool = False,
+        device: Optional[torch.device] = None
+    ) -> None:
+        """Run packed-token forward and optional backward over micro-batches."""
+
+        if self.model is None:
+            raise RuntimeError("Call engine.prepare_model() before forward_backward_batch().")
+
+        total_loss_weight = self._compute_total_loss_weight(mb_list, device)
+        loss_multiplier = self._get_loss_multiplier()
+
+        for mb_idx, mb_item in enumerate(mb_list):
+            inputs, ctx = prepare_packed_mb_inputs(mb_item)
+            logits = self._forward_microbatch(inputs)
+
+            if process_fn is None:
+                logprobs, entropy = (
+                    self._compute_logrobs_and_entropy(
+                        logits,
+                        ctx,
+                        temperature=temperature,
+                        grad_scaler=True,
+                    )
+                )
+                loss = loss_fn(
+                    logprobs=logprobs,
+                    entropy=entropy,
+                    mb_input=ctx["mb_input"],
+                )
+            else:
+                loss = process_fn(logits, ctx, loss_fn)
+
+            loss = self._scale_loss(
+                loss,
+                ctx,
+                total_loss_weight,
+                loss_multiplier,
+                loss_weight_fn,
+            )
+
+            if not forward_only and loss is not None:
+                if mb_idx == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+                    logger.info("packed mb[%d] before backward, loss=%.6f", mb_idx, loss.item())
+                self._backward_loss(loss)
+
+    @torch.no_grad()
+    def compute_logprobs(
+        self,
+        mb_list: list[Any],
+        *,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Compute packed log-probabilities without backward."""
+
+        if self.model is None:
+            raise RuntimeError("Call engine.prepare_model() before compute_logprobs().")
+
+        all_logprobs = []
+        for mb_item in mb_list:
+            inputs, ctx = prepare_packed_mb_inputs(mb_item)
+            logits = self._forward_microbatch(inputs)
+            logprobs, _ = self._compute_logrobs_and_entropy(
+                logits,
+                ctx,
+                temperature=temperature,
+                grad_scaler=False,
+            )
+            all_logprobs.append(logprobs.cpu())
+        return torch.cat(all_logprobs, dim=0)
+
+    def _forward_microbatch(self, inputs: dict[str, Any]) -> torch.Tensor:
+        outputs = self.model(**inputs)
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+        return logits.squeeze(0)
+
+    def _compute_logrobs_and_entropy(
+        self,
+        logits: torch.Tensor,
+        ctx: Any,
+        temperature: float,
+        grad_scaler: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sp_info = self.get_sp_info()
+        sp_size = int(sp_info.get("sp_size", 1))
+        mb_input = ctx["mb_input"]
+        cu_seqlens = mb_input.get("cu_seqlens")
+
+        if sp_size > 1:
+            from torchturbo.adapters.rl.sp import (
+                gather_entropy_and_shift,
+                gather_logprobs_and_shift,
+            )
+
+            labels = mb_input["_input_ids_rolled"]
+            logprobs, entropy = gather_logprobs_entropy(logits, labels, temperature)
+            logprobs = gather_logprobs_and_shift(
+                logprobs,
+                ctx["sp_pad_size"],
+                cu_seqlens,
+                sp_info,
+                grad_scaler=grad_scaler,
+            )
+            entropy = gather_entropy_and_shift(
+                entropy,
+                ctx["sp_pad_size"],
+                cu_seqlens,
+                sp_info,
+                grad_scaler=grad_scaler,
+            )
+            return logprobs, entropy
+
+        input_ids = ctx["model_inputs"]["input_ids"].squeeze(0)
+        if ctx["pad_length"] > 0:
+            logits = logits[: -ctx["pad_length"]]
+            input_ids = input_ids[: -ctx["pad_length"]]
+
+        shifted_logits = shifted_packed_tensor(logits, cu_seqlens, 0, 1)
+        shifted_labels = shifted_packed_tensor(input_ids, cu_seqlens, 1, 0)
+        logprobs, entropy = gather_logprobs_entropy(
+            shifted_logits,
+            shifted_labels,
+            temperature,
+        )
+        return logprobs, entropy
+
+    def _scale_loss(
+        self,
+        loss: torch.Tensor,
+        ctx: Any,
+        total_loss_weight: torch.Tensor,
+        loss_multiplier: float,
+        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+    ) -> torch.Tensor:
+        loss_scale = loss_weight_fn(ctx["mb_input"]) / total_loss_weight * loss_multiplier
+        return loss * loss_scale
+
+    def _compute_total_loss_weight(
+        self,
+        mb_list: list[Any],
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        sp_info = self.get_sp_info()
+        sp_size = int(sp_info.get("sp_size", 1))
+
+        total = torch.tensor(0.0, device=device)
+
+        for mb_item in mb_list:
+            mb = get_packed_mb_orig(mb_item)
+            if "ppo_loss_mask" in mb:
+                total += mb["ppo_loss_mask"].float().sum()
+            else:
+                if "input_ids" in mb:
+                    local_tokens = float(mb["input_ids"].numel())
+                    if sp_size > 1:
+                        local_tokens *= sp_size
+                    total += local_tokens
+
+        dp_info = self.get_dp_info()
+        dp_group = dp_info.get("dp_group")
+        dp_size = int(dp_info.get("dp_size", 1))
+        if dist.is_initialized() and dp_group is not None and dp_size > 1:
+            self._sync_device()
+            dist.all_reduce(total, op=dist.ReduceOp.SUM, group=dp_group)
+            dist.barrier(group=dp_group)
+        return total.clamp(min=1.0)
+
+    def _get_loss_multiplier(self) -> float:
+        sp_info = self.get_sp_info()
+        dp_info = self.get_dp_info()
+        sp_size = int(sp_info.get("sp_size", 1))
+        dp_size = int(dp_info.get("dp_size", 1))
+        if sp_size > 1:
+            return float(dp_size) / float(sp_size)
+        return float(dp_size)
+
+    def _backward_loss(self, loss: torch.Tensor) -> None:
+        try:
+            from torchturbo.engine.backends.fsdp2.prefetch import (
+                fsdp2_backward_prefetch_manager,
+            )
+
+            with fsdp2_backward_prefetch_manager:
+                loss.backward()
+        except ImportError:
+            loss.backward()
+
+    @staticmethod
+    def _sync_device() -> None:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     # ------------------------------------------------------------------
     # Internal

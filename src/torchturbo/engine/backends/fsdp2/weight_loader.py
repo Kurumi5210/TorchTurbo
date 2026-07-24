@@ -438,8 +438,19 @@ class DistParamLoader:
     def _flush_pending_tasks(self, tasks, sharded_sd):
         """Wait for async broadcasts, convert dtype, distribute and store in state dict.
 
-        For each task: wait handle → convert broadcast dtype to target dtype
-        (e.g., bf16→fp32) if needed → distribute_tensor (if DTensor) → assign.
+        For DTensor (FSDP-managed) params: ``distribute_tensor`` the broadcast
+        full tensor, ``to_local()`` the local shard, then rebuild a standalone
+        DTensor with ``from_local()``. ``to_local()`` is a view into the
+        just-broadcast full buffer, so the shard is materialised as an
+        independent tensor (``clone`` on device, ``.to("cpu")`` under offload)
+        before ``from_local`` — that releases ``task.full_tensor`` every
+        iteration instead of pinning each full buffer in ``sharded_sd``. Memory
+        stays flat as the state dict accumulates (no OOM) without a
+        ``to_empty``/``copy_`` fast path.
+
+        Plain (no_shard / replicated) params are not FSDP-managed: the broadcast
+        tensor is stored directly and stays on the compute device even under
+        offload.
         """
         for task in tasks:
             task.handle.wait()
@@ -449,19 +460,36 @@ class DistParamLoader:
                 task.full_tensor = task.full_tensor.to(task.target_dtype)
 
             if isinstance(task.param, DTensor):
-                sharded_tensor = distribute_tensor(
+                sharded = distribute_tensor(
                     task.full_tensor, task.mesh, task.param.placements, src_data_rank=None
                 )
+                # Materialise a standalone local shard so the full broadcast
+                # buffer can be freed this iteration (the view into it is gone).
+                local = sharded.to_local()
+                if self.is_cpu_offload:
+                    local = local.to("cpu")
+                else:
+                    local = local.clone()
+                del sharded, task.full_tensor
+                # run_check=False skips the all-gather verification — the shard
+                # came from distribute_tensor, so placements are already correct.
+                # With run_check=False, from_local cannot infer the global shape
+                # from a sharded local shard, so pass the param's global
+                # shape/stride explicitly.
+                sharded_sd[task.key] = DTensor.from_local(
+                    local,
+                    task.mesh,
+                    task.param.placements,
+                    run_check=False,
+                    shape=task.param.shape,
+                    stride=task.param.stride(),
+                )
+            else:
                 # Only FSDP-managed (DTensor) params are CPU-offloaded. Ignored
                 # no_shard params are plain tensors, not managed by CPUOffloadPolicy,
                 # so they must stay on the compute device.
-                if self.is_cpu_offload:
-                    sharded_tensor = sharded_tensor.to("cpu")
-            else:
-                sharded_tensor = task.full_tensor
-
-            sharded_sd[task.key] = sharded_tensor
-            del task.full_tensor
+                sharded_sd[task.key] = task.full_tensor
+                del task.full_tensor
 
         del tasks
 

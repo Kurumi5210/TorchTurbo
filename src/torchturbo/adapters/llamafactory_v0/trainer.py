@@ -419,9 +419,6 @@ class TorchTurboTrainerBase:
             model, inputs, ga=ga, return_outputs=True, **kwargs
         )
         self._record_mtp_outputs(outputs)  # no-op for BD (no mtp_loss attr)
-        from ...engine.profiling import step_profiling
-
-        step_profiling()
         return (loss, outputs) if return_outputs else loss
 
     def _record_mtp_outputs(self, outputs) -> None:

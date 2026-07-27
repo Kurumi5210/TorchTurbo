@@ -7,9 +7,11 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 from transformers import PretrainedConfig
 
+import torch
 import torch.nn as nn
 
 from ...logging import get_logger
+from ...runtime import DeviceRuntime
 
 if TYPE_CHECKING:
     from ..config import EngineConfig
@@ -24,9 +26,24 @@ class BaseBackend(ABC):
 
     name: str = ""
 
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
         self.config = config
         self.logger = get_logger(type(self).__module__)
+        if not isinstance(device_runtime, DeviceRuntime):
+            raise TypeError(
+                "device_runtime must be a DeviceRuntime. "
+                "Create backends through TorchTurboEngine so the engine can "
+                "select the process device runtime first."
+            )
+        self._device_runtime = device_runtime
+
+    @property
+    def device_runtime(self) -> DeviceRuntime:
+        return self._device_runtime
+
+    @property
+    def device(self) -> torch.device:
+        return self._device_runtime.device
 
     @abstractmethod
     def prepare_model(

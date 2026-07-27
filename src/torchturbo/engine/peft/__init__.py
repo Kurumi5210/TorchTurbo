@@ -32,7 +32,7 @@ Public API
 .. autofunction:: apply_peft
 .. autofunction:: register_grouped_mlp_lora
 .. autofunction:: expand_all_linear_targets
-.. autoclass:: GroupedMLPLoRA
+.. autoclass:: torchturbo.engine.peft.lora.GroupedMLPLoRA
     :members:
 """
 
@@ -41,7 +41,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Union
 
-from .lora import GroupedMLPLoRA
 from .weights import (
     apply_lora_delta,
     build_lora_delta_map,
@@ -53,7 +52,6 @@ from .weights import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "GroupedMLPLoRA",
     "apply_peft",
     "expand_all_linear_targets",
     "register_grouped_mlp_lora",
@@ -85,6 +83,7 @@ def register_grouped_mlp_lora(
     lora_config : LoraConfig
         The LoRA configuration to register the custom module with.
     """
+    from .lora import GroupedMLPLoRA
     from torchturbo.models.modules.moe.experts import GroupedMLP
 
     lora_config._register_custom_module({GroupedMLP: GroupedMLPLoRA})

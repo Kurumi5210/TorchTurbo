@@ -51,11 +51,14 @@ class DistParamLoader:
         device,
         is_cpu_offload,
         weight_converter,
+        device_runtime,
     ):
         self.model = model
         self.hf_config = model.config
         self.device = device
         self.is_cpu_offload = is_cpu_offload
+        self.device_runtime = device_runtime
+        self.device = device_runtime.device
         self.path = Path(path)
         self.mesh = mesh
         self.world_mesh = world_mesh
@@ -103,7 +106,7 @@ class DistParamLoader:
         return index["weight_map"]
 
     def _sync_log_rank0(self, content, update_prev=True):
-        torch.cuda.synchronize()
+        self.device_runtime.synchronize()
         dist.barrier()
         cur = time.perf_counter()
         if self.rank == 0:
@@ -417,7 +420,7 @@ class DistParamLoader:
         then all-reduce (MIN) ensures every rank uses the same conservative
         value so broadcast collectives never hang due to mismatched flush timing.
         """
-        mem_free, mem_total = torch.cuda.mem_get_info()
+        mem_free, mem_total = self.device_runtime.memory_info()
         reserve_bytes = int(mem_total * self._MEM_RESERVE_FRACTION)
         local_budget = max(mem_free - reserve_bytes, 0)
 
@@ -494,14 +497,14 @@ class DistParamLoader:
         del tasks
 
         # Memory cleanup after each batch
-        mem_free, mem_total = torch.cuda.mem_get_info()
+        mem_free, mem_total = self.device_runtime.memory_info()
         mem_used = mem_total - mem_free
         utilization = mem_used / mem_total
         if utilization > (1 - self._MEM_RESERVE_FRACTION):
             before_free = mem_free
-            torch.cuda.empty_cache()
+            self.device_runtime.empty_cache()
             gc.collect()
-            new_free, _ = torch.cuda.mem_get_info()
+            new_free, _ = self.device_runtime.memory_info()
             freed_gb = (new_free - before_free) / 1024 ** 3
             logger.info(f"Rank {self.rank} Cleaned {freed_gb:.2f} GB GPU memory "
                        f"(utilization: {utilization:.1%} -> {(mem_total - new_free)/mem_total:.1%})")
@@ -593,9 +596,9 @@ class DistParamLoader:
     def _cleanup(self):
         self.local_sd = None
         gc.collect()
-        torch.cuda.synchronize()
+        self.device_runtime.synchronize()
         dist.barrier()
-        torch.cuda.empty_cache()
+        self.device_runtime.empty_cache()
 
     # ── Public API ─────────────────────────────────────────────────
 

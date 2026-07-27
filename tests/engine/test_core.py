@@ -1,9 +1,12 @@
 """Tests for TorchTurboEngine one-stop-shop API."""
 
+import importlib
+
 import pytest
 import torch
 import torch.nn as nn
 
+import torchturbo.engine.core as engine_core
 from torchturbo.engine import (
     BaseBackend,
     DistributedBackend,
@@ -18,6 +21,7 @@ from torchturbo.engine import (
 )
 from torchturbo.engine.backend_registry import _BACKENDS
 from torchturbo.engine.backends.fsdp2.config import FSDPConfig
+from torchturbo.runtime.cpu import CpuRuntime
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +48,30 @@ class DummyBackend(BaseBackend):
         return optimizer_cls(model.parameters(), **kw)
 
 
+class ProfilingBackend(DummyBackend):
+    def prepare_model(self, model, parallel_plan=None, peft_config=None):
+        return model
+
+    def load_model(self, model, model_name_or_path, parallel_context):
+        return model
+
+    def save_model(self, model, model_name_or_path, output_dir, parallel_context, **kw):
+        return None
+
+    def get_dp_info(self) -> dict[str, int]:
+        return {"dp_rank": 0, "dp_size": 1, "dp_group": None}
+
+    def get_ep_info(self) -> dict[str, int]:
+        return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
+
+    def get_sp_info(self) -> dict[str, int]:
+        return {"sp_rank": 0, "sp_size": 1, "sp_group": None}
+
+    def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
+        loss = torch.tensor(0.0)
+        return (loss, None) if return_outputs else loss
+
+
 class RecordingHook(TrainHook):
     def __init__(self):
         self.calls = []
@@ -59,6 +87,20 @@ class RecordingHook(TrainHook):
 
     def on_microbatch_end(self, state):
         self.calls.append(f"microbatch:{state.global_step}")
+
+
+class RecordingProfiler:
+    def __init__(self):
+        self.calls = []
+
+    def start(self):
+        self.calls.append("start")
+
+    def step(self):
+        self.calls.append("step")
+
+    def stop(self):
+        self.calls.append("stop")
 
 
 def mse_loss(model, batch, state):
@@ -147,6 +189,86 @@ class TestEngineSetup:
     def test_unknown_backend_raises(self):
         with pytest.raises(ValueError, match="Unknown"):
             TorchTurboEngine({"backend": "nonexistent"})
+
+    def test_failed_backend_init_does_not_publish_ops(self, monkeypatch):
+        ops_module = importlib.import_module("torchturbo.ops.ops")
+        monkeypatch.setattr(ops_module, "_OPS", None)
+
+        class FailingBackend(ProfilingBackend):
+            def __init__(self, config, device_runtime):
+                raise RuntimeError("backend init failed")
+
+        monkeypatch.setattr(engine_core, "get_device_runtime", CpuRuntime)
+        monkeypatch.setattr(engine_core, "get_backend", lambda _: FailingBackend)
+
+        with pytest.raises(RuntimeError, match="backend init failed"):
+            TorchTurboEngine(EngineConfig())
+
+        assert ops_module._OPS is None
+
+    def test_profiling_uses_device_runtime_profiler(self, monkeypatch, tmp_path):
+        runtime = CpuRuntime()
+        profiler = RecordingProfiler()
+        profiler_kwargs = {}
+
+        def fake_profiler(*, output_dir: str, worker_name: str):
+            profiler_kwargs["output_dir"] = output_dir
+            profiler_kwargs["worker_name"] = worker_name
+            return profiler
+
+        monkeypatch.setattr(runtime, "profiler", fake_profiler)
+        monkeypatch.setattr(engine_core, "get_device_runtime", lambda: runtime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: ProfilingBackend if backend_name == "fsdp2" else None,
+        )
+
+        engine = TorchTurboEngine(EngineConfig())
+        engine.start_profiling(str(tmp_path))
+        engine.step_profiling()
+        engine.stop_profiling()
+
+        assert profiler.calls == ["start", "step", "stop"]
+        assert profiler_kwargs["output_dir"] == str(tmp_path / "profiling")
+        assert profiler_kwargs["worker_name"].startswith("rank")
+        assert (tmp_path / "profiling").is_dir()
+
+    def test_profiling_start_failure_clears_previous_profiler(
+        self, monkeypatch, tmp_path
+    ):
+        runtime = CpuRuntime()
+        first_profiler = RecordingProfiler()
+
+        class FailingProfiler(RecordingProfiler):
+            def start(self):
+                self.calls.append("start")
+                raise RuntimeError("profiler start failed")
+
+        second_profiler = FailingProfiler()
+        profilers = iter((first_profiler, second_profiler))
+
+        def fake_profiler(*, output_dir: str, worker_name: str):
+            return next(profilers)
+
+        monkeypatch.setattr(runtime, "profiler", fake_profiler)
+        monkeypatch.setattr(engine_core, "get_device_runtime", lambda: runtime)
+        monkeypatch.setattr(
+            engine_core,
+            "get_backend",
+            lambda backend_name: ProfilingBackend if backend_name == "fsdp2" else None,
+        )
+
+        engine = TorchTurboEngine(EngineConfig())
+        engine.start_profiling(str(tmp_path))
+
+        with pytest.raises(RuntimeError, match="profiler start failed"):
+            engine.start_profiling(str(tmp_path))
+
+        assert first_profiler.calls == ["start", "stop"]
+        assert second_profiler.calls == ["start"]
+        with pytest.raises(RuntimeError, match="No active profiler"):
+            engine.step_profiling()
 
 
 # ---------------------------------------------------------------------------

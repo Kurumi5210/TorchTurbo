@@ -2,6 +2,7 @@ import math
 from typing import Optional
 
 import torch
+from torchturbo.runtime import get_device_runtime
 
 
 def slice_tensor_for_ep_rank(tensor, ep_rank, ep_world_size):
@@ -234,12 +235,14 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
         record_stream (bool): Whether to record the stream of the tensor, to prevent memory leak
                               when the DtoH data transfer is on a side stream.
     """
-    if torch.is_tensor(tensor) and tensor.is_cuda:
+    if torch.is_tensor(tensor) and tensor.device.type != "cpu":
         cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
         if as_numpy:
             cpu_tensor = cpu_tensor.numpy()
         if record_stream:
-            tensor.record_stream(torch.cuda.current_stream())
+            current_stream = get_device_runtime().current_stream()
+            if current_stream is not None:
+                tensor.record_stream(current_stream)
         tensor = cpu_tensor
     return tensor
 

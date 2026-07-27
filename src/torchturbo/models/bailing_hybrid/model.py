@@ -5,11 +5,8 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from torchturbo.models.modules.attention.ulysses import (
-    patch_kda_attention_forward_for_sp,
     ulysses_flash_attention_forward,
 )
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-from torchturbo.utils.device import get_device_name, is_npu_available
 from torchturbo.utils.flash_attn_utils import (
     index_first_axis,
     pad_input,
@@ -21,6 +18,7 @@ from torchturbo.models.modules.attention.ulysses.ulysses import (
     gather_seq_scatter_heads,
     gather_heads_scatter_seq,
 )
+from torchturbo.runtime import get_device_runtime
 
 from ..registry import register_model
 from ..base import TurboModel
@@ -343,29 +341,22 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
     @staticmethod
     def _pre_init_patches(config):
         from . import modeling_bailing_moe_v3 as bailing_moe_v3_model
+        from torchturbo.ops import ops
 
         TurboBailingMoeV3ForCausalLM._patch_mla_attention_interface_for_config(
             bailing_moe_v3_model.BailingMoeV3MultiLatentAttention,
             config._attn_implementation,
         )
 
-        if is_npu_available:
-            from torchturbo.ops import npu_fused_ops
+        def rms_norm_forward(self, hidden_states):
+            return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
-            bailing_moe_v3_model.BailingMoeV3RMSNorm.forward = (
-                npu_fused_ops.fused_rms_norm_forward_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+        bailing_moe_v3_model.BailingMoeV3RMSNorm.forward = rms_norm_forward
 
     def on_materialized(self):
         """Initialize runtime buffers after weights are on the real device."""
 
-        device = get_device_name()
+        device = get_device_runtime().device
         rotary_emb = self.model.rotary_emb
         inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(
             rotary_emb.config, device

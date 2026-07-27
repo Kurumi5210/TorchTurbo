@@ -1,66 +1,19 @@
-import os
-from copy import deepcopy
-from functools import wraps
-
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from .moe_config import MoEConfig
-from torchturbo.utils.device import is_npu_available
+from torchturbo.ops import ops
 
 try:
-    import grouped_gemm
-except ImportError:
-    grouped_gemm = None
-
-try:
-    import transformer_engine.pytorch as te
     from transformer_engine.pytorch import GroupedLinear
 except ImportError:
     GroupedLinear = None
 
 
-def grouped_gemm_is_available():
-    """Check if grouped_gemm is available."""
-    return grouped_gemm is not None
-
-
 def transformer_engine_is_available():
     """Check if transformer_engine is available."""
     return GroupedLinear is not None
-
-
-def assert_grouped_gemm_is_available():
-    """Assert that grouped_gemm is available."""
-    assert grouped_gemm_is_available(), (
-        "Grouped GEMM is not available. Please run "
-        "`pip install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4`."
-    )
-
-
-if is_npu_available:
-    from mindspeed.core.fusions.grouped_matmul import Ops
-
-    gg_ops = Ops
-else:
-    assert_grouped_gemm_is_available()
-    gg_ops = grouped_gemm.ops
-
-
-def conditional_jit_fuser(use_fused_swiglu=False):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-
-        if not is_npu_available and use_fused_swiglu:
-            print("Using JIT fuser for fused swiglu.")
-            jit_fuser = torch.compile
-            wrapper = jit_fuser(wrapper)
-        return wrapper
-
-    return decorator
 
 
 class GroupedMLP(torch.nn.Module):
@@ -72,7 +25,6 @@ class GroupedMLP(torch.nn.Module):
     def __init__(
         self,
         num_local_experts: int,
-        use_fused_swiglu: bool,
         use_te: bool,
         config: MoEConfig,
         layer_number: int = None,
@@ -91,27 +43,26 @@ class GroupedMLP(torch.nn.Module):
         else:
             self.swiglu_limit = 0.0
 
+        if self.swiglu_limit < 0:
+            raise ValueError("moe_swiglu_limit must be non-negative.")
+
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError(
                     "Activation function must be silu or gelu when using GroupedMLP."
                 )
 
-            @conditional_jit_fuser(use_fused_swiglu)
-            def glu(x, probs):
-                if use_fused_swiglu:
-                    # use npu fused kernel for glu
-                    import torch_npu
-
-                    return torch_npu.npu_swiglu(x, dim=-1)
-                gate, up = torch.chunk(x, 2, dim=-1)
-                # Apply swiglu_limit if configured (DeepSeek V4 style).
-                if self.swiglu_limit > 0:
-                    up = torch.clamp(
-                        up.float(), min=-self.swiglu_limit, max=self.swiglu_limit
-                    )
-                    gate = torch.clamp(gate.float(), max=self.swiglu_limit)
-                return (self.config.activation_func(gate) * up).to(x.dtype)
+            def glu(x, _probs):
+                if (
+                    self.config.activation_func is F.silu
+                    and self.swiglu_limit == 0.0
+                ):
+                    return ops.swiglu(x)
+                return ops.gated_activation(
+                    x,
+                    activation_func=self.config.activation_func,
+                    limit=self.swiglu_limit,
+                )
 
             self.activation_func = glu
         else:
@@ -222,7 +173,7 @@ class GroupedMLP(torch.nn.Module):
                 # Second grouped linear: fc2_input_size -> hidden_size
                 fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
             else:
-                # Fall back to original grouped_gemm implementation
+                # Fall back to the grouped_matmul op registry.
                 # Reshape the weights for the grouped GEMMs.
                 w1 = self.weight1.view(
                     self.num_local_experts, self.config.hidden_size, -1
@@ -231,13 +182,13 @@ class GroupedMLP(torch.nn.Module):
                     self.num_local_experts, -1, self.config.hidden_size
                 )
 
-                fc1_output = gg_ops.gmm(
+                fc1_output = ops.grouped_matmul(
                     permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
                 )
                 intermediate_parallel = self.activation_func_with_probs(
                     fc1_output, permuted_probs.unsqueeze(-1)
                 )
-                fc2_output = gg_ops.gmm(
+                fc2_output = ops.grouped_matmul(
                     intermediate_parallel, w2, tokens_per_expert, trans_b=False
                 )
         else:

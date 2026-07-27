@@ -9,8 +9,7 @@ from transformers import AutoModelForImageTextToText
 from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-from torchturbo.utils.device import is_npu_available, get_device_name
+from torchturbo.runtime import is_npu_available, get_device_name
 
 from ...engine.config import ParameterGroup
 from ..base import TurboVLMModel
@@ -66,7 +65,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
         return groups
 
     def __init__(self, config: Qwen3_5MoeConfig) -> None:
-        self._pre_init_patches()
         if hasattr(config, "vision_config"):
             config.vision_config._attn_implementation = "flash_attention_2"
         super().__init__(config)
@@ -77,13 +75,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
         from .parallel_plan import get_parallel_plan
 
         return get_parallel_plan(**kwargs)
-
-    @staticmethod
-    def _pre_init_patches():
-        if is_npu_available:
-            from torchturbo.ops.npu_fused_ops import fused_token_permutation_npu, fused_token_unpermutation_npu
-            MoEAlltoAllTokenDispatcher.token_permutation = fused_token_permutation_npu
-            MoEAlltoAllTokenDispatcher.token_unpermutation = fused_token_unpermutation_npu
 
     def _post_init_patches(self):
         import torch
@@ -232,7 +223,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
         self.model.get_rope_index = _wrapped_get_rope_index
 
-        if is_npu_available:
+        if is_npu_available():
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_gdr
             for _, module in self.model.named_modules():
                 if hasattr(module, "chunk_gated_delta_rule"):

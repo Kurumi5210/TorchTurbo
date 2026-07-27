@@ -27,7 +27,6 @@ class QWen3MoeLayerWrapper(MoELayer):
             config=moe_config,
             ep_group=ep_group,
             submodules=moe_submodules,
-            use_fused_swiglu=False,
         )
 
         if hasattr(original_module, "shared_experts"):

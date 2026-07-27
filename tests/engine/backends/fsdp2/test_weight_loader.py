@@ -17,6 +17,7 @@ import torch.nn as nn
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 import torchturbo.engine.backends.fsdp2.weight_loader as weight_loader_mod
 from torchturbo.engine.backends.fsdp2.weight_loader import DistParamLoader
+from torchturbo.runtime import TurboDevice
 
 
 class TinyModel(nn.Module):
@@ -73,7 +74,10 @@ def test_load_weights_cpu_offload_assigns_and_restores_buffers(monkeypatch):
 def test_load_model_materializes_model_when_cpu_offload(monkeypatch):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.fsdp_config = types.SimpleNamespace(cpu_offload=True)
-    backend.device = torch.device("cuda:0")
+    backend._device_runtime = types.SimpleNamespace(
+        device=torch.device("cuda"),
+        turbo_device=TurboDevice.CUDA,
+    )
     backend._mesh = None
     backend._register_no_shard_params_grad_sync = lambda model: None
 
@@ -94,7 +98,7 @@ def test_load_model_materializes_model_when_cpu_offload(monkeypatch):
     backend.load_model(model, "unused", {}, load_weights=False)
 
     assert to_empty_calls == [torch.device("cpu")]
-    assert helper_calls == [(model, torch.device("cuda:0"))]
+    assert helper_calls == [(model, torch.device("cuda"))]
 
 
 def test_broadcast_buffers_writes_directly_into_module(monkeypatch):

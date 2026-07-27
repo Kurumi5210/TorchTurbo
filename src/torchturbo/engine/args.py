@@ -69,6 +69,8 @@ class TorchTurboArgs:
         Distributed backend (``"fsdp2"``).
     mixed_precision:
         Mixed precision policy (``"bf16"``, ``"fp16"``, ``"fp32"``, ``"fp8"``).
+    op_policy:
+        Default op dispatch policy (``"auto"``, ``"native"``, ``"custom"``).
     sp_size:
         Sequence parallelism group size.
     ep_size:
@@ -98,6 +100,7 @@ class TorchTurboArgs:
 
     backend: str | None = None
     mixed_precision: str | None = None
+    op_policy: str | None = None
     sp_size: int | None = None
     ep_size: int | None = None
     gradient_checkpointing: bool = True
@@ -149,6 +152,14 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="POLICY",
         help="Mixed precision policy (bf16, fp16, fp32, fp8). "
         "Replaces TORCH_TURBO_MIXED_PRECISION.",
+    )
+    parser.add_argument(
+        "--tt_op_policy",
+        type=str,
+        default=None,
+        metavar="POLICY",
+        help="Default op dispatch policy (auto, native, custom). "
+        "Replaces TORCH_TURBO_OP_POLICY.",
     )
     parser.add_argument(
         "--tt_sp_size",
@@ -319,6 +330,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
     args = TorchTurboArgs(
         backend=parsed.tt_backend,
         mixed_precision=parsed.tt_mixed_precision,
+        op_policy=parsed.tt_op_policy,
         sp_size=parsed.tt_sp_size,
         ep_size=parsed.tt_ep_size,
         gradient_checkpointing=parsed.tt_gradient_checkpointing,
@@ -344,6 +356,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         for v in [
             args.backend,
             args.mixed_precision,
+            args.op_policy,
             args.sp_size,
             args.ep_size,
             args.enable_mtp,

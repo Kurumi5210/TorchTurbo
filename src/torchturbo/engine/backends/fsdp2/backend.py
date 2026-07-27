@@ -23,13 +23,14 @@ from torchturbo.models.modules.attention.ulysses import (
 )
 from torchturbo.models.modules.comm import all_gather_tensor
 from torchturbo.models.base import SequenceParallelInputMode
+from torchturbo.ops import ops
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
     ParallelPlan,
 )
+from torchturbo.runtime import DeviceRuntime
 from torchturbo.engine.utils import strip_peft_prefix
-from torchturbo.utils.device import get_device_name, is_cuda_available, is_npu_available
 from torchturbo.utils.flash_attn_utils import get_unpad_data
 
 from ...backend_registry import register_backend
@@ -83,8 +84,8 @@ class FSDP2Backend(BaseBackend):
 
     name = "fsdp2"
 
-    def __init__(self, config: EngineConfig) -> None:
-        super().__init__(config)
+    def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
+        super().__init__(config, device_runtime)
         self.fsdp_config: FSDPConfig = config.backend_config
         fsdp_config = self.fsdp_config
         self.mixed_precision = config.mixed_precision
@@ -109,8 +110,6 @@ class FSDP2Backend(BaseBackend):
         self._dp_group: dist.ProcessGroup = None
         self._dp_rank: int = 0
         self._dp_size: int = 1
-
-        self.device = get_device_name()
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
@@ -236,7 +235,7 @@ class FSDP2Backend(BaseBackend):
             )
 
         world_size = world_size
-        device_name = get_device_name()
+        device_name = self.device.type
         self._world_mesh = init_device_mesh(device_name, (world_size,))
         self._mesh = init_device_mesh(
             device_name, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
@@ -388,6 +387,7 @@ class FSDP2Backend(BaseBackend):
                 device=self.device,
                 is_cpu_offload=self.fsdp_config.cpu_offload,
                 weight_converter=weight_converter,
+                device_runtime=self.device_runtime,
             )
             loader.load_weights()
         else:
@@ -448,6 +448,7 @@ class FSDP2Backend(BaseBackend):
             path=model_name_or_path,
             processing_class=None,
             weight_converter=weight_converter,
+            device_runtime=self.device_runtime,
         )
         saver.save_model(output_dir)
 
@@ -1195,10 +1196,7 @@ class FSDP2Backend(BaseBackend):
             standard "predict next token" shift).  i-th MTP head uses
             ``i + 1`` (predict token at t+i+2 instead of t+1).
         """
-        from torch.nn import CrossEntropyLoss
-
-        loss_fct = CrossEntropyLoss(reduction="sum")
-        ignore_index = loss_fct.ignore_index  # -100
+        ignore_index = -100
 
         # Shift labels by (1 + shift_extra) positions to the left.
         labels = nn.functional.pad(labels, (0, 1 + shift_extra), value=ignore_index)
@@ -1216,29 +1214,12 @@ class FSDP2Backend(BaseBackend):
 
         labels = labels.view(-1).to(logits.device)
         logits = logits.view(-1, logits.size(-1))
-
-        if is_npu_available:
-            import torch_npu
-            loss = torch_npu.npu_cross_entropy_loss(
-                logits, labels, reduction="sum", ignore_index=ignore_index
-            )
-            if isinstance(loss, tuple):
-                loss = loss[0]
-            if loss.dim() > 0:
-                loss = loss.squeeze()
-        elif is_cuda_available:
-            try:
-                from flash_attn.ops.triton.cross_entropy import (
-                    cross_entropy_loss as fa_cross_entropy_loss,
-                )
-                loss, _ = fa_cross_entropy_loss(
-                    logits, labels, ignore_index=ignore_index
-                )
-                loss = loss.sum()
-            except ImportError:
-                loss = loss_fct(logits, labels)
-        else:
-            loss = loss_fct(logits, labels)
+        loss = ops.cross_entropy_loss(
+            logits,
+            labels,
+            reduction="sum",
+            ignore_index=ignore_index,
+        )
 
         if sp_size > 1 and sp_group is not None:
             # Keep SP loss reduction in the autograd graph.  A plain

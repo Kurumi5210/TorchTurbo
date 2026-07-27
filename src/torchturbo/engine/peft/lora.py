@@ -7,8 +7,8 @@ with the PEFT library via ``LoraConfig._register_custom_module``.
 Design
 ------
 GroupedMLP stores all expert weights in two fused tensors (``weight1`` and
-``weight2``) and uses a grouped GEMM kernel (``gg_ops.gmm``) that performs
-all expert matmuls in a single CUDA kernel launch.  Standard PEFT LoRA
+``weight2``) and uses the ``grouped_matmul`` op to perform all expert
+matmuls in a single fused launch when available.  Standard PEFT LoRA
 cannot be applied because:
 
 1. GroupedMLP is not an ``nn.Linear`` — it has no ``in_features`` /
@@ -45,7 +45,8 @@ import torch.nn as nn
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
-from torchturbo.models.modules.moe.experts import GroupedMLP, gg_ops
+from torchturbo.ops import ops
+from torchturbo.models.modules.moe.experts import GroupedMLP
 
 
 class GroupedLoRALinear(nn.Module):
@@ -108,7 +109,7 @@ class GroupedLoRALinear(nn.Module):
         torch.Tensor
             Output tensor of shape ``(total_tokens, out_features)``.
         """
-        return gg_ops.gmm(x, self.weight, tokens_per_expert, trans_b=False)
+        return ops.grouped_matmul(x, self.weight, tokens_per_expert, trans_b=False)
 
     def __repr__(self) -> str:
         return (
@@ -668,7 +669,9 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
             # ===== FC1: base GEMM + LoRA GEMM =====
             # Base fc1.
             fc1_base_dtype = x.dtype
-            fc1_output = gg_ops.gmm(x, w1, tokens_per_expert, trans_b=False)
+            fc1_output = ops.grouped_matmul(
+                x, w1, tokens_per_expert, trans_b=False
+            )
 
             # LoRA fc1: additive residual via grouped GEMM.
             for adapter_name in active:
@@ -680,11 +683,11 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
                 # Apply dropout and cast to LoRA dtype (float32).
                 x_drop = dropout(x).to(lora_A.weight.dtype)
                 # LoRA-A: (E, H, r)  → output (tokens, r)
-                a_result = gg_ops.gmm(
+                a_result = ops.grouped_matmul(
                     x_drop, lora_A.weight, tokens_per_expert, trans_b=False
                 )
                 # LoRA-B: (E, r, fc1_out)  → output (tokens, fc1_out)
-                b_result = gg_ops.gmm(
+                b_result = ops.grouped_matmul(
                     a_result, lora_B.weight, tokens_per_expert, trans_b=False
                 )
                 fc1_output = fc1_output + b_result.to(fc1_base_dtype) * scaling
@@ -696,7 +699,7 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
 
             # ===== FC2: base GEMM + LoRA GEMM =====
             fc2_base_dtype = intermediate_parallel.dtype
-            fc2_output = gg_ops.gmm(
+            fc2_output = ops.grouped_matmul(
                 intermediate_parallel, w2, tokens_per_expert, trans_b=False
             )
 
@@ -708,10 +711,10 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
                 lora_B2 = self.lora_B2[adapter_name]
 
                 inter_drop = dropout(intermediate_parallel).to(lora_A2.weight.dtype)
-                a2_result = gg_ops.gmm(
+                a2_result = ops.grouped_matmul(
                     inter_drop, lora_A2.weight, tokens_per_expert, trans_b=False
                 )
-                b2_result = gg_ops.gmm(
+                b2_result = ops.grouped_matmul(
                     a2_result, lora_B2.weight, tokens_per_expert, trans_b=False
                 )
                 fc2_output = fc2_output + b2_result.to(fc2_base_dtype) * scaling

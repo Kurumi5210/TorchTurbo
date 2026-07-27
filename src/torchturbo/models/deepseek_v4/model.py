@@ -5,9 +5,6 @@ from transformers import AutoModelForCausalLM
 
 from torchturbo.models.modules.attention.ulysses import all_gather_sp
 from torchturbo.models.modules.moe.moe_layer import MoELayer
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-from torchturbo.ops import npu_fused_ops
-from torchturbo.utils.device import is_npu_available
 
 from ..base import TurboModel
 from ..registry import register_model
@@ -100,6 +97,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
     @staticmethod
     def _pre_init_patches(config):
         from . import modeling_deepseek_v4 as deepseek_v4_model
+        from torchturbo.ops import ops
 
         origin_moe_forward = getattr(
             MoELayer, "_torchturbo_deepseek_v4_origin_forward", MoELayer.forward
@@ -112,16 +110,10 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
         MoELayer.forward = deepseek_moe_forward
 
-        if is_npu_available:
-            deepseek_v4_model.DeepseekV4RMSNorm.forward = (
-                npu_fused_ops.fused_rms_norm_forward_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+        def rms_norm_forward(self, hidden_states):
+            return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+        deepseek_v4_model.DeepseekV4RMSNorm.forward = rms_norm_forward
 
         config._attn_implementation = "eager"
 

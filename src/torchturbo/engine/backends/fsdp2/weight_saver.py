@@ -21,11 +21,13 @@ class ShardedParamManager:
         rank,
         mesh,
         weight_converter,
+        device_runtime,
         path=None,
         processing_class=None,
     ):
         self.move_to_cpu = True
         self.model = model
+        self.device_runtime = device_runtime
 
         self.rank = rank
         self.mesh = mesh
@@ -221,7 +223,7 @@ class ShardedParamManager:
     def _gc_cleanup(self):
         gpu_before = self._get_gpu_memory_usage_percent()
         cpu_before = self._get_cpu_memory_usage_percent()
-        torch.cuda.empty_cache()
+        self.device_runtime.empty_cache()
         gc.collect()
         gpu_after = self._get_gpu_memory_usage_percent()
         cpu_after = self._get_cpu_memory_usage_percent()
@@ -302,7 +304,7 @@ class ShardedParamManager:
         return tensor
 
     def _get_gpu_memory_usage_percent(self):
-        mem_free, mem_total = torch.cuda.mem_get_info()
+        mem_free, mem_total = self.device_runtime.memory_info()
         mem_used = mem_total - mem_free
         utilization = (mem_used / mem_total) * 100.0
         return utilization

@@ -7,11 +7,9 @@ except ImportError:
 
 import torch
 
-from torchturbo.ops import npu_fused_ops
-from torchturbo.utils.device import is_npu_available, get_device_name
+from torchturbo.runtime import is_npu_available, get_device_name
 from .modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
 from .configuration_glm_moe_dsa import GlmMoeDsaConfig
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..base import TurboModel
@@ -64,18 +62,13 @@ class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
 
     @staticmethod
     def _pre_init_patches(config):
-        if is_npu_available:
-            import torchturbo.models.glm_moe_dsa.modeling_glm_moe_dsa as glm5_model
+        from torchturbo.ops import ops
+        import torchturbo.models.glm_moe_dsa.modeling_glm_moe_dsa as glm5_model
 
-            glm5_model.GlmMoeDsaRMSNorm.forward = (
-                npu_fused_ops.fused_rms_norm_forward_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+        def rms_norm_forward(self, hidden_states):
+            return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+        glm5_model.GlmMoeDsaRMSNorm.forward = rms_norm_forward
 
         # patch moe_layer forward
         origin_moe_forward = MoELayer.forward
@@ -99,7 +92,7 @@ class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
 
-        if is_npu_available:
+        if is_npu_available():
             from functools import partial
             from .npu import npu_fused_dsa_attn_forward
             from .modeling_glm_moe_dsa import GlmMoeDsaAttention

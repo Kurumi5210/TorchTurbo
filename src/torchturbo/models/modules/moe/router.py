@@ -40,8 +40,7 @@ class Router(ABC, torch.nn.Module):
             torch.Tensor: Logits tensor.
         """
         if self.weight.device.type == "cpu":
-            # move weights to GPU
-            self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+            self.weight.data = self.weight.data.to(device=input.device)
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == "fp32":

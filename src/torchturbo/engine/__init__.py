@@ -39,6 +39,7 @@ from .config import (
     FreezePolicy,
     MixedPrecisionPolicy,
     MTPConfig,
+    OpsConfig,
     ParameterGroup,
 )
 from .core import TorchTurboEngine
@@ -62,6 +63,7 @@ __all__ = [
     "FreezePolicy",
     "MixedPrecisionPolicy",
     "MTPConfig",
+    "OpsConfig",
     "ParameterGroup",
     # Engine
     "BaseBackend",

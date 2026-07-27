@@ -33,7 +33,6 @@ def _replace_qwen3_5_moe_only(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
-        use_fused_swiglu=False,
     )
 
     if hasattr(original_module, "shared_expert"):

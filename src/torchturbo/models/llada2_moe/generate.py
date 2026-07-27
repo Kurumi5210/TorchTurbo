@@ -50,32 +50,51 @@ _DEFAULT_EOS_ID = 156892    # same as pad_token_id in LLaDA2.
 _DEFAULT_PROMPT = "Provide a comprehensive yet accessible introduction to Large Language Models (LLMs)."
 
 
-def _load_torchturbo_device_utils():
-    """Load ``torchturbo/utils/device.py`` standalone (it only imports torch,
-    so we sidestep the full ``torchturbo`` package which pulls in engine/peft).
+def _load_torchturbo_runtime():
+    """Load the ``torchturbo.runtime`` package without importing torchturbo.
+
+    This keeps the standalone inference entry point independent from the full
+    engine/registry/peft import chain.
     Returns ``(is_npu_available, get_device_name)``.
 
     Walks up from this file (``.../models/llada2_moe/generate.py``) looking for
-    a sibling ``utils/device.py`` — robust to wherever the script lives under
+    a sibling ``runtime`` package -- robust to wherever the script lives under
     ``torchturbo/src/torchturbo``.
     """
     cur = os.path.dirname(os.path.abspath(__file__))
-    device_py = None
+    runtime_dir = None
     while cur and cur != os.path.dirname(cur):  # stop at filesystem root
-        cand = os.path.join(cur, "utils", "device.py")
-        if os.path.isfile(cand):
-            device_py = cand
+        cand = os.path.join(cur, "runtime")
+        if os.path.isfile(os.path.join(cand, "runtime.py")):
+            runtime_dir = cand
             break
         cur = os.path.dirname(cur)
-    if device_py is None:
+    if runtime_dir is None:
         raise SystemExit(
-            "torchturbo device utils not found (utils/device.py). Walked up from "
-            f"{os.path.dirname(os.path.abspath(__file__))} without finding utils/."
+            "torchturbo runtime package not found. Walked up from "
+            f"{os.path.dirname(os.path.abspath(__file__))} without finding runtime/."
         )
-    spec = importlib.util.spec_from_file_location("tt_device_utils", device_py)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.is_npu_available, mod.get_device_name
+
+    package_name = "tt_standalone_runtime"
+    package = types.ModuleType(package_name)
+    package.__path__ = [runtime_dir]
+    package.__package__ = package_name
+    sys.modules[package_name] = package
+
+    for submodule in ("base", "runtime"):
+        full_name = f"{package_name}.{submodule}"
+        spec = importlib.util.spec_from_file_location(
+            full_name,
+            os.path.join(runtime_dir, f"{submodule}.py"),
+        )
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"Unable to load torchturbo runtime module: {submodule}.")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[full_name] = module
+        spec.loader.exec_module(module)
+
+    runtime_module = sys.modules[f"{package_name}.runtime"]
+    return runtime_module.is_npu_available, runtime_module.get_device_name
 
 
 def _load_torchturbo_modeling():
@@ -207,9 +226,13 @@ def _synchronize():
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
-    is_npu_available, get_device_name = _load_torchturbo_device_utils()
+    is_npu_available, get_device_name = _load_torchturbo_runtime()
     # If --device npu is requested but unavailable, fall back to the host's best device.
-    device = args.device if (args.device != "npu" or is_npu_available) else get_device_name()
+    device = (
+        args.device
+        if (args.device != "npu" or is_npu_available())
+        else get_device_name()
+    )
     print(f"[generate] device={device} dtype={args.dtype}", flush=True)
 
     # 1. Tokenizer — plain AutoTokenizer, no trust_remote_code pitfalls here.

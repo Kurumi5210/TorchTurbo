@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 import os
 
 import torch
@@ -11,7 +11,6 @@ from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
-from torchturbo.utils.device import is_npu_available
 
 
 @dataclass
@@ -80,12 +79,10 @@ class MoELayer(BaseMoELayer):
         config: MoEConfig,
         ep_group: dist.ProcessGroup,
         submodules: Optional[MoESubmodules] = None,
-        use_fused_swiglu: Optional[bool] = False,
         use_fused_permute_unpermute: Optional[bool] = False,
         use_te: Optional[bool] = False,
         layer_number: Optional[int] = None,
     ):
-        self.use_fused_swiglu = use_fused_swiglu
         self.use_fused_permute_unpermute = use_fused_permute_unpermute
         self.use_te = use_te
         self.submodules = submodules
@@ -113,7 +110,6 @@ class MoELayer(BaseMoELayer):
         self.experts = build_module(
             self.submodules.experts,
             self.num_local_experts,
-            self.use_fused_swiglu,
             self.use_te,
             self.config,
             layer_number=self.layer_number,
@@ -145,12 +141,13 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )
 
-            if is_npu_available:
-                # apply shape transform for npu fused kernel
+            if self.token_dispatcher.deferred_probs_to_unpermutation:
                 num_tokens, _ = probs.shape
-                probs = probs.masked_select(routing_map).view(num_tokens, -1)
+                probs_for_unpermutation = probs.masked_select(routing_map).view(
+                    num_tokens, -1
+                )
                 output, mlp_bias = self.token_dispatcher.token_unpermutation(
-                    expert_output, mlp_bias, probs
+                    expert_output, mlp_bias, probs=probs_for_unpermutation
                 )
             else:
                 expert_output = expert_output * permuted_probs.unsqueeze(-1)

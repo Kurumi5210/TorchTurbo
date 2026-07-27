@@ -5,8 +5,7 @@ from .modeling_llada2_moe import LLaDA2MoeModelLM
 from ..base import TurboModel
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
-from torchturbo.utils.device import is_npu_available, get_device_name
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from torchturbo.runtime import get_device_runtime
 
 
 class LLaDA2WeightConverter(BaseWeightConverter):
@@ -39,19 +38,17 @@ class TurboLLaDA2MoeForCausalLM(TurboModel, LLaDA2MoeModelLM):
 
     @staticmethod
     def _pre_init_patches(config):
-        if is_npu_available:
-            from torchturbo.ops import npu_fused_ops
-            from .modeling_llada2_moe import LLaDA2MoeRMSNorm
+        from torchturbo.ops import ops
+        from .modeling_llada2_moe import LLaDA2MoeRMSNorm
 
-            LLaDA2MoeRMSNorm.forward = (
-                npu_fused_ops.fused_rms_norm_forward_npu
+        def rms_norm_forward(self, hidden_states):
+            return ops.rms_norm(
+                hidden_states,
+                self.weight,
+                self.variance_epsilon,
             )
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+
+        LLaDA2MoeRMSNorm.forward = rms_norm_forward
 
     @staticmethod
     def _post_init_patches():
@@ -59,7 +56,7 @@ class TurboLLaDA2MoeForCausalLM(TurboModel, LLaDA2MoeModelLM):
 
     def on_materialized(self) -> None:
         rotary_emb = self.model.rotary_emb
-        device = get_device_name()
+        device = get_device_runtime().device
 
         inv_freq, attention_scaling = rotary_emb.compute_default_rope_parameters(
             rotary_emb.config, device

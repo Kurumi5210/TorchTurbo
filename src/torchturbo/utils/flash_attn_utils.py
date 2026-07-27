@@ -1,11 +1,11 @@
 import os
 import torch
 import torch.nn.functional as F
-from torchturbo.utils.device import is_torch_npu_available
 from einops import rearrange, repeat
+from torchturbo.runtime import is_npu_available
 from torchturbo.utils.functools import cache
 
-if is_torch_npu_available():
+if is_npu_available():
     import math
     import torch_npu
 

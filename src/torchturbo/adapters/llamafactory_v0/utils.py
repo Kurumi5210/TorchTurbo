@@ -23,6 +23,7 @@ from ...engine.config import (
     MixedPrecisionPolicy,
     MTPConfig,
     ParameterGroup,
+    OpsConfig,
 )
 from ...engine.backends.fsdp2.config import (
     FSDPConfig,
@@ -30,6 +31,7 @@ from ...engine.backends.fsdp2.config import (
 )
 from ...engine.hooks import TrainState
 from ...logging import get_logger
+from ...ops.base import OpPolicy
 from torchturbo.parallel import FSDPParallelPlan
 
 
@@ -153,6 +155,13 @@ def _build_config_from_args(
     ep_size = tt.ep_size if (tt is not None and tt.ep_size is not None) else 1
     parallel_plan = FSDPParallelPlan(sp_size=sp_size, ep_size=ep_size)
 
+    # --- Ops ---
+    ops_config = (
+        OpsConfig(policy=OpPolicy(str(tt.op_policy).lower()))
+        if tt is not None and tt.op_policy is not None
+        else OpsConfig()
+    )
+
     # --- Freeze policy ---
     freeze_policy = _build_freeze_policy(tt)
 
@@ -172,6 +181,7 @@ def _build_config_from_args(
         backend_config=fsdp_config,
         activation_checkpointing=ac_config,
         comm=comm_config,
+        ops=ops_config,
         checkpoint=checkpoint_config,
         mtp=mtp_config,
         freeze_policy=freeze_policy,

@@ -76,6 +76,21 @@ def test_build_config_maps_mtp_args_to_engine_config():
     assert cfg.mtp.loss_scaling_factor == 0.3
 
 
+def test_build_config_maps_op_policy_to_engine_config():
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.ops.base import OpPolicy
+
+    training_args = types.SimpleNamespace(
+        fsdp=[], fsdp_config={}, gradient_checkpointing=True
+    )
+    tt = TorchTurboArgs(op_policy="native")
+
+    cfg, _ = build_config_from_lf_args(training_args=training_args, torchturbo_args=tt)
+
+    assert cfg.ops.policy is OpPolicy.NATIVE
+
+
 def test_build_config_cli_prefetch_ignores_lf_yaml_prefetch():
     """TorchTurbo prefetch config does not read LF fsdp_config prefetch fields."""
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args

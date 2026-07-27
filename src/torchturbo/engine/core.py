@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 from typing import Any, Callable, Iterable, Optional
 
 import math
@@ -16,17 +18,14 @@ from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
 from .hooks import TrainHook, TrainState
 from .utils import has_meta_tensor
-
-from torchturbo.utils.device import is_npu_available
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
     get_packed_mb_orig,
     prepare_packed_mb_inputs,
     shifted_packed_tensor,
 )
-
-if is_npu_available:
-    from torch_npu.contrib import transfer_to_npu as _
+from ..ops import get_or_create_ops
+from ..runtime import ProfilerHandle, get_device_runtime
 
 
 logger = get_logger(__name__)
@@ -193,7 +192,7 @@ class TorchTurboEngine:
         else:
             self.config = config
 
-        # Select distributed backend
+        # Select distributed backend before configuring process-wide state.
         backend_name = self.config.backend.value
         backend_cls = get_backend(backend_name)
         if backend_cls is None:
@@ -202,7 +201,15 @@ class TorchTurboEngine:
                 f"Available: {get_available_backends()}"
             )
 
-        self.backend: BaseBackend = backend_cls(self.config)
+        # Resolve the process-wide device runtime before backend construction.
+        self.device_runtime = get_device_runtime()
+        self.backend: BaseBackend = backend_cls(self.config, self.device_runtime)
+        self._profiler: ProfilerHandle | None = None
+        self.ops = get_or_create_ops(
+            device_runtime=self.device_runtime,
+            default_policy=self.config.ops.policy,
+        )
+        self.ops.log_ops_selection()
 
         # These are set by setup()
         self.model: nn.Module | None = None
@@ -213,7 +220,11 @@ class TorchTurboEngine:
         # Hooks (can be added before or after setup)
         self.hooks: list[TrainHook] = []
 
-        logger.info("TorchTurboEngine initialized: backend=%s", backend_name)
+        logger.info(
+            "TorchTurboEngine initialized: backend=%s, device=%s",
+            backend_name,
+            self.device_runtime.device.type,
+        )
 
     # ------------------------------------------------------------------
     # Model preparation (meta device → shard → load weights)
@@ -592,21 +603,43 @@ class TorchTurboEngine:
 
     def start_profiling(self, output_dir: str) -> None:
         """Start TorchTurbo profiling under ``output_dir``."""
-        from .profiling import start_profiling
+        profiling_dir = os.path.join(output_dir, "profiling")
+        os.makedirs(profiling_dir, exist_ok=True)
 
-        start_profiling(output_dir)
+        old_profiler = self._profiler
+        if old_profiler is not None:
+            old_profiler.stop()
+            self._profiler = None
+
+        rank = int(os.environ.get("RANK", 0))
+        try:
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+        except Exception:
+            pass
+
+        profiler = self.device_runtime.profiler(
+            output_dir=profiling_dir,
+            worker_name=f"rank{rank}_{socket.gethostname()}",
+        )
+        profiler.start()
+        self._profiler = profiler
+        logger.info("Profiling started, output dir: %s", profiling_dir)
 
     def step_profiling(self) -> None:
         """Advance TorchTurbo profiling by one optimizer step."""
-        from .profiling import step_profiling
-
-        step_profiling()
+        if self._profiler is None:
+            raise RuntimeError("No active profiler. Call engine.start_profiling() first.")
+        self._profiler.step()
 
     def stop_profiling(self) -> None:
         """Stop TorchTurbo profiling and flush traces."""
-        from .profiling import stop_profiling
-
-        stop_profiling()
+        if self._profiler is None:
+            raise RuntimeError("No active profiler. Call engine.start_profiling() first.")
+        profiler = self._profiler
+        profiler.stop()
+        logger.info("Profiling stopped, traces flushed.")
+        self._profiler = None
 
     # ------------------------------------------------------------------
     # Data loading (SP-aware)

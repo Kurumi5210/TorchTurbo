@@ -5,11 +5,9 @@ except ImportError:
 
 import torch
 
-from torchturbo.ops import npu_fused_ops
-from torchturbo.utils.device import is_npu_available, get_device_name
+from torchturbo.runtime import is_npu_available, get_device_name
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .configuration_kimi_k25 import KimiK25Config
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..base import TurboVLMModel
@@ -67,16 +65,17 @@ class TurboKimiK25ForConditionalGeneration(
     @staticmethod
     def _pre_init_patches():
         from . import modeling_deepseek as ds
+        from torchturbo.ops import ops
 
-        if is_npu_available:
-            ds.apply_rotary_pos_emb = npu_fused_ops.apply_rotary_pos_emb_kimi_moe
-            ds.DeepseekV3RMSNorm.forward = npu_fused_ops.fused_rms_norm_forward_npu
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+        def rms_norm_forward(self, hidden_states):
+            return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
+
+        ds.DeepseekV3RMSNorm.forward = rms_norm_forward
+
+        if is_npu_available():
+            from .npu import apply_rotary_pos_emb_kimi_moe
+
+            ds.apply_rotary_pos_emb = apply_rotary_pos_emb_kimi_moe
 
         # patch moe_layer forward
         origin_moe_forward = MoELayer.forward

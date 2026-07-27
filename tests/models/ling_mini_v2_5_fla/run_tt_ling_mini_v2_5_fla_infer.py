@@ -132,7 +132,6 @@ if __name__ == "__main__":
         sp_size=4,
         sp_mode="ulysses",
         average_in_collective=True,
-        use_fused_swiglu=False,
         use_fused_rope=False,
         use_fused_rms_norm=False,
         use_fused_permute_unpermute=False,

@@ -49,6 +49,9 @@ torchturbo 的核心约定是 **model-first**：
 - Adapter 连接框架：Adapter hook 到现有训练框架，不改变模型行为。
 - Engine 编排流程：Engine 协调各组件完成训练生命周期。
 
+Device Runtime 抽象、算子注册与分发的设计和扩展方式见
+[`docs/design/runtime_and_ops.md`](docs/design/runtime_and_ops.md)。
+
 ### Model
 
 每个模型目录负责三件事：
@@ -224,6 +227,7 @@ docs/runs/
 | `TORCH_TURBO_DISABLE=1` | 禁用 torchturbo 自动激活 |
 | `TORCH_TURBO_BACKEND=fsdp2` | 选择分布式 backend |
 | `TORCH_TURBO_MIXED_PRECISION=bf16` | 混合精度策略 |
+| `TORCH_TURBO_OP_POLICY=auto` | 算子分发策略：`auto` / `native` / `custom` |
 | `TORCH_TURBO_GRADIENT_CHECKPOINTING=true` | activation checkpointing |
 | `TORCH_TURBO_SP_SIZE=2` | Sequence Parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Expert Parallel size |
@@ -271,6 +275,7 @@ class TurboMyModelForCausalLM(MyModelForCausalLM):
 ```text
 torchturbo/
 ├── docs/
+│   ├── design/                # 架构设计和扩展指南
 │   └── runs/                  # 模型运行文档和图片
 ├── scripts/
 │   ├── runs/                  # 当前训练入口脚本
@@ -293,9 +298,10 @@ torchturbo/
     │       ├── attention/     # Ulysses SP helpers
     │       ├── comm/          # 通信原语
     │       └── moe/           # MoE 组件
-    ├── ops/                   # NPU fused ops
+    ├── ops/                   # 算子注册、provider 与分发
     ├── parallel/              # ParallelPlan 定义
     ├── registry/              # Adapter / Patch 注册机制
+    ├── runtime/               # Device Runtime 抽象与设备选择
     └── utils/
 ```
 

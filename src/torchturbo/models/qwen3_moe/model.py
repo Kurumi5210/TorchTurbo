@@ -5,9 +5,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeConfig,
 )
 
-from torchturbo.ops import npu_fused_ops
-from torchturbo.utils.device import is_npu_available, get_device_name
-from torchturbo.models.modules.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from torchturbo.runtime import is_npu_available, get_device_name
 from torchturbo.models.modules.attention.ulysses.utils import create_causal_mask
 from ..base import TurboModel
 from ..registry import register_model
@@ -50,19 +48,11 @@ class TurboQwen3MoeForCausalLM(TurboModel, Qwen3MoeForCausalLM):
     def _pre_init_patches():
         import transformers.models.qwen3_moe.modeling_qwen3_moe as qwen3_moe_model
 
-        if is_npu_available:
-            qwen3_moe_model.apply_rotary_pos_emb = (
-                npu_fused_ops.apply_rotary_pos_emb_npu
-            )
-            qwen3_moe_model.Qwen3MoeRMSNorm.forward = (
-                npu_fused_ops.fused_rms_norm_forward_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_permutation = (
-                npu_fused_ops.fused_token_permutation_npu
-            )
-            MoEAlltoAllTokenDispatcher.token_unpermutation = (
-                npu_fused_ops.fused_token_unpermutation_npu
-            )
+        if is_npu_available():
+            from .npu import apply_rotary_pos_emb_npu, rms_norm_forward_npu
+
+            qwen3_moe_model.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+            qwen3_moe_model.Qwen3MoeRMSNorm.forward = rms_norm_forward_npu
 
         qwen3_moe_model.create_causal_mask = create_causal_mask
 

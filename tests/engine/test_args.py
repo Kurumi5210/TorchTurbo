@@ -33,6 +33,15 @@ def test_parse_torchturbo_args_prefetch_defaults():
     assert remaining == []
     assert args.prefetch_strategy == "auto"
     assert args.prefetch_direction == "forward_backward"
+    assert args.op_policy is None
+
+
+def test_parse_torchturbo_args_op_policy():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, _ = parse_torchturbo_args(["--tt_op_policy", "custom"])
+
+    assert args.op_policy == "custom"
 
 
 def test_parse_torchturbo_args_gradient_checkpointing():

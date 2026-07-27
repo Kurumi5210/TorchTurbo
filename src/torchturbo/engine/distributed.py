@@ -5,11 +5,10 @@ from __future__ import annotations
 from datetime import timedelta
 import os
 
-import torch
 import torch.distributed as dist
 
 from ..logging import get_logger
-from ..utils.device import get_device_name, get_nccl_backend, get_torch_device
+from ..runtime import get_device_runtime
 
 logger = get_logger(__name__)
 
@@ -43,11 +42,12 @@ def init_process_group_if_needed(enable_cpu_backend: bool = False) -> bool:
         )
         return False
 
-    device_type = get_device_name()
+    runtime = get_device_runtime()
+    device_type = runtime.device.type
     if device_type != "cpu":
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         try:
-            get_torch_device().set_device(local_rank)
+            runtime.set_device(local_rank)
         except Exception:  # pragma: no cover - defensive, device-specific
             logger.warning(
                 "Failed to set %s device to local rank %d before process-group init",
@@ -56,15 +56,7 @@ def init_process_group_if_needed(enable_cpu_backend: bool = False) -> bool:
                 exc_info=True,
             )
 
-    backend_map = getattr(torch.distributed.Backend, "default_device_backend_map", {})
-    backend = backend_map.get(device_type)
-    if backend is None:
-        if device_type == "npu":
-            backend = get_nccl_backend()
-        elif device_type == "cpu":
-            backend = "gloo"
-        else:
-            backend = "nccl"
+    backend = runtime.dist_backend
 
     if enable_cpu_backend and device_type != "cpu":
         backend = f"{device_type}:{backend},cpu:gloo"

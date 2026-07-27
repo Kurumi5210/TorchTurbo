@@ -16,12 +16,14 @@ Usage::
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from argparse import ArgumentTypeError
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
 
+from ..ops.base import OpPolicy
 from .args import string_to_bool
 
 
@@ -32,6 +34,7 @@ from .args import string_to_bool
 ENV_MAP: dict[str, str] = {
     "TORCH_TURBO_BACKEND": "backend",
     "TORCH_TURBO_MIXED_PRECISION": "mixed_precision",
+    "TORCH_TURBO_OP_POLICY": "ops.policy",
     "TORCH_TURBO_GRADIENT_CHECKPOINTING": "activation_checkpointing.enabled",
     "TORCH_TURBO_AC_USE_REENTRANT": "activation_checkpointing.use_reentrant",
     "TORCH_TURBO_RESHARD_AFTER_FWD": "backend_config.reshard_after_forward",
@@ -108,6 +111,17 @@ class MixedPrecisionConfig:
     policy: str = "bf16"
     param_dtype: str | None = None
     reduce_dtype: str | None = None
+
+
+@dataclass
+class OpsConfig:
+    """Op dispatch configuration."""
+
+    policy: OpPolicy = OpPolicy.AUTO
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.policy, OpPolicy):
+            raise TypeError("OpsConfig.policy must be an OpPolicy.")
 
 
 @dataclass
@@ -284,6 +298,9 @@ class EngineConfig:
     mixed_precision: MixedPrecisionPolicy = MixedPrecisionPolicy.BF16
     """Global mixed precision policy."""
 
+    ops: OpsConfig = field(default_factory=OpsConfig)
+    """Op dispatch settings."""
+
     backend_config: Any = None
     """Backend-specific config (e.g. ``FSDPConfig``, ``MegatronConfig``).
     If ``None``, the backend uses its own defaults."""
@@ -315,6 +332,8 @@ class EngineConfig:
         """Auto-create default backend_config, then apply env var overrides."""
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
+        if self.ops is None:
+            self.ops = OpsConfig()
         self.apply_env_overrides()
 
     def _set_top_level(self, field_name: str, value: str) -> None:
@@ -373,6 +392,9 @@ class EngineConfig:
         backend = DistributedBackend(d.get("backend", "fsdp2"))
         mp = MixedPrecisionPolicy(d.get("mixed_precision", "bf16"))
 
+        if "op_policy" in d:
+            raise ValueError("op_policy is no longer supported; use ops.policy.")
+
         # Parallel Plan (parse sp, ep, tp sizes)
         parallel_d = d.get("parallel", {})
 
@@ -426,6 +448,20 @@ class EngineConfig:
                 comm_d["overlap_comm_compute"] = d["comm_overlap"]
         comm = CommConfig(**comm_d)
 
+        # Ops
+        ops_d = d.get("ops", {})
+        if isinstance(ops_d, OpsConfig):
+            ops = ops_d
+        else:
+            if ops_d is None:
+                ops_d = {}
+            if not isinstance(ops_d, dict):
+                raise TypeError("ops must be a dict or OpsConfig.")
+            ops_d = dict(ops_d)
+            if "policy" in ops_d:
+                ops_d["policy"] = OpPolicy(ops_d["policy"])
+            ops = OpsConfig(**ops_d) if ops_d else OpsConfig()
+
         # Checkpoint
         ckpt_d = d.get("checkpoint", {})
         if not ckpt_d:
@@ -449,6 +485,7 @@ class EngineConfig:
             "backend_config",
             "activation_checkpointing",
             "comm",
+            "ops",
             "checkpoint",
             "dp_size",
             "tp_size",
@@ -479,6 +516,7 @@ class EngineConfig:
             backend=backend,
             parallel_plan=parallel_plan,
             mixed_precision=mp,
+            ops=ops,
             backend_config=backend_config,
             activation_checkpointing=ac,
             comm=comm,
@@ -528,6 +566,11 @@ class EngineConfig:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize back to a dict (for logging, etc.)."""
-        from dataclasses import asdict
 
-        return asdict(self)
+        data = {}
+        for field_info in dataclasses.fields(self):
+            value = getattr(self, field_info.name)
+            if dataclasses.is_dataclass(value):
+                value = dataclasses.asdict(value)
+            data[field_info.name] = value
+        return data

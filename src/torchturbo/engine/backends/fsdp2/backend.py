@@ -384,10 +384,9 @@ class FSDP2Backend(BaseBackend):
                 rank=self.rank,
                 mesh=self._mesh,
                 world_mesh=self._world_mesh,
-                device=self.device,
+                device_runtime=self.device_runtime,
                 is_cpu_offload=self.fsdp_config.cpu_offload,
                 weight_converter=weight_converter,
-                device_runtime=self.device_runtime,
             )
             loader.load_weights()
         else:

@@ -48,14 +48,12 @@ class DistParamLoader:
         rank,
         mesh,
         world_mesh,
-        device,
+        device_runtime,
         is_cpu_offload,
         weight_converter,
-        device_runtime,
     ):
         self.model = model
         self.hf_config = model.config
-        self.device = device
         self.is_cpu_offload = is_cpu_offload
         self.device_runtime = device_runtime
         self.device = device_runtime.device

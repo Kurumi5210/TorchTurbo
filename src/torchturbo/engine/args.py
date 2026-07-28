@@ -113,6 +113,13 @@ class TorchTurboArgs:
     freeze_language_model: bool = False
     profiling: bool = False
 
+    # Adapter-seeded fields (NOT CLI ``--tt_*`` flags). Adapters fold values
+    # sourced from their own args (model path, output_dir, bf16/fp16 -> mixed
+    # precision, ...) onto these before calling ``build_from_args``, so the
+    # builder can reconstruct an EngineConfig from a single TorchTurboArgs.
+    model_path: str | None = None
+    output_dir: str | None = None
+
     # Block-diffusion (BD) fields — threaded into EngineConfig.diffusion by
     # build_config_from_lf_args(); only active for is_diffusion_model models.
     cap_lambda: float = 0.0  # CAP/DPARALLEL confidence loss weight (entropy on correct tokens). 0 = disabled.
@@ -244,8 +251,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tt_enable_mtp",
-        action="store_true",
-        help="Build Multi-Token-Prediction (MTP) layers. Off by default.",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Build Multi-Token-Prediction (MTP) layers. "
+        "Accepts --tt_enable_mtp, --tt_enable_mtp true, or --tt_enable_mtp false. "
+        "Off by default.",
     )
     parser.add_argument(
         "--tt_mtp_loss_scaling_factor",
@@ -256,18 +269,33 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tt_freeze_vision_tower",
-        action="store_true",
-        help="Freeze vision encoder parameters (requires_grad=False).",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Freeze vision encoder parameters (requires_grad=False). "
+        "Accepts --tt_freeze_vision_tower, ... true, or ... false.",
     )
     parser.add_argument(
         "--tt_freeze_multi_modal_projector",
-        action="store_true",
-        help="Freeze multi-modal projector parameters (requires_grad=False).",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Freeze multi-modal projector parameters (requires_grad=False). "
+        "Accepts --tt_freeze_multi_modal_projector, ... true, or ... false.",
     )
     parser.add_argument(
         "--tt_freeze_language_model",
-        action="store_true",
-        help="Freeze language model parameters (requires_grad=False).",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Freeze language model parameters (requires_grad=False). "
+        "Accepts --tt_freeze_language_model, ... true, or ... false.",
     )
     parser.add_argument(
         "--tt_cap_lambda",
@@ -295,8 +323,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tt_profiling",
-        action="store_true",
-        help="Enable NPU/CUDA profiling. Outputs to {output_dir}/profiling/.",
+        type=string_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="BOOL",
+        help="Enable NPU/CUDA profiling. Outputs to {output_dir}/profiling/. "
+        "Accepts --tt_profiling, ... true, or ... false.",
     )
 
     return parser

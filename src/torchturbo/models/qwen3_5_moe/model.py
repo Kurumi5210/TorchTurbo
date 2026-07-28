@@ -106,24 +106,39 @@ class TurboQwen3_5MoeForConditionalGeneration(
             return mm_token_type_ids
 
         @functools.wraps(original_get_rope_index)
-        def _wrapped_get_rope_index(*args, **kwargs):
-            if "mm_token_type_ids" not in kwargs or kwargs["mm_token_type_ids"] is None:
-                input_ids = kwargs.get("input_ids")
-                if input_ids is not None:
-                    kwargs["mm_token_type_ids"] = _build_mm_token_type_ids(input_ids)
+        def _wrapped_get_rope_index(
+            input_ids,
+            mm_token_type_ids=None,
+            image_grid_thw=None,
+            video_grid_thw=None,
+            attention_mask=None,
+            **kwargs,
+        ):
+            # ``mm_token_type_ids`` is a *positional* parameter of the upstream
+            # ``get_rope_index`` (right after ``input_ids``), so a caller may
+            # pass it (and ``input_ids``) positionally OR by keyword — and the
+            # open-source LF collator never passes ``mm_token_type_ids`` at all.
+            # Bind these to real parameters here instead of ``*args`` /
+            # ``**kwargs``: reading them from ``kwargs`` breaks when they're
+            # passed positionally (which the signature invites — caller 2 in
+            # modeling_qwen3_5_moe.py passes ``input_ids`` positionally, so the
+            # old ``kwargs["input_ids"]`` would KeyError).
+            if mm_token_type_ids is None:
+                mm_token_type_ids = _build_mm_token_type_ids(input_ids)
 
-            attention_mask = kwargs.get("attention_mask")
             # Packing-aware path only when the mask actually carries packing
             # labels (neat packing): values > 1 distinguish packed sub-sequences.
             # A plain 0/1 mask (or no mask) falls through to the upstream impl,
             # so non-packed training and inference are byte-identical to before.
             if attention_mask is None or attention_mask.numel() == 0:
-                return original_get_rope_index(*args, **kwargs)
-
-            input_ids = kwargs["input_ids"]
-            mm_token_type_ids = kwargs["mm_token_type_ids"]
-            image_grid_thw = kwargs.get("image_grid_thw")
-            video_grid_thw = kwargs.get("video_grid_thw")
+                return original_get_rope_index(
+                    input_ids,
+                    mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
 
             position_ids = torch.zeros(
                 3,

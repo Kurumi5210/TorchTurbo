@@ -49,8 +49,19 @@ def auto_detect_dataset_dir() -> str | None:
 
 
 def main():
-    import torchturbo  # noqa: F401
+    import torchturbo
     from torchturbo.engine.args import parse_torchturbo_args, set_torchturbo_args
+
+    # Explicitly activate the LlamaFactory adapter. ``import torchturbo`` only
+    # auto-activates when a single framework is detectable; in a dev image with
+    # both ms-swift and LlamaFactory installed that is ambiguous (availability
+    # can't tell which one this process will run — torchturbo is imported
+    # before the framework loads), so activate LF here unambiguously.
+    #
+    # Must run BEFORE ``from llamafactory.train.tuner import run_exp`` below so
+    # the adapter's RunExpPatch has monkey-patched ``tuner.run_exp`` by the
+    # time ``run_exp`` is bound into this module's namespace.
+    torchturbo.activate("llamafactory_v0")
 
     # Parse --tt_* flags and strip them from argv
     argv = sys.argv[1:]

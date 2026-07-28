@@ -25,9 +25,9 @@ fi
 #model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
 model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
 
-seq_length=$((1024 * 8))
-sp_size=1
-ep_size=8
+seq_length=$((1024 * 32))
+sp_size=2
+ep_size=4
 dataset=med_debug
 packing_mode=packing_sep
 finetuning_type=full

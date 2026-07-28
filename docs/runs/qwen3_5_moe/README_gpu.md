@@ -201,6 +201,7 @@ load_path = lazy_load_moe_checkpoint(resuming_path="aistudio://18265422/rootmode
 print(load_path) # 挂载路径点，可直接读取ckpt
 ```
 
+### llamafactory运行命令
 
 安装依赖
 ```bash
@@ -212,4 +213,18 @@ bash scripts/runs/gpu_deps/qwen3_5_moe_deps.sh
 ```bash
 cd /input/asystem/xiyun.wc/torchturbo
 bash scripts/runs/gpu_lf_qwen3_5_moe_text_sft.sh
+```
+
+### swift运行命令
+
+安装依赖
+```bash
+cd /input/asystem/xiyun.wc/torchturbo
+bash scripts/runs/gpu_deps/qwen3_5_moe_swift_deps.sh
+```
+
+运行训练
+```bash
+cd /input/asystem/xiyun.wc/torchturbo
+bash scripts/runs/gpu_swift_qwen3_5_moe_mllm_sft_debug.sh
 ```

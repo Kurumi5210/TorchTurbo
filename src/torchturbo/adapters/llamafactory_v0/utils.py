@@ -13,26 +13,11 @@ import torch.nn.functional as F
 from ...engine import EngineConfig
 from ...engine.args import TorchTurboArgs, string_to_bool
 from ...engine.config import (
-    ActivationCheckpointingConfig,
-    CheckpointConfig,
-    CommConfig,
-    DiffusionConfig,
-    DistributedBackend,
     ENV_MAP,
-    FreezePolicy,
     MixedPrecisionPolicy,
-    MTPConfig,
-    ParameterGroup,
-    OpsConfig,
-)
-from ...engine.backends.fsdp2.config import (
-    FSDPConfig,
-    ShardingStrategy,
 )
 from ...engine.hooks import TrainState
 from ...logging import get_logger
-from ...ops.base import OpPolicy
-from torchturbo.parallel import FSDPParallelPlan
 
 
 logger = get_logger(__name__)
@@ -92,31 +77,43 @@ def _build_config_from_args(
     torchturbo_args: TorchTurboArgs | None = None,
     raw_args: Any = None,
 ) -> tuple[EngineConfig, Any]:
-    """Map LlamaFactory args and torchturbo CLI args to EngineConfig."""
+    """Map LlamaFactory args and torchturbo CLI args to EngineConfig.
+
+    Adapter-specific bits (LF mixed-precision seed, FSDP CPU-offload
+    reconciliation with LF ``fsdp`` options, gradient-checkpointing takeover
+    with LF-arg side effects, checkpoint paths) are resolved here and folded
+    onto the :class:`TorchTurboArgs` so the shared
+    :func:`build_from_args` can reconstruct the EngineConfig from that
+    single argument. All ``--tt_*``-driven slices live there.
+    """
+    from ...engine.config import build_from_args
 
     tt = torchturbo_args  # shorthand
 
-    # --- Backend ---
-    backend = DistributedBackend.FSDP2
-    if tt is not None and tt.backend is not None:
-        backend = DistributedBackend(tt.backend)
+    # --- Mixed precision seed (bf16/fp16/fp8 from LF training args) ---
+    # Only seed tt when the user did not pass --tt_mixed_precision; explicit tt
+    # value wins, env overrides still apply in EngineConfig.__post_init__.
+    if tt.mixed_precision is None:
+        mixed_precision_hint = MixedPrecisionPolicy.FP32
+        if training_args is not None:
+            if getattr(training_args, "bf16", False):
+                mixed_precision_hint = MixedPrecisionPolicy.BF16
+            elif getattr(training_args, "fp16", False):
+                mixed_precision_hint = MixedPrecisionPolicy.FP16
+            if getattr(training_args, "fp8", False):
+                mixed_precision_hint = MixedPrecisionPolicy.FP8
+        tt.mixed_precision = mixed_precision_hint.value
 
-    # --- Mixed precision ---
-    mixed_precision = MixedPrecisionPolicy.FP32
-    if training_args is not None:
-        if getattr(training_args, "bf16", False):
-            mixed_precision = MixedPrecisionPolicy.BF16
-        elif getattr(training_args, "fp16", False):
-            mixed_precision = MixedPrecisionPolicy.FP16
-        if getattr(training_args, "fp8", False):
-            mixed_precision = MixedPrecisionPolicy.FP8
-    if tt is not None and tt.mixed_precision is not None:
-        mixed_precision = MixedPrecisionPolicy(tt.mixed_precision)
+    # --- FSDP CPU offload: reconcile LF fsdp options with --tt_cpu_offload ---
+    # Single source of truth, shared with the early process-group init in the
+    # adapter patch so the two never diverge. resolve_cpu_offload raises on an
+    # explicit --tt_cpu_offload=false that contradicts an LF-requested offload.
+    fsdp_options = (
+        getattr(training_args, "fsdp", []) if training_args is not None else []
+    )
+    tt.cpu_offload = resolve_cpu_offload(fsdp_options, tt, strict=True)
 
-    # --- FSDP config (from HF's fsdp/fsdp_config + TorchTurbo args) ---
-    fsdp_config = _build_fsdp_config(training_args, tt)
-
-    # --- Activation checkpointing ---
+    # --- Activation checkpointing takeover (LF-owned, with side effects) ---
     # HF/LF gradient checkpointing wraps model forwards after model loading.
     # TorchTurbo owns FSDP2 wrapping, so disable LF's implementation here. When
     # LF requested gradient checkpointing, the engine enables plan-defined AC
@@ -128,134 +125,18 @@ def _build_config_from_args(
         raw_args,
         tt,
     )
+    tt.gradient_checkpointing = ac_enabled
 
-    ac_config = ActivationCheckpointingConfig(
-        enabled=ac_enabled,
-        use_reentrant=bool(getattr(tt, "ac_use_reentrant", False)) if tt else False,
+    # --- Checkpoint paths (LF-native model/output_dir onto tt) ---
+    tt.model_path = (
+        getattr(model_args, "model_name_or_path", None) if model_args else None
+    )
+    tt.output_dir = (
+        getattr(training_args, "output_dir", None) if training_args else None
     )
 
-    # --- Communication ---
-    comm_config = CommConfig(
-        overlap_comm_compute=False,  # default off, user can override
-    )
-
-    # --- Checkpoint paths ---
-    checkpoint_config = CheckpointConfig(
-        hf_model_path=(
-            getattr(model_args, "model_name_or_path", None) if model_args else None
-        ),
-    )
-    if training_args is not None:
-        output_dir = getattr(training_args, "output_dir", None)
-        if output_dir:
-            checkpoint_config.dcp_path = output_dir
-
-    # --- Parallel plan ---
-    sp_size = tt.sp_size if (tt is not None and tt.sp_size is not None) else 1
-    ep_size = tt.ep_size if (tt is not None and tt.ep_size is not None) else 1
-    parallel_plan = FSDPParallelPlan(sp_size=sp_size, ep_size=ep_size)
-
-    # --- Ops ---
-    ops_config = (
-        OpsConfig(policy=OpPolicy(str(tt.op_policy).lower()))
-        if tt is not None and tt.op_policy is not None
-        else OpsConfig()
-    )
-
-    # --- Freeze policy ---
-    freeze_policy = _build_freeze_policy(tt)
-
-    # --- MTP ---
-    mtp_config = _build_mtp_config(tt)
-
-    # --- Diffusion (BD/CAP; inert for non-diffusion models) ---
-    diffusion_config = _build_diffusion_config(tt)
-
-    # --- Extra ---
-    extra: dict[str, Any] = {}
-
-    return EngineConfig(
-        backend=backend,
-        parallel_plan=parallel_plan,
-        mixed_precision=mixed_precision,
-        backend_config=fsdp_config,
-        activation_checkpointing=ac_config,
-        comm=comm_config,
-        ops=ops_config,
-        checkpoint=checkpoint_config,
-        mtp=mtp_config,
-        freeze_policy=freeze_policy,
-        diffusion=diffusion_config,
-        extra=extra,
-    ), raw_args
-
-
-def _build_mtp_config(torchturbo_args: TorchTurboArgs | None) -> MTPConfig:
-    if torchturbo_args is None:
-        return MTPConfig()
-
-    loss_scaling_factor = (
-        torchturbo_args.mtp_loss_scaling_factor
-        if torchturbo_args.mtp_loss_scaling_factor is not None
-        else MTPConfig().loss_scaling_factor
-    )
-    return MTPConfig(
-        enabled=bool(torchturbo_args.enable_mtp),
-        loss_scaling_factor=float(loss_scaling_factor),
-    )
-
-
-def _build_diffusion_config(torchturbo_args: TorchTurboArgs | None) -> DiffusionConfig:
-    if torchturbo_args is None:
-        return DiffusionConfig()
-    return DiffusionConfig(
-        cap_lambda=float(torchturbo_args.cap_lambda or 0.0),
-        bd_mask_low=float(torchturbo_args.bd_mask_low),
-        bd_mask_high=float(torchturbo_args.bd_mask_high),
-    )
-
-
-def _build_freeze_policy(torchturbo_args: TorchTurboArgs | None) -> FreezePolicy:
-    if torchturbo_args is None:
-        return FreezePolicy()
-
-    groups: list[ParameterGroup] = []
-    if torchturbo_args.freeze_vision_tower:
-        groups.append(ParameterGroup.VISION_TOWER)
-    if torchturbo_args.freeze_multi_modal_projector:
-        groups.append(ParameterGroup.MULTI_MODAL_PROJECTOR)
-    if torchturbo_args.freeze_language_model:
-        groups.append(ParameterGroup.LANGUAGE_MODEL)
-    return FreezePolicy(parameter_groups=tuple(groups))
-
-
-def _build_fsdp_config(
-    training_args: Any,
-    torchturbo_args: TorchTurboArgs | None = None,
-) -> FSDPConfig:
-    """Build FSDPConfig from LF FSDP args plus TorchTurbo-owned FSDP args."""
-    fsdp_options = (
-        getattr(training_args, "fsdp", []) if training_args is not None else []
-    )
-
-    # Single source of truth for CPU-offload determination — shared with the
-    # early process-group init in the adapter patch so the two never diverge.
-    cpu_offload = resolve_cpu_offload(fsdp_options, torchturbo_args, strict=True)
-
-    # Prefetch is TorchTurbo-owned config; LF fsdp_config is not read for it.
-    # tt prefetch fields default to "auto" / "forward_backward", never None.
-    tt_args = torchturbo_args or TorchTurboArgs()
-
-    return FSDPConfig(
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        reshard_after_forward=True,
-        cpu_offload=cpu_offload,
-        pin_memory=True,
-        prefetch_strategy=tt_args.prefetch_strategy,
-        prefetch_direction=tt_args.prefetch_direction,
-        forward_prefetch_depth=tt_args.forward_prefetch_depth,
-        backward_prefetch_depth=tt_args.backward_prefetch_depth,
-    )
+    config = build_from_args(tt)
+    return config, raw_args
 
 
 def _take_over_lf_gradient_checkpointing(
@@ -387,11 +268,12 @@ def resolve_cpu_offload(
 ) -> bool:
     """Resolve CPU offload from LF ``fsdp`` options plus ``--tt_cpu_offload``.
 
-    Single source of truth shared by ``_build_fsdp_config`` (which sets
-    ``EngineConfig.backend_config.cpu_offload``) and by early process-group
-    initialization, so the gloo-backend decision and the engine config can never
-    diverge. ``fsdp_options`` may be the parsed list (``training_args.fsdp``) or
-    the raw string from :func:`fsdp_options_from_raw_args`.
+    Single source of truth shared by ``_build_config_from_args`` (which feeds
+    ``cpu_offload`` into the shared ``build_from_args``) and by early
+    process-group initialization, so the gloo-backend decision and the engine
+    config can never diverge. ``fsdp_options`` may be the parsed list
+    (``training_args.fsdp``) or the raw string from
+    :func:`fsdp_options_from_raw_args`.
 
     With ``strict=True`` (config path) an explicit ``--tt_cpu_offload=false`` that
     would disable an adapter-requested offload raises. Early PG init uses

@@ -1,11 +1,19 @@
-"""torchturbo — one-line import for optimized distributed training.
+"""torchturbo — optimized distributed training engine.
 
-Usage::
+Importing torchturbo discovers the built-in adapters and backends (importing the
+package side-effects nothing beyond registration). Adapter **activation is
+explicit**: callers opt into a framework by naming it::
 
-    import torchturbo  # auto-detects and activates the right adapter
+    import torchturbo
+    torchturbo.activate("llamafactory_v0")   # or "msswift"
 
-That's it.  If LlamaFactory v0 is active, torchturbo will automatically
-patch ``run_sft`` to use the engine with optimal FSDP settings.
+This avoids the wrong adapter activating in a dev image that has both
+LlamaFactory and ms-swift installed — availability-based detection can't tell
+which one a process is about to run, because torchturbo is imported *before*
+the framework is loaded. Each launcher opts in unambiguously:
+``scripts/runs/run_lf.py`` calls ``activate("llamafactory_v0")``; the swift path
+imports ``torchturbo.adapters.msswift.plugin``, which activates the msswift
+adapter.
 
 Extra engine config via env vars::
 
@@ -55,6 +63,7 @@ __all__ = [
     "OpsConfig",
     "ParameterGroup",
     "TorchTurboEngine",
+    "activate",
     "detect",
     "detect_all",
     "get_available_backends",
@@ -71,13 +80,27 @@ logger = get_logger(__name__)
 
 
 def _discover_builtin_adapters() -> None:
-    """Import built-in adapter packages so they auto-register."""
+    """Import built-in adapter packages so they auto-register.
+
+    Only the immediate children of :mod:`torchturbo.adapters` are imported —
+    each adapter registers itself via ``@register_adapter`` in its package
+    ``__init__``. Framework-coupled submodules (e.g. the swift-base subclasses
+    in ``msswift.pipeline`` / ``loader`` / ``args``, which must live at module
+    top level for dill pickling) are imported lazily by the adapter's
+    ``activate()``. This keeps the swift and llamafactory adapters isolated:
+    ``import torchturbo`` (and this discovery sweep) never drags in a framework
+    that isn't being used, so running one framework emits no import warnings
+    about — and requires — neither the other framework nor its adapter modules.
+
+    Depth-1 ``iter_modules`` is used instead of recursive ``walk_packages`` so
+    those framework-coupled submodules are not eagerly imported here.
+    """
     import importlib
     import pkgutil
 
     from . import adapters as adapters_pkg
 
-    for _importer, module_name, _is_pkg in pkgutil.walk_packages(
+    for _importer, module_name, _is_pkg in pkgutil.iter_modules(
         adapters_pkg.__path__,
         prefix=adapters_pkg.__name__ + ".",
     ):
@@ -97,34 +120,56 @@ def detect_all() -> list[str]:
     return FrameworkDetector.detect_all()
 
 
-def _auto_activate() -> None:
-    """Auto-detect and activate the first matching adapter.
+def activate(name: str | None = None) -> BaseAdapter | None:
+    """Activate one adapter.
 
-    Called once at import time.  This is what makes the one-line import work.
-    Set ``TORCH_TURBO_DISABLE=1`` to skip auto-activation.
+    Adapter activation is **explicit** — ``import torchturbo`` no longer
+    activates anything. Callers opt in by naming the framework (see module
+    docstring). Idempotent: re-activating an already-active adapter is a no-op.
+
+    * ``name`` given (the supported path): activate that adapter. Raises
+      ``ValueError`` if no adapter is registered under *name*. This is what
+      launchers use — ``run_lf.py`` calls ``activate("llamafactory_v0")``; the
+      swift path imports ``msswift.plugin`` which calls
+      ``activate("msswift")``.
+    * ``name`` ``None`` (convenience, not the recommended path): activate only
+      when detection is unambiguous — exactly one adapter reports its framework
+      present. In a multi-framework install this refuses to guess and returns
+      ``None``; name the adapter explicitly instead.
     """
-    import os
+    if name is not None:
+        adapter = get_adapter(name)
+        if adapter is None:
+            raise ValueError(f"No adapter registered for {name!r}")
+        logger.info("Activating adapter for %r", name)
+        adapter.activate()
+        return adapter
 
-    if os.environ.get("TORCH_TURBO_DISABLE", "").lower() in ("1", "true", "yes"):
-        logger.info("torchturbo disabled via TORCH_TURBO_DISABLE env var.")
-        return
+    detected = FrameworkDetector.detect_all()
+    if len(detected) == 1:
+        framework = detected[0]
+        adapter = get_adapter(framework)
+        if adapter is None:
+            return None
+        logger.info("Auto-activating adapter for %r", framework)
+        adapter.activate()
+        return adapter
 
-    framework = detect()
-    if framework is None:
-        logger.debug("No framework detected.")
-        return
+    if len(detected) > 1:
+        # Both frameworks installed: availability can't tell which one this
+        # process will run, and torchturbo is imported before the framework is
+        # loaded, so there is no reliable automatic signal. Stay inactive and
+        # let the launcher activate its own adapter explicitly.
+        logger.info(
+            "Multiple frameworks detected (%s); skipping auto-activation — "
+            "activate the intended adapter explicitly (e.g. via the launcher).",
+            ", ".join(detected),
+        )
+    return None
 
-    adapter = get_adapter(framework)
-    if adapter is None:
-        return
 
-    logger.info("Auto-activating adapter for %r", framework)
-    adapter.activate()
-
-
-# Run on import
+# Discovery at import time, activation is explicit (see ``activate``).
 _discover_builtin_adapters()
-_auto_activate()
 
 # Register built-in models
 from . import models as _models_pkg  # noqa: F401 - trggers _register_builtins()

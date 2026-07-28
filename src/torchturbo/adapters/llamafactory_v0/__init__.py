@@ -80,7 +80,8 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         return get_llamafactory_version()
 
     def detect(self) -> bool:
-        """Detect if LlamaFactory v0 is active."""
+        """Detect if LlamaFactory v0 is the framework being driven this process.
+        """
         lf_loaded = any(
             key.startswith("llamafactory") and not key.startswith("llamafactory.v1")
             for key in sys.modules

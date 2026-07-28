@@ -467,9 +467,7 @@ class DistParamLoader:
                 # Materialise a standalone local shard so the full broadcast
                 # buffer can be freed this iteration (the view into it is gone).
                 local = sharded.to_local()
-                if self.is_cpu_offload:
-                    local = local.to("cpu")
-                else:
+                if not self.is_cpu_offload:
                     local = local.clone()
                 del sharded, task.full_tensor
                 # run_check=False skips the all-gather verification — the shard
@@ -485,6 +483,8 @@ class DistParamLoader:
                     shape=task.param.shape,
                     stride=task.param.stride(),
                 )
+                if self.is_cpu_offload:
+                    sharded_sd[task.key] = sharded_sd[task.key].to("cpu")
             else:
                 # Only FSDP-managed (DTensor) params are CPU-offloaded. Ignored
                 # no_shard params are plain tensors, not managed by CPUOffloadPolicy,

@@ -41,6 +41,7 @@ from .config import (
     MTPConfig,
     OpsConfig,
     ParameterGroup,
+    build_from_args,
 )
 from .core import TorchTurboEngine
 from .distributed import init_process_group_if_needed
@@ -48,6 +49,8 @@ from .hooks import TrainHook, TrainState
 
 
 __all__ = [
+    # Shared EngineConfig builder (lf + msswift + ...)
+    "build_from_args",
     # CLI args
     "TorchTurboArgs",
     "get_torchturbo_args",

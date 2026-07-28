@@ -60,7 +60,7 @@ else:
     FusedRMSNormGated = None
     fla_causal_conv1d = None
 
-from torch_turbo.utils.flash_attn_utils import get_unpad_data_lf
+from torchturbo.utils.flash_attn_utils import get_unpad_data_lf
 from torchturbo.utils.functools import cache
 
 logger = logging.get_logger(__name__)

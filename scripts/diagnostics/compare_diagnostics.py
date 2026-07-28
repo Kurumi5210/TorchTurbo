@@ -2659,6 +2659,9 @@ def main():
     elif args.mode == "torchturbo":
         os.environ.pop("TORCH_TURBO_DISABLE", None)
         import torchturbo  # noqa: F401
+        # Explicit activation — import time no longer auto-activates. This
+        # script drives LlamaFactory, so opt into the LF adapter here.
+        torchturbo.activate("llamafactory_v0")
 
         print("\n" + "=" * 80)
         print("  TORCHTURBO (LlamaFactory + torchturbo)")

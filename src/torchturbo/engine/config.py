@@ -23,8 +23,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
 
+from ..logging import get_logger
 from ..ops.base import OpPolicy
-from .args import string_to_bool
+from .args import TorchTurboArgs, string_to_bool
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -574,3 +577,152 @@ class EngineConfig:
                 value = dataclasses.asdict(value)
             data[field_info.name] = value
         return data
+
+
+# ---------------------------------------------------------------------------
+# EngineConfig builder — single mapping from ``TorchTurboArgs`` → EngineConfig
+# ---------------------------------------------------------------------------
+
+
+def build_from_args(torchturbo_args: TorchTurboArgs | None) -> EngineConfig:
+    """Assemble an :class:`EngineConfig` purely from a :class:`TorchTurboArgs`.
+
+    Every slice of the engine config is reconstructed from the parsed
+    ``--tt_*`` flags (the single source of truth for turbo-owned settings).
+    Both adapters (llamafactory_v0, msswift) — and future ones — fold any
+    adapter-resolved bits (mixed-precision seed from the adapter's bf16/fp16,
+    checkpoint paths from the adapter's model/output_dir, CPU-offload
+    reconciliation, gradient-checkpointing takeover) onto the
+    :class:`TorchTurboArgs` they pass in, so this function needs only that one
+    argument. Adding a new ``--tt_*`` flag touches only ``engine/args.py`` +
+    this builder, and every adapter picks it up.
+
+    ``FSDPConfig`` / ``FSDPParallelPlan`` are imported lazily (mirroring
+    :meth:`EngineConfig.__post_init__`) to avoid an import cycle: they live in
+    ``torchturbo.engine.backends.fsdp2.config`` / ``torchturbo.parallel``,
+    which import nothing from this module.
+
+    Parameters
+    ----------
+    torchturbo_args:
+        Parsed ``--tt_*`` args (the single source of truth for turbo flags).
+        ``None`` is treated as all-defaults.
+    """
+    from torchturbo.engine.backends.fsdp2.config import FSDPConfig, ShardingStrategy
+    from torchturbo.parallel import FSDPParallelPlan
+
+    tt = torchturbo_args or TorchTurboArgs()
+
+    # --- Backend ---
+    backend = DistributedBackend.FSDP2
+    if tt.backend is not None:
+        backend = DistributedBackend(tt.backend)
+
+    # --- Mixed precision (adapter may have seeded tt.mixed_precision) ---
+    mixed_precision = MixedPrecisionPolicy.FP32
+    if tt.mixed_precision is not None:
+        mixed_precision = MixedPrecisionPolicy(tt.mixed_precision)
+
+    # --- Parallel plan (sp / ep) ---
+    parallel_plan = FSDPParallelPlan(
+        sp_size=tt.sp_size if tt.sp_size is not None else 1,
+        ep_size=tt.ep_size if tt.ep_size is not None else 1,
+    )
+
+    # --- Backend config (prefetch from tt; cpu_offload resolved by adapter) ---
+    fsdp_config = _build_fsdp_config(tt)
+
+    # --- Activation checkpointing (enabled + reentrant both from tt) ---
+    ac_config = ActivationCheckpointingConfig(
+        enabled=bool(tt.gradient_checkpointing),
+        use_reentrant=bool(tt.ac_use_reentrant),
+    )
+
+    config = EngineConfig(
+        backend=backend,
+        parallel_plan=parallel_plan,
+        mixed_precision=mixed_precision,
+        backend_config=fsdp_config,
+        activation_checkpointing=ac_config,
+        comm=CommConfig(overlap_comm_compute=False),
+        checkpoint=_build_checkpoint_config(tt),
+        ops=_build_ops_config(tt),
+        mtp=_build_mtp_config(tt),
+        freeze_policy=_build_freeze_policy(tt),
+        diffusion=_build_diffusion_config(tt),
+        extra={},
+    )
+    logger.info(
+        "Built EngineConfig from TorchTurboArgs: backend=%s, mp=%s, sp=%d, ep=%d",
+        config.backend.value,
+        config.mixed_precision.value,
+        parallel_plan.sp_size,
+        parallel_plan.ep_size,
+    )
+    return config
+
+
+def _build_fsdp_config(tt: TorchTurboArgs) -> "FSDPConfig":
+    """FSDPConfig from tt prefetch fields + tt.cpu_offload."""
+    from torchturbo.engine.backends.fsdp2.config import FSDPConfig, ShardingStrategy
+
+    return FSDPConfig(
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        reshard_after_forward=True,
+        cpu_offload=bool(tt.cpu_offload),
+        pin_memory=True,
+        prefetch_strategy=tt.prefetch_strategy,
+        prefetch_direction=tt.prefetch_direction,
+        forward_prefetch_depth=tt.forward_prefetch_depth,
+        backward_prefetch_depth=tt.backward_prefetch_depth,
+    )
+
+
+def _build_checkpoint_config(tt: TorchTurboArgs) -> CheckpointConfig:
+    """CheckpointConfig from the adapter-seeded model/output paths on tt."""
+    output_dir = tt.output_dir
+    return CheckpointConfig(
+        hf_model_path=tt.model_path,
+        dcp_path=output_dir if output_dir else None,
+    )
+
+
+def _build_ops_config(tt: TorchTurboArgs) -> OpsConfig:
+    """OpsConfig from the ``--tt_op_policy`` flag (default AUTO when unset)."""
+    if tt.op_policy is None:
+        return OpsConfig()
+    return OpsConfig(policy=OpPolicy(str(tt.op_policy).lower()))
+
+
+def _build_mtp_config(tt: TorchTurboArgs) -> MTPConfig:
+    loss_scaling_factor = (
+        tt.mtp_loss_scaling_factor
+        if tt.mtp_loss_scaling_factor is not None
+        else MTPConfig().loss_scaling_factor
+    )
+    return MTPConfig(
+        enabled=bool(tt.enable_mtp),
+        loss_scaling_factor=float(loss_scaling_factor),
+    )
+
+
+def _build_freeze_policy(tt: TorchTurboArgs) -> FreezePolicy:
+    groups: list[ParameterGroup] = []
+    if tt.freeze_vision_tower:
+        groups.append(ParameterGroup.VISION_TOWER)
+    if tt.freeze_multi_modal_projector:
+        groups.append(ParameterGroup.MULTI_MODAL_PROJECTOR)
+    if tt.freeze_language_model:
+        groups.append(ParameterGroup.LANGUAGE_MODEL)
+    return FreezePolicy(parameter_groups=tuple(groups))
+
+
+def _build_diffusion_config(tt: TorchTurboArgs) -> DiffusionConfig:
+    # BD/CAP config for block-diffusion (dLLM) training. Gated by the model's
+    # ``is_diffusion_model`` attribute — inert (cap_lambda=0) for non-diffusion
+    # models, so constructing it unconditionally here is safe for all adapters.
+    return DiffusionConfig(
+        cap_lambda=float(tt.cap_lambda or 0.0),
+        bd_mask_low=float(tt.bd_mask_low),
+        bd_mask_high=float(tt.bd_mask_high),
+    )

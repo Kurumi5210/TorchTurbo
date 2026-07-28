@@ -39,7 +39,7 @@ class LlamaFactoryHook(TrainHook):
         self.save_interval = save_interval
 
     def on_train_begin(self, state: TrainState) -> None:
-        logger.info(
+        logger.info_rank0(
             "LlamaFactory training started: %d epochs, max_steps=%s",
             state.num_epochs,
             state.max_steps,
@@ -87,7 +87,7 @@ class LlamaFactoryHook(TrainHook):
         if hasattr(flash_integration, "_flash_attention_forward"):
             flash_integration._flash_attention_forward = patched_forward
 
-        logger.info(
+        logger.info_rank0(
             "Patched transformers.modeling_flash_attention_utils._flash_attention_forward via LlamaFactoryHook for SP size=%d",
             sp_size,
         )

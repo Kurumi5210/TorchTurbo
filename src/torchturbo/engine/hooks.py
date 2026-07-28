@@ -96,7 +96,10 @@ class TrainHook:
         class LoggingHook(TrainHook):
             def on_step_end(self, state: TrainState) -> None:
                 if state.global_step % 10 == 0:
-                    print(f"Step {state.global_step}, Loss: {state.metrics.get('loss', '?')}")
+                    logger.info_rank0(
+                        "Step %d, Loss: %s",
+                        state.global_step, state.metrics.get('loss', '?'),
+                    )
     """
 
     # pylint: disable=unused-argument

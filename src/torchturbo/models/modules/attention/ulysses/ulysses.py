@@ -15,6 +15,9 @@ from .utils import (
     pad_tensor,
     slice_input_tensor,
 )
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def all_to_all_tensor(
@@ -396,7 +399,7 @@ def patch_vlm_for_ulysses_input_slicing(model_class: type):
     original_forward = model_class.forward
     wrapped_forward = _create_ulysses_wrapped_decoder_forward(original_forward)
     model_class.forward = wrapped_forward
-    print(f"Monkey patch {model_class.__name__}.forward for Ulysses SP input slicing.")
+    logger.info_rank0("Monkey patch %s.forward for Ulysses SP input slicing.", model_class.__name__)
 
 
 def patch_forward_for_sp_input_slicing(

@@ -4,6 +4,9 @@ from torch.nn.parameter import Parameter
 
 from .moe_config import MoEConfig
 from torchturbo.ops import ops
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 try:
     from transformer_engine.pytorch import GroupedLinear
@@ -87,8 +90,7 @@ class GroupedMLP(torch.nn.Module):
         # Initialize weight.
         self.use_te = use_te
         if transformer_engine_is_available() and self.use_te:
-            if torch.distributed.get_rank() == 0:
-                print("Using TE GroupedLinear.")
+            logger.debug_rank0("Using TE GroupedLinear.")
             self.fc1_linear = GroupedLinear(
                 num_gemms=self.num_local_experts,
                 in_features=self.config.hidden_size,
@@ -107,8 +109,7 @@ class GroupedMLP(torch.nn.Module):
                 device="cuda",
             )
         else:
-            if torch.distributed.get_rank() == 0:
-                print("Using fused op grouped_matmul.")
+            logger.debug_rank0("Using fused op grouped_matmul.")
             self.weight1 = Parameter(
                 torch.empty(
                     self.config.hidden_size * self.num_local_experts,

@@ -60,7 +60,7 @@ def apply_ulysses_sp_patch(engine: Any) -> bool:
     flash_utils._flash_attention_forward = patched
     if hasattr(flash_integration, "_flash_attention_forward"):
         flash_integration._flash_attention_forward = patched
-    logger.info("Ulysses SP flash-attention patch applied (sp_size=%d)", sp_size)
+    logger.info_rank0("Ulysses SP flash-attention patch applied (sp_size=%d)", sp_size)
     return True
 
 
@@ -284,7 +284,7 @@ class TurboTrainerMixin:
                 orig = args.gradient_accumulation_steps
                 args.gradient_accumulation_steps = orig * sp_size
                 args._torchturbo_sp_adjusted = True
-                logger.info(
+                logger.info_rank0(
                     "SP=%d: gradient_accumulation_steps %d -> %d (step count "
                     "compensated)",
                     sp_size, orig, args.gradient_accumulation_steps,

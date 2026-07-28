@@ -95,7 +95,7 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
         # Override parent's num_samples (used by __len__ in parent)
         self.num_samples = self.num_iterations * self.sp_size
 
-        logger.info(
+        logger.info_rank0(
             "SPDistributedSampler: world=%d, rank=%d, sp_size=%d, "
             "dp_size=%d, dp_rank=%d, iterations=%d",
             self.num_replicas,
@@ -220,7 +220,7 @@ class TorchTurboEngine:
         # Hooks (can be added before or after setup)
         self.hooks: list[TrainHook] = []
 
-        logger.info(
+        logger.info_rank0(
             "TorchTurboEngine initialized: backend=%s, device=%s",
             backend_name,
             self.device_runtime.device.type,
@@ -288,16 +288,16 @@ class TorchTurboEngine:
         if self.config.mtp.enabled:
             n_mtp = getattr(config, "num_nextn_predict_layers", 0)
             if n_mtp > 0:
-                logger.info("MTP enabled: %d MTP layer(s) will be built", n_mtp)
+                logger.info_rank0("MTP enabled: %d MTP layer(s) will be built", n_mtp)
             else:
-                logger.warning(
+                logger.warning_rank0(
                     "--tt_enable_mtp passed but model config has "
                     "num_nextn_predict_layers=0 — nothing to enable."
                 )
         else:
             if hasattr(config, "num_nextn_predict_layers"):
                 if config.num_nextn_predict_layers > 0:
-                    logger.info(
+                    logger.info_rank0(
                         "MTP off (default): stripping %d MTP layer(s) — "
                         "their checkpoint weights will be skipped. "
                         "Pass --tt_enable_mtp to enable.",
@@ -337,9 +337,9 @@ class TorchTurboEngine:
             )
 
         with turbo_model_cls.init_context(config):
-            logger.info("Building model on meta device: %s", model_name_or_path)
+            logger.info_rank0("Building model on meta device: %s", model_name_or_path)
             with torch.device("meta"):
-                logger.info(
+                logger.info_rank0(
                     "Using torchturbo model class: %s", turbo_model_cls.__name__
                 )
                 model = turbo_model_cls._from_config(config)
@@ -348,7 +348,7 @@ class TorchTurboEngine:
                 parallel_plan = self._resolve_parallel_plan(model)
 
                 # Prepare model via backend (module replacement → LoRA → sharding).
-                logger.info("Sharding model via %s backend", self.config.backend.value)
+                logger.info_rank0("Sharding model via %s backend", self.config.backend.value)
                 model = self.backend.prepare_model(
                     model, parallel_plan=parallel_plan, peft_config=peft_config
                 )
@@ -356,7 +356,7 @@ class TorchTurboEngine:
                 parallel_context = self._get_parallel_context()
                 model.on_parallelized(parallel_context)
 
-        logger.info(
+        logger.info_rank0(
             "%s model via %s backend",
             "Loading" if load_weights else "Materializing",
             self.config.backend.value,
@@ -380,7 +380,7 @@ class TorchTurboEngine:
                 f"{', '.join(meta_tensor_names)}"
             )
 
-        logger.info("Model built: %s (%s)", type(model).__name__, torch_dtype)
+        logger.info_rank0("Model built: %s (%s)", type(model).__name__, torch_dtype)
         return model
 
     def _apply_freeze_policy(self, model: nn.Module, policy: FreezePolicy) -> None:
@@ -419,7 +419,7 @@ class TorchTurboEngine:
                     f"in {type(model).__name__}."
                 )
 
-            logger.info(
+            logger.info_rank0(
                 "Froze %d parameter tensors (%d elements) in group %s",
                 tensor_count,
                 element_count,
@@ -456,7 +456,7 @@ class TorchTurboEngine:
             dist.barrier()
 
         if not dist.is_initialized() or dist.get_rank() == 0:
-            logger.info("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
+            logger.info_rank0("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
             self._log_model_info(model)
         
         return model
@@ -469,7 +469,7 @@ class TorchTurboEngine:
             parallel_context=self._get_parallel_context(),
             **kwargs,
         )
-        logger.info(
+        logger.info_rank0(
             "Model saved in %s via %s backend", output_dir, self.config.backend.value
         )
 
@@ -513,7 +513,7 @@ class TorchTurboEngine:
         self.optimizer = self.backend.prepare_optimizer(
             self.model, optimizer_cls, **kwargs
         )
-        logger.info("Created optimizer: %s", type(self.optimizer).__name__)
+        logger.info_rank0("Created optimizer: %s", type(self.optimizer).__name__)
         return self.optimizer
 
     def prepare_lr_scheduler(
@@ -540,7 +540,7 @@ class TorchTurboEngine:
             )
 
         self.lr_scheduler = scheduler_cls(self.optimizer, **kwargs)
-        logger.info("Created LR scheduler: %s", type(self.lr_scheduler).__name__)
+        logger.info_rank0("Created LR scheduler: %s", type(self.lr_scheduler).__name__)
         return self.lr_scheduler
 
     def _resolve_parallel_plan(self, model: nn.Module):
@@ -554,7 +554,7 @@ class TorchTurboEngine:
             )
 
         plan = type(model).get_default_parallel_plan()
-        logger.info(
+        logger.info_rank0(
             "Auto-discovered default parallel plan from %s "
             "(plan_keys=%d, sp=%d, ep=%d)",
             type(model).__name__,
@@ -564,7 +564,7 @@ class TorchTurboEngine:
         )
 
         if self.config.parallel_plan is not None:
-            logger.info("Overriding parallel plan with engine config")
+            logger.info_rank0("Overriding parallel plan with engine config")
             engine_plan = self.config.parallel_plan
 
             for attr in ["sp_size", "ep_size"]:
@@ -577,7 +577,7 @@ class TorchTurboEngine:
                     plan.plan = {}
                 plan.plan.update(engine_plan.plan)
 
-        logger.info(
+        logger.info_rank0(
             "Parallel Plan for %s (sp=%d, ep=%d)",
             type(model).__name__,
             getattr(plan, "sp_size", 1),
@@ -624,7 +624,7 @@ class TorchTurboEngine:
         )
         profiler.start()
         self._profiler = profiler
-        logger.info("Profiling started, output dir: %s", profiling_dir)
+        logger.info_rank0("Profiling started, output dir: %s", profiling_dir)
 
     def step_profiling(self) -> None:
         """Advance TorchTurbo profiling by one optimizer step."""
@@ -638,7 +638,7 @@ class TorchTurboEngine:
             raise RuntimeError("No active profiler. Call engine.start_profiling() first.")
         profiler = self._profiler
         profiler.stop()
-        logger.info("Profiling stopped, traces flushed.")
+        logger.info_rank0("Profiling stopped, traces flushed.")
         self._profiler = None
 
     # ------------------------------------------------------------------
@@ -713,7 +713,7 @@ class TorchTurboEngine:
             drop_last=drop_last,
         )
 
-        logger.info(
+        logger.info_rank0(
             "Created SP-aware DataLoader: dp_size=%d, dp_rank=%d, sp_size=%d",
             dp_info["dp_size"],
             dp_info["dp_rank"],
@@ -782,7 +782,7 @@ class TorchTurboEngine:
         if sp_size > 1:
             original_grad_accum = gradient_accumulation_steps
             gradient_accumulation_steps *= sp_size
-            logger.info(
+            logger.info_rank0(
                 "SP auto-adapt: sp_size=%d, gradient_accumulation_steps %d → %d",
                 sp_size,
                 original_grad_accum,
@@ -864,7 +864,7 @@ class TorchTurboEngine:
                         self.model.parameters(), max_grad_norm
                     ).item()
                     if not torch.isfinite(torch.tensor(state.grad_norm)):
-                        logger.warning("Non-finite grad norm — skipping step")
+                        logger.warning_rank0("Non-finite grad norm — skipping step")
                         state.skip_optimizer_step = True
 
                 if not state.skip_optimizer_step:
@@ -1062,7 +1062,11 @@ class TorchTurboEngine:
 
             if not forward_only and loss is not None:
                 if mb_idx == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
-                    logger.info("packed mb[%d] before backward, loss=%.6f", mb_idx, loss.item())
+                    logger.info_rank0(
+                        "packed mb[%d] before backward, loss=%.6f",
+                        mb_idx,
+                        loss.item(),
+                    )
                 self._backward_loss(loss)
 
     @torch.no_grad()
@@ -1224,7 +1228,7 @@ class TorchTurboEngine:
             return
 
         # --- Architecture ---
-        logger.info("Model architecture:\n%s", model)
+        logger.debug_rank0("Model architecture:\n%s", model)
 
         # --- Sharding table ---
         try:
@@ -1261,7 +1265,7 @@ class TorchTurboEngine:
             )
 
         lines.append(sep)
-        logger.info("Parameter sharding map:\n%s", "\n".join(lines))
+        logger.debug_rank0("Parameter sharding map:\n%s", "\n".join(lines))
 
     @staticmethod
     def _fire(hooks: list[TrainHook], hook_name: str, state: TrainState) -> None:

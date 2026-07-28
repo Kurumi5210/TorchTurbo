@@ -34,7 +34,7 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
 
     tt = get_torchturbo_args()
     if tt is None:
-        logger.warning(
+        logger.warning_rank0(
             "No TorchTurboArgs stashed (set_torchturbo_args not called); using "
             "all-turbo defaults. The launcher (run_swift.py) must parse --tt_* "
             "before sft_main()."
@@ -69,7 +69,7 @@ def build_lora_config_from_swift_args(args: Any) -> Any | None:
     try:
         from peft import LoraConfig, TaskType
     except ImportError:
-        logger.warning("peft not installed — cannot build LoraConfig.")
+        logger.warning_rank0("peft not installed — cannot build LoraConfig.")
         return None
 
     rank = int(getattr(args, "lora_rank", 8) or 8)

@@ -38,9 +38,9 @@ Public API
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Union
 
+from ...logging import get_logger
 from .weights import (
     apply_lora_delta,
     build_lora_delta_map,
@@ -49,7 +49,7 @@ from .weights import (
     compute_lora_delta_grouped_mlp_w2,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "apply_peft",
@@ -87,7 +87,7 @@ def register_grouped_mlp_lora(
     from torchturbo.models.modules.moe.experts import GroupedMLP
 
     lora_config._register_custom_module({GroupedMLP: GroupedMLPLoRA})
-    logger.info("Registered GroupedMLPLoRA for GroupedMLP")
+    logger.info_rank0("Registered GroupedMLPLoRA for GroupedMLP")
 
 
 def expand_all_linear_targets(model: Any, peft_config: Any) -> None:
@@ -165,7 +165,7 @@ def expand_all_linear_targets(model: Any, peft_config: Any) -> None:
             if isinstance(module, custom_cls):
                 if name not in peft_config.target_modules:
                     peft_config.target_modules.add(name)
-                    logger.info(
+                    logger.debug_rank0(
                         "expand_all_linear_targets: added custom module "
                         "target %r (from %s)",
                         name,
@@ -231,7 +231,7 @@ def apply_peft(
     total_count = frozen_count + lora_count
     lora_ratio = lora_count / total_count if total_count > 0 else 0.0
 
-    logger.info(
+    logger.info_rank0(
         "Applied PEFT LoRA to model — "
         "frozen params: %s, LoRA params: %s, LoRA ratio: %.4f",
         f"{frozen_count:,}",

@@ -63,7 +63,9 @@ else:
 from torchturbo.utils.flash_attn_utils import get_unpad_data_lf
 from torchturbo.utils.functools import cache
 
-logger = logging.get_logger(__name__)
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @cache
@@ -546,7 +548,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
-            logger.warning_once(
+            logger.warning_rank0_once(
                 "The fast path is not available because one of the required library is not installed. Falling back to "
                 "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
                 " https://github.com/Dao-AILab/causal-conv1d"

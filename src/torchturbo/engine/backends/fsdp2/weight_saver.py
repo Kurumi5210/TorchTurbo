@@ -13,6 +13,10 @@ from torch.distributed._tensor import DTensor
 
 from torchturbo.engine.peft.weights import apply_lora_delta, build_lora_delta_map
 from torchturbo.engine.utils import is_peft_adapter_param, strip_peft_prefix
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 class ShardedParamManager:
     def __init__(
@@ -65,9 +69,11 @@ class ShardedParamManager:
         self.param_to_filename = self._src_weight_map
         self.local_params = self._build_meta_info()
         self._lora_delta_map = build_lora_delta_map(model)
-        if self._lora_delta_map and self.rank == 0:
-            print(f"[LoRA] Detected {len(self._lora_delta_map)} base parameters "
-                  f"with LoRA deltas to merge during save")
+        if self._lora_delta_map:
+            logger.info_rank0(
+                "[LoRA] Detected %d base parameters with LoRA deltas to merge during save",
+                len(self._lora_delta_map),
+            )
 
     def _update_per_shard(self, shard_params, dst_rank):
         shard_bytes = 0
@@ -141,8 +147,7 @@ class ShardedParamManager:
     def _build_meta_info(self):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()
-        if self.rank == 0:
-            print(f"_build_meta_info starting...")
+        logger.info_rank0("[save] building meta info...")
 
         common_params = []
         expert_params = []
@@ -174,8 +179,7 @@ class ShardedParamManager:
         self._assign_param_to_ranks(expert_params, self.edp_ranks, common_params)
 
         elapsed = time.perf_counter() - start_time
-        if self.rank == 0:
-            print(f"_build_meta_info completed in {elapsed:.2f}s")
+        logger.info_rank0("[save] meta info built in %.2fs", elapsed)
 
         return set(self.rank_to_params[self.rank])
 
@@ -227,14 +231,15 @@ class ShardedParamManager:
         gc.collect()
         gpu_after = self._get_gpu_memory_usage_percent()
         cpu_after = self._get_cpu_memory_usage_percent()
-        if torch.distributed.get_rank() == 0:
-            print(f"Memory alert - GPU: {gpu_before:.1f}% -> {gpu_after:.1f}% , CPU: {cpu_before:.1f}% -> {cpu_after:.1f}%")
+        logger.warning_rank0(
+            "Memory alert - GPU: %.1f%% -> %.1f%%, CPU: %.1f%% -> %.1f%%",
+            gpu_before, gpu_after, cpu_before, cpu_after,
+        )
 
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()
-        if self.rank == 0:
-            print(f"_get_local_hf_state_dict starting...")
+        logger.info_rank0("[save] building local HF state dict...")
 
         full_sd = {}
         for name, param in self.model.named_parameters():
@@ -243,8 +248,13 @@ class ShardedParamManager:
             if is_peft_adapter_param(clean_name):
                 continue
 
-            if torch.distributed.get_rank() == 0:
-                print(f"[saving] param_name: {clean_name} (original: {name})")
+            # Per-param trace is DEBUG-only (it was a large share of the sample
+            # log because it fired on every rank × every parameter). Only mention
+            # the original name when it actually differs from the clean name.
+            if clean_name != name:
+                logger.debug_rank0("[saving] param: %s (original: %s)", clean_name, name)
+            else:
+                logger.debug_rank0("[saving] param: %s", clean_name)
             if isinstance(param, DTensor):
                 full_tensor = param.full_tensor()
             else:
@@ -273,8 +283,7 @@ class ShardedParamManager:
             clean_name = strip_peft_prefix(name)
             if self.param_converter.is_persist_buffer(clean_name):
                 hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
-                if torch.distributed.get_rank() == 0:
-                    print(f"[saving] buf_name: {clean_name}->{hf_buffer_name}")
+                logger.debug_rank0("[saving] buffer: %s -> %s", clean_name, hf_buffer_name)
                 if isinstance(buf, DTensor):
                     buf = buf.full_tensor()
                 if hf_buffer_name in local_params:
@@ -287,12 +296,15 @@ class ShardedParamManager:
         missing_params = local_params - set(full_sd.keys())
         extra_params = set(full_sd.keys()) - local_params
         if len(full_sd.keys()) != len(local_params):
-            print(f"[Rank {self.rank}] Missing params ({len(missing_params)}): {missing_params}")
-            print(f"[Rank {self.rank}] Extra params ({len(extra_params)}): {extra_params}")
+            logger.warning_rank0(
+                "[save] param count mismatch on rank %d — missing=%d, extra=%d",
+                self.rank, len(missing_params), len(extra_params),
+            )
+            logger.warning_rank0("[save] missing params: %s", missing_params)
+            logger.warning_rank0("[save] extra params: %s", extra_params)
 
         elapsed = time.perf_counter() - start_time
-        if self.rank == 0:
-            print(f"_get_local_hf_state_dict completed in {elapsed:.2f}s")
+        logger.info_rank0("[save] local HF state dict built in %.2fs", elapsed)
 
         return full_sd
 
@@ -338,12 +350,18 @@ class ShardedParamManager:
                 shard_dict[param] = state_dict[param]
                 weight_map[param] = file_name
             if shard_dict:
-                print(f"[Rank {self.rank}] Saving {file_name} with {len(shard_dict)} params...")
+                logger.debug_rank0(
+                    "[save][rank %d] Saving %s with %d params...",
+                    self.rank, file_name, len(shard_dict),
+                )
                 file_start = time.perf_counter()
                 file_path = save_path / file_name
                 save_file(shard_dict, file_path.as_posix())
                 file_elapsed = time.perf_counter() - file_start
-                print(f"[Rank {self.rank}] Saved {file_name} in {file_elapsed:.2f}s")
+                logger.debug_rank0(
+                    "[save][rank %d] Saved %s in %.2fs",
+                    self.rank, file_name, file_elapsed,
+                )
 
         # step 3, deal with non-tensor metas
         weight_map_list = [None] * self.world_size
@@ -366,7 +384,7 @@ class ShardedParamManager:
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(save_path)
 
-            print(f"Rank: {self.rank} - Saved hf model to {save_path.absolute()}")
+            logger.info_rank0("[save] HF model saved to %s", save_path.absolute())
         os.sync()
         torch.distributed.barrier()
 

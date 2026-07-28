@@ -76,7 +76,7 @@ class TurboModelMixin:
         peft_config = getattr(engine, "peft_config", None)
         torch_dtype = _resolve_dtype(getattr(self, "torch_dtype", None))
 
-        logger.info(
+        logger.info_rank0(
             "TurboModelMixin: building via turbo engine (%s, dtype=%s, peft=%s, native_loader=%s)",
             model_dir, torch_dtype, "yes" if peft_config is not None else "no",
             type(self).__mro__[1].__name__,

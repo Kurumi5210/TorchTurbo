@@ -67,6 +67,10 @@ from transformers.generation.utils import GenerationMixin
 from .configuration_kimi_k25 import KimiK25Config
 from .modeling_deepseek import DeepseekV3ForCausalLM
 
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
+
 # Flash attention imports
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -74,7 +78,7 @@ if is_flash_attn_2_available():
     # from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 if is_torch_npu_available():
-    print("Using npu_fusion_attention", flush=True)
+    logger.info_rank0("Using npu_fusion_attention")
     from torchturbo.utils.flash_attn_utils import (
         index_first_axis,
         pad_input,

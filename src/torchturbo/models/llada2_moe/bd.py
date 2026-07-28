@@ -36,6 +36,11 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+from torchturbo.logging import get_logger
+
+
+logger = get_logger(__name__)
+
 # ``-100`` is the HF / PyTorch / LlamaFactory convention for the loss ignore index. Reuse LF's
 # constant in production; fall back to the literal for pure-CPU tests that load this file via
 # importlib without llamafactory installed.
@@ -200,14 +205,18 @@ def build_bd_cache(model_path: str, data_file: str, pad_to_block: bool = False,
                 continue
             cache.append(item)
 
-    is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
-    if is_rank0:
-        mode = "packed" if pad_to_block else "single"
-        print(
-            f"[BD-CACHE] mode={mode} | loaded {len(cache)} samples | dropped {dropped} | "
-            f"max_len={max_seq_len} | mask_id={mask_id} pad_id={pad_id} | {data_file}",
-            flush=True,
-        )
+    mode = "packed" if pad_to_block else "single"
+    logger.info_rank0(
+        "[BD-CACHE] mode=%s | loaded %d samples | dropped %d | "
+        "max_len=%d | mask_id=%d pad_id=%d | %s",
+        mode,
+        len(cache),
+        dropped,
+        max_seq_len,
+        mask_id,
+        pad_id,
+        data_file,
+    )
     return cache, mask_id, pad_id
 
 
@@ -473,13 +482,13 @@ class BDDataset(Dataset):
             raw = cutoff_len
             cutoff_len = _align_cutoff_to_block(cutoff_len, self.block_size)
             if cutoff_len != raw:
-                is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
-                if is_rank0:
-                    print(
-                        f"[BD] cutoff_len {raw} not a BLOCK_SIZE({self.block_size}) multiple "
-                        f"(LF neat_packing subtracts 1) -> aligned to {cutoff_len}",
-                        flush=True,
-                    )
+                logger.info_rank0(
+                    "[BD] cutoff_len %d not a BLOCK_SIZE(%d) multiple "
+                    "(LF neat_packing subtracts 1) -> aligned to %d",
+                    raw,
+                    self.block_size,
+                    cutoff_len,
+                )
             self.max_seq_len = cutoff_len
             self.beam_len = 2 * cutoff_len
         else:
@@ -497,17 +506,26 @@ class BDDataset(Dataset):
                 max_seq_len=self.max_seq_len, block_size=self.block_size,
                 columns=columns, tags=tags,
             )
-            self.beam_plans = pack_beams(self.samples, self.beam_len, self.block_size, self.max_seq_len)
-            is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
-            if is_rank0:
-                total = sum(len(p) for p in self.beam_plans)
-                fill = sum(2 * sum(t for _, t, _ in p) for p in self.beam_plans) / max(len(self.beam_plans), 1)
-                print(
-                    f"[BD-PACK] block_diag_attn ON | beams={len(self.beam_plans)} | "
-                    f"packed={total}/{len(self.samples)} | avg_fill={fill:.0f}/{self.beam_len} | "
-                    f"max_len={self.max_seq_len} mask~U[{self.mask_low},{self.mask_high}]",
-                    flush=True,
-                )
+            self.beam_plans = pack_beams(
+                self.samples, self.beam_len, self.block_size, self.max_seq_len
+            )
+            total = sum(len(p) for p in self.beam_plans)
+            fill = sum(
+                2 * sum(t for _, t, _ in p) for p in self.beam_plans
+            ) / max(len(self.beam_plans), 1)
+            logger.info_rank0(
+                "[BD-PACK] block_diag_attn ON | beams=%d | "
+                "packed=%d/%d | avg_fill=%.0f/%d | "
+                "max_len=%d mask~U[%s,%s]",
+                len(self.beam_plans),
+                total,
+                len(self.samples),
+                fill,
+                self.beam_len,
+                self.max_seq_len,
+                self.mask_low,
+                self.mask_high,
+            )
         else:
             self.samples, self.mask_id, self.pad_id = build_bd_cache(
                 model_path, data_file, pad_to_block=False,

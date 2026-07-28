@@ -29,7 +29,7 @@ def _version_matches(version: str, specifier: str) -> bool:
         return Version(version) in SpecifierSet(specifier, prereleases=True)
     except ImportError:
         # Fallback: very basic check
-        logger.warning(
+        logger.warning_rank0(
             "packaging not installed — skipping strict version check "
             "for %s against %s",
             version,
@@ -82,7 +82,7 @@ class BaseAdapter(ABC):
 
         for p in self._patches:
             if not _version_matches(version, p.supported_versions):
-                logger.warning(
+                logger.warning_rank0(
                     "Skipping patch %r: needs %s, but framework is %s",
                     p.name or p.__class__.__name__,
                     p.supported_versions,
@@ -90,7 +90,7 @@ class BaseAdapter(ABC):
                 )
                 continue
 
-            logger.info(
+            logger.info_rank0(
                 "Applying patch: %s (versions=%s, framework=%s)",
                 p.name or p.__class__.__name__,
                 p.supported_versions,
@@ -101,7 +101,7 @@ class BaseAdapter(ABC):
     def revert_patches(self) -> None:
         """Revert all patches in reverse order."""
         for p in reversed(self._patches):
-            logger.info("Reverting patch: %s", p.name or p.__class__.__name__)
+            logger.info_rank0("Reverting patch: %s", p.name or p.__class__.__name__)
             p.revert()
         self._patches.clear()
 

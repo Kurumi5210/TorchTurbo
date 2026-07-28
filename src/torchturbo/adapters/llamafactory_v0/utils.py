@@ -62,7 +62,7 @@ def build_config_from_lf_args(
     )
     # Note: env vars are already applied by EngineConfig.__post_init__
 
-    logger.info(
+    logger.info_rank0(
         "Built EngineConfig from LlamaFactory args: backend=%s, mp=%s",
         config.backend.value,
         config.mixed_precision.value,
@@ -392,7 +392,7 @@ def build_lora_config_from_lf_args(
     try:
         from peft import LoraConfig, TaskType
     except ImportError:
-        logger.warning("peft not installed — cannot build LoraConfig from LF args.")
+        logger.warning_rank0("peft not installed — cannot build LoraConfig from LF args.")
         return None
 
     # Map LlamaFactory finetuning args to LoraConfig fields.
@@ -535,7 +535,7 @@ def strip_lora_args(args: Any) -> Any:
             out.append(tok)
             i += 1
 
-        logger.info(
+        logger.info_rank0(
             "torchturbo: stripped LoRA CLI flags and set finetuning_type=full "
             "(LoRA managed by torchturbo engine)"
         )

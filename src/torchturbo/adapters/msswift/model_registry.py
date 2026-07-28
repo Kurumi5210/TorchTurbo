@@ -75,9 +75,9 @@ def register_turbo_models_to_swift() -> None:
         except ImportError:
             pass
         except Exception:
-            logger.debug("swift_template registration failed for %r", name, exc_info=True)
+            logger.debug_rank0("swift_template registration failed for %r", name, exc_info=True)
 
-    logger.info("Registered %d turbo models into swift MODEL_MAPPING", len(get_all_models()))
+    logger.info_rank0("Registered %d turbo models into swift MODEL_MAPPING", len(get_all_models()))
 
 
 def register_turbo_trainers_to_swift() -> None:
@@ -94,4 +94,4 @@ def register_turbo_trainers_to_swift() -> None:
         for task_type, dotted in spec.turbo_trainers.items():
             TrainerFactory.TRAINER_MAPPING[task_type] = dotted
             registered.append(f"{spec.name}:{task_type}")
-    logger.info("Registered turbo trainers into TrainerFactory: %s", registered)
+    logger.info_rank0("Registered turbo trainers into TrainerFactory: %s", registered)

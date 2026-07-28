@@ -125,7 +125,7 @@ def bake_loss_scale_into_labels(inputs: dict) -> dict:
 
     non_binary = bool(mask.any()) and bool(((ls > 0) & (ls < 1)).any())
     if non_binary:
-        logger.warning(
+        logger.warning_rank0(
             "loss_scale has non-binary values in (0,1); turbo drops them "
             "(only 0/positive binary weights are folded into labels). "
             "Use --loss_scale ignore_empty_think."
@@ -233,7 +233,7 @@ def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
             row = tpos2[0] if tpos2.dim() == 3 else tpos2
             inputs.update(_gpc(row.reshape(1, -1) if row.dim() == 1 else row))
         except Exception:
-            logger.debug("pad: recompute cu_seq_lens failed", exc_info=True)
+            logger.debug_rank0("pad: recompute cu_seq_lens failed", exc_info=True)
 
     # Position_ids row 0 = text: prepend the (now-padded) text row so the model
     # sees [4, bsz, seq]. mrope rows stay 1-3.

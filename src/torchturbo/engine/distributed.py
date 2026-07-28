@@ -36,7 +36,7 @@ def init_process_group_if_needed(enable_cpu_backend: bool = False) -> bool:
         return False
 
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        logger.debug(
+        logger.debug_rank0(
             "No distributed launch detected (RANK/WORLD_SIZE unset); "
             "skipping process-group initialization."
         )
@@ -49,7 +49,7 @@ def init_process_group_if_needed(enable_cpu_backend: bool = False) -> bool:
         try:
             runtime.set_device(local_rank)
         except Exception:  # pragma: no cover - defensive, device-specific
-            logger.warning(
+            logger.warning_rank0(
                 "Failed to set %s device to local rank %d before process-group init",
                 device_type,
                 local_rank,
@@ -61,7 +61,7 @@ def init_process_group_if_needed(enable_cpu_backend: bool = False) -> bool:
     if enable_cpu_backend and device_type != "cpu":
         backend = f"{device_type}:{backend},cpu:gloo"
 
-    logger.info(
+    logger.info_rank0(
         "Initializing torch.distributed (backend=%s, timeout=%s, cpu_offload=%s)",
         backend,
         DEFAULT_PROCESS_GROUP_TIMEOUT,

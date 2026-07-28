@@ -80,7 +80,7 @@ class DictFieldPatch(BasePatch):
                 original(parser, field)
 
         HfArgumentParser._parse_dataclass_field = _patched
-        logger.info(
+        logger.info_rank0(
             "Patched HfArgumentParser for dict-typed fields: %s",
             sorted(field_names),
         )
@@ -97,7 +97,7 @@ class DictFieldPatch(BasePatch):
             return
         HfArgumentParser._parse_dataclass_field = self._original
         self._original = None
-        logger.info("Reverted HfArgumentParser dict-field patch")
+        logger.info_rank0("Reverted HfArgumentParser dict-field patch")
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +144,14 @@ class RunExpPatch(BasePatch):
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
             from ...engine.distributed import init_process_group_if_needed
+            from ...logging import logging_configure
 
             raw_args = read_args(args)
 
             # Retrieve CLI-parsed torchturbo args (stashed by the entry point).
             tt_args = get_torchturbo_args()
+            logging_configure(tt_args.log_level)
+            logger.info_rank0("torchturbo CLI args: %s", tt_args)
 
             # Initialize the process group *before* get_train_args — that call
             # triggers transformers/accelerate to create the default group with a
@@ -172,7 +175,7 @@ class RunExpPatch(BasePatch):
             stage = getattr(finetuning_args, "stage", None)
 
             if stage not in {"sft", "pt", "dpo"}:
-                logger.warning(
+                logger.warning_rank0(
                     "torchturbo: LlamaFactory stage %r is not enabled for "
                     "TorchTurbo yet; running native LlamaFactory.",
                     stage,
@@ -193,7 +196,7 @@ class RunExpPatch(BasePatch):
                         "TorchTurbo LlamaFactory LoRA requires PEFT to build "
                         "the adapter config before engine initialization."
                     )
-                logger.info(
+                logger.info_rank0(
                     "torchturbo: LoRA mode detected — r=%d, alpha=%d, "
                     "target_modules=%s, dropout=%.2f",
                     peft_config.r,
@@ -202,7 +205,7 @@ class RunExpPatch(BasePatch):
                     peft_config.lora_dropout,
                 )
             else:
-                logger.info(
+                logger.info_rank0(
                     "torchturbo: Full-parameter training mode (finetuning_type=%s)",
                     getattr(finetuning_args, "finetuning_type", "full"),
                 )
@@ -236,7 +239,7 @@ class RunExpPatch(BasePatch):
             # Keep the current run's LoRA config on the adapter context.
             # LoadModelPatch reads it when LF calls from_pretrained.
             if peft_config is not None:
-                logger.info(
+                logger.info_rank0(
                     "torchturbo: LoRA config set for current LF run "
                     "(r=%d, target_modules=%s)",
                     peft_config.r,
@@ -251,14 +254,14 @@ class RunExpPatch(BasePatch):
             # apply_patches checks version compat for each patch
             adapter.apply_patches(engine)
 
-            logger.info(
+            logger.info_rank0(
                 "torchturbo: engine ready, entering run_exp for stage: %s",
                 stage,
             )
             return self._original(raw_args, callbacks)
 
         tuner_module.run_exp = _patched_run_exp
-        logger.info("Patched tuner.run_exp")
+        logger.info_rank0("Patched tuner.run_exp")
 
         # launcher.py does `from .train.tuner import run_exp`
         # meaning it holds a reference to the unpatched version if imported before torchturbo
@@ -268,7 +271,7 @@ class RunExpPatch(BasePatch):
             if hasattr(launcher_module, "run_exp"):
                 self._launcher_module = launcher_module
                 launcher_module.run_exp = _patched_run_exp
-                logger.debug("Patched launcher.run_exp")
+                logger.debug_rank0("Patched launcher.run_exp")
         except ImportError as e:
             raise ImportError("Failed to patch llamafactory.launcher")
 
@@ -279,7 +282,7 @@ class RunExpPatch(BasePatch):
             if hasattr(train_module, "run_exp"):
                 self._train_module = train_module
                 train_module.run_exp = _patched_run_exp
-                logger.debug("Patched train.run_exp")
+                logger.debug_rank0("Patched train.run_exp")
         except ImportError as e:
             raise ImportError("Failed to patch train")
 
@@ -423,7 +426,7 @@ class CollatorPatch(BasePatch):
             return result
 
         MultiModalDataCollatorForSeq2Seq.__call__ = _patched_call
-        logger.info("CollatorPatch applied for %s", patched_types)
+        logger.info_rank0("CollatorPatch applied for %s", patched_types)
 
     def revert(self) -> None:
         if self._cls and self._original_call:
@@ -490,7 +493,7 @@ class LoadModelPatch(BasePatch):
                 def _patched_from_pretrained(
                     pretrained_model_name_or_path, *args, **kwargs
                 ):
-                    logger.info(
+                    logger.info_rank0(
                         "torchturbo: intercepting %s.from_pretrained → "
                         "engine.prepare_model(%r)",
                         klass_name,
@@ -524,7 +527,7 @@ class LoadModelPatch(BasePatch):
                 )
             )
 
-            logger.info("Patched %s.from_pretrained", cls_name)
+            logger.info_rank0("Patched %s.from_pretrained", cls_name)
 
     def revert(self) -> None:
         if self._module is None:
@@ -534,7 +537,7 @@ class LoadModelPatch(BasePatch):
             cls = getattr(self._module, cls_name, None)
             if cls is not None:
                 cls.from_pretrained = original
-                logger.info("Reverted %s.from_pretrained", cls_name)
+                logger.info_rank0("Reverted %s.from_pretrained", cls_name)
 
         self._originals.clear()
 
@@ -634,12 +637,12 @@ class CreateRefModelPatch(BasePatch):
             if ref_path is not None:
                 ref_model.requires_grad_(False)
                 ref_model.eval()
-                logger.info(
+                logger.info_rank0(
                     "torchturbo: created reference model from %s",
                     ref_model_args.model_name_or_path,
                 )
             else:
-                logger.info(
+                logger.info_rank0(
                     "torchturbo: created empty reference model from policy config; "
                     "weights will be copied from the initial policy."
                 )
@@ -671,7 +674,7 @@ class CreateRefModelPatch(BasePatch):
         except ImportError:
             if required:
                 raise
-            logger.debug(
+            logger.debug_rank0(
                 "torchturbo: %s not found; skipping create_ref_model patch.",
                 module_path,
             )
@@ -680,7 +683,7 @@ class CreateRefModelPatch(BasePatch):
         if not hasattr(module, "create_ref_model"):
             if required:
                 raise AttributeError(f"{module_path} has no create_ref_model.")
-            logger.debug(
+            logger.debug_rank0(
                 "torchturbo: %s has no create_ref_model; skipping patch.",
                 module_path,
             )
@@ -696,7 +699,7 @@ class CreateRefModelPatch(BasePatch):
         if not already_recorded:
             self._originals.append((module, "create_ref_model", original))
         setattr(module, "create_ref_model", patched)
-        logger.info(
+        logger.info_rank0(
             "torchturbo: replaced %s.create_ref_model",
             getattr(module, "__name__", repr(module)),
         )
@@ -733,7 +736,7 @@ class TrainerClassPatch(BasePatch):
         original = unwrap_torchturbo_trainer_class(getattr(module, attr_name))
         self._originals.append((module, attr_name, original))
         setattr(module, attr_name, patched_cls)
-        logger.info(
+        logger.info_rank0(
             "torchturbo: replaced %s.%s with %s",
             getattr(module, "__name__", repr(module)),
             attr_name,
@@ -748,7 +751,7 @@ class TrainerClassPatch(BasePatch):
                 unwrap_torchturbo_trainer_class,
             )
         except ImportError:
-            logger.warning("LlamaFactory SFT trainer not found; skipping trainer patch.")
+            logger.warning_rank0("LlamaFactory SFT trainer not found; skipping trainer patch.")
             return
 
         base_cls = unwrap_torchturbo_trainer_class(sft_workflow.CustomSeq2SeqTrainer)
@@ -767,7 +770,7 @@ class TrainerClassPatch(BasePatch):
                 unwrap_torchturbo_trainer_class,
             )
         except ImportError:
-            logger.warning("LlamaFactory PT trainer not found; skipping trainer patch.")
+            logger.warning_rank0("LlamaFactory PT trainer not found; skipping trainer patch.")
             return
 
         base_cls = unwrap_torchturbo_trainer_class(pt_workflow.CustomTrainer)
@@ -788,7 +791,7 @@ class TrainerClassPatch(BasePatch):
         except ImportError:
             if getattr(self.adapter, "stage", None) == "dpo":
                 raise ImportError("LlamaFactory DPO trainer not found.")
-            logger.debug("LlamaFactory DPO trainer not found; skipping trainer patch.")
+            logger.debug_rank0("LlamaFactory DPO trainer not found; skipping trainer patch.")
             return
 
         base_cls = unwrap_torchturbo_trainer_class(dpo_trainer.CustomDPOTrainer)
@@ -839,7 +842,7 @@ class AcceleratorPatch(BasePatch):
         try:
             from accelerate import Accelerator
         except ImportError:
-            logger.warning("accelerate not found — skipping AcceleratorPatch.")
+            logger.warning_rank0("accelerate not found — skipping AcceleratorPatch.")
             return
 
         # ---- 1. Guard prepare: error out if accelerate thinks it owns FSDP2 ----
@@ -872,7 +875,7 @@ class AcceleratorPatch(BasePatch):
 
             accel_self._models.append(model)
 
-            logger.info(
+            logger.info_rank0(
                 "torchturbo: prepare_model skipped FSDP wrapping "
                 "(already sharded by engine)"
             )
@@ -887,7 +890,7 @@ class AcceleratorPatch(BasePatch):
             return engine.backend.clip_grad_norm_(parameters, max_norm, norm_type)
 
         Accelerator.clip_grad_norm_ = _patched_clip_grad_norm
-        logger.info(
+        logger.info_rank0(
             "torchturbo: Patched Accelerator.clip_grad_norm_ to use backend's implementation"
         )
 
@@ -898,7 +901,7 @@ class AcceleratorPatch(BasePatch):
             loss.backward()
 
         Accelerator.backward = _patched_backward
-        logger.info(
+        logger.info_rank0(
             "torchturbo: Patched Accelerator.backward to plain"
         )
 
@@ -926,7 +929,7 @@ class AcceleratorPatch(BasePatch):
         #         "torchturbo: Patched Accelerator.prepare_data_loader to aware SP"
         #     )
 
-        logger.info("AcceleratorPreparePatch applied")
+        logger.info_rank0("AcceleratorPreparePatch applied")
 
     def revert(self) -> None:
         try:
@@ -1043,14 +1046,14 @@ class RegisterAutoclassPatch(BasePatch):
         try:
             from llamafactory.model.model_utils import misc as misc_module
         except ImportError:
-            logger.debug(
+            logger.debug_rank0(
                 "llamafactory.model.model_utils.misc not found — "
                 "skipping RegisterAutoclassPatch."
             )
             return
 
         if not hasattr(misc_module, "register_autoclass"):
-            logger.debug(
+            logger.debug_rank0(
                 "register_autoclass not found in misc module — "
                 "skipping RegisterAutoclassPatch."
             )
@@ -1071,7 +1074,7 @@ class RegisterAutoclassPatch(BasePatch):
                     # register_for_auto_class — find the inner model class.
                     base_cls = _find_base_model_class(model)
                     if base_cls is not None:
-                        logger.info(
+                        logger.info_rank0(
                             "torchturbo: register_autoclass — using %s "
                             "instead of %s for register_for_auto_class",
                             base_cls.__name__,
@@ -1079,7 +1082,7 @@ class RegisterAutoclassPatch(BasePatch):
                         )
                         model_cls = base_cls
                     else:
-                        logger.warning(
+                        logger.warning_rank0(
                             "torchturbo: register_autoclass — could not find "
                             "a PreTrainedModel subclass on %s; skipping "
                             "register_for_auto_class",
@@ -1106,7 +1109,7 @@ class RegisterAutoclassPatch(BasePatch):
                 self._patched_modules[mod] = original_fn
                 mod.register_autoclass = _patched_register_autoclass
 
-        logger.info("RegisterAutoclassPatch applied")
+        logger.info_rank0("RegisterAutoclassPatch applied")
 
     def revert(self) -> None:
         for mod, original in self._patched_modules.items():
@@ -1146,7 +1149,7 @@ class LogCallbackPatch(BasePatch):
         try:
             from llamafactory.train.callbacks import LogCallback
         except ImportError:
-            logger.debug("LogCallback not found; skipping LogCallbackPatch.")
+            logger.debug_rank0("LogCallback not found; skipping LogCallbackPatch.")
             return
 
         self._original_on_log = LogCallback.on_log
@@ -1170,7 +1173,7 @@ class LogCallbackPatch(BasePatch):
 
         LogCallback.on_log = _patched_on_log
         LogCallback._write_log = _patched_write_log
-        logger.info(
+        logger.info_rank0(
             "LogCallbackPatch applied — grad_norm will be written to trainer_log.jsonl"
         )
 
@@ -1209,7 +1212,7 @@ class PretrainProcessorPatch(BasePatch):
         try:
             from llamafactory.data.processor.pretrain import PretrainDatasetProcessor
         except ImportError:
-            logger.debug("PretrainDatasetProcessor not found; skipping.")
+            logger.debug_rank0("PretrainDatasetProcessor not found; skipping.")
             return
 
         original = PretrainDatasetProcessor.preprocess_dataset
@@ -1224,7 +1227,7 @@ class PretrainProcessorPatch(BasePatch):
             return preprocess_multimodal_pretrain(self, examples, img_examples)
 
         PretrainDatasetProcessor.preprocess_dataset = _patched
-        logger.info("PretrainProcessorPatch applied")
+        logger.info_rank0("PretrainProcessorPatch applied")
 
     def revert(self) -> None:
         if self._original is not None:

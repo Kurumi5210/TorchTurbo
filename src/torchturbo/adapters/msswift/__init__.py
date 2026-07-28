@@ -59,7 +59,7 @@ class MSSwiftAdapter(BaseAdapter):
         install_vlm_dataset_adapter()
 
         self._active = True
-        logger.info("ms-swift adapter activated (turbo models/trainers registered)")
+        logger.info_rank0("ms-swift adapter activated (turbo models/trainers registered)")
 
     def deactivate(self) -> None:
         from . import engine_registry
@@ -68,4 +68,4 @@ class MSSwiftAdapter(BaseAdapter):
         uninstall_vlm_dataset_adapter()
         engine_registry.clear()
         self._active = False
-        logger.info("ms-swift adapter deactivated")
+        logger.info_rank0("ms-swift adapter deactivated")

@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-from ..logging import get_logger
+from ..logging import LogLevel, get_logger
 
 logger = get_logger(__name__)
 
@@ -31,6 +31,17 @@ def string_to_bool(value: str | bool) -> bool:
     from transformers.hf_argparser import string_to_bool as hf_string_to_bool
 
     return hf_string_to_bool(value)
+
+
+def parse_log_level(value: str) -> LogLevel:
+    """Parse a TorchTurbo log level name."""
+    try:
+        return LogLevel[value.strip()]
+    except KeyError as exc:
+        supported = ", ".join(LogLevel.__members__)
+        raise argparse.ArgumentTypeError(
+            f"Unsupported log level {value!r}; supported levels: {supported}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +107,8 @@ class TorchTurboArgs:
         Defaults to ``0.3``.
     bd_mask_high:
         As ``bd_mask_low`` but the upper bound. Defaults to ``0.8``.
+    log_level:
+        TorchTurbo log level. Defaults to ``LogLevel.INFO``.
     """
 
     backend: str | None = None
@@ -112,6 +125,7 @@ class TorchTurboArgs:
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
     profiling: bool = False
+    log_level: LogLevel = LogLevel.INFO
 
     # Adapter-seeded fields (NOT CLI ``--tt_*`` flags). Adapters fold values
     # sourced from their own args (model path, output_dir, bf16/fp16 -> mixed
@@ -331,6 +345,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable NPU/CUDA profiling. Outputs to {output_dir}/profiling/. "
         "Accepts --tt_profiling, ... true, or ... false.",
     )
+    parser.add_argument(
+        "--tt_log_level",
+        type=parse_log_level,
+        default=LogLevel.INFO,
+        metavar="LEVEL",
+        help="TorchTurbo log level: DEBUG, INFO, WARNING, or ERROR.",
+    )
 
     return parser
 
@@ -382,6 +403,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         prefetch_direction=parsed.tt_prefetch_direction,
         forward_prefetch_depth=parsed.tt_forward_prefetch_depth,
         backward_prefetch_depth=parsed.tt_backward_prefetch_depth,
+        log_level=parsed.tt_log_level,
     )
 
     if any(
@@ -396,6 +418,5 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.mtp_loss_scaling_factor,
         ]
     ):
-        logger.info("torchturbo CLI args: %s", args)
-
+        logger.info_rank0("torchturbo CLI args: %s", args)
     return args, remaining

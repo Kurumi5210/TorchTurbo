@@ -12,6 +12,20 @@ def test_string_to_bool_matches_transformers_semantics():
     assert string_to_bool("f") is False
 
 
+def test_parse_torchturbo_args_log_level():
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.logging import LogLevel
+
+    args, _ = parse_torchturbo_args([])
+    assert args.log_level is LogLevel.INFO
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_log_level", "DEBUG", "--foo", "bar"]
+    )
+    assert args.log_level is LogLevel.DEBUG
+    assert remaining == ["--foo", "bar"]
+
+
 def test_parse_torchturbo_args_prefetch_depth():
     from torchturbo.engine.args import parse_torchturbo_args
 

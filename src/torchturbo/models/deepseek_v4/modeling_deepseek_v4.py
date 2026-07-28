@@ -19,10 +19,11 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+from torchturbo.logging import get_logger
 
 from .configuration_deepseek_v4 import DeepseekV4Config
 
-logger = logging.get_logger(__name__)
+logger = get_logger(__name__)
 
 
 

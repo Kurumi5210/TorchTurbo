@@ -35,9 +35,12 @@ from torchturbo.utils.flash_attn_utils import get_unpad_data
 
 from ...backend_registry import register_backend
 from ...config import EngineConfig
+from ....logging import get_logger
 from ..base import BaseBackend
 from .config import FSDPConfig
 from .prefetch import FSDPPrefetchManager
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -94,7 +97,6 @@ class FSDP2Backend(BaseBackend):
 
         self.prefetch_manager = FSDPPrefetchManager(
             config=self.fsdp_config,
-            logger=self.logger,
         )
 
         # Sequence parallel process group and device mesh
@@ -123,7 +125,7 @@ class FSDP2Backend(BaseBackend):
           group 1: [4, 5, 6, 7]
         """
         if not dist.is_initialized():
-            self.logger.warning(
+            logger.warning_rank0(
                 "torch.distributed not initialized — skipping SP group creation. "
                 "SP groups will be created lazily when needed."
             )
@@ -147,7 +149,7 @@ class FSDP2Backend(BaseBackend):
                 sp_group = group
         sp_rank = dist.get_rank(sp_group)
 
-        self.logger.info(
+        logger.info_rank0(
             "Created SP process group: sp_size=%d, rank=%d, " "group_ranks=%s",
             sp_size,
             rank,
@@ -177,7 +179,7 @@ class FSDP2Backend(BaseBackend):
             self._dp_group = dist.group.WORLD
             self._dp_rank = self.rank
             self._dp_size = world_size
-            print(f"sp_size <= 1, _dp_group={self._dp_group}")
+            self.logger.debug("sp_size <= 1, _dp_group=%s", self._dp_group)
             return self._dp_group
 
         if world_size % self._sp_size != 0:
@@ -241,7 +243,7 @@ class FSDP2Backend(BaseBackend):
             device_name, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
         )
 
-        self.logger.info("Created DeviceMesh")
+        logger.info_rank0("Created DeviceMesh")
 
         self._create_sp_group(sp_size)
         self._create_dp_group()
@@ -289,13 +291,16 @@ class FSDP2Backend(BaseBackend):
                         parent_fqn, _, name = fqn.rpartition(".")
                         parent = model.get_submodule(parent_fqn)
                         setattr(parent, name, new_module)
-                        self.logger.info(
+                        # Per-module trace is DEBUG-only; it fires once per
+                        # replaced/patched module and would otherwise inflate
+                        # the log on every rank.
+                        logger.debug_rank0(
                             "FSDP2Backend replaced module %s with %s",
                             fqn,
                             type(new_module).__name__,
                         )
                     else:
-                        self.logger.info("FSDP2Backend patched module %s in-place", fqn)
+                        logger.debug_rank0("FSDP2Backend patched module %s in-place", fqn)
 
         return model
 
@@ -346,7 +351,7 @@ class FSDP2Backend(BaseBackend):
         if peft_config is not None:
             from ...peft import apply_peft
 
-            self.logger.info("Applying PEFT LoRA to model")
+            logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
 
         # Phase 3: Activation checkpointing must be applied before FSDP2 so
@@ -672,13 +677,12 @@ class FSDP2Backend(BaseBackend):
 
         if not self.config.activation_checkpointing.enabled:
             target_fqns = [fqn or "<root>" for fqn, _ in target_modules]
-            if self.rank == 0:
-                self.logger.warning(
-                    "Activation checkpoint targets are configured in the "
-                    "parallel plan, but activation_checkpointing.enabled is "
-                    "False; skipping activation checkpointing for %s.",
-                    target_fqns,
-                )
+            logger.warning_rank0(
+                "Activation checkpoint targets are configured in the "
+                "parallel plan, but activation_checkpointing.enabled is "
+                "False; skipping activation checkpointing for %s.",
+                target_fqns,
+            )
             return model
 
         # TorchTurbo owns activation checkpointing here. Make sure HF's own
@@ -1142,11 +1146,13 @@ class FSDP2Backend(BaseBackend):
                 if int(os.environ.get('TORCH_TURBO_DEBUG_MTP', '0')):
                     rank = torch.distributed.get_rank()
                     with torch.no_grad():
-                        print(
-                            f'[TORCH_TURBO_DEBUG_MTP_LOSS] rank={rank} '
-                            f'sp_rank={sp_rank} head={i} '
-                            f'raw_mtp_loss={mtp_loss_i.item():.6f}',
-                            flush=True
+                        logger.debug(
+                            "[TORCH_TURBO_DEBUG_MTP_LOSS] rank=%d "
+                            "sp_rank=%d head=%d raw_mtp_loss=%.6f",
+                            rank,
+                            sp_rank,
+                            i,
+                            mtp_loss_i.item(),
                         )
 
         scaling = float(self.config.mtp.loss_scaling_factor)

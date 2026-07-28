@@ -23,6 +23,8 @@ Extra engine config via env vars::
 
 from __future__ import annotations
 
+import os
+
 from .logging import get_logger
 from .detector import FrameworkDetector
 from .engine import (
@@ -67,6 +69,7 @@ __all__ = [
     "detect",
     "detect_all",
     "get_available_backends",
+    "get_logger",
     "register_adapter",
     "register_backend",
 ]
@@ -107,7 +110,7 @@ def _discover_builtin_adapters() -> None:
         try:
             importlib.import_module(module_name)
         except Exception as e:
-            logger.warning("Failed to import adapter %s", module_name, exc_info=True)
+            logger.warning_rank0("Failed to import adapter %s", module_name, exc_info=True)
 
 
 def detect() -> str | None:
@@ -141,9 +144,13 @@ def activate(name: str | None = None) -> BaseAdapter | None:
         adapter = get_adapter(name)
         if adapter is None:
             raise ValueError(f"No adapter registered for {name!r}")
-        logger.info("Activating adapter for %r", name)
+        logger.info_rank0("Activating adapter for %r", name)
         adapter.activate()
         return adapter
+
+    if os.environ.get("TORCH_TURBO_DISABLE", "").lower() in ("1", "true", "yes"):
+        logger.info_rank0("torchturbo disabled via TORCH_TURBO_DISABLE env var.")
+        return None
 
     detected = FrameworkDetector.detect_all()
     if len(detected) == 1:
@@ -151,7 +158,7 @@ def activate(name: str | None = None) -> BaseAdapter | None:
         adapter = get_adapter(framework)
         if adapter is None:
             return None
-        logger.info("Auto-activating adapter for %r", framework)
+        logger.info_rank0("Auto-activating adapter for %r", framework)
         adapter.activate()
         return adapter
 
@@ -160,7 +167,7 @@ def activate(name: str | None = None) -> BaseAdapter | None:
         # process will run, and torchturbo is imported before the framework is
         # loaded, so there is no reliable automatic signal. Stay inactive and
         # let the launcher activate its own adapter explicitly.
-        logger.info(
+        logger.info_rank0(
             "Multiple frameworks detected (%s); skipping auto-activation — "
             "activate the intended adapter explicitly (e.g. via the launcher).",
             ", ".join(detected),

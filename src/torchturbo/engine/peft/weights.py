@@ -20,6 +20,9 @@ import torch.nn as nn
 from torch.distributed._tensor import DTensor
 
 from torchturbo.engine.utils import strip_peft_prefix
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +105,10 @@ def init_lora_tensor(
             # These modes require base weights to be already loaded or
             # data-driven init and are not compatible with the
             # meta-device → broadcast flow.  Fall back to default init.
-            import warnings
-
-            warnings.warn(
-                f"init_lora_weights={init_lora_weights!r} is not supported "
-                "in meta-device broadcast flow, falling back to default "
-                "(kaiming_uniform / zeros)",
-                stacklevel=2,
+            logger.warning_rank0_once(
+                "init_lora_weights=%r is not supported in meta-device "
+                "broadcast flow, falling back to default (kaiming_uniform / zeros)",
+                init_lora_weights,
             )
             if is_a:
                 nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))

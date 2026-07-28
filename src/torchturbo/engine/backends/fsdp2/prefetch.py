@@ -22,6 +22,8 @@ from torchturbo.utils.torch_utils import torch_version
 
 from .config import FSDPConfig, FSDPPrefetchDirection, FSDPPrefetchStrategy
 
+logger = get_logger(__name__)
+
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp._fully_shard import FSDPModule
 else:
@@ -140,13 +142,8 @@ def _source_for_node(
 class FSDPPrefetchManager:
     """Discovers MoE chains and applies a prefetch strategy to a wrapped model."""
 
-    def __init__(
-        self,
-        config: FSDPConfig,
-        logger: Any = None,
-    ) -> None:
+    def __init__(self, config: FSDPConfig) -> None:
         self.config = config
-        self.logger = logger if logger is not None else get_logger(__name__)
         self.chains: List[PrefetchChain] = []
         self._expert_forward_prefetch_targets: Dict[
             "FSDPModule", List["FSDPModule"]
@@ -159,7 +156,7 @@ class FSDPPrefetchManager:
         # set_modules_to_{forward,backward}_prefetch require torch >= 2.5.0.
         if torch_version() < (2, 5, 0):
             if self.config.prefetch_strategy != FSDPPrefetchStrategy.NATIVE:
-                self.logger.warning(
+                logger.warning_rank0(
                     "FSDP prefetch requires torch >= 2.5.0 for "
                     "set_modules_to_{forward,backward}_prefetch; got %s, "
                     "skipping prefetch.",
@@ -182,7 +179,7 @@ class FSDPPrefetchManager:
         self.chains = self._discover_moe_chains(model)
         if not self.chains:
             if self.config.prefetch_strategy != FSDPPrefetchStrategy.AUTO:
-                self.logger.warning(
+                logger.warning_rank0(
                     "FSDP prefetch: no eligible MoE chain discovered; skipping"
                 )
             return
@@ -194,7 +191,7 @@ class FSDPPrefetchManager:
         if enable_backward:
             self._flush_backward_targets(backward_targets)
 
-        self.logger.info(
+        logger.info_rank0(
             "FSDP prefetch configured: strategy=%s, forward=%s, backward=%s",
             self.config.prefetch_strategy.value,
             True,
@@ -468,10 +465,10 @@ class FSDPPrefetchManager:
         return _dedup(modules)
 
     def _log_discovery(self) -> None:
-        self.logger.info("FSDP prefetch discovered %d chain(s):", len(self.chains))
+        logger.info_rank0("FSDP prefetch discovered %d chain(s):", len(self.chains))
         for chain in self.chains:
             n_experts = sum(1 for n in chain.nodes if n.experts is not None)
-            self.logger.info(
+            logger.info_rank0(
                 "- %s: nodes=%d, experts=%d, bootstrap=%s",
                 chain.name,
                 len(chain.nodes),

@@ -65,13 +65,17 @@ from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
 
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
 
     # from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 if is_torch_npu_available():
-    print("Using npu_fusion_attention", flush=True)
+    logger.info_rank0("Using npu_fusion_attention")
     from torchturbo.utils.flash_attn_utils import (
         index_first_axis,
         pad_input,
@@ -91,8 +95,6 @@ if is_torch_fx_available():
 
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
-
-logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "DeepseekV3Config"
 
@@ -756,7 +758,7 @@ class DeepseekV3Attention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         if layer_idx is None:
-            logger.warning_once(
+            logger.warning_rank0_once(
                 f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
@@ -1101,7 +1103,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                     else self.q_a_proj.weight.dtype
                 )
 
-            logger.warning_once(
+            logger.warning_rank0_once(
                 f"The input hidden states seems to be silently casted in float32, this might be related to"
                 f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
                 f" {target_dtype}."

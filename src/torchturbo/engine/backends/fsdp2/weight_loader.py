@@ -140,8 +140,7 @@ class DistParamLoader:
         Each rank determines which HF parameter names it needs to read from disk.
         """
         start_time = time.perf_counter()
-        if self.rank == 0:
-            logger.info("[DistParamLoader] _build_meta_info starting...")
+        logger.info_rank0("[load] building meta info...")
 
         common_params = []
         expert_param_groups = []  # list of (model_param_name, [local_hf_names], total_local_bytes)
@@ -184,15 +183,15 @@ class DistParamLoader:
         self._assign_param_to_ranks(expert_param_groups, self.edp_ranks, common_params)
 
         elapsed = time.perf_counter() - start_time
-        if self.rank == 0:
-            logger.info(f"[DistParamLoader] _build_meta_info completed in {elapsed:.2f}s")
-            num_files = len(set(
-                self.param_to_filename[p]
-                for p in self.rank_to_params[self.rank]
-                if p in self.param_to_filename
-            ))
-            logger.info(f"[DistParamLoader] Rank 0 will read {num_files} files for "
-                       f"{len(self.rank_to_params[self.rank])} params")
+        num_files = len(set(
+            self.param_to_filename[p]
+            for p in self.rank_to_params[self.rank]
+            if p in self.param_to_filename
+        ))
+        logger.info_rank0(
+            "[load] meta info built in %.2fs; rank 0 will read %d files for %d params",
+            elapsed, num_files, len(self.rank_to_params[self.rank]),
+        )
 
         return set(self.rank_to_params[self.rank])
 
@@ -290,8 +289,10 @@ class DistParamLoader:
         local_sd = {}
         if files_needed:
             files = [self.path / f for f in sorted(files_needed.keys())]
-            logger.info(f"[Rank {self.rank}] Loading {len(files)} files with "
-                       f"{len(self.local_params)} parameters...")
+            logger.debug_rank0(
+                "[load][rank %d] Loading %d files with %d parameters...",
+                self.rank, len(files), len(self.local_params),
+            )
             t0 = time.perf_counter()
             for f in files:
                 file_params = load_file(f.as_posix(), device="cpu")
@@ -320,12 +321,14 @@ class DistParamLoader:
                             virtual_key, file_params[physical_key]
                         )
 
-            logger.info(f"[Rank {self.rank}] Loaded {len(local_sd)} params in "
-                       f"{time.perf_counter() - t0:.2f}s")
+            logger.debug_rank0(
+                "[load][rank %d] Loaded %d params in %.2fs",
+                self.rank, len(local_sd), time.perf_counter() - t0,
+            )
         else:
-            logger.info(f"[Rank {self.rank}] No parameters to load")
+            logger.debug_rank0("[load][rank %d] No parameters to load", self.rank)
 
-        self._sync_log_rank0("[Load File] Load finished")
+        self._sync_log_rank0("[load] local shards loaded")
         return local_sd
 
     # ── Async Broadcast Helpers ────────────────────────────────────
@@ -426,12 +429,10 @@ class DistParamLoader:
         dist.all_reduce(budget_tensor, op=dist.ReduceOp.MIN)
         budget_bytes = min(int(budget_tensor.item()), self._BROADCAST_MEM_BUDGET_CAP)
 
-        if self.rank == 0:
-            logger.info(
-                f"[Broadcast] Memory budget: {budget_bytes / 1024**3:.2f} GB "
-                f"(local free: {mem_free / 1024**3:.2f} GB, "
-                f"reserve: {reserve_bytes / 1024**3:.2f} GB)"
-            )
+        logger.info_rank0(
+            "[load] broadcast memory budget: %.2f GB (local free: %.2f GB, reserve: %.2f GB)",
+            budget_bytes / 1024**3, mem_free / 1024**3, reserve_bytes / 1024**3,
+        )
         return budget_bytes
 
     # ── Flush Pending Tasks ────────────────────────────────────────
@@ -504,8 +505,11 @@ class DistParamLoader:
             gc.collect()
             new_free, _ = self.device_runtime.memory_info()
             freed_gb = (new_free - before_free) / 1024 ** 3
-            logger.info(f"Rank {self.rank} Cleaned {freed_gb:.2f} GB GPU memory "
-                       f"(utilization: {utilization:.1%} -> {(mem_total - new_free)/mem_total:.1%})")
+            logger.debug_rank0(
+                "[load][rank %d] Cleaned %.2f GB GPU memory (utilization: %.1f%% -> %.1f%%)",
+                self.rank, freed_gb, utilization * 100,
+                (mem_total - new_free) / mem_total * 100,
+            )
 
     # ── Buffer Handling ────────────────────────────────────────────
 
@@ -516,12 +520,16 @@ class DistParamLoader:
             if self.param_converter.is_persist_buffer(clean_name):
                 hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
                 if hf_buffer_name not in self.param_to_filename:
-                    if self.rank == 0:
-                        logger.info(f"[Weight Loader] SKIP buffer (not in checkpoint): {clean_name} (original: {name})")
+                    logger.debug_rank0(
+                        "[load] SKIP buffer (not in checkpoint): %s (original: %s)",
+                        clean_name, name,
+                    )
                     continue
                 if hf_buffer_name not in self.param_to_rank:
-                    if self.rank == 0:
-                        logger.info(f"[Weight Loader] SKIP buffer (not assigned): {clean_name} (original: {name})")
+                    logger.debug_rank0(
+                        "[load] SKIP buffer (not assigned): %s (original: %s)",
+                        clean_name, name,
+                    )
                     continue
                 owner = self.param_to_rank[hf_buffer_name]
                 hf_dtype = self.param_converter.get_default_hf_dtype(hf_buffer_name)
@@ -558,12 +566,16 @@ class DistParamLoader:
             else:
                 hf_name = self.param_converter.to_common_hf_name(clean_name)
                 if hf_name not in self.param_to_filename:
-                    if self.rank == 0:
-                        logger.info(f"[Weight Loader] SKIP (not in checkpoint): {clean_name} (original: {name})")
+                    logger.debug_rank0(
+                        "[load] SKIP (not in checkpoint): %s (original: %s)",
+                        clean_name, name,
+                    )
                     continue
                 if hf_name not in self.param_to_rank:
-                    if self.rank == 0:
-                        logger.info(f"[Weight Loader] SKIP (not assigned): {clean_name} (original: {name})")
+                    logger.debug_rank0(
+                        "[load] SKIP (not assigned): %s (original: %s)",
+                        clean_name, name,
+                    )
                     continue
                 # Broadcast in checkpoint dtype; dtype conversion deferred to flush
                 hf_dtype = self.param_converter.get_default_hf_dtype(clean_name)
@@ -577,8 +589,9 @@ class DistParamLoader:
                 self._flush_pending_tasks(pending, sharded_sd)
                 pending = []
                 pending_bytes = 0
-                if self.rank == 0:
-                    logger.info(f"[Broadcast] {processed}/{num_params} params")
+                logger.debug_rank0(
+                    "[load] broadcast flushed %d/%d params", processed, num_params
+                )
 
             pending.append(_PendingTask(handle, full, param, mesh, name, target_dtype))
             pending_bytes += tensor_bytes
@@ -587,7 +600,7 @@ class DistParamLoader:
         if pending:
             self._flush_pending_tasks(pending, sharded_sd)
 
-        self._sync_log_rank0(f"[Rank {self.rank}] Broadcast {processed}/{num_params} params done")
+        self._sync_log_rank0(f"[load] broadcast {processed}/{num_params} params done")
 
     # ── Cleanup ────────────────────────────────────────────────────
 
@@ -607,7 +620,7 @@ class DistParamLoader:
 
         # buffers (small, kept synchronous)
         self._broadcast_buffers(sharded_sd)
-        self._sync_log_rank0(f"[Rank {self.rank}] broadcast buffers")
+        self._sync_log_rank0("[load] broadcast buffers")
 
         # parameters (pipelined async broadcasts)
         self._broadcast_params(sharded_sd)
@@ -615,6 +628,6 @@ class DistParamLoader:
         if hasattr(self.model, "tie_weights"):
             self.model.tie_weights()
         del sharded_sd
-        self._sync_log_rank0(f"[Rank {self.rank}] Broadcast/sharding done")
+        self._sync_log_rank0("[load] broadcast/sharding done")
 
         self._cleanup()

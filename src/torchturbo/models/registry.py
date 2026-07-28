@@ -74,4 +74,4 @@ def _register_builtins() -> None:
                         f".{module_name}.model", package=__package__
                     )
                 except Exception as e:
-                    logger.warning("Failed to load model %r: %s", module_name, e)
+                    logger.warning_rank0("Failed to load model %r: %s", module_name, e)

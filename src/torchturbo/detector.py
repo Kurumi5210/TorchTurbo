@@ -29,7 +29,7 @@ class FrameworkDetector:
         for name, adapter in get_adapters_by_priority():
             try:
                 if adapter.detect():
-                    logger.info("Detected framework: %s", name)
+                    logger.info_rank0("Detected framework: %s", name)
                     return name
             except Exception:
                 logger.debug("Adapter %r raised during detect()", name, exc_info=True)

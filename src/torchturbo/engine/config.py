@@ -652,7 +652,7 @@ def build_from_args(torchturbo_args: TorchTurboArgs | None) -> EngineConfig:
         diffusion=_build_diffusion_config(tt),
         extra={},
     )
-    logger.info(
+    logger.info_rank0(
         "Built EngineConfig from TorchTurboArgs: backend=%s, mp=%s, sp=%d, ep=%d",
         config.backend.value,
         config.mixed_precision.value,

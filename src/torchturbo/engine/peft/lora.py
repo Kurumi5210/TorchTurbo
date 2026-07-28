@@ -37,7 +37,6 @@ local experts) have independent per-expert LoRA configurations.
 from __future__ import annotations
 
 import math
-import warnings
 from typing import Any, Optional, Union
 
 import torch
@@ -47,6 +46,9 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from torchturbo.ops import ops
 from torchturbo.models.modules.moe.experts import GroupedMLP
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class GroupedLoRALinear(nn.Module):
@@ -577,7 +579,7 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
     def unmerge(self) -> None:
         """Unmerge all merged adapters from the base weights."""
         if not self.merged_adapters:
-            warnings.warn("Already unmerged. Nothing to do.")
+            logger.warning_rank0_once("Already unmerged. Nothing to do.")
             return
 
         while self.merged_adapters:

@@ -240,7 +240,7 @@ class OpDispatcher:
         if unavailable:
             lines.extend(["", "Unavailable details:", *unavailable])
 
-        logger.info(
+        logger.info_rank0(
             "TorchTurbo ops selection (device=%s, policy=%s):\n%s",
             self._device_runtime.device.type,
             self._default_policy.value,

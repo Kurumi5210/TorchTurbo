@@ -89,7 +89,9 @@ if is_torch_fx_available():
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
 
-logger = logging.get_logger(__name__)
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BailingMoeV3Config"
 
@@ -1353,7 +1355,7 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
-                logger.warning_once(
+                logger.warning_rank0_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`transformers."
                 )
                 use_cache = False

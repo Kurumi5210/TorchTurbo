@@ -4,6 +4,10 @@ from typing import Tuple, Union
 
 import torch
 
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class ModuleSpec:
@@ -37,7 +41,7 @@ def import_module(module_path: Tuple[str]):
     try:
         module = __import__(base_path, globals(), locals(), [name])
     except ImportError as e:
-        print(f"couldn't import module due to {e}")
+        logger.warning_rank0("couldn't import module due to %s", e)
         return None
     return vars(module)[name]
 

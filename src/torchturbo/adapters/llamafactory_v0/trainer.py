@@ -72,13 +72,13 @@ class TorchTurboTrainerBase:
         engine = self._engine()
         template_name = getattr(engine, "_lf_template_name", None)
         if not template_name:
-            logger.warning("No template name on engine; skipping MLLM PT collator upgrade.")
+            logger.warning_rank0("No template name on engine; skipping MLLM PT collator upgrade.")
             return
 
         from llamafactory.data.template import TEMPLATES
         template = TEMPLATES.get(template_name)
         if template is None:
-            logger.warning(
+            logger.warning_rank0(
                 "Template %r not in registry; skipping MLLM PT collator upgrade.",
                 template_name,
             )
@@ -92,7 +92,7 @@ class TorchTurboTrainerBase:
             tokenizer=self.tokenizer,
             processor=self._mm_processor,
         )
-        logger.info("Upgraded PT collator to MultiModalDataCollatorForSeq2Seq")
+        logger.info_rank0("Upgraded PT collator to MultiModalDataCollatorForSeq2Seq")
 
     def _raise_if_unsupported_trainer_options(self, finetuning_args: Any) -> None:
         unsupported = self._get_unsupported_trainer_options(finetuning_args)
@@ -143,7 +143,7 @@ class TorchTurboTrainerBase:
         optimizer_kwargs.pop("optimizer_dict", None)
 
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
-        logger.info(
+        logger.info_rank0(
             "torchturbo: created optimizer via engine.prepare_optimizer "
             "(%s, %s)",
             optimizer_cls.__name__,
@@ -157,7 +157,7 @@ class TorchTurboTrainerBase:
             output_dir = self.args.output_dir
 
         save_path = str(Path(output_dir) / "huggingface")
-        logger.info("torchturbo: saving model via engine.save_model(%s)", save_path)
+        logger.info_rank0("torchturbo: saving model via engine.save_model(%s)", save_path)
         engine.save_model(self.model, save_path)
 
         if getattr(self.args, "push_to_hub", False) and not _internal_call:
@@ -182,7 +182,7 @@ class TorchTurboTrainerBase:
             orig = args.gradient_accumulation_steps
             args.gradient_accumulation_steps = orig * sp_size
             args._torchturbo_sp_adjusted = True
-            logger.info(
+            logger.info_rank0(
                 "SP=%d: gradient_accumulation_steps %d -> %d",
                 sp_size,
                 orig,
@@ -259,7 +259,7 @@ class TorchTurboTrainerBase:
             orig_ga = args.gradient_accumulation_steps
             args.gradient_accumulation_steps = orig_ga * sp_size
             args._torchturbo_sp_adjusted = True
-            logger.info(
+            logger.info_rank0(
                 "BD SP=%d: gradient_accumulation_steps %d -> %d",
                 sp_size, orig_ga, args.gradient_accumulation_steps,
             )
@@ -275,8 +275,8 @@ class TorchTurboTrainerBase:
         )
 
     def train(self, *args, **kwargs):
-        from ...engine.args import get_torchturbo_args
         from ...engine.hooks import TrainState
+        from ...engine.args import get_torchturbo_args
 
         engine = self._engine()
         sp_info = engine.backend.get_sp_info()
@@ -298,14 +298,15 @@ class TorchTurboTrainerBase:
             engine.start_profiling(self.args.output_dir)
 
         try:
-            return super().train(*args, **kwargs)
+            result = super().train(*args, **kwargs)
         finally:
             if profiling_enabled:
                 engine.stop_profiling()
 
+        return result
+
     def _make_torchturbo_profiling_callback(self):
         from transformers import TrainerCallback
-
         engine = self._engine()
 
         class TorchTurboProfilingCallback(TrainerCallback):
@@ -475,7 +476,7 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
         if getattr(self.finetuning_args, "ref_model", None) is None:
             self._copy_model_state(self.model, ref_model)
-            logger.info(
+            logger.info_rank0(
                 "torchturbo: initialized DPO reference model from policy weights."
             )
 
@@ -623,8 +624,7 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
         from ...models.base import SequenceParallelInputMode
 
-        input_mode = model.get_sequence_parallel_input_mode()
-        if input_mode == SequenceParallelInputMode.POST_EMBEDDING:
+        if model.get_sequence_parallel_input_mode() == SequenceParallelInputMode.POST_EMBEDDING:
             (
                 inputs["input_ids"],
                 inputs["position_ids"],

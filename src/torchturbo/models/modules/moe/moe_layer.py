@@ -11,6 +11,9 @@ from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -169,23 +172,29 @@ class MoELayer(BaseMoELayer):
                 output = output + shared_expert_output
 
             if rank == 0 and int(os.environ.get('TORCH_TURBO_DEBUG', '0')):
-                print(
-                    f"hidden_states.shape {hidden_states.shape} hidden_states {hidden_states}"
+                logger.debug_rank0(
+                    "hidden_states.shape %s hidden_states %s",
+                    hidden_states.shape, hidden_states,
                 )
-                print(
-                    f"dispatched_input.shape {dispatched_input.shape} dispatched_input {dispatched_input}"
+                logger.debug_rank0(
+                    "dispatched_input.shape %s dispatched_input %s",
+                    dispatched_input.shape, dispatched_input,
                 )
-                print(
-                    f"tokens_per_expert.shape {tokens_per_expert.shape} tokens_per_expert {tokens_per_expert}"
+                logger.debug_rank0(
+                    "tokens_per_expert.shape %s tokens_per_expert %s",
+                    tokens_per_expert.shape, tokens_per_expert,
                 )
-                print(
-                    f"permuted_probs.shape {permuted_probs.shape} permuted_probs {permuted_probs}"
+                logger.debug_rank0(
+                    "permuted_probs.shape %s permuted_probs %s",
+                    permuted_probs.shape, permuted_probs,
                 )
-                print(
-                    f"before unpermutation: expert_output.shape {expert_output.shape} expert_output {expert_output}"
+                logger.debug_rank0(
+                    "before unpermutation: expert_output.shape %s expert_output %s",
+                    expert_output.shape, expert_output,
                 )
-                print(
-                    f"after unpermutation: expert_output.shape {output.shape} expert_output {output}"
+                logger.debug_rank0(
+                    "after unpermutation: expert_output.shape %s expert_output %s",
+                    output.shape, output,
                 )
 
             return output, mlp_bias, logits

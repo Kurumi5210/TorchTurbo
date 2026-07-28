@@ -98,15 +98,6 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         if self._active:
             return
 
-        # Use LlamaFactory's logger
-        try:
-            from llamafactory.extras.logging import get_logger as lf_get_logger
-            from ...logging import set_logger_factory
-
-            set_logger_factory(lf_get_logger)
-        except ImportError:
-            pass
-
         # Auto register LF templates/plugins for all torchturbo models
         self._register_lf_templates()
 
@@ -131,7 +122,7 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         run_exp_patch.patch()  # apply immediately (no engine needed yet)
 
         self._active = True
-        logger.info("LlamaFactory v0 adapter activated (patches registered)")
+        logger.info_rank0("LlamaFactory v0 adapter activated (patches registered)")
 
     def deactivate(self) -> None:
         """Revert all patches."""
@@ -140,13 +131,9 @@ class LlamaFactoryV0Adapter(BaseAdapter):
 
         self.revert_patches()
 
-        from ...logging import reset_logger_factory
-
-        reset_logger_factory()
-
         self.engine = None
         self._active = False
-        logger.info("LlamaFactory v0 adapter deactivated.")
+        logger.info_rank0("LlamaFactory v0 adapter deactivated.")
 
     @staticmethod
     def _register_lf_templates() -> None:

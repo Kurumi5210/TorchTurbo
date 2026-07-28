@@ -122,7 +122,7 @@ def install_vlm_dataset_adapter() -> bool:
         from swift.dataset.preprocessor.core import RowPreprocessor
         from swift.template.base import Template
     except Exception:
-        logger.debug("swift RowPreprocessor/Template not importable; skipping VLM dataset adapter")
+        logger.debug_rank0("swift RowPreprocessor/Template not importable; skipping VLM dataset adapter")
         return False
 
     # --- Wrap 1: dataset-level multimodal detection -------------------------
@@ -134,7 +134,7 @@ def install_vlm_dataset_adapter() -> bool:
             global _multimodal_dataset
             if not _multimodal_dataset and _is_multimodal_dataset(built):
                 _multimodal_dataset = True
-                logger.info(
+                logger.info_rank0(
                     "torchturbo: multimodal dataset detected (media column present) — "
                     "media-less samples are padded with fake media so every rank drives "
                     "the media tower under FSDP+expert-parallel (per-layer all-gather "
@@ -160,14 +160,14 @@ def install_vlm_dataset_adapter() -> bool:
                 try:
                     _build_pad_media(inputs)
                 except Exception:
-                    logger.debug("VLM dataset adapter pad skipped for a sample", exc_info=True)
+                    logger.debug_rank0("VLM dataset adapter pad skipped for a sample", exc_info=True)
             return orig_ppi(self, inputs)
 
         _wrapped_ppi._turbo_vlm_adapter_pad_installed = True
         _wrapped_ppi._turbo_original = orig_ppi
         Template._preprocess_inputs = _wrapped_ppi
 
-    logger.info("torchturbo VLM dataset adapter installed")
+    logger.info_rank0("torchturbo VLM dataset adapter installed")
     return True
 
 

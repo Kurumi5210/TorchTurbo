@@ -1,70 +1,191 @@
-"""Pluggable logging for torchturbo.
+"""Logging utilities for torchturbo.
 
-By default, uses Python's standard ``logging`` module.  When an adapter
-activates, it can swap in the framework's logger so that all torchturbo
-messages go through the same logging pipeline.
+The log level is configured by the caller. Rank-0 helpers avoid duplicate
+messages in distributed runs, and log output is compatible with tqdm progress
+bars.
 
-Usage inside torchturbo::
+Usage::
 
-    from torchturbo.logging import get_logger
+    from torchturbo.logging import LogLevel, get_logger, logging_configure
+
+    logging_configure(level=LogLevel.DEBUG)
     logger = get_logger(__name__)
-    logger.info("hello")  # uses whatever logger the adapter set
-
-Adapters call::
-
-    from torchturbo.logging import set_logger_factory
-    from llamafactory.extras.logging import get_logger as lf_get_logger
-    set_logger_factory(lf_get_logger)
+    logger.info_rank0("hello")
 """
 
 from __future__ import annotations
 
 import logging
-import sys
+import os
+from enum import Enum
 from typing import Any, Callable
 
-_root = logging.getLogger("torchturbo")
-if not _root.handlers:
-    _handler = logging.StreamHandler(sys.stdout)
-    _handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    )
-    _root.addHandler(_handler)
-    _root.setLevel(logging.DEBUG)
+# Root logger name for torchturbo.
+_LIBRARY_NAME = "torchturbo"
 
-# The factory function: name -> logger-like object
-_logger_factory: Callable[[str], Any] = logging.getLogger
+# Match the log format used by LlamaFactory and Transformers.
+_FORMAT = "[%(levelname)s|%(asctime)s] %(name)s:%(lineno)s >> %(message)s"
+_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 
-def get_logger(name: str) -> Any:
-    """Get a logger for the given module name.
+class LogLevel(Enum):
+    """Log levels supported by torchturbo."""
 
-    Returns whatever logger the current factory produces.  By default
-    this is a standard ``logging.Logger``.  After an adapter calls
-    :func:`set_logger_factory`, it returns the framework's logger.
+    DEBUG = logging.DEBUG
+    INFO = logging.INFO
+    WARNING = logging.WARNING
+    ERROR = logging.ERROR
+
+
+class _TqdmStream:
+    """Write through ``tqdm.write`` without disrupting progress bars."""
+
+    def __init__(self) -> None:
+        self._fallback = __import__("sys").stdout
+
+    def _writer(self) -> Callable[[str], Any]:
+        try:
+            from tqdm.auto import tqdm  # type: ignore[import-untyped]
+
+            return lambda msg: tqdm.write(msg, end="")
+        except Exception:
+            return self._fallback.write
+
+    def write(self, msg: str) -> int:
+        written = self._writer()(msg)
+        return len(msg) if written is None else written
+
+    def flush(self) -> None:
+        try:
+            self._fallback.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        try:
+            return self._fallback.isatty()
+        except Exception:
+            return False
+
+    def reconfigure(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+        getattr(self._fallback, "reconfigure", lambda *a, **k: None)(*args, **kwargs)
+
+
+class TqdmStreamHandler(logging.StreamHandler):
+    """Logging handler that writes through ``tqdm`` when available."""
+
+    def __init__(self) -> None:
+        super().__init__(_TqdmStream())
+
+
+class TurboLogger:
+    """Wrapper around :class:`logging.Logger` with distributed helpers.
+
+    Plain methods log on every rank. ``*_rank0`` methods log only on rank 0,
+    and ``*_rank0_once`` methods log once per logger instance on rank 0.
     """
-    return _logger_factory(name)
+
+    __slots__ = ("_name", "_log", "_rank0", "_once")
+
+    @staticmethod
+    def is_rank0() -> bool:
+        """Return whether the current process is rank 0."""
+        rank = os.getenv("LOCAL_RANK") or os.getenv("RANK")
+        if rank is None:
+            return True
+        try:
+            return int(rank) == 0
+        except ValueError:
+            return rank == "0"
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._log = logging.getLogger(name)
+        self._rank0 = self.is_rank0()
+        self._once: set[tuple] = set()
+
+    def _rank0_once(self, args: tuple, kwargs: dict) -> bool:
+        """Return whether a message should be emitted once on rank 0."""
+        if not self._rank0:
+            return False
+        key = (args, tuple(sorted(kwargs.items())))
+        if key in self._once:
+            return False
+        self._once.add(key)
+        return True
+
+    def info(self, *args: Any, **kwargs: Any) -> None:
+        self._log.info(*args, **kwargs)
+
+    def info_rank0(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0:
+            kwargs.setdefault("stacklevel", 2)
+            self._log.info(*args, **kwargs)
+
+    def info_rank0_once(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0_once(args, kwargs):
+            kwargs.setdefault("stacklevel", 2)
+            self._log.info(*args, **kwargs)
+
+    def debug(self, *args: Any, **kwargs: Any) -> None:
+        self._log.debug(*args, **kwargs)
+
+    def debug_rank0(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0:
+            kwargs.setdefault("stacklevel", 2)
+            self._log.debug(*args, **kwargs)
+
+    def debug_rank0_once(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0_once(args, kwargs):
+            kwargs.setdefault("stacklevel", 2)
+            self._log.debug(*args, **kwargs)
+
+    def warning(self, *args: Any, **kwargs: Any) -> None:
+        self._log.warning(*args, **kwargs)
+
+    def warning_rank0(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0:
+            kwargs.setdefault("stacklevel", 2)
+            self._log.warning(*args, **kwargs)
+
+    def warning_rank0_once(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0_once(args, kwargs):
+            kwargs.setdefault("stacklevel", 2)
+            self._log.warning(*args, **kwargs)
+
+    def error(self, *args: Any, **kwargs: Any) -> None:
+        self._log.error(*args, **kwargs)
+
+    def error_rank0(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0:
+            kwargs.setdefault("stacklevel", 2)
+            self._log.error(*args, **kwargs)
+
+    def error_rank0_once(self, *args: Any, **kwargs: Any) -> None:
+        if self._rank0_once(args, kwargs):
+            kwargs.setdefault("stacklevel", 2)
+            self._log.error(*args, **kwargs)
 
 
-def set_logger_factory(factory: Callable[[str], Any]) -> None:
-    """Replace the logger factory.
-
-    Parameters
-    ----------
-    factory:
-        A callable that takes a module name (str) and returns a logger-like
-        object with ``.info()``, ``.warning()``, ``.debug()`` etc.
-
-    Example::
-
-        from llamafactory.extras.logging import get_logger
-        set_logger_factory(get_logger)
-    """
-    global _logger_factory
-    _logger_factory = factory
+def logging_configure(level: LogLevel = LogLevel.INFO) -> None:
+    """Set the torchturbo root logger level."""
+    if not isinstance(level, LogLevel):
+        raise TypeError(f"level must be a LogLevel, got {type(level).__name__}")
+    logging.getLogger(_LIBRARY_NAME).setLevel(level.value)
 
 
-def reset_logger_factory() -> None:
-    """Reset to Python's standard ``logging.getLogger``."""
-    global _logger_factory
-    _logger_factory = logging.getLogger
+def get_logger(name: str) -> TurboLogger:
+    """Return a :class:`TurboLogger` for *name*."""
+    return TurboLogger(name)
+
+
+def _install() -> None:
+    """Install the default handler for the torchturbo root logger."""
+    root = logging.getLogger(_LIBRARY_NAME)
+    handler = TqdmStreamHandler()
+    handler.setFormatter(logging.Formatter(fmt=_FORMAT, datefmt=_DATEFMT))
+    root.addHandler(handler)
+    root.propagate = False
+
+
+_install()

@@ -80,7 +80,7 @@ class TurboEnginePipelineMixin:
         engine_registry.set_packing_length(
             getattr(self.args, "packing_length", None) or getattr(self.args, "max_length", None)
         )
-        logger.info(
+        logger.info_rank0(
             "TurboSwiftSft: engine ready (backend=%s, mp=%s)",
             config.backend.value, config.mixed_precision.value,
         )
@@ -106,12 +106,12 @@ class TurboEnginePipelineMixin:
             if getattr(self, "template", None) is None:
                 return
             self.template._post_encode = lambda model, inputs: inputs
-            logger.info(
+            logger.info_rank0(
                 "TurboSwiftSft: bypassed swift _post_encode "
                 "(turbo VLM self-encodes from pixel_values)"
             )
         except Exception:
-            logger.debug("TurboSwiftSft: could not override template._post_encode", exc_info=True)
+            logger.debug_rank0("TurboSwiftSft: could not override template._post_encode", exc_info=True)
 
     def prepare_model(self, args=None, model=None, template=None, train_dataset=None, **kwargs):
         # The engine already built + sharded + applied freeze/LoRA inside

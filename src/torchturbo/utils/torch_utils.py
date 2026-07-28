@@ -3,6 +3,10 @@ from typing import List, Tuple, Union
 
 import torch
 
+from torchturbo.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def torch_version(
     version: str = torch.__version__, return_dev: bool = False
@@ -18,7 +22,7 @@ def torch_version(
 
         # Assuming that we're interested in the second use-case more than the first,
         # return the pre-release or dev numbering
-        print(f"Pytorch pre-release version {version} - assuming intent to test it")
+        logger.info_rank0("Pytorch pre-release version %s - assuming intent to test it", version)
 
     ver = tuple(int(numbering.group(n)) for n in range(1, 4))
     if return_dev:
@@ -32,20 +36,20 @@ def compare_tensors(key, custom, ref, rank, atol=1e-5):
         return
     # check if the shapes match
     if custom.shape != ref.shape:
-        print(f" Rank {rank} - Key: {key} - Shape mismatch ")
-        print(f" Rank {rank} - Key: {key} - Expected shape: {custom.shape}")
-        print(f" Rank {rank} - Key: {key} - Actual shape: {ref.shape}")
+        logger.debug_rank0("Rank %s - Key: %s - Shape mismatch", rank, key)
+        logger.debug_rank0("Rank %s - Key: %s - Expected shape: %s", rank, key, custom.shape)
+        logger.debug_rank0("Rank %s - Key: %s - Actual shape: %s", rank, key, ref.shape)
 
     if not torch.allclose(custom.float(), ref.float(), atol=atol):
         diff = torch.abs(custom - ref)
         max_diff = torch.max(diff)
         mean_diff = torch.mean(diff)
-        print(f"Rank {rank} - Key: {key} - Max difference: {max_diff.item():.6f}")
-        print(f"Rank {rank} - Key: {key} - Mean difference: {mean_diff.item():.6f}")
-        print(f"Rank {rank} - Key: {key} - Custom shape: {custom.shape}")
-        print(f"Rank {rank} - Key: {key} - Ref shape: {ref.shape}")
-        print(f"Rank {rank} - Key: {key} - Custom value: {custom}")
-        print(f"Rank {rank} - Key: {key} - Ref value: {ref}")
+        logger.debug_rank0("Rank %s - Key: %s - Max difference: %.6f", rank, key, max_diff.item())
+        logger.debug_rank0("Rank %s - Key: %s - Mean difference: %.6f", rank, key, mean_diff.item())
+        logger.debug_rank0("Rank %s - Key: %s - Custom shape: %s", rank, key, custom.shape)
+        logger.debug_rank0("Rank %s - Key: %s - Ref shape: %s", rank, key, ref.shape)
+        logger.debug_rank0("Rank %s - Key: %s - Custom value: %s", rank, key, custom)
+        logger.debug_rank0("Rank %s - Key: %s - Ref value: %s", rank, key, ref)
 
 
 def load_safetensors_dir(model_dir: str) -> dict:
@@ -105,7 +109,7 @@ def load_safetensors_dir(model_dir: str) -> dict:
         else:
             raise ValueError(f"{filepath} is not a torch bin or safetensor file.")
         t1 = time.perf_counter()
-        print(f"[Loading] load {filepath} done in {t1 - t0:.2f} s", flush=True)
+        logger.debug_rank0("[load] %s done in %.2fs", filepath, t1 - t0)
         return state_dict
 
     state_dict = {}

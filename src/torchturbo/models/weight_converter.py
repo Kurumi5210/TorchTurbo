@@ -555,10 +555,9 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
         w1 = tensor.reshape(num_local_experts, self.config.hidden_size, -1)
         w1 = w1.permute(0, 2, 1).contiguous()  # [num_local, 2I, H]
-        # All-gather across EP group to reconstruct full [E, 2I, H]
-        w1_list = [torch.zeros_like(w1) for _ in range(self.ep_size)]
-        dist.all_gather(w1_list, w1, group=self.ep_group)
-        full_w1 = torch.cat(w1_list, dim=0)  # [E, 2I, H]
+        # All-gather directly into output tensor, avoiding intermediate list + cat
+        full_w1 = w1.new_zeros(self.moe_config.num_moe_experts, *w1.shape[1:])
+        dist.all_gather_into_tensor(full_w1, w1, group=self.ep_group)
         hf_name = self.convert_expert_weight1_to_hf(name)
         return {hf_name: full_w1}
 
@@ -571,10 +570,9 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
         w2 = tensor.reshape(num_local_experts, self.config.moe_intermediate_size, self.config.hidden_size)
         w2 = w2.permute(0, 2, 1).contiguous()  # [num_local, H, I]
-        # All-gather across EP group to reconstruct full [E, H, I]
-        w2_list = [torch.zeros_like(w2) for _ in range(self.ep_size)]
-        dist.all_gather(w2_list, w2, group=self.ep_group)
-        full_w2 = torch.cat(w2_list, dim=0)  # [E, H, I]
+        # All-gather directly into output tensor, avoiding intermediate list + cat
+        full_w2 = w2.new_zeros(self.moe_config.num_moe_experts, *w2.shape[1:])
+        dist.all_gather_into_tensor(full_w2, w2, group=self.ep_group)
         hf_name = self.convert_expert_weight2_to_hf(name)
         return {hf_name: full_w2}
 

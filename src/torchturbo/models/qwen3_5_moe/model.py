@@ -54,6 +54,12 @@ class TurboQwen3_5MoeForConditionalGeneration(
     multi_modal_projector_module_names = ("model.visual.merger",)
     language_model_module_names = ("model.language_model",)
 
+    @property
+    def visual(self):
+        # swift's qwen _post_encode (forward pre-hook on this outer model) calls
+        # ``model.visual``; the tower lives on the inner Qwen3_5MoeModel.
+        return self.model.visual
+
     def get_parameter_groups(self):
         groups = super().get_parameter_groups()
         groups[ParameterGroup.VISION_TOWER] = (

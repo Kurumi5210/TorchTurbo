@@ -50,10 +50,6 @@ class TurboEnginePipelineMixin:
     * :meth:`_build_turbo_engine` — build the :class:`TorchTurboEngine` from the
       parsed args, apply LoRA, stash it (per stage) in :mod:`engine_registry`
       for the model loader. Runs BEFORE the model loads.
-    * :meth:`_bypass_swift_post_encode` — after the model + template are
-      prepared, make swift's VLM ``_post_encode`` a passthrough so turbo
-      self-encodes images. Runs AFTER ``_prepare_template`` (needs ``self.model``
-      / ``self.template``).
     * :meth:`prepare_model` — short-circuit swift's ``TunerMixin.prepare_model``
       (LoRA / freeze are applied inside the engine).
     """
@@ -62,8 +58,8 @@ class TurboEnginePipelineMixin:
         """Build the engine and stash it for :class:`TurboModelLoader`.
 
         Runs before ``_prepare_model_tokenizer`` — at this point ``self.model``
-        does not exist yet, so anything needing the built model belongs in
-        :meth:`_bypass_swift_post_encode` instead.
+        does not exist yet, so anything needing the built model belongs after
+        ``_prepare_template``.
         """
         from ...engine import TorchTurboEngine
 
@@ -84,34 +80,6 @@ class TurboEnginePipelineMixin:
             "TurboSwiftSft: engine ready (backend=%s, mp=%s)",
             config.backend.value, config.mixed_precision.value,
         )
-
-    def _bypass_swift_post_encode(self) -> None:
-        """Make swift's VLM ``_post_encode`` a passthrough for turbo VLM models.
-
-        Call AFTER ``_prepare_model_tokenizer`` / ``_prepare_template`` — both
-        ``self.model`` and ``self.template`` must exist. turbo self-encodes
-        images from ``pixel_values`` inside its forward
-        (``model.model.visual``) and exposes NO top-level ``model.visual``;
-        swift's qwen VLM ``_post_encode`` instead pre-encodes via
-        ``model.visual`` (the HF Qwen2VL convention) and would raise
-        AttributeError. The passthrough lets pixel_values / image_grid_thw flow
-        through to turbo's forward, which self-encodes — matching turbo's VLM
-        contract and avoiding pre-encode/self-encode double-encoding. No-op for
-        non-VLM models.
-        """
-        try:
-            from ...models.base import TurboVLMModel
-            if not isinstance(self.model, TurboVLMModel):
-                return
-            if getattr(self, "template", None) is None:
-                return
-            self.template._post_encode = lambda model, inputs: inputs
-            logger.info_rank0(
-                "TurboSwiftSft: bypassed swift _post_encode "
-                "(turbo VLM self-encodes from pixel_values)"
-            )
-        except Exception:
-            logger.debug_rank0("TurboSwiftSft: could not override template._post_encode", exc_info=True)
 
     def prepare_model(self, args=None, model=None, template=None, train_dataset=None, **kwargs):
         # The engine already built + sharded + applied freeze/LoRA inside
@@ -142,10 +110,6 @@ class TurboSwiftSft(TurboEnginePipelineMixin, SwiftSft):  # type: ignore[misc]
         # skipped.
         self._prepare_model_tokenizer()
         self._prepare_template()
-        # Bypass swift's VLM _post_encode AFTER the model+template exist (turbo
-        # VLM self-encodes from pixel_values). Must run post-_prepare_template,
-        # not inside _build_turbo_engine (which runs pre-model-load).
-        self._bypass_swift_post_encode()
         self._prepare_flash_ckpt()
 
 

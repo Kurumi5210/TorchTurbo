@@ -23,10 +23,9 @@ pip install /input/torchturbo/stable/h20/build/flash_attn-2.8.3.post1-cp312-cp31
 pip install /input/torchturbo/stable/h20/build/nv_grouped_gemm-1.1.4.post8-cp312-cp312-linux_x86_64.whl --no-deps
 pip install /input/torchturbo/stable/h20/build/causal_conv1d-1.6.2.post1-cp312-cp312-linux_x86_64.whl --no-deps
 
-pip install ms-swift==4.1.0
-
-pip install transformers==5.7.0
+pip install ms_swift==4.4.2
+pip install transformers==5.9.0
 pip install peft==0.18.0
-pip install datasets==3.6.0
+pip install datasets==5.0.1
 
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

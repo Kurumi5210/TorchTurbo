@@ -46,26 +46,12 @@ class MSSwiftAdapter(BaseAdapter):
         register_turbo_models_to_swift()
         register_turbo_trainers_to_swift()
 
-        # Install the VLM dataset adapter: it auto-detects multimodal datasets at
-        # construction time (presence of an ``images``/``videos`` column) and only
-        # then pads media-less samples with fake media, so every rank drives the
-        # media tower (FSDP+expert-parallel needs every rank to post the
-        # per-layer media-tower all-gathers). Pure-text datasets stay untouched.
-        # No CLI flag — the signal comes from the dataset swift just built. The
-        # current path pads with an image for qwen3.5-moe; future multimodal
-        # towers reuse the same pattern (see vlm_dataset_adapter).
-        from .vlm_dataset_adapter import install_vlm_dataset_adapter
-
-        install_vlm_dataset_adapter()
-
         self._active = True
         logger.info_rank0("ms-swift adapter activated (turbo models/trainers registered)")
 
     def deactivate(self) -> None:
         from . import engine_registry
-        from .vlm_dataset_adapter import uninstall_vlm_dataset_adapter
 
-        uninstall_vlm_dataset_adapter()
         engine_registry.clear()
         self._active = False
         logger.info_rank0("ms-swift adapter deactivated")

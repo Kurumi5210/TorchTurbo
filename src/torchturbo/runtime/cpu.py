@@ -5,7 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
-from .base import DeviceRuntime, ProfilerHandle, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, TurboDevice
 
 
 class CpuRuntime(DeviceRuntime):
@@ -71,7 +71,9 @@ class CpuRuntime(DeviceRuntime):
         *,
         output_dir: str,
         worker_name: str,
-    ) -> ProfilerHandle:
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ) -> BaseProfiler:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement profiler()."
         )

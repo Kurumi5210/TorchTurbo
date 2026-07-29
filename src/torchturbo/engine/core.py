@@ -25,7 +25,7 @@ from torchturbo.adapters.rl.packed import (
     shifted_packed_tensor,
 )
 from ..ops import get_or_create_ops
-from ..runtime import ProfilerHandle, get_device_runtime
+from ..runtime import BaseProfiler, get_device_runtime
 
 
 logger = get_logger(__name__)
@@ -204,7 +204,7 @@ class TorchTurboEngine:
         # Resolve the process-wide device runtime before backend construction.
         self.device_runtime = get_device_runtime()
         self.backend: BaseBackend = backend_cls(self.config, self.device_runtime)
-        self._profiler: ProfilerHandle | None = None
+        self._profiler: BaseProfiler | None = None
         self.ops = get_or_create_ops(
             device_runtime=self.device_runtime,
             default_policy=self.config.ops.policy,
@@ -601,10 +601,27 @@ class TorchTurboEngine:
     # Profiling
     # ------------------------------------------------------------------
 
-    def start_profiling(self, output_dir: str) -> None:
+    def start_profiling(
+        self,
+        output_dir: str,
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ) -> None:
         """Start TorchTurbo profiling under ``output_dir``."""
+        if memory_snapshot_steps is not None and memory_snapshot_steps < 1:
+            raise ValueError("memory_snapshot_steps must be greater than 0")
+
+        memory_snapshot_enabled = memory_snapshot_steps is not None
+        if not profiling_enabled and not memory_snapshot_enabled:
+            return
+
         profiling_dir = os.path.join(output_dir, "profiling")
-        os.makedirs(profiling_dir, exist_ok=True)
+        if profiling_enabled:
+            os.makedirs(profiling_dir, exist_ok=True)
+
+        memory_snapshot_dir = os.path.join(output_dir, "memory_snapshot")
+        if memory_snapshot_enabled:
+            os.makedirs(memory_snapshot_dir, exist_ok=True)
 
         old_profiler = self._profiler
         if old_profiler is not None:
@@ -621,10 +638,20 @@ class TorchTurboEngine:
         profiler = self.device_runtime.profiler(
             output_dir=profiling_dir,
             worker_name=f"rank{rank}_{socket.gethostname()}",
+            profiling_enabled=profiling_enabled,
+            memory_snapshot_steps=memory_snapshot_steps,
         )
         profiler.start()
         self._profiler = profiler
-        logger.info_rank0("Profiling started, output dir: %s", profiling_dir)
+
+        if profiling_enabled:
+            logger.info_rank0("Profiling started, output dir: %s", profiling_dir)
+        if memory_snapshot_enabled:
+            logger.info_rank0(
+                "Memory snapshot scheduled for the first %s steps, output dir: %s",
+                memory_snapshot_steps,
+                memory_snapshot_dir,
+            )
 
     def step_profiling(self) -> None:
         """Advance TorchTurbo profiling by one optimizer step."""

@@ -211,7 +211,13 @@ class TestEngineSetup:
         profiler = RecordingProfiler()
         profiler_kwargs = {}
 
-        def fake_profiler(*, output_dir: str, worker_name: str):
+        def fake_profiler(
+            *,
+            output_dir: str,
+            worker_name: str,
+            profiling_enabled: bool,
+            memory_snapshot_steps: int | None,
+        ):
             profiler_kwargs["output_dir"] = output_dir
             profiler_kwargs["worker_name"] = worker_name
             return profiler
@@ -225,7 +231,7 @@ class TestEngineSetup:
         )
 
         engine = TorchTurboEngine(EngineConfig())
-        engine.start_profiling(str(tmp_path))
+        engine.start_profiling(str(tmp_path), True, None)
         engine.step_profiling()
         engine.stop_profiling()
 
@@ -248,7 +254,13 @@ class TestEngineSetup:
         second_profiler = FailingProfiler()
         profilers = iter((first_profiler, second_profiler))
 
-        def fake_profiler(*, output_dir: str, worker_name: str):
+        def fake_profiler(
+            *,
+            output_dir: str,
+            worker_name: str,
+            profiling_enabled: bool,
+            memory_snapshot_steps: int | None,
+        ):
             return next(profilers)
 
         monkeypatch.setattr(runtime, "profiler", fake_profiler)
@@ -260,10 +272,10 @@ class TestEngineSetup:
         )
 
         engine = TorchTurboEngine(EngineConfig())
-        engine.start_profiling(str(tmp_path))
+        engine.start_profiling(str(tmp_path), True, None)
 
         with pytest.raises(RuntimeError, match="profiler start failed"):
-            engine.start_profiling(str(tmp_path))
+            engine.start_profiling(str(tmp_path), True, None)
 
         assert first_profiler.calls == ["start", "stop"]
         assert second_profiler.calls == ["start"]

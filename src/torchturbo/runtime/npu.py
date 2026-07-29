@@ -1,10 +1,88 @@
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 
 import torch
 
-from .base import DeviceRuntime, ProfilerHandle, TurboDevice
+from .base import BaseProfiler, DeviceRuntime, TurboDevice
+
+
+class _NpuProfiler(BaseProfiler):
+    def __init__(
+        self,
+        output_dir: str,
+        worker_name: str,
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ) -> None:
+        self._profiler = None
+        if profiling_enabled:
+            import torch_npu
+
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                export_type=[torch_npu.profiler.ExportType.Text],
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                mstx=False,
+                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                l2_cache=False,
+                op_attr=False,
+                data_simplification=False,
+                record_op_args=False,
+                gc_detect_threshold=None,
+            )
+
+            self._profiler = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                schedule=torch_npu.profiler.schedule(
+                    wait=0, warmup=0, active=1, repeat=1, skip_first=1
+                ),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    output_dir, worker_name=worker_name
+                ),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                with_modules=False,
+                with_flops=False,
+                experimental_config=experimental_config,
+            )
+        self._snapshot_path = os.path.join(
+            os.path.dirname(output_dir),
+            "memory_snapshot",
+            f"{worker_name}.pickle",
+        )
+        self._memory_snapshot_steps = memory_snapshot_steps
+        self._memory_snapshot_active = False
+        self._step = 0
+
+    def start(self) -> None:
+        if self._profiler is not None:
+            self._profiler.start()
+        if self._memory_snapshot_steps is not None:
+            torch.npu.memory._record_memory_history()
+            self._memory_snapshot_active = True
+
+    def step(self) -> None:
+        self._step += 1
+        if self._memory_snapshot_active and self._step == self._memory_snapshot_steps:
+            self._memory_snapshot_active = False
+            try:
+                torch.npu.memory._dump_snapshot(self._snapshot_path)
+            finally:
+                torch.npu.memory._record_memory_history(enabled=None)
+        if self._profiler is not None:
+            self._profiler.step()
+
+    def stop(self) -> None:
+        if self._memory_snapshot_active:
+            self._memory_snapshot_active = False
+            torch.npu.memory._record_memory_history(enabled=None)
+        if self._profiler is not None:
+            self._profiler.stop()
 
 
 class NpuRuntime(DeviceRuntime):
@@ -78,36 +156,12 @@ class NpuRuntime(DeviceRuntime):
         *,
         output_dir: str,
         worker_name: str,
-    ) -> ProfilerHandle:
-        import torch_npu
-
-        experimental_config = torch_npu.profiler._ExperimentalConfig(
-            export_type=[torch_npu.profiler.ExportType.Text],
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
-            mstx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
-            l2_cache=False,
-            op_attr=False,
-            data_simplification=False,
-            record_op_args=False,
-            gc_detect_threshold=None,
-        )
-
-        return torch_npu.profiler.profile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU,
-            ],
-            schedule=torch_npu.profiler.schedule(
-                wait=0, warmup=0, active=1, repeat=1, skip_first=1
-            ),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                output_dir, worker_name=worker_name
-            ),
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-            with_modules=False,
-            with_flops=False,
-            experimental_config=experimental_config,
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ) -> BaseProfiler:
+        return _NpuProfiler(
+            output_dir,
+            worker_name,
+            profiling_enabled,
+            memory_snapshot_steps,
         )

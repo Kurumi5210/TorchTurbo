@@ -2,17 +2,32 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
-from typing import Protocol
 
 import torch
 
 
-class ProfilerHandle(Protocol):
-    def start(self) -> None: ...
+class BaseProfiler(ABC):
+    @abstractmethod
+    def __init__(
+        self,
+        output_dir: str,
+        worker_name: str,
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ) -> None:
+        ...
 
-    def step(self) -> None: ...
+    @abstractmethod
+    def start(self) -> None:
+        ...
 
-    def stop(self) -> None: ...
+    @abstractmethod
+    def step(self) -> None:
+        ...
+
+    @abstractmethod
+    def stop(self) -> None:
+        ...
 
 
 class TurboDevice(StrEnum):
@@ -82,5 +97,12 @@ class DeviceRuntime(ABC):
         ...
 
     @abstractmethod
-    def profiler(self, *, output_dir: str, worker_name: str) -> ProfilerHandle:
+    def profiler(
+        self,
+        *,
+        output_dir: str,
+        worker_name: str,
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ) -> BaseProfiler:
         ...

@@ -66,7 +66,14 @@ class FakeRuntime(DeviceRuntime):
     def manual_seed_all(self, seed: int) -> None:
         return None
 
-    def profiler(self, *, output_dir: str, worker_name: str):
+    def profiler(
+        self,
+        *,
+        output_dir: str,
+        worker_name: str,
+        profiling_enabled: bool,
+        memory_snapshot_steps: int | None,
+    ):
         self.profiler_calls.append((output_dir, worker_name))
         return FakeProfiler()
 
@@ -105,7 +112,12 @@ def test_cpu_runtime_contract():
         pass
 
     with pytest.raises(NotImplementedError, match="profiler"):
-        runtime.profiler(output_dir="/tmp", worker_name="worker")
+        runtime.profiler(
+            output_dir="/tmp",
+            worker_name="worker",
+            profiling_enabled=True,
+            memory_snapshot_steps=None,
+        )
 
 
 def test_device_runtime_synchronize_stream():

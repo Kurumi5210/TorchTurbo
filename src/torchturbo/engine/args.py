@@ -125,6 +125,7 @@ class TorchTurboArgs:
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
     profiling: bool = False
+    memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
 
     # Adapter-seeded fields (NOT CLI ``--tt_*`` flags). Adapters fold values
@@ -342,8 +343,18 @@ def _build_parser() -> argparse.ArgumentParser:
         const=True,
         default=False,
         metavar="BOOL",
-        help="Enable NPU/CUDA profiling. Outputs to {output_dir}/profiling/. "
+        help="Enable NPU/CUDA profiling for the second step. "
+        "Outputs to {output_dir}/profiling/. "
         "Accepts --tt_profiling, ... true, or ... false.",
+    )
+    parser.add_argument(
+        "--tt_memory_snapshot_steps",
+        type=int,
+        default=None,
+        metavar="STEPS",
+        help="Number of optimizer steps to capture from training step 0. For "
+        "example, 3 captures the first 3 optimizer steps. Outputs to "
+        "{output_dir}/memory_snapshot/.",
     )
     parser.add_argument(
         "--tt_log_level",
@@ -396,6 +407,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         freeze_multi_modal_projector=parsed.tt_freeze_multi_modal_projector,
         freeze_language_model=parsed.tt_freeze_language_model,
         profiling=parsed.tt_profiling,
+        memory_snapshot_steps=parsed.tt_memory_snapshot_steps,
         cap_lambda=parsed.tt_cap_lambda,
         bd_mask_low=parsed.tt_bd_mask_low,
         bd_mask_high=parsed.tt_bd_mask_high,

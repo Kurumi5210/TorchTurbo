@@ -589,7 +589,7 @@ class DistParamLoader:
                 self._flush_pending_tasks(pending, sharded_sd)
                 pending = []
                 pending_bytes = 0
-                logger.debug_rank0(
+                logger.info_rank0(
                     "[load] broadcast flushed %d/%d params", processed, num_params
                 )
 

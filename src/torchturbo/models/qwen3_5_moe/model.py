@@ -60,6 +60,14 @@ class TurboQwen3_5MoeForConditionalGeneration(
         # ``model.visual``; the tower lives on the inner Qwen3_5MoeModel.
         return self.model.visual
 
+    def get_norm(self):
+        # Final text-model RMSNorm lives on the inner language model (nested
+        # below base_model); the base default ``<base_model>.norm`` does not find
+        # it. Expose it so the FSDP2 tail optimizer merges it into the lm_head
+        # resident unit instead of the auto root unit (the root unit's lone norm
+        # breaks CPU offload).
+        return self.model.language_model.norm
+
     def get_parameter_groups(self):
         groups = super().get_parameter_groups()
         groups[ParameterGroup.VISION_TOWER] = (

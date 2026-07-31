@@ -35,7 +35,7 @@ from swift.pipelines.train.sft import SwiftSft
 from .args import TurboSftArguments
 from . import engine_registry
 from .utils import build_config_from_swift_args, build_lora_config_from_swift_args
-from ...logging import get_logger
+from ...logging import LogLevel, get_logger, logging_configure
 
 logger = get_logger(__name__)
 
@@ -62,6 +62,10 @@ class TurboEnginePipelineMixin:
         ``_prepare_template``.
         """
         from ...engine import TorchTurboEngine
+        from ...engine.args import get_torchturbo_args
+
+        tt_args = get_torchturbo_args()
+        logging_configure(tt_args.log_level if tt_args is not None else LogLevel.INFO)
 
         config = build_config_from_swift_args(self.args)
         engine = TorchTurboEngine(config)

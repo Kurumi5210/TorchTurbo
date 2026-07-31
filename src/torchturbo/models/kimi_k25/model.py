@@ -50,6 +50,20 @@ class TurboKimiK25ForConditionalGeneration(
     def get_weight_converter(self, parallel_context):
         return KimiK25WeightConverter(self, parallel_context)
 
+    def get_norm(self):
+        # Final text-model RMSNorm is nested at ``language_model.model.norm``;
+        # the base default ``<base_model>.norm`` does not find it. Expose it so
+        # the FSDP2 tail optimizer merges it into the lm_head resident unit
+        # instead of the auto root unit (whose sole managed norm breaks CPU
+        # offload — ``_validate_cpu_offload_params`` fails at the first forward).
+        return self.language_model.model.norm
+
+    def get_lm_head(self):
+        # kimi wraps the text model in ``language_model`` (a ForCausalLM); the
+        # lm_head lives there, not at the top level. Override the base default
+        # (``self.lm_head``) so the tail unit / output-embedding resolve correctly.
+        return self.language_model.lm_head
+
     def __init__(self, config: KimiK25Config) -> None:
         self._pre_init_patches()
         super().__init__(config)

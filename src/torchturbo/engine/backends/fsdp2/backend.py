@@ -35,6 +35,7 @@ from torchturbo.utils.flash_attn_utils import get_unpad_data
 
 from ...backend_registry import register_backend
 from ...config import EngineConfig
+from ...distributed import init_process_group_if_needed
 from ....logging import get_logger
 from ..base import BaseBackend
 from .config import FSDPConfig
@@ -90,6 +91,10 @@ class FSDP2Backend(BaseBackend):
     def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
         super().__init__(config, device_runtime)
         self.fsdp_config: FSDPConfig = config.backend_config
+
+        if self.fsdp_config.cpu_offload:
+            init_process_group_if_needed(enable_cpu_backend=True)
+
         fsdp_config = self.fsdp_config
         self.mixed_precision = config.mixed_precision
         self.sharding_strategy = fsdp_config.sharding_strategy
@@ -585,8 +590,8 @@ class FSDP2Backend(BaseBackend):
             except (NotImplementedError, AttributeError):
                 pass
 
-        # Accelerate-style output embedding discovery. We do not guess an
-        # lm_head attribute; models must expose it through this HF API.
+        # Output embedding (turbo ``get_output_embeddings`` -> ``get_lm_head`` by
+        # default, overridable per model; non-turbo models keep HF's API).
         output_embed = None
         get_output_embeddings = getattr(model, "get_output_embeddings", None)
         if callable(get_output_embeddings):
@@ -912,6 +917,10 @@ class FSDP2Backend(BaseBackend):
         has no norm among its direct children (e.g. deeply nested VLMs), in
         which case the norm simply stays in the root unit.
         """
+        declared_norm = model.get_norm()
+        if isinstance(declared_norm, nn.Module):
+            return declared_norm
+
         base_prefix = getattr(model, "base_model_prefix", "")
         base_model = getattr(model, base_prefix, None) if base_prefix else model
         if not isinstance(base_model, nn.Module):
@@ -1003,6 +1012,109 @@ class FSDP2Backend(BaseBackend):
         return optimizer_cls(optimizer_params, **optimizer_kwargs)
 
     @torch.no_grad()
+    def _clip_grad_norm_cpu_offload(
+        self, moe_params, params, ignored_params, max_norm, norm_type
+    ):
+        """Grad-norm + clip for the FSDP2 CPU-offload path — fully chunked on the
+        compute device (peak GPU mem = one chunk, ``CLIP_CHUNK_BYTES``).
+        """
+        all_params = list(moe_params) + list(params) + list(ignored_params)
+        if not all_params:
+            return torch.tensor(0.0)
+
+        reduce_device = self.device if not isinstance(self.device, str) else torch.device(self.device)
+        world_group = dist.group.WORLD
+
+        offloaded = [p for p in all_params if hasattr(p.grad, "_local_tensor")]
+        plain_grads = [p.grad for p in all_params if not hasattr(p.grad, "_local_tensor")]
+
+        # --- Pass 1: moe gradient scaling (1/ep), chunked on the device, before
+        # the norm so the norm sees the ep-corrected moe grads.
+        if moe_params:
+            for chunk in self._iter_offloaded_chunks(moe_params):
+                self._scale_offloaded_chunk_on_device(
+                    chunk, reduce_device, self.gradient_scaling_factor
+                )
+
+        # --- Pass 2: global norm, chunked on the device.
+        def _accumulate(t, acc):
+            if t.numel() == 0:
+                return acc
+            if norm_type == float("inf"):
+                m = t.detach().float().abs().amax()
+                return m if bool(m > acc) else acc
+            return acc + (t.detach().float().abs() ** norm_type).sum()
+
+        acc = (
+            torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
+            if norm_type == float("inf")
+            else torch.zeros((), device=reduce_device, dtype=torch.float32)
+        )
+        for chunk in self._iter_offloaded_chunks(offloaded):
+            chunk_dev = [l.to(reduce_device, non_blocking=True) for l in chunk]
+            self.device_runtime.synchronize()  # H2D complete before reading chunk_dev
+            for t in chunk_dev:
+                acc = _accumulate(t, acc)
+        for g in plain_grads:
+            acc = _accumulate(g, acc)
+        if norm_type == float("inf"):
+            dist.all_reduce(acc, op=dist.ReduceOp.MAX, group=world_group)
+            total_norm = acc
+        else:
+            dist.all_reduce(acc, op=dist.ReduceOp.SUM, group=world_group)
+            total_norm = acc ** (1.0 / norm_type)
+
+        # --- Pass 3: clip scaling, chunked on the device.
+        clip_coef = float(max_norm) / (float(total_norm) + 1e-6)
+        if clip_coef < 1.0:
+            coef = min(clip_coef, 1.0)
+            for chunk in self._iter_offloaded_chunks(offloaded):
+                self._scale_offloaded_chunk_on_device(chunk, reduce_device, coef)
+            if plain_grads:
+                torch._foreach_mul_(plain_grads, coef)
+        return total_norm
+
+    def _iter_offloaded_chunks(self, params):
+        """Yield budget-sized lists of CPU-local shards (``_local_tensor``) of
+        offloaded (DTensor) grads from ``params``, so each chunk's GPU footprint
+        stays within ``CLIP_CHUNK_BYTES``."""
+        CLIP_CHUNK_BYTES = 512 * 1024 * 1024
+        chunk: list = []
+        chunk_bytes = 0
+        for p in params:
+            g = p.grad
+            if g is None or not hasattr(g, "_local_tensor"):
+                continue
+            l = g._local_tensor
+            if l.numel() == 0:
+                continue
+            b = l.element_size() * l.numel()
+            if chunk and chunk_bytes + b > CLIP_CHUNK_BYTES:
+                yield chunk
+                chunk, chunk_bytes = [], 0
+            chunk.append(l)
+            chunk_bytes += b
+        if chunk:
+            yield chunk
+
+    def _scale_offloaded_chunk_on_device(self, cpu_locals, reduce_device, factor):
+        """Move one chunk of CPU-local grad shards to the compute device, scale by
+        ``factor`` (one batched ``_foreach_mul_``), and copy the result back into
+        the CPU local objects in place (persists to ``p.grad`` — the offloaded
+        param is on CPU, so ``p.grad`` cannot be reassigned).
+
+        non_blocking H2D enqueues the chunk's copies concurrently, but the mul is
+        not guaranteed to share the H2D stream, so synchronize before reading
+        ``chunk_dev``; another sync after the D2H frees the device chunk so peak
+        stays at one chunk.
+        """
+        chunk_dev = [l.to(reduce_device, non_blocking=True) for l in cpu_locals]
+        self.device_runtime.synchronize()  # H2D complete before mul reads chunk_dev
+        torch._foreach_mul_(chunk_dev, factor)
+        torch._foreach_copy_(cpu_locals, chunk_dev)
+        self.device_runtime.synchronize()  # D2H complete; chunk_dev freed on return
+
+    @torch.no_grad()
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
         params = []
         grads = []
@@ -1027,6 +1139,14 @@ class FSDP2Backend(BaseBackend):
                 else:
                     ignored_params.append(param)
                     ignored_grads.append(param.grad)
+
+        # FSDP2 CPU offload: grads are sharded DTensors on CPU and the
+        # DTensor-collective fast path has no cpu backend on the (cuda) mesh —
+        # use the gloo-based local-reduce path instead.
+        if self.fsdp_config.cpu_offload:
+            return self._clip_grad_norm_cpu_offload(
+                moe_params, params, ignored_params, max_norm, norm_type
+            )
 
         edp_total_norm_list = []
         if moe_params:

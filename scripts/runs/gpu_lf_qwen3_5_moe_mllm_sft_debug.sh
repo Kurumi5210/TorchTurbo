@@ -22,6 +22,11 @@ if [ -z "$USER_NAME" ]; then
     exit 1
 fi
 
+if [ ! -d /mnt/medmm-s3/common/data/debug_data ]; then
+    mkdir -p /mnt/medmm-s3/common/data
+    ln -s /input/torchturbo/stable/dataset/med /mnt/medmm-s3/common/data/debug_data
+fi
+
 #model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
 model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
 

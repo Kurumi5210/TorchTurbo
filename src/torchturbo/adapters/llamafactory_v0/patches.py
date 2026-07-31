@@ -143,7 +143,6 @@ class RunExpPatch(BasePatch):
             from .hooks import LlamaFactoryHook
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
-            from ...engine.distributed import init_process_group_if_needed
             from ...logging import logging_configure
 
             raw_args = read_args(args)
@@ -152,22 +151,6 @@ class RunExpPatch(BasePatch):
             tt_args = get_torchturbo_args()
             logging_configure(tt_args.log_level)
             logger.info_rank0("torchturbo CLI args: %s", tt_args)
-
-            # Initialize the process group *before* get_train_args — that call
-            # triggers transformers/accelerate to create the default group with a
-            # device-only backend (nccl/hccl). Doing it first lets us register a
-            # CPU (gloo) backend for FSDP CPU-offload collectives; accelerate then
-            # detects the existing group and reuses it. The offload decision reuses
-            # the same resolver as EngineConfig.backend_config.cpu_offload
-            # (strict=False here so config building stays the single place that
-            # validates adapter/tt offload conflicts).
-            init_process_group_if_needed(
-                enable_cpu_backend=resolve_cpu_offload(
-                    fsdp_options_from_raw_args(raw_args),
-                    tt_args,
-                    strict=False,
-                )
-            )
 
             model_args, data_args, training_args, finetuning_args, generating_args = (
                 get_train_args(raw_args)

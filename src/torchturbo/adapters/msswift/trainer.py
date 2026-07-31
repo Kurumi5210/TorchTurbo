@@ -141,6 +141,29 @@ class TurboTrainerMixin:
         apply_ulysses_sp_patch(engine)
         install_clip_override(self, engine)
         install_accelerator_overrides(self)
+        # Force ``model.device`` to the compute device via a class-level attribute
+        # under offload; non-offload keeps HF's default.
+        if engine.config.backend_config.cpu_offload:
+            import torch
+            from ...runtime import get_device_name
+
+            def _offload_device(model):
+                try:
+                    first = next(model.parameters())
+                except StopIteration:
+                    return torch.device(get_device_name())
+                # FSDP2-managed DTensor offloaded to CPU -> report compute device.
+                if hasattr(first, "device_mesh") and first.device.type == "cpu":
+                    return torch.device(get_device_name())
+                return first.device
+
+            model = self.model
+            if model is not None:
+                setattr(type(model), "device", _offload_device(model))
+
+    def _move_model_to_device(self, model, _device):
+        # turbo engine manages param placement, so skip the move.
+        return model
 
     def train(self, *args, **kwargs):
         """Wrap swift's training loop with TorchTurbo profiling when

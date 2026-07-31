@@ -339,6 +339,65 @@ def test_tail_unit_does_not_guess_lm_head_attr(monkeypatch):
     )
 
 
+class VLMOuter(TaggedModule):
+    """Outer VLM wrapper exposing a nested final norm via ``get_norm``, mirroring
+    the qwen3.5 / kimi turbo wrappers that delegate to the inner language model.
+    The norm is invisible to the direct-child class-name scan (it lives under
+    ``model.language_model``), so discovery must come from ``get_norm``;
+    otherwise it falls into the auto root unit and breaks CPU offload.
+    """
+
+    base_model_prefix = "model"
+
+    def get_norm(self):
+        return self.model.language_model.norm
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_vlm_nested_norm_via_get_norm_joins_tail_unit(monkeypatch):
+    calls = []
+
+    def fake_fully_shard(module, mesh, **kwargs):
+        calls.append((module_tags(module), kwargs.get("reshard_after_forward")))
+
+    import torch.distributed.fsdp as fsdp
+
+    monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
+
+    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._mesh = object()
+    backend._world_mesh = "world"
+    backend.mixed_precision = types.SimpleNamespace(value="no")
+    backend.reshard_after_forward = True
+    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.rank = 0
+    backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    model = VLMOuter("root")
+    inner = TaggedModule("model")
+    language_model = TaggedModule("language_model")
+    language_model.norm = FinalNorm("norm")
+    inner.language_model = language_model
+    inner.visual = TaggedModule("visual")
+    model.model = inner
+    lm_head = TaggedModule("lm_head")
+    model.lm_head = lm_head
+    embed = TaggedModule("embed")
+    model.get_input_embeddings = lambda: embed
+
+    backend._shard_model(model, FSDPParallelPlan())
+
+    # The get_norm-declared nested norm is paired with lm_head in a resident
+    # tail unit instead of falling through to the auto root unit.
+    assert (["norm", "lm_head"], False) in calls
+    # Root unit is still created (resident) but must not own the norm.
+    assert ("root", False) in calls
+    # norm must be covered by the tail unit, not carved as a standalone unit.
+    assert not any(tags == "norm" for tags, _ in calls)
+
+
 def test_tail_unit_skips_modules_inside_explicit_parent(monkeypatch):
     calls = []
 

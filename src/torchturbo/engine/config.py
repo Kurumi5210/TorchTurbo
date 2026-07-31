@@ -223,10 +223,21 @@ class DiffusionConfig:
     bd_mask_high: float = 0.8
     """Per-sample noise ratio sigma upper bound."""
 
+    bd_block_size: int = 32
+    """Block size (``BLOCK_SIZE``) for the block-diagonal attention mask; the
+    unit ``cutoff_len`` is ceil-aligned to. Must be a positive integer (default
+    ``32``, dFactory/LLaDA2 default). Only affects the BD dataset/loss path."""
+
     def __post_init__(self) -> None:
         self.cap_lambda = float(self.cap_lambda)
         self.bd_mask_low = float(self.bd_mask_low)
         self.bd_mask_high = float(self.bd_mask_high)
+        self.bd_block_size = int(self.bd_block_size)
+        if self.bd_block_size < 1:
+            raise ValueError(
+                f"DiffusionConfig.bd_block_size must be a positive integer, "
+                f"got {self.bd_block_size}."
+            )
 
 
 @dataclass(frozen=True)
@@ -725,4 +736,5 @@ def _build_diffusion_config(tt: TorchTurboArgs) -> DiffusionConfig:
         cap_lambda=float(tt.cap_lambda or 0.0),
         bd_mask_low=float(tt.bd_mask_low),
         bd_mask_high=float(tt.bd_mask_high),
+        bd_block_size=int(tt.bd_block_size),
     )

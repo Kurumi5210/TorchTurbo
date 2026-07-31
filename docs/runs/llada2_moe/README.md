@@ -29,6 +29,7 @@ bash scripts/runs/lf_llada2_text_sft.sh
 | `--bf16` | 计算精度 |
 | `--tt_sp_size` / `--tt_ep_size` | 序列并行 / 专家并行（SP1EP1 纯 FSDP2 走精度对齐基线） |
 | `--tt_bd_mask_low` / `--tt_bd_mask_high` | **BD 加噪比例 sigma 采样区间** `U[low,high]`，默认 0.3 / 0.8；每条样本独立采一个 sigma，按比例把 maskable token 替换成 `<|mask|>` |
+| `--tt_bd_block_size` | **BD 块大小（block-diagonal attention 粒度）**，默认 32（dFactory/LLaDA2 默认值）；`cutoff_len` 会向上对齐到 `bd_block_size` 的整数倍，BD beam 内按此粒度切块双向可见、跨块不可见 |
 | `--tt_cap_lambda` | **CAP 置信度损失权重**；`>0` 开启（推荐 2.0），默认 0 = 关闭 |
 
 示例（脚本里的实际配置）：

@@ -56,7 +56,7 @@ except ImportError:
 MASK_ID = 156895   # <|mask|>  — runtime: tok.mask_token_id; literal is fallback/test only.
 PAD_ID = 156892    # <|endoftext|> = eos = pad — runtime: tok.pad_token_id (= config.pad_token_id).
 MASK_LOW, MASK_HIGH = 0.3, 0.8   # default sigma sampling range; overridden by --tt_bd_mask_low/high.
-BLOCK_SIZE = 32                  # dFactory block_size (default; overridable via BDDataset).
+BLOCK_SIZE = 32                  # dFactory block_size (default; overridable via --tt_bd_block_size -> BDDataset).
 
 # Length defaults: used only when ``cutoff_len`` is None (keeps legacy behavior / no drift in the
 # fallback path). Production always injects ``cutoff_len``.
@@ -469,21 +469,27 @@ class BDDataset(Dataset):
     def __init__(self, model_path: str, data_file: str, block_diag_attn: bool = False,
                  cutoff_len: int | None = None,
                  mask_low: float = MASK_LOW, mask_high: float = MASK_HIGH,
+                 block_size: int = BLOCK_SIZE,
                  columns: dict | None = None, tags: dict | None = None) -> None:
         self.block_diag_attn = block_diag_attn
-        self.block_size = BLOCK_SIZE
+        if block_size < 1:
+            raise ValueError(
+                f"block_size must be a positive integer, got {block_size}."
+            )
+        self.block_size = int(block_size)
 
         # Per-sample real truncation limit = cutoff_len; total beam length = 2*cutoff_len
         # (fall back to module defaults when cutoff_len is None).
         if cutoff_len:
             assert cutoff_len > 0, f"cutoff_len must be positive, got {cutoff_len}"
-            # Undo LF neat_packing's ``cutoff_len -= 1`` and ceil to a BLOCK_SIZE multiple
-            # (see _align_cutoff_to_block).
+            # Undo LF neat_packing's ``cutoff_len -= 1`` and ceil to a self.block_size
+            # multiple (see _align_cutoff_to_block). self.block_size defaults to
+            # BLOCK_SIZE (32) and is overridable via --tt_bd_block_size.
             raw = cutoff_len
             cutoff_len = _align_cutoff_to_block(cutoff_len, self.block_size)
             if cutoff_len != raw:
                 logger.info_rank0(
-                    "[BD] cutoff_len %d not a BLOCK_SIZE(%d) multiple "
+                    "[BD] cutoff_len %d not a block_size(%d) multiple "
                     "(LF neat_packing subtracts 1) -> aligned to %d",
                     raw,
                     self.block_size,

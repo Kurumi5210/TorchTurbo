@@ -107,6 +107,10 @@ class TorchTurboArgs:
         Defaults to ``0.3``.
     bd_mask_high:
         As ``bd_mask_low`` but the upper bound. Defaults to ``0.8``.
+    bd_block_size:
+        LLaDA2 block-diffusion block size (the BD block-diagonal attention
+        granularity and the unit ``cutoff_len`` is ceil-aligned to). Defaults to
+        ``32`` (dFactory/LLaDA2 default). Only affects the BD dataset path.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
     """
@@ -140,6 +144,7 @@ class TorchTurboArgs:
     cap_lambda: float = 0.0  # CAP/DPARALLEL confidence loss weight (entropy on correct tokens). 0 = disabled.
     bd_mask_low: float = 0.3  # LLaDA2 BD per-sample sigma lower bound.
     bd_mask_high: float = 0.8  # LLaDA2 BD per-sample sigma upper bound.
+    bd_block_size: int = 32  # LLaDA2 BD block size (block-diagonal attn granularity; cutoff ceil-aligns to it).
 
     # Prefetch strategy (FSDP2 unit prefetch; orthogonal to LLaDA2, kept in sync with mainline).
     prefetch_strategy: str = "auto"
@@ -337,6 +342,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "Only affects the BD dataset path.",
     )
     parser.add_argument(
+        "--tt_bd_block_size",
+        type=int,
+        default=32,
+        metavar="INT",
+        help="LLaDA2 BD block size (block-diagonal attention granularity; "
+             "cutoff_len is ceil-aligned to it). Default 32. Only affects the "
+             "BD dataset path.",
+    )
+    parser.add_argument(
         "--tt_profiling",
         type=string_to_bool,
         nargs="?",
@@ -411,6 +425,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
         cap_lambda=parsed.tt_cap_lambda,
         bd_mask_low=parsed.tt_bd_mask_low,
         bd_mask_high=parsed.tt_bd_mask_high,
+        bd_block_size=parsed.tt_bd_block_size,
         prefetch_strategy=parsed.tt_prefetch_strategy,
         prefetch_direction=parsed.tt_prefetch_direction,
         forward_prefetch_depth=parsed.tt_forward_prefetch_depth,

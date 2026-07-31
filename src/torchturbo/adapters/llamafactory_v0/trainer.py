@@ -208,8 +208,9 @@ class TorchTurboTrainerBase:
         """Build the SP-aware DataLoader for block-diffusion (``BDDataset``).
 
         BD needs per-sample ``[noisy|clean]`` beams + a 4D block mask, so it
-        cannot use LlamaFactory's tokenized dataset. Noise range comes from
-        ``engine.config.diffusion``; the rest (cutoff_len, data file, model path,
+        cannot use LlamaFactory's tokenized dataset. Noise range and block size
+        come from ``engine.config.diffusion`` (``--tt_bd_mask_low/high``,
+        ``--tt_bd_block_size``); the rest (cutoff_len, data file, model path,
         block_diag_attn) is read from the LF args the engine stashed at run_exp
         time. SP folds ``gradient_accumulation_steps *= sp_size`` so the backend's
         ``compute_diffusion_loss`` ``/ ga`` lands on the right scale.
@@ -231,15 +232,18 @@ class TorchTurboTrainerBase:
 
         cutoff_len = getattr(data_args, "cutoff_len", None)
         if cutoff_len:
-            # Undo LF neat_packing's `cutoff_len -= 1` and ceil to a BLOCK_SIZE multiple.
-            cutoff_len = bd._align_cutoff_to_block(cutoff_len)
+            # Undo LF neat_packing's `cutoff_len -= 1` and ceil to a block_size multiple.
+            # Use diff.bd_block_size (from --tt_bd_block_size, default 32) so this alignment
+            # and the SP divisibility check below match the alignment BDDataset re-applies.
+            cutoff_len = bd._align_cutoff_to_block(cutoff_len, diff.bd_block_size)
             beam_len = 2 * cutoff_len
             if sp_size > 1 and beam_len % sp_size != 0:
                 raise ValueError(
                     f"BD beam_len=2*cutoff_len={beam_len} must be divisible by "
                     f"sp_size={sp_size} (SP slices the beam, see "
                     "backend.compute_diffusion_loss). "
-                    f"Adjust --cutoff_len (aligned value {cutoff_len})."
+                    f"Adjust --cutoff_len or --tt_bd_block_size "
+                    f"(aligned value {cutoff_len}, block_size {diff.bd_block_size})."
                 )
 
         bd_data_file, bd_columns, bd_tags = bd.resolve_bd_data_file(data_args)
@@ -250,6 +254,7 @@ class TorchTurboTrainerBase:
             cutoff_len=cutoff_len,
             mask_low=diff.bd_mask_low,
             mask_high=diff.bd_mask_high,
+            block_size=diff.bd_block_size,
             columns=bd_columns,
             tags=bd_tags,
         )

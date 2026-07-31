@@ -30,6 +30,7 @@ model_name_or_path=/mnt/sfs_turbo/models/LLaDA2.1-mini
 # torchturbo --tt_* flags:
 #   --tt_bd_mask_low/--tt_bd_mask_high : BD per-sample noise ratio sigma range U[low,high], default 0.3/0.8.
 #   --tt_cap_lambda                    : CAP confidence-loss weight; >0 enables (e.g. 2.0), default 0 = off.
+#   --tt_bd_block_size                 : BD block-diagonal attention block size; cutoff_len ceil-aligns to it, default 32.
 
 seq_length=$((1024 * 4))
 sp_size=2
@@ -94,6 +95,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_ep_size $ep_size \
     --tt_bd_mask_low 0.3 \
     --tt_bd_mask_high 0.8 \
+    --tt_bd_block_size 32 \
     --stage sft \
     --model_name_or_path $model_name_or_path \
     --trust_remote_code \

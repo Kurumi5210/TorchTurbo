@@ -297,7 +297,7 @@ class CollatorPatch(BasePatch):
     name = "collator"
     supported_versions = _LF_V0
 
-    _PATCHED_MODEL_TYPES = ("qwen3_5_moe",)
+    _PATCHED_MODEL_TYPES = ("qwen3_5_moe", "qwen3_5")
 
     def __init__(self) -> None:
         self._original_call = None

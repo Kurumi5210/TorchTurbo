@@ -320,6 +320,58 @@ class OpDispatcher:
             impl=impl,
         )
 
+    def gated_delta_rule(
+        self,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        *,
+        initial_state=None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens=None,
+        impl: str | None = None,
+    ):
+        return self._dispatch(
+            "gated_delta_rule",
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            impl=impl,
+        )
+
+    def causal_conv1d(
+        self,
+        x,
+        weight,
+        bias=None,
+        *,
+        activation=None,
+        initial_state=None,
+        output_final_state: bool = False,
+        cu_seqlens=None,
+        impl: str | None = None,
+    ):
+        return self._dispatch(
+            "causal_conv1d",
+            x,
+            weight,
+            bias,
+            activation=activation,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            impl=impl,
+        )
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)

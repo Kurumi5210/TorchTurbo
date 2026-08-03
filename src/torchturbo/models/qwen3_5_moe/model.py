@@ -9,7 +9,7 @@ from transformers import AutoModelForImageTextToText
 from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
-from torchturbo.runtime import is_npu_available, get_device_name
+from torchturbo.runtime import get_device_runtime
 
 from ...engine.config import ParameterGroup
 from ..base import TurboVLMModel
@@ -252,11 +252,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
         self.model.get_rope_index = _wrapped_get_rope_index
 
-        if is_npu_available():
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_gdr
-            for _, module in self.model.named_modules():
-                if hasattr(module, "chunk_gated_delta_rule"):
-                    module.chunk_gated_delta_rule = fla_gdr
 
     def on_parallelized(self, parallel_context):
         from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing
@@ -518,7 +513,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
             gather_heads_scatter_seq,
         )
         from .modeling_qwen3_5_moe import _get_cu_seqlens
-        from fla.modules.convolution import causal_conv1d
+        from torchturbo.ops import ops
         import torch.nn.functional as F
 
         def _slice_param(weight, dim):
@@ -647,8 +642,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
                     dim=0,
                 )
 
-            local_qkv, _ = causal_conv1d(
-                x=local_qkv,  # FLA conv1d accepts [b, s, d] format input
+            local_qkv, _ = ops.causal_conv1d(
+                x=local_qkv,  # [B, T, D]
                 weight=local_conv_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=local_conv_bias,
                 activation=self_attn.activation,
@@ -702,7 +697,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
             g = -A_log_local.float().exp() * F.softplus(a.float() + dt_bias_local)
 
             # Chunk Gated Delta Rule (core linear attention)
-            out, _ = self_attn.chunk_gated_delta_rule(
+            out, _ = ops.gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
@@ -732,7 +727,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
         return Qwen3_5MoeWeightConverter(self, parallel_context)
 
     def on_materialized(self):
-        device = get_device_name()
+        device = get_device_runtime().device
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
         lm = self.model.language_model

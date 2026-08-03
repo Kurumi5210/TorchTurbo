@@ -1,40 +1,38 @@
 #!/usr/bin/env python
 # ruff: noqa: E501
-"""Compare torchturbo training-side modeling vs vLLM prefill (inference) precision.
+"""Precision comparison harness for torchturbo vs Megatron-Core (and, in a
+separate setup, vLLM) on a single Ascend NPU.
 
-Pipeline
---------
-1. ``--mode gen_input``  tokenize a fixed prompt → ``input.npy`` (shared tokens)
-2. ``--mode turbo``      run the **real** turbo model (TorchTurboEngine.build_model,
-                         ep=1/sp=1, no extra autocast) and record the module
-                         relationship-graph + raw I/O tensors → ``turbo.pt``
-3. ``--mode vllm``       run vLLM prefill (tp=1, enforce_eager, prompt_token_ids)
-                         and record the module graph + raw I/O → ``vllm.pt``
-4. ``--mode compare``    read both .pt, CLI diff + divergence localization
-5. ``--mode pt2json``    convert an existing ``<side>/graph.pt`` (+ ``logp.npy``)
-                         → browser-loadable ``graph.json`` (for old dumps).
+Pipeline (see ``run_turbo_vs_megatron.sh``)
+-------------------------------------------
+1. ``--mode gen_input``        tokenize a fixed prompt → ``input_spec.pt``
+2. ``--mode megatron``         one merged forward: graph capture + forward-logits
+                               + loss/grad, → ``megatron/{graph.pt,logp.npy,loss_grad.json}``
+3. ``--mode turbo``            same merged forward on the TorchTurboEngine side →
+                               ``turbo/{...}``
+4. ``--mode compare``          diff the two ``graph.pt`` (forward logits/boxes)
+   ``--mode loss_grad_compare``diff the two ``loss_grad.json`` (loss + grad_norm)
 
-Recording model
----------------
-A forward hook is registered on **every** ``nn.Module`` under the hook root.
-During the forward pass the hooks do **only** recording (no analysis):
+Other modes (used by the sibling vLLM setup / the HTML viewer):
+  ``--mode vllm``      vLLM prefill graph capture (not part of the megatron flow)
+  ``--mode pt2json``   convert an existing ``<side>/graph.pt``→browser ``graph.json``
 
-  * capture every input/output tensor (with a path label like ``args.0`` /
-    ``kwargs.hidden_states`` / ``out.1``) → moved to **CPU fp32** immediately;
-    the GPU never retains captured intermediates;
-  * store, per module ("box": its FQN):
-      - I/O raw tensors + scalar stats (shape/dtype/norm/sum/mean/max_abs)
-      - ``parent`` / ``children``            — module-tree relationships
-      - ``exec_pre`` / ``exec_post``         — global forward order, from which
-        prev/next-sibling and data-flow predecessor are derived
-  * persist everything to a single ``<side>.pt`` file.
+A merged forward
+----------------
+Each leg (turbo/megatron) runs ONE forward per side that does all three at once:
 
-Because turbo and vLLM differ in operator order / fused ops inside attn / MoE,
-recursion reaches leaf projections so a human can pick any two boxes and diff
-them. Boxes that don't pair across architectures are themselves diagnostic (e.g.
-turbo ``q_proj`` vs vLLM ``qkv_proj``).
+  * records the module relationship-graph — ``graph.pt`` (the recorder captures
+    ``.detach().cpu().clone()`` copies, so autograd is untouched and the graph is
+    byte-identical to the old infer-only run);
+  * derives per-token ``logp`` for the forward-logits comparator (``logp.npy``);
+  * computes one **unified** next-token CE from the same logits
+    (``_ce_loss_from_logits`` = HF ``ForCausalLMLoss``) and ``backward()``s it, so
+    grad flows through the real path (SP/EP/FSDP2 for turbo, MCore for megatron)
+    and the result lands in ``loss_grad.json``.
 
-Target: logp mean abs diff at the **千分位 (~1e-3)** level.
+Because both sides run the *same* loss on logits from byte-identical inputs, the
+loss/grad_norm ratio isolates the **backward path** exactly. Target: logits mean
+abs diff ~1e-3 (千分位); loss/grad within the same ballpark there.
 """
 
 from __future__ import annotations
@@ -58,16 +56,24 @@ except Exception:  # noqa: BLE001
     torch = None  # type: ignore[assignment]
 
 
+def _compute_dtype(name: str):
+    """str → torch dtype, used by the turbo + megatron legs so they never drift.
+    (vLLM takes a dtype *string*, so mode_vllm keeps its own str→str map.)"""
+    import torch
+    return {"bfloat16": torch.bfloat16, "float16": torch.float16,
+            "float32": torch.float32}[name]
+
+
 # ─────────────────────────────── CLI ────────────────────────────────
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="torchturbo vs vLLM train/infer precision comparison",
+        description="torchturbo vs Megatron-Core (or vLLM) train/infer precision comparison",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--mode", choices=["gen_input", "turbo", "vllm", "megatron",
-                                  "compare", "pt2json"],
+                                  "compare", "pt2json", "loss_grad_compare"],
                    required=True, help="Run mode.")
     p.add_argument("--model_path", type=str, default=None,
                    help="HF model path (required for gen_input / turbo / vllm).")
@@ -120,6 +126,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--megatron_sequence_parallel", action="store_true",
                    help="[megatron] Enable MCore sequence_parallel. Off by default for a single-GPU "
                         "compare (matches the HF/turbo SPLIT=0 forward).")
+    p.add_argument("--megatron_mindspeed_path", type=str, default=None,
+                   help="[megatron, Ascend] Path to a MindSpeed checkout (the dir containing "
+                        "the `mindspeed` package). Added to sys.path and `mindspeed.megatron_adaptor` "
+                        "is imported BEFORE megatron.bridge/core so MCore's CUDA/TE ops get patched "
+                        "to Ascend equivalents. Use this instead of `pip install -e <mindspeed>`. "
+                        "If unset, relies on an already-importable `mindspeed` (e.g. on PYTHONPATH).")
     # ── hook scope / recording (turbo / vllm) ──
     p.add_argument("--hook_root", type=str, default=None,
                    help="[turbo/vllm] Attribute path (relative to the model) to recurse "
@@ -159,6 +171,9 @@ def parse_args() -> argparse.Namespace:
                         "and sits next to the .pt).")
     p.add_argument("--out_json", type=str, default=None,
                    help="[pt2json] output graph.json path (default: alongside the .pt).")
+    p.add_argument("--packed", action="store_true",
+                   help="[gen_input] Pack multiple short sequences into one "
+                        "with reset position_ids and cu_seqlens boundaries.")
     p.add_argument("--max_raw_bytes", type=int, default=262144,
                    help="[turbo/vllm/pt2json] Max raw-bytes (original dtype) to embed per "
                         "tensor in graph.json as base64. Tensors larger than this keep only "
@@ -215,7 +230,7 @@ class InputSpec:
 
     def __init__(self, token_ids, mode="text", pixel_values=None,
                  image_grid_thw=None, image_paths=None, meta=None,
-                 text_prompt=None):
+                 text_prompt=None, cu_seqlens=None):
         self.token_ids = list(token_ids)
         self.mode = mode
         self.pixel_values = pixel_values
@@ -223,6 +238,17 @@ class InputSpec:
         self.image_paths = image_paths or []
         self.text_prompt = text_prompt
         self.meta = meta or {}
+        self.cu_seqlens = cu_seqlens
+
+    @property
+    def is_packed(self) -> bool:
+        return self.cu_seqlens is not None and len(self.cu_seqlens) > 2
+
+    @property
+    def boundaries(self) -> set:
+        if not self.is_packed:
+            return set()
+        return set(self.cu_seqlens[1:-1])
 
     def save(self, path: str) -> None:
         import torch
@@ -232,6 +258,7 @@ class InputSpec:
             "pixel_values": self.pixel_values, "image_grid_thw": self.image_grid_thw,
             "image_paths": self.image_paths, "meta": self.meta,
             "text_prompt": self.text_prompt,
+            "cu_seqlens": self.cu_seqlens,
         }, path)
 
     @classmethod
@@ -240,7 +267,8 @@ class InputSpec:
         d = torch.load(path, map_location="cpu", weights_only=False)
         return cls(d["token_ids"], d.get("mode", "text"), d.get("pixel_values"),
                    d.get("image_grid_thw"), d.get("image_paths", []), d.get("meta", {}),
-                   text_prompt=d.get("text_prompt"))
+                   text_prompt=d.get("text_prompt"),
+                   cu_seqlens=d.get('cu_seqlens'))
 
 
 class InputBuilder:
@@ -442,7 +470,14 @@ class Qwen3_5InputBuilder(InputBuilder):
         else:
             # text-only: a plain 1D arange is correct (the text model expands
             # [1, seq] → [4, seq] internally and pure-text uses 1D positions).
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            if spec.is_packed:
+                pos_list = []
+                for i in range(len(spec.cu_seqlens) - 1):
+                    seg_len = spec.cu_seqlens[i + 1] - spec.cu_seqlens[i]
+                    pos_list.extend(range(seg_len))
+                position_ids = torch.tensor(pos_list, dtype=torch.long, device=device).unsqueeze(0)
+            else:
+                position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
             kw = {
                 "input_ids": ids,
                 "attention_mask": attention_mask,
@@ -527,9 +562,62 @@ class Qwen3_5InputBuilder(InputBuilder):
         else:
             # text-only: a plain 1-D arange broadcast to [batch, seq], matching
             # the HF text-side 1-D rope (GPTModel text path consumes 2-D ids).
-            kw["position_ids"] = (torch.arange(seq_len, device=device)
-                                  .unsqueeze(0).expand_as(ids).contiguous())
+            if spec.is_packed:
+                pos_list = []
+                for i in range(len(spec.cu_seqlens) - 1):
+                    seg_len = spec.cu_seqlens[i + 1] - spec.cu_seqlens[i]
+                    pos_list.extend(range(seg_len))
+                kw["position_ids"] = (torch.tensor(pos_list, dtype=torch.long,
+                                      device=device).unsqueeze(0).expand_as(ids).contiguous())
+            else:
+                kw["position_ids"] = (torch.arange(seq_len, device=device)
+                                      .unsqueeze(0).expand_as(ids).contiguous())
         return kw
+
+
+def _device_kind() -> str:
+    """'cuda' or 'npu' — single source for which accelerator backend is active.
+
+    turbo/vLLM originally hard-coded CUDA. On Ascend (torch_npu installed and
+    visible) this returns 'npu' so the whole pipeline runs on NPU. Used to pick
+    the device string, the process-group backend, and the visibility env var.
+    """
+    import torch
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
+    return "cuda"
+
+
+def _resolve_device(gpu_id: int) -> str:
+    """Backend-agnostic device string honoring TORCHTURBO_DEVICE override."""
+    import os
+    forced = os.environ.get("TORCHTURBO_DEVICE")
+    if forced:
+        return forced
+    return f"{_device_kind()}:{gpu_id}"
+
+
+def _device_str() -> str:
+    """Bare backend name ('cuda' / 'npu') for APIs that take a device object."""
+    return _device_kind()
+
+
+def _set_visible_devices(gpu_id: int) -> None:
+    """Set the accelerator-visibility env var for the active backend."""
+    import os
+    if _device_kind() == "npu":
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(gpu_id)
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+
+def _set_device_zero() -> None:
+    """torch.<backend>.set_device(0) for the active backend."""
+    import torch
+    if _device_kind() == "npu":
+        torch.npu.set_device(0)
+    else:
+        torch.cuda.set_device(0)
 
 
 def _to_device(t, device):
@@ -846,7 +934,7 @@ class GraphRecorder:
                                else 1e9)
         return {"nodes": self.nodes, "root": self._root_name or ""}
 
-    def save(self, path: str, meta: dict) -> None:
+    def save(self, path: str, meta: dict) -> dict:
         graph = self.finalize()
         graph["meta"] = meta
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -860,6 +948,7 @@ class GraphRecorder:
         stack_driven = sum(1 for n in self.nodes.values() if n.get("parent"))
         print(f"  saved {len(self.nodes)} nodes, {n_raw} raw tensors "
               f"({n_drop} non-tensor slots), {stack_driven} stack-assigned parents → {path}")
+        return graph
 
 
 def _tensor_raw_bytes(t):
@@ -1007,6 +1096,28 @@ def mode_gen_input(args: argparse.Namespace) -> None:
         fake_image_count=getattr(args, "fake_image_count", 1),
         out_dir=args.out_dir,
     )
+    if getattr(args, "packed", False) and args.input_mode == "text":
+        texts_packed = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Mathematics rewards patience and careful step sizes.",
+            "Reinforcement learning compounds ideas over thousands of rollouts.",
+        ]
+        seqs = []
+        for t in texts_packed:
+            ids_t = builder.tok(t, add_special_tokens=True, return_tensors=None)["input_ids"]
+            ids_t = ids_t[:args.seq_len]
+            seqs.append(ids_t)
+        packed_ids = []
+        cu_seqlens = [0]
+        for seq in seqs:
+            packed_ids.extend(seq)
+            cu_seqlens.append(len(packed_ids))
+        spec = InputSpec(packed_ids, mode="text",
+                         meta={"texts": texts_packed, "n_seqs": len(seqs)},
+                         cu_seqlens=cu_seqlens)
+        print(f"[gen_input] packed {len(seqs)} sequences -> {len(packed_ids)} tokens, "
+              f"cu_seqlens={cu_seqlens}")
+
     spec.meta.update({"model_path": args.model_path, "arch": builder.name,
                       "seq_len": len(spec.token_ids), "builder_mode": args.input_mode,
                       "fake_image": fake_image})
@@ -1030,16 +1141,40 @@ def mode_gen_input(args: argparse.Namespace) -> None:
 
 
 def _init_dist_single_gpu() -> None:
+    """Initialize a world-size-1 process group bound to localhost.
+
+    The compare harness is strictly single-device (world=1, rank=0), so the PG
+    must rendezvous on 127.0.0.1 — never on a job-scheduler-injected
+    ``MASTER_ADDR``. On a PTJob/Ascend box the launcher exports
+    ``MASTER_ADDR=<remote-master-host>`` and ``MASTER_PORT=23456`` for its OWN
+    multi-rank launch; if a naive ``init_process_group(...)`` (no ``init_method``)
+    reads those env vars it tries to rendezvous with the unreachable remote
+    master and hangs forever in ``_env_rendezvous_handler``/``_create_c10d_store``
+    — even though we are local-only. We therefore FORCE ``MASTER_ADDR=127.0.0.1``
+    (overwrite, not setdefault) and pass an explicit ``init_method`` so torch
+    never consults the injected scheduler env. If a PG is already initialized
+    (e.g. mindspeed/torch_npu pulled one up earlier) we leave it untouched.
+    """
     import torch
     import torch.distributed as dist
+    from datetime import timedelta
     if dist.is_available() and dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29555")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend, init_method="env://", rank=0, world_size=1)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"          # force localhost (overwrite)
+    os.environ.setdefault("MASTER_PORT", "29555")     # reuse free port if given
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        backend = "hccl"
+    elif torch.cuda.is_available():
+        backend = "nccl"
+    else:
+        backend = "gloo"
+    port = os.environ["MASTER_PORT"]
+    dist.init_process_group(
+        backend=backend, init_method=f"tcp://127.0.0.1:{port}",
+        rank=0, world_size=1, timeout=timedelta(seconds=60),
+    )
 
 
 def _attr_path(obj, path: str):
@@ -1078,11 +1213,10 @@ def _resolve_hook_root(model, args, builder=None, spec=None):
 
 
 def mode_turbo(args: argparse.Namespace) -> None:
-    import numpy as np
     import torch
     if not args.model_path:
         sys.exit("--model_path is required for turbo mode")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    _set_visible_devices(args.gpu_id)
     os.environ["TORCH_TURBO_SP_SIZE"] = "1"
     os.environ["TORCH_TURBO_EP_SIZE"] = "1"
     os.environ.setdefault("TORCH_TURBO_BACKEND", "fsdp2")
@@ -1092,65 +1226,27 @@ def mode_turbo(args: argparse.Namespace) -> None:
     from torchturbo.engine.core import TorchTurboEngine
 
     _init_dist_single_gpu()
-    torch.cuda.set_device(0)
+    _set_device_zero()
 
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16,
-                 "float32": torch.float32}
-    compute_dtype = dtype_map[args.dtype]
-
+    compute_dtype = _compute_dtype(args.dtype)
     engine = TorchTurboEngine()
     print("[turbo] building model (ep=1, sp=1, world=1) via TorchTurboEngine …")
     model = engine.build_model(args.model_path, torch_dtype=compute_dtype,
                                trust_remote_code=True, load_weights=True)
     model.eval()
 
-    # Load the shared input spec + builder first so the hook root can follow the
-    # builder's default (mm → full model incl. vision tower; text → backbone).
     spec = InputSpec.load(os.path.join(args.out_dir, "input_spec.pt"))
     builder = _resolve_builder(args.model_path, args.arch)
     hook_root_mod, hook_root_name = _resolve_hook_root(model, args, builder, spec)
-    print(f"[turbo] hook root = {hook_root_name or '<root>'}")
-
-    # Build forward kwargs from the one shared spec → turbo/vllm symmetric.
-    fwd_kwargs = builder.turbo_kwargs(spec, device="cuda", dtype=compute_dtype)
-    ids = fwd_kwargs["input_ids"]
-    seq_len = ids.shape[1]
-    print(f"[turbo] input mode={spec.mode} seq_len={seq_len}"
+    print(f"[turbo] hook root = {hook_root_name or '<root>'}  "
+          f"input mode={spec.mode} seq_len={len(spec.token_ids)}"
           + (f" n_images={len(spec.image_paths)}" if spec.mode == "image_text" else ""))
 
-    rec = GraphRecorder(hook_filter=args.hook_filter)
-    rec.register(hook_root_mod, root_name=hook_root_name)
-
-    # NOTE: no extra autocast — run the model with its own dtype / forward semantics
-    # so the precision environment matches online training. For image_text the
-    # builder passes position_ids=None + mm_token_type_ids so the model computes
-    # its 3D mrope positions itself (matching online inference / vLLM).
-    with torch.no_grad():
-        out = model(**fwd_kwargs)
-    rec.remove()
-    logits = out.logits if hasattr(out, "logits") and out.logits is not None else out[0]
-    print(f"[turbo] logits {tuple(logits.shape)}; captured {len(rec.nodes)} nodes")
-
-    logits_f = logits.float()
-    log_probs = torch.log_softmax(logits_f, dim=-1)
-    tgt = ids[0, 1:]
-    gathered = log_probs[0, :-1, :].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-    logp = torch.zeros(seq_len, dtype=torch.float32)
-    logp[1:] = gathered.cpu()
-
-    out_dir = os.path.join(args.out_dir, "turbo")
-    os.makedirs(out_dir, exist_ok=True)
-    np.save(os.path.join(out_dir, "logp.npy"), logp.numpy())
-    param_dtype = next((str(p.dtype) for _, p in model.named_parameters()), None)
-    rec.save(os.path.join(out_dir, "graph.pt"), {
-        "backend": "torchturbo-fsdp2", "seq_len": int(seq_len),
-        "hook_root": hook_root_name, "param_dtype_sample": param_dtype,
-        "compute_dtype": str(compute_dtype), "hook_filter": args.hook_filter,
-    })
-    # browser-loadable twin of graph.pt (passes logp for the HTML summary)
-    write_graph_json(_load_graph(os.path.join(out_dir, "graph.pt")),
-                     os.path.join(out_dir, "graph.json"), logp=logp.numpy(),
-                     max_raw_bytes=args.max_raw_bytes)
+    fwd_kwargs = builder.turbo_kwargs(spec, device=_device_str(), dtype=compute_dtype)
+    _run_side(side="turbo", backend="torchturbo-fsdp2", model=model,
+              fwd_kwargs=fwd_kwargs, ids=fwd_kwargs["input_ids"], spec=spec,
+              args=args, compute_dtype=compute_dtype,
+              hook_root_mod=hook_root_mod, hook_root_name=hook_root_name)
 
 
 # ─────────────────────────── vllm runner ────────────────────────────
@@ -1162,8 +1258,18 @@ def mode_vllm(args: argparse.Namespace) -> None:
     from vllm import LLM, SamplingParams
     if not args.model_path:
         sys.exit("--model_path is required for vllm mode")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    _set_visible_devices(args.gpu_id)
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    if _device_kind() == "npu":
+        os.environ.setdefault("VLLM_PLATFORM", "Ascend")
+        for _k, _v in (("VLLM_USE_V1", "1"),
+                       ("VLLM_VERSION", "0.21.0"),
+                       ("VLLM_ASCEND_ENABLE_NZ", "0"),
+                       ("HCCL_BUFFSIZE", "300"),
+                       ("ASCEND_BUFFER_POOL", "4:8"),
+                       ("USE_MULTI_GROUPS_KV_CACHE", "1"),
+                       ("USE_MULTI_BLOCK_POOL", "1")):
+            os.environ.setdefault(_k, _v)
 
     dtype_map = {"bfloat16": "bfloat16", "float16": "float16", "float32": "float"}
     vllm_dtype = dtype_map[args.dtype]
@@ -1236,14 +1342,13 @@ def mode_vllm(args: argparse.Namespace) -> None:
     np.save(os.path.join(out_dir, "logp.npy"), logp)
     param_dtype = next((str(p.dtype) for _, p in model.named_parameters()
                         if p.numel() > 0), None)
-    rec.save(os.path.join(out_dir, "graph.pt"), {
+    graph = rec.save(os.path.join(out_dir, "graph.pt"), {
         "backend": "vllm-prefill", "seq_len": int(seq_len),
         "hook_root": hook_root_name, "param_dtype_sample": param_dtype,
         "compute_dtype": vllm_dtype, "hook_filter": args.hook_filter,
     })
-    write_graph_json(_load_graph(os.path.join(out_dir, "graph.pt")),
-                     os.path.join(out_dir, "graph.json"), logp=logp,
-                     max_raw_bytes=args.max_raw_bytes)
+    write_graph_json(graph, os.path.join(out_dir, "graph.json"),
+                     logp=logp, max_raw_bytes=args.max_raw_bytes)
 
 
 # ─────────────────────────── megatron (mbridge) runner ──────────────
@@ -1252,21 +1357,39 @@ def mode_vllm(args: argparse.Namespace) -> None:
 def _ensure_megatron_on_path() -> bool:
     """Best-effort import check for the Megatron-Bridge (mbridge) stack.
 
-    The GPU compare box installs ``megatron-bridge`` (which pulls
+    The GPU/NPU compare box installs ``megatron-bridge`` (which pulls
     ``megatron-lm``/MCore) under an importable ``megatron`` namespace; this Mac
     dev env has neither. We only ``print`` guidance here and let the real import
     in ``mode_megatron`` raise the authoritative error.
     """
     import importlib
+    bridge_err = core_err = None
     try:
         importlib.import_module("megatron.bridge")  # noqa: F401
-        importlib.import_module("megatron.core")    # noqa: F401
-        return True
     except Exception as e:  # noqa: BLE001
-        print(f"[megatron] NOTE: megatron.bridge / megatron.core not importable in "
-              f"this env ({e.__class__.__name__}). The megatron mode requires the "
-              f"mbridge + MCore stack on the GPU box.")
-        return False
+        bridge_err = e
+    try:
+        importlib.import_module("megatron.core")    # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        core_err = e
+    if bridge_err is None and core_err is None:
+        return True
+    if bridge_err is not None and core_err is None:
+        print("[megatron] NOTE: megatron.core imports fine but megatron.bridge does "
+              "not — bridge (mbridge) is a separate package usually consumed from a "
+              "Megatron-Bridge checkout via PYTHONPATH. Export MEGATRON_PATH to point "
+              f"at its /src dir (where megatron/bridge lives). Bridge error: "
+              f"{bridge_err.__class__.__name__}: {bridge_err}")
+    elif bridge_err is None and core_err is not None:
+        print("[megatron] NOTE: megatron.bridge imports fine but megatron.core does "
+              "not — MCore is expected on the NPU box (pip-installed or via PYTHONPATH). "
+              f"Core error: {core_err.__class__.__name__}: {core_err}")
+    else:
+        print(f"[megatron] NOTE: neither megatron.bridge nor megatron.core is "
+              f"importable (bridge: {bridge_err.__class__.__name__}; "
+              f"core: {core_err.__class__.__name__}). The megatron mode requires the "
+              f"mbridge + MCore stack on the NPU box.")
+    return False
 
 
 def _apply_mbridge_parallelism(provider, *, tp, pp, ep, etp,
@@ -1306,10 +1429,15 @@ def _build_mbridge_model(model_path: str, dtype, args):
     checkpoint dir needed.
     """
     from megatron.bridge import AutoBridge
-    from megatron.bridge.utils.common_utils import (
-        maybe_initialize_distributed, disable_mtp_for_inference)
-
-    maybe_initialize_distributed(timeout_minutes=60)
+    # Initialize a world-size-1 PG bound to 127.0.0.1. Do NOT fall back to a
+    # bare init_process_group(): on a PTJob/Ascend box MASTER_ADDR is injected
+    # as the remote scheduler master and a bare init would hang there. Reuse the
+    # same localhost-forced helper turbo/vllm use so both legs behave identically.
+    _init_dist_single_gpu()
+    try:
+        from megatron.bridge.utils.common_utils import disable_mtp_for_inference
+    except ImportError:
+        disable_mtp_for_inference = lambda m: None
 
     bridge = AutoBridge.from_hf_pretrained(
         model_path, torch_dtype=dtype, trust_remote_code=True)
@@ -1333,108 +1461,371 @@ def _build_mbridge_model(model_path: str, dtype, args):
         # VP>1: a compare run is single-stage; surface that early.
         sys.exit(f"[megatron] expected 1 model stage, got {len(model_list)} "
                  f"(virtual_pipeline_model_parallel_size>1 not supported for compare).")
-    model = model_list[0].cuda()
+    model = model_list[0].to(_resolve_device(args.gpu_id))
     model.eval()
     if not args.megatron_keep_mtp:
         # MTP is a training-only head; disabling it makes ``forward`` return the
         # main LM-head logits (matching the HF/turbo side, which also returns the
-        # non-MTP head). It also prevents NCCL collective hangs on single-GPU.
+        # non-MTP head) and avoids NCCL collective hangs on single-GPU.
         disable_mtp_for_inference(model)
     if hasattr(model, "config"):
+        # The merged run computes the loss ITSELF from the logits (not through
+        # MCore's in-forward loss path), so the framework loss-scale that
+        # ``grad_scale_func`` applies is never on the critical path — clear it so
+        # the raw backward is what we measure.
         model.config.grad_scale_func = None
     return model
 
 
 def mode_megatron(args: argparse.Namespace) -> None:
-    import numpy as np
     import torch
     if not args.model_path:
         sys.exit("--model_path is required for megatron mode")
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    _set_visible_devices(args.gpu_id)
+
+    mindspeed_path = getattr(args, "megatron_mindspeed_path", None)
+    if mindspeed_path:
+        if not os.path.isdir(mindspeed_path):
+            sys.exit(f"[megatron] --megatron_mindspeed_path not a dir: {mindspeed_path}")
+        if mindspeed_path not in sys.path:
+            sys.path.insert(0, mindspeed_path)
+        print(f"[megatron] using mindspeed from {mindspeed_path}")
+    try:
+        import mindspeed  # noqa: F401  — triggers megatron_adaptor patch
+        from mindspeed import megatron_adaptor  # noqa: F401
+        print("[megatron] mindspeed.megatron_adaptor imported (NPU op patch active)")
+    except ImportError as e:
+        sys.exit(
+            "[megatron] failed to import mindspeed / megatron_adaptor. On Ascend this "
+            "adapter is required so MCore runs on NPU ops. Point at your MindSpeed "
+            f"checkout with --megatron_mindspeed_path (or PYTHONPATH). Error: {e}")
+
     if not _ensure_megatron_on_path():
         sys.exit("[megatron] aborting — megatron.bridge/megatron.core not importable.")
 
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16,
-                 "float32": torch.float32}
-    compute_dtype = dtype_map[args.dtype]
+    compute_dtype = _compute_dtype(args.dtype)
     if args.megatron_pp > 1:
         sys.exit("[megatron] pipeline_parallel_size>1 is not supported for the "
                  "compare forward (need a single stage that owns the lm_head). "
                  "Use --megatron_pp 1.")
-    torch.cuda.set_device(0)
+    _set_device_zero()
 
     print(f"[megatron] building mbridge/MCore model (tp={args.megatron_tp} "
           f"pp={args.megatron_pp} ep={args.megatron_ep}, dtype={args.dtype}) …")
     model = _build_mbridge_model(args.model_path, compute_dtype, args)
     unwrap = model.module if hasattr(model, "module") else model
 
-    # Load the shared input spec + builder; build MCore forward kwargs. AutoBridge
-    # routes text→GPTModel and image_text→Qwen3VLModel (qwen3.5 VLM) automatically.
     spec = InputSpec.load(os.path.join(args.out_dir, "input_spec.pt"))
     builder = _resolve_builder(args.model_path, args.arch)
     if not hasattr(builder, "megatron_kwargs"):
         sys.exit(f"[megatron] builder {builder.name} has no megatron_kwargs(); "
-                 "only qwen3.5 is supported this iteration.")
-    fwd_kwargs = builder.megatron_kwargs(spec, device="cuda")
-    fwd_kwargs.pop("runtime_gather_output", None)  # set per-forward below
-    ids = fwd_kwargs["input_ids"]
-    seq_len = ids.shape[1]
-    n_imgs = len(spec.image_paths) if spec.mode == "image_text" else 0
-    print(f"[megatron] input mode={spec.mode} seq_len={seq_len}"
-          + (f" n_images={n_imgs}" if spec.mode == "image_text" else ""))
+                 "only the qwen3.5 builder drives a Megatron forward this iteration.")
+    fwd_kwargs = builder.megatron_kwargs(spec, device=_device_str())
+    fwd_kwargs.pop("runtime_gather_output", None)      # set per-forward below
+    fwd_kwargs["runtime_gather_output"] = True         # gather full-vocab logits
+    print(f"[megatron] input mode={spec.mode} seq_len={len(spec.token_ids)}"
+          + (f" n_images={len(spec.image_paths)}" if spec.mode == "image_text" else ""))
 
-    # Hook root: the GPTModel itself (so embedding, decoder layers, and the
-    # output_layer/lm_head are all captured as a top-level box-diagram). The
-    # recorder's stack-driven parent links mirror the MCore module tree exactly.
-    hook_root_mod = unwrap
-    hook_root_name = ""
+    # Hook root: the model itself (embedding, decoder layers, output_layer/lm_head
+    # all captured); the recorder's stack-driven parents mirror the MCore tree.
+    _run_side(side="megatron", backend="megatron-mcore-via-mbridge", model=model,
+              fwd_kwargs=fwd_kwargs, ids=fwd_kwargs["input_ids"], spec=spec,
+              args=args, compute_dtype=compute_dtype,
+              hook_root_mod=unwrap, hook_root_name="",
+              extra={"tp": args.megatron_tp, "pp": args.megatron_pp,
+                     "ep": args.megatron_ep, "etp": args.megatron_etp,
+                     "keep_mtp": bool(args.megatron_keep_mtp)})
+
+
+# ───────────────────── merged forward: graph + loss + grad ──────────────────
+#
+# Both legs (turbo, megatron) run ONE forward per side that does all of:
+#   1) record the module relationship-graph (the GraphRecorder hooks) — graph.pt,
+#      identical to the old infer-only run (hooks capture .detach().cpu().clone()
+#      copies, so neither the captured numbers nor autograd are affected);
+#   2) derive per-token logp for the forward-logits comparator (logp.npy);
+#   3) compute the training loss from those SAME logits and backward() it, so
+#      grad flows through the real path (SP/EP/FSDP2 for turbo, MCore for
+#      megatron) — loss_grad.json.
+#
+# We forward with ``labels=None`` (so the model returns logits, keeping the
+# graph.pt contract intact) and compute one unified next-token CE ourselves via
+# ``_ce_loss_from_logits``. Because turbo and megatron use the *same* loss
+# function on logits produced from byte-identical inputs, the ONLY thing their
+# loss/grad_norm ratio can tell you is a BACKWARD-path difference — exactly the
+# variable this harness isolates. At TP=1 this CE is numerically equal to MCore's
+# native ``vocab_parallel_cross_entropy`` (verified independently), so the
+# merged contract costs nothing in fidelity.
+
+
+def _grad_norm_of(model) -> tuple[float, int]:
+    """L2 norm of the gradient over all params that received a grad — the same
+    quantity MCore's ``clip_grad_norm`` / torchturbo's optimizer uses, so the
+    number is directly meaningful. fp32-accrued to avoid bf16 underflow on NPU."""
+    import torch
+    total_sq = 0.0
+    count = 0
+    for _, p in model.named_parameters():
+        if p.grad is not None:
+            total_sq += float(p.grad.detach().float().pow(2).sum().item())
+            count += 1
+    return total_sq ** 0.5, count
+
+
+def _ce_loss_from_logits(logits, input_ids, boundaries=None):
+    """Next-token cross-entropy from raw logits — the ONE loss contract both
+    legs use, computed identically so only the BACKWARD path can differ.
+
+    Mirrors HF ``ForCausalLMLoss``: ``logits[:,:-1]`` vs ``labels[:,1:]``,
+    ``F.cross_entropy``, ``ignore_index=-100``, ``reduction='mean'`` over the
+    ``seq_len-1`` valid next-token positions. Logits upcast to fp32 (same as HF)
+    to dodge bf16 CE underflow. The returned loss keeps its autograd graph — do
+    NOT detach here (the caller backward()s it)."""
+    import torch.nn.functional as F
+    logits_f = logits.float()
+    shift_logits = logits_f[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    if boundaries:
+        labels_1d = shift_labels.reshape(-1).clone()
+        for b in boundaries:
+            idx = b - 1
+            if 0 <= idx < labels_1d.shape[0]:
+                labels_1d[idx] = -100
+        shift_labels = labels_1d.reshape_as(shift_labels)
+    return F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        ignore_index=-100, reduction="mean",
+    )
+
+
+def _logp_from_logits(logits, ids, seq_len, boundaries=None):
+    """Per-position next-token logp aligned to ``ids`` (the same ``logp.npy``
+    convention the infer-only run produced), [seq_len] fp32 on CPU. Position 0
+    has no predecessor → stays 0, matching vLLM's prompt_logprobs[0]."""
+    import torch
+    import numpy as np
+    gathered = torch.log_softmax(logits.float(), dim=-1)[0, :-1, :] \
+        .gather(-1, ids[0, 1:].unsqueeze(-1)).squeeze(-1)
+    logp = np.zeros(seq_len, dtype=np.float32)
+    logp[1:] = gathered.detach().float().cpu().numpy()
+    if boundaries:
+        for b in boundaries:
+            if 0 < b < seq_len:
+                logp[b] = 0.0
+    return logp
+
+
+def _intercept_logits(out):
+    """Return the [b,s,vocab] logits tensor from a forward that kept labels=None.
+
+    turbo (HF/torchturbo) returns a CausalLMOutput whose ``.logits`` is the LM
+    head; MCore's GPTModel/VLM returns logits directly, possibly wrapped in a
+    tuple for PP-last-stage / VLM shapes. One spot, so both legs behave alike."""
+    if hasattr(out, "logits") and out.logits is not None:
+        return out.logits
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return out
+
+
+def _grad_params(model):
+    """First param's dtype as a representative sample of the model's storage
+    dtype (both legs print this into graph.pt meta)."""
+    return next((str(p.dtype) for _, p in model.named_parameters()
+                 if p.numel() > 0), None)
+
+
+def _write_loss_grad_json(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+_CMD_NATIVE = "_ce_loss_from_logits: F.cross_entropy on logits[:,:-1] vs " \
+              "ids[:,1:] (ignore_index=-100, mean) — = HF ForCausalLMLoss, " \
+              "computed on the same logits as graph.pt"
+
+
+def _run_side(*, side, backend, model, fwd_kwargs, ids, spec, args,
+              compute_dtype, hook_root_mod, hook_root_name,
+              extra: dict | None = None):
+    """The shared merged-forward pipeline for the turbo and megatron legs.
+
+    The caller builds ``model`` + ``fwd_kwargs`` — the only things that genuinely
+    differ across frameworks — then everything from the recorder through the
+    graph.pt + loss_grad.json + logp.npy saves is identical on both sides,
+    which is the whole point of factoring it out.
+
+    Autograd is left ON (no torch.no_grad): the recorder's hooks capture
+    ``.detach().cpu().clone()`` copies, so the autograd graph is unaffected and
+    ``graph.pt`` is byte-identical to the old infer-only run, yet backward()
+    still flows to populate the grads we measure. ``model`` must already be in
+    the deterministic/eval state the caller wants.
+
+    ``backend`` is a human label for graph.pt meta (e.g. ``torchturbo-fsdp2``).
+    ``extra`` (e.g. megatron tp/pp/ep/etp/keep_mtp) is folded into BOTH the
+    loss_grad.json and graph.pt meta so a dumped graph/self-describes its run."""
+    import numpy as np
+    seq_len = ids.shape[1]
 
     rec = GraphRecorder(hook_filter=args.hook_filter)
     rec.register(hook_root_mod, root_name=hook_root_name)
-
-    # No extra autocast — MCore runs in the provider's autocast_dtype (bf16) via
-    # its own Float16Module/TE path, matching the turbo side's precision env.
-    # ``**fwd_kwargs`` carries input_ids/position_ids/attention_mask/labels and,
-    # for image_text, pixel_values/image_grid_thw — the exact set
-    # ``Qwen3VLModel.forward`` / ``GPTModel.forward`` accept.
-    fwd_kwargs["runtime_gather_output"] = True  # gather full-vocab logits on this stage
-    with torch.no_grad():
-        out = model(**fwd_kwargs)
+    model.zero_grad(set_to_none=True)
+    out = model(**fwd_kwargs)
     rec.remove()
+    logits = _intercept_logits(out)
+    print(f"[{side}] logits {tuple(logits.shape)}; captured {len(rec.nodes)} nodes")
 
-    logits = out
-    # text: GPTModel.forward(labels=None) → logits [b, s, vocab].
-    # VLM:  Qwen3VLModel.forward(labels=None, PP last stage) → logits [b, s, vocab]
-    #       (CP>1 only would return (output, loss_mask); we run CP=1). Upcast fp32.
-    if isinstance(logits, (tuple, list)):
-        logits = logits[0]
-    logits = logits.float()
-    print(f"[megatron] logits {tuple(logits.shape)}; captured {len(rec.nodes)} nodes")
+    boundaries = spec.boundaries if spec.is_packed else None
+    
+    logp = _logp_from_logits(logits, ids, seq_len, boundaries)
 
-    # Per-token logp (same convention as turbo) aligned to the shared token_ids.
-    tok_ids = ids[0]
-    log_probs = torch.log_softmax(logits, dim=-1)
-    tgt = tok_ids[1:]
-    gathered = log_probs[0, :-1, :].gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
-    logp = torch.zeros(seq_len, dtype=torch.float32)
-    logp[1:] = gathered.detach().float().cpu()
+    loss_t = _ce_loss_from_logits(logits, ids, boundaries)
+    loss_t.backward()
+    grad_norm, n_params = _grad_norm_of(model)
+    print(f"[{side}] loss: {float(loss_t.detach()):.6f}  "
+          f"grad_norm: {grad_norm:.6f}  ({n_params} params with grad)")
 
-    out_dir = os.path.join(args.out_dir, "megatron")
-    os.makedirs(out_dir, exist_ok=True)
-    np.save(os.path.join(out_dir, "logp.npy"), logp.numpy())
-    param_dtype = next((str(p.dtype) for _, p in unwrap.named_parameters()
-                        if p.numel() > 0), None)
-    rec.save(os.path.join(out_dir, "graph.pt"), {
-        "backend": "megatron-mcore-via-mbridge", "seq_len": int(seq_len),
-        "hook_root": hook_root_name, "param_dtype_sample": param_dtype,
+    # num_valid_tokens = next-token positions actually scored = (seq_len-1)
+    # minus the internal packed boundaries, which are masked (-100) because a
+    # token there would be asked to predict the FIRST token of the next sequence.
+    n_boundaries = len(boundaries) if boundaries else 0
+    num_valid = max(int(seq_len) - 1 - n_boundaries, 0)
+    grad_payload = {
+        "side": side, "mode": "merged_loss_grad", "input_mode": spec.mode,
+        "seq_len": int(seq_len), "num_valid_tokens": num_valid,
+        "packed": bool(spec.is_packed),
+        "loss": float(loss_t.detach()), "grad_norm": grad_norm,
+        "n_params_with_grad": n_params, "compute_dtype": str(compute_dtype),
+        "loss_native_path": _CMD_NATIVE,
+    }
+    graph_meta = {
+        "backend": backend, "seq_len": int(seq_len), "packed": bool(spec.is_packed),
+        "hook_root": hook_root_name, "param_dtype_sample": _grad_params(model),
         "compute_dtype": str(compute_dtype), "hook_filter": args.hook_filter,
-        "tp": args.megatron_tp, "pp": args.megatron_pp,
-        "ep": args.megatron_ep, "etp": args.megatron_etp,
-        "keep_mtp": bool(args.megatron_keep_mtp),
-    })
-    write_graph_json(_load_graph(os.path.join(out_dir, "graph.pt")),
-                     os.path.join(out_dir, "graph.json"), logp=logp.numpy(),
-                     max_raw_bytes=args.max_raw_bytes)
+    }
+    if extra:
+        grad_payload.update(extra)
+        graph_meta.update(extra)
+
+    out_dir = os.path.join(args.out_dir, side)
+    os.makedirs(out_dir, exist_ok=True)
+    np.save(os.path.join(out_dir, "logp.npy"), logp)
+    _write_loss_grad_json(os.path.join(out_dir, "loss_grad.json"), grad_payload)
+
+    graph = rec.save(os.path.join(out_dir, "graph.pt"), graph_meta)
+    write_graph_json(graph, os.path.join(out_dir, "graph.json"),
+                     logp=logp, max_raw_bytes=args.max_raw_bytes)
+    print(f"[{side}] → {out_dir}/graph.pt + loss_grad.json + logp.npy")
+
+
+def mode_loss_grad_compare(args: argparse.Namespace) -> None:
+    """Reduce the two per-side ``loss_grad.json`` files into a single report line.
+
+    Unlike ``mode_compare`` (which diffs forward graph.pt tensors), this just
+    arithmetic-diffs the two scalars; no MCore/bridge import is needed, so it
+    runs cleanly on a non-GPU box too."""
+    t_path = os.path.join(args.out_dir, "turbo", "loss_grad.json")
+    m_path = os.path.join(args.out_dir, "megatron", "loss_grad.json")
+    if not os.path.exists(t_path) or not os.path.exists(m_path):
+        sys.exit("[loss_grad_compare] missing turbo/loss_grad.json and/or "
+                 "megatron/loss_grad.json — run --mode turbo and --mode megatron "
+                 "(each writes graph.pt + loss_grad.json in one merged forward) first.")
+    with open(t_path) as f:
+        t = json.load(f)
+    with open(m_path) as f:
+        m = json.load(f)
+
+    # Guard: refuse to compare unless both sides record the SAME input_mode, seq_len AND packed-ness.
+    def _bail(field, tv, mv):
+        sys.exit(
+            f"[loss_grad_compare] REFUSING to compare: the two sides ran on "
+            f"different inputs ({field} mismatch: turbo={tv!r} vs "
+            f"megatron={mv!r}). Re-run gen_input ONCE, then run turbo AND "
+            f"megatron against that same input_spec.pt — do NOT regenerate the "
+            f"spec between the two legs. (turbo: {t_path}; megatron: {m_path})")
+
+    for field, tf, mf in (
+        ("input_mode", t.get("input_mode"), m.get("input_mode")),
+        ("seq_len", t.get("seq_len"), m.get("seq_len")),
+        ("packed", bool(t.get("packed")), bool(m.get("packed"))),
+    ):
+        if tf != mf:
+            _bail(field, tf, mf)
+    input_mode = t.get("input_mode")
+    seq_len = t.get("seq_len")
+    packed = bool(t.get("packed"))
+
+    def _rel(a, b):
+        return abs(a - b) / max(abs(a), abs(b), 1e-12)
+
+    t_loss, m_loss = float(t["loss"]), float(m["loss"])
+    t_grad, m_grad = float(t["grad_norm"]), float(m["grad_norm"])
+    t_np, m_np = t.get("n_params_with_grad"), m.get("n_params_with_grad")
+    n_valid = m.get("num_valid_tokens") or t.get("num_valid_tokens")
+    report = {
+        "mode": "loss_grad_compare",
+        "input_mode": input_mode,
+        "seq_len": seq_len,
+        "packed": packed,
+        "num_valid_tokens": n_valid,
+        "loss": {
+            "turbo": t_loss, "megatron": m_loss,
+            "abs_diff": abs(t_loss - m_loss),
+            "rel_diff": _rel(t_loss, m_loss),
+        },
+        "grad_norm": {
+            "turbo": t_grad, "megatron": m_grad,
+            "abs_diff": abs(t_grad - m_grad),
+            "rel_diff": _rel(t_grad, m_grad),
+            "ratio_turbo_over_megatron": t_grad / max(m_grad, 1e-12),
+            "turbo_params": t_np, "megatron_params": m_np,
+            "params_match": (t_np == m_np),
+        },
+        "native_paths": {
+            "turbo": t.get("loss_native_path"),
+            "megatron": m.get("loss_native_path"),
+        },
+        "note": ("Both sides use the SAME next-token CE mean contract "
+                 "(``_ce_loss_from_logits`` = HF ForCausalLMLoss, shift + ignore_index=-100 "
+                 "+ mean, on the very same logits the graph recorder captured), so loss "
+                 "& grad_norm are directly comparable. If the forward logits already "
+                 "aligned (~1e-3 in the [4/4] compare report) but loss/grad still "
+                 "diverge, the gap is in the BACKWARD path (SP/EP/FSDP2 vs MCore), not "
+                 "the model weights or the loss math. NOTE param counts differ when the "
+                 "two frameworks expose tied embeddings / MTP head / buffers differently; "
+                 "for an apples-to-apples grad compare both sides should report the SAME "
+                 "n_params_with_grad — if they differ, treat the grad_norm ratio as "
+                 "indicative only and compare loss first."),
+    }
+    out_json = os.path.join(args.out_dir, "loss_grad_report.json")
+    with open(out_json, "w") as f:
+        json.dump(report, f, indent=2)
+
+    bar = "=" * 70
+    print(f"\n{bar}")
+    print("  LOSS & GRAD NORM COMPARISON  (turbo vs megatron, unified from-logits CE)")
+    print(bar)
+    print(f"  input_mode={report['input_mode']}  seq_len={report['seq_len']}"
+          f"  packed={report['packed']}  valid_tokens={n_valid}")
+    print(f"  turbo loss:        {t_loss:.6f}")
+    print(f"  megatron loss:     {m_loss:.6f}")
+    print(f"  loss abs diff:     {report['loss']['abs_diff']:.6f}")
+    print(f"  loss rel diff:     {report['loss']['rel_diff']:.4e}")
+    print("")
+    pm = "MATCH" if report['grad_norm']['params_match'] else "DIFFER"
+    print(f"  turbo grad_norm:   {t_grad:.6f}  ({t_np} params with grad)")
+    print(f"  megatron grad_norm:{m_grad:.6f}  ({m_np} params with grad)  [param set: {pm}]")
+    print(f"  grad abs diff:     {report['grad_norm']['abs_diff']:.6f}")
+    print(f"  grad rel diff:     {report['grad_norm']['rel_diff']:.4e}")
+    print(f"  grad ratio t/m:    {report['grad_norm']['ratio_turbo_over_megatron']:.6f}")
+    if not report['grad_norm']['params_match']:
+        print("  ⚠ param counts differ → grad_norm ratio is indicative only, not")
+        print("    apples-to-apples (likely tied embeddings / MTP head / buffers")
+        print("    exposed differently by the two frameworks). Compare loss first.")
+    print(f"{bar}")
+    print(f"\nJSON report -> {out_json}")
 
 
 # (heavyweight MCore/mbridge imports live inside mode_megatron so importing this
@@ -1920,6 +2311,8 @@ def main() -> None:
         mode_megatron(args)
     elif args.mode == "compare":
         mode_compare(args)
+    elif args.mode == "loss_grad_compare":
+        mode_loss_grad_compare(args)
     elif args.mode == "pt2json":
         mode_pt2json(args)
     else:

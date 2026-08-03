@@ -27,5 +27,9 @@ pip install matplotlib
 # install packages related to npu triton
 pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl --no-deps
 pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/flash_linear_attention-0.5.2-py3-none-any.whl --no-deps
+pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/mindstudio_probe-26.0.0-py3-none-any.whl --no-deps
+pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/torch_npu-2.10.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl
+pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/flash_linear_attention_npu-26.6.0-1codex.gdr.100layer.repro.910_93.aarch64-py3-none-any.whl --force-reinstall --no-deps 
 
+rm -rf /usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_api/lib/libopapi.so
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

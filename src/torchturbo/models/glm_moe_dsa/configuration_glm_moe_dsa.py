@@ -9,7 +9,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
 
     attribute_map = {
         "num_local_experts": "n_routed_experts",
-        "head_dim": "qk_rope_head_dim",
     }
 
     def __init__(

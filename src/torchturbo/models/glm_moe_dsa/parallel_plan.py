@@ -53,12 +53,21 @@ def get_parallel_plan() -> FSDPParallelPlan:
 
     return FSDPParallelPlan(
         plan={
+            "model.layers.*": FSDPPlanSpec(
+                activation_checkpoint=True,
+            ),
             "model.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
             "model.layers.*.mlp": FSDPPlanSpec(
                 replace_module=_replace_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
+            ),
+            "model.embed_tokens": FSDPPlanSpec(
+                standalone_world_shard=True,
+            ),
+            "lm_head": FSDPPlanSpec(
+                standalone_world_shard=True,
             ),
         },
         sp_size=1,

@@ -815,6 +815,34 @@ def generate_sparse_mask(
 #     return attn_output, attn_weights, present_key_value
 
 
+def _get_kv_b_weight(kv_b_proj: nn.Module) -> torch.Tensor:
+    """Get the effective kv_b_proj weight, including LoRA delta if applicable.
+
+    When LoRA is applied, ``kv_b_proj`` is wrapped by ``peft.lora.Linear`` and
+    ``.weight`` only returns the base weight without the LoRA delta.  This
+    function adds the delta back so that the MLA absorb computation uses the
+    correct weights.
+    """
+    base_weight = kv_b_proj.weight
+    if not hasattr(kv_b_proj, "lora_A") or not hasattr(kv_b_proj, "lora_B"):
+        return base_weight
+    lora_A = getattr(kv_b_proj, "lora_A")
+    lora_B = getattr(kv_b_proj, "lora_B")
+    merged = set(getattr(kv_b_proj, "merged_adapters", []))
+    delta = None
+    for adapter_name in lora_A:
+        if adapter_name in merged:
+            continue
+        scaling = kv_b_proj.scaling[adapter_name]
+        a = lora_A[adapter_name].weight
+        b = lora_B[adapter_name].weight
+        adapter_delta = (b @ a) * scaling
+        delta = adapter_delta if delta is None else delta + adapter_delta
+    if delta is None:
+        return base_weight
+    return base_weight + delta
+
+
 def _npu_prepare_qkv_for_mla_absorb(
     self,
     hidden_states: torch.Tensor,
@@ -882,7 +910,9 @@ def _npu_prepare_qkv_for_mla_absorb(
     #              = (q * W_UQ * W_UK^T) * k^T
     # =====================================================================
     # Get kv_b weight and reshape to [H, qk_nope + v_head, kv_lora_rank]
-    kv_b_weight = self.kv_b_proj.weight.view(self.num_heads, -1, self.kv_lora_rank)
+    kv_b_weight = _get_kv_b_weight(self.kv_b_proj).view(
+        self.num_heads, -1, self.kv_lora_rank
+    )
 
     # q_nope: [B, S, H, qk_nope] @ [H, qk_nope, kv_lora] -> [B, S, H, kv_lora]
     q_nope_absorbed = torch.einsum(

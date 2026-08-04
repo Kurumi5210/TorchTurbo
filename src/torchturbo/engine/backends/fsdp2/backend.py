@@ -770,6 +770,19 @@ class FSDP2Backend(BaseBackend):
             submodule._tt_original_forward = submodule.forward
             submodule.forward = make_checkpointed_forward(submodule)
 
+        # When base model params are frozen (e.g. LoRA) and activation
+        # checkpointing with use_reentrant=False is active, the recompute
+        # inside checkpoint cannot build a gradient path if input embeddings
+        # have requires_grad=False, causing "element 0 of tensors does not
+        # require grad" on backward(). enable_input_require_grads() registers
+        # a forward hook on the embed tokens layer that forces its output to
+        # require_grad=True, so gradients always flow to LoRA adapters.
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+            self.logger.info(
+                "Called enable_input_require_grads() after activation checkpointing"
+            )
+
         return model
 
     def _collect_no_shard(

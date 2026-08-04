@@ -1,4 +1,4 @@
-# Qwen3 MoE
+# Qwen35 MoE GPU
 
 ## 运行脚本
 

@@ -15,7 +15,94 @@
 - [ ] 接入 Ascend C 算子后验证性能/精度 @执伞 @cjs02503376
 - [ ] 27B dense 模型 scaling 到 256K，更新长跑实验 @cjs02503376
 
+## AIStudio 环境
+
+```python
+import os
+from pypai.job import PythonJobBuilder
+from pypai.conf import ExecConf
+from pypai.conf import KMConf
+from pypai.conf import GpuType
+from pypai.conf import AlertConf
+from aistudio_common.openapi.models import DataStore
+
+def update_pypai():
+    # install dependencies
+    import subprocess
+    try:
+        subprocess.run(["pip", "install", "--upgrade", "aii-pypai"], check=True)
+        print("pip executes succeeded!")
+    except subprocess.CalledProcessError as e:
+        print(f"pip executes failed with code {e.returncode}")
+
+def torch_train():
+    update_pypai()
+    #a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-antfinix-sfs")
+    #a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-aicompiler-sfs")
+    a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-02-aidc-antfinix-sfs")
+    a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
+    a3_aic_pcache = DataStore(mount_point="/mnt/aicompiler-a3/common", store_name="ais-pcache-a3-common-aicompiler")
+    km_conf = KMConf(
+        # qwen3.5
+        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-6968dbd2-20260612130916"
+        
+    )
+    labels={
+        "\"sigma.ali/rack-group-num\"": "1",  # 同超节点约束，确保任务在同一超节点内i
+        "\"kubemaker.alipay.com/enable-pytorch-coscheduling\"": "true"  # 确保 PyTorchJob Pod 同时创建，避免超节点调度失败
+    }
+    edl_job_args = "--critical_worker_index=0:2 --relaunch_always=false --relaunch_count 0"
+
+    annotations = {
+        "ELASTICDL_MASTER_CONFIGURATION": '{"cpu": 4, "memory": 2048, "image":"hcr.meta-wulan01.hw-wulan.local/kubemaker/elasticdl:test-aarch64-bc4298b59706f305893044af221fa99880ae2210"}'
+    }
+
+    node_gpu_num = 16
+    node_num = 1
+
+    command = ""
+    command += f"export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && "
+    command += f"source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && "
+
+    command += ' sleep inf'
+    name = 'test-glucose180-qwen3_5'
+
+    master= ExecConf(cpu=256, memory=2800000, gpu_num=node_gpu_num, num=1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
+    worker = ExecConf(cpu=256, memory=2800000, gpu_num=node_gpu_num, num=node_num-1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
+
+    job = PythonJobBuilder(# source_root="./",
+                           main_file="", #命令模式必填空，详情参考：https://yuque.antfin-inc.com/aii/aistudio/gpu-job#y3tRY
+                           km_conf=km_conf,
+                           command=command,
+                           platform="kubemaker",
+                           k8s_app_name="hpuopt",
+                           k8s_priority="high",  
+                           distribution_strategy="AllreduceStrategy",    
+                           master=master,       
+                           worker=worker,
+                           runtime="pytorch",
+                           name=name,
+                           tag="type=SFT,basemodel=ling25",
+                           data_stores = [a3_sfs_old, a3_sfs_new, a3_aic_pcache],   # a3_sfs_new is not found since 2026-07-14
+                           #data_stores = [a3_sfs_old],
+                           host_network=False,
+                           labels=labels,
+                           edl_job_args = edl_job_args,)
+                          #  annotations=annotations,
+
+    job.run()
+
+if __name__ == "__main__":
+    torch_train()
+```
+
 ## 运行脚本
+
+安装依赖：
+
+```bash
+bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
+```
 
 | 任务 | 脚本 |
 | --- | --- |

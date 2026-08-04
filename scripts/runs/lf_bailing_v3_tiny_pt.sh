@@ -31,7 +31,8 @@ if [ -z "$USER_NAME" ]; then
 fi
 
 #model_name_or_path=/sfs_turbo/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324/
-model_name_or_path=/sfs_turbo/zhisan/models/ling_tiny_v3_0000324
+#model_name_or_path=/sfs_turbo/zhisan/models/ling_tiny_v3_0000324
+model_name_or_path=/mnt/aicompiler-a3/common/models/ling_tiny_v3_0000324
 output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/ling_v3/lf/
 
 seq_length=$((1024 * 8))

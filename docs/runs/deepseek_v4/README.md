@@ -36,6 +36,7 @@ def torch_train():
 
     labels={
         "\"sigma.ali/rack-group-num\"":"1",
+        "\"kubemaker.alipay.com/enable-pytorch-coscheduling\"": "true"  # 确保 PyTorchJob Pod 同时创建，避免超节点调度失败，【多节点（node_num>1）必须带！】
     }
     edl_job_args = "--critical_worker_index=0:2 --relaunch_always=false --relaunch_count 0"
 

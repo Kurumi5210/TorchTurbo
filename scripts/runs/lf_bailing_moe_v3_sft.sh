@@ -18,7 +18,8 @@ export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
-model_name_or_path=/sfs_turbo/pretrained_models/bailing_v3/ling-v3-flash-2-layer
+#model_name_or_path=/sfs_turbo/pretrained_models/bailing_v3/ling-v3-flash-2-layer
+model_name_or_path=/mnt/aicompiler-a3/common/pretrained_models/bailing_v3/ling-v3-flash-2-layer
 output_dir=/sfs_turbo/zlj/output
 
 seq_length=$((1024 * 4))
@@ -61,7 +62,11 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUN_LF="$(dirname "$0")/run_lf.py"
+DATASET_DIR="${REPO_ROOT}/dataset/npu/"
 
 export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
 export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
@@ -75,6 +80,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --do_train \
     --val_size 0 \
     --flash_attn fa2 \
+    --dataset_dir ${DATASET_DIR} \
     --dataset $dataset \
     --preprocessing_num_workers $((NNODES * 16)) \
     --cutoff_len ${seq_length} \

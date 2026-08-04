@@ -45,7 +45,8 @@ if [ -z "$USER_NAME" ]; then
     exit 1
 fi
 
-model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
+#model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
+model_name_or_path=/mnt/aicompiler-a3/common/pretrained_models/Qwen3.5-35B-A3B
 
 seq_length=$((1024 * 4))
 sp_size=2

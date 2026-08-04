@@ -18,7 +18,8 @@ export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
-model_name_or_path=/sfs_turbo/pretrained_models/Kimi-K2.5-bf16-new/
+#model_name_or_path=/sfs_turbo/pretrained_models/Kimi-K2.5-bf16-new/
+model_name_or_path=/mnt/aicompiler-a3/common/pretrained_models/Kimi-K2.5-bf16-new/
 output_dir=/sfs_turbo/${USER_NAME}/sft/ckpt/kimi_k25/lf/
 
 seq_length=$((1024 * 4))

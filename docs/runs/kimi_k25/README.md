@@ -24,12 +24,14 @@ def torch_train():
     update_pypai()
     a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-02-aidc-antfinix-sfs")
     a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
+    a3_aic_pcache = DataStore(store_name="ais-pcache-a3-common-aicompiler", mount_point="/mnt/aicompiler-a3/common")
     km_conf = KMConf(
         image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64"
     )
 
     labels={
         "\"sigma.ali/rack-group-num\"":"1",
+        "\"kubemaker.alipay.com/enable-pytorch-coscheduling\"": "true"  # 确保 PyTorchJob Pod 同时创建，避免超节点调度失败，【多节点（node_num>1）必须带！】
     }
     edl_job_args = "--critical_worker_index=0:2 --relaunch_always=false --relaunch_count 0"
 
@@ -63,7 +65,7 @@ def torch_train():
                            runtime="pytorch",
                            name=name,
                            tag="type=SFT,basemodel=ling25",
-                           data_stores = [a3_sfs_old, a3_sfs_new],
+                           data_stores = [a3_sfs_old, a3_sfs_new, a3_aic_pcache],
                            host_network=False,
                            labels=labels,
                            edl_job_args = edl_job_args,)

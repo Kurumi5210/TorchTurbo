@@ -62,7 +62,9 @@ fi
 
 log_file=$output_dir/log-$NODE_RANK.txt
 echo $output_dir
-cp -r $0 $output_dir
+if [ "$NODE_RANK" -eq 0 ]; then
+    cp -f "$0" "$output_dir/"
+fi
 cur_time=$(date "+%Y%m%d-%H%M%S")
 echo $cur_time >> $log_file
 echo $output_dir >> $log_file

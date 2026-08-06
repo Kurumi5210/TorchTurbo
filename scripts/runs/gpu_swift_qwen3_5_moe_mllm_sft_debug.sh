@@ -101,7 +101,9 @@ ep_size=4
 output_dir=/input/asystem/${USER_NAME}/ckpt/qwen35_35B/swift_sft_sp${sp_size}ep${ep_size}_node${NNODES}
 mkdir -p "$output_dir"
 log_file=$output_dir/log-$NODE_RANK.txt
-cp -r "$0" "$output_dir"
+if [ "$NODE_RANK" -eq 0 ]; then
+    cp -f "$0" "$output_dir/"
+fi
 { date "+%Y%m%d-%H%M%S"; echo "$output_dir"; } >> "$log_file"
 
 # --- paths: make torchturbo + ms-swift importable ---------------------------

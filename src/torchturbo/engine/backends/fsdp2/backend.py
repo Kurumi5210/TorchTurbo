@@ -1058,24 +1058,18 @@ class FSDP2Backend(BaseBackend):
                 return m if bool(m > acc) else acc
             return acc + (t.detach().float().abs() ** norm_type).sum()
 
-        acc = (
-            torch.tensor(0.0, device=reduce_device, dtype=torch.float32)
-            if norm_type == float("inf")
-            else torch.zeros((), device=reduce_device, dtype=torch.float32)
-        )
+        acc = torch.zeros((), device=reduce_device, dtype=torch.float32)
         for chunk in self._iter_offloaded_chunks(offloaded):
             chunk_dev = [l.to(reduce_device, non_blocking=True) for l in chunk]
             self.device_runtime.synchronize()  # H2D complete before reading chunk_dev
             for t in chunk_dev:
                 acc = _accumulate(t, acc)
-        for g in plain_grads:
-            acc = _accumulate(g, acc)
-        if norm_type == float("inf"):
-            dist.all_reduce(acc, op=dist.ReduceOp.MAX, group=world_group)
-            total_norm = acc
-        else:
-            dist.all_reduce(acc, op=dist.ReduceOp.SUM, group=world_group)
-            total_norm = acc ** (1.0 / norm_type)
+        reduce_op = dist.ReduceOp.MAX if norm_type == float("inf") else dist.ReduceOp.SUM
+        dist.all_reduce(acc, op=reduce_op, group=world_group)
+        # no_shard gradients are already world-reduced and replicated.
+        for grad in plain_grads:
+            acc = _accumulate(grad, acc)
+        total_norm = acc if norm_type == float("inf") else acc ** (1.0 / norm_type)
 
         # --- Pass 3: clip scaling, chunked on the device.
         clip_coef = float(max_norm) / (float(total_norm) + 1e-6)

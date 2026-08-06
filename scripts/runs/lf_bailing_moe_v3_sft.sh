@@ -40,6 +40,7 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 
 export ASCEND_PROCESS_LOG_PATH=$output_dir/log
+export PATH=/usr/local/Ascend/aarch64-linux/bin:$PATH
 
 mkdir -p $output_dir
 if [ -d $output_dir ]; then

@@ -112,6 +112,8 @@ class TurboKimiK25ForConditionalGeneration(
         cls = type(self.language_model)
         patch_forward_for_sp_input_slicing(cls, sp_group, sp_size)
 
+        self.patch_ulysses_fa(sp_info)
+
     def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""
 

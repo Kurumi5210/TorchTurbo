@@ -93,7 +93,6 @@ class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
         sp_size = sp_info["sp_size"]
 
         if is_npu_available():
-            from functools import partial
             from .npu import npu_fused_dsa_attn_forward
             from .modeling_glm_moe_dsa import GlmMoeDsaAttention
 
@@ -103,8 +102,3 @@ class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
                 )
 
             GlmMoeDsaAttention.forward = _patched_forward
-
-            # patched_forward = partial(
-            #     npu_fused_dsa_attn_forward, sp_group=sp_group, sp_size=sp_size
-            # )
-            # GlmMoeDsaAttention.forward = patched_forward

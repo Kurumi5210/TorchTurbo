@@ -458,7 +458,7 @@ class TorchTurboEngine:
         if not dist.is_initialized() or dist.get_rank() == 0:
             logger.info_rank0("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
             self._log_model_info(model)
-        
+
         return model
 
     def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
@@ -1007,6 +1007,13 @@ class TorchTurboEngine:
         input_ids_rolled = None
         if sp_size > 1:
             from torchturbo.adapters.rl.sp import pad_and_slice_packed_inputs
+            from torchturbo.models.base import SequenceParallelInputMode
+
+            # POST_EMBEDDING (e.g. VLM wrappers）:
+            # defer SP slicing to the model's patch_forward_for_sp_input_slicing
+            # (which slices post-embedding inputs_embeds)
+            input_mode = self.model.get_sequence_parallel_input_mode()
+            do_slice = input_mode != SequenceParallelInputMode.POST_EMBEDDING
 
             (
                 padded_input_ids,
@@ -1019,6 +1026,7 @@ class TorchTurboEngine:
                 padded_position_ids,
                 attention_mask,
                 sp_info,
+                do_slice=do_slice,
             )
 
         max_seqlen = max(seqlens) if seqlens else total_len

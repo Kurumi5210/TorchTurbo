@@ -56,16 +56,12 @@ class TurboQwen3MoeForCausalLM(TurboModel, Qwen3MoeForCausalLM):
 
         qwen3_moe_model.create_causal_mask = create_causal_mask
 
-        # qwen3_moe_model.Qwen3MoeRotaryEmbedding = TurboQwen3MoeRotaryEmbedding
-
-        # TODO(zlj)
-        # parallel_state = get_parallel_state()
-        # if parallel_state.sp_enabled():
-        #     qwen3_moe_model.create_causal_mask = create_causal_mask
-        # qwen3_moe_model.create_causal_mask = create_causal_mask
-
     def _post_init_patches(self):
         pass
+
+    def on_parallelized(self, parallel_context):
+        sp_info = parallel_context["sp"]
+        self.patch_ulysses_fa(sp_info)
 
     def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""

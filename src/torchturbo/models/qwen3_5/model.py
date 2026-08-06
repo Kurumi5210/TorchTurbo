@@ -115,6 +115,8 @@ class TurboQwen3_5ForConditionalGeneration(
             if num_attention_heads % sp_size != 0:
                 self._patch_ulysses_fa_for_sp(num_attention_heads, sp_size)
 
+            self.patch_ulysses_fa(sp_info)
+
             self.patch_gated_delta_net_for_sp(
                 Qwen3_5GatedDeltaNet, sp_group, sp_size, sp_rank
             )

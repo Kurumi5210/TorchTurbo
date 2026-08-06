@@ -40,6 +40,8 @@ class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
         if self.get_hf_linear_attn_norm_name() in param_name:
             return torch.float32
         return self.dtype
+
+
 @register_model(
     "qwen3_5_moe",
     config_cls=Qwen3_5MoeConfig,
@@ -281,6 +283,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 self._patch_ulysses_fa_for_sp(
                     num_attention_heads, sp_size
                 )
+
+            self.patch_ulysses_fa(sp_info)
 
             self.patch_gated_delta_net_for_sp(
                 Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank

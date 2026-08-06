@@ -130,6 +130,35 @@ def gather_heads_scatter_seq(
     return SeqAllToAll.apply(sp_group, sp_size, x, seq_dim, head_dim, False)
 
 
+def patch_flash_attention_forward_for_sp(sp_info: dict[str, Any]) -> None:
+    """Patch ``_flash_attention_forward`` with Ulysses all-to-all if SP>1."""
+    sp_group = sp_info.get("sp_group")
+    sp_size = sp_info.get("sp_size", 1)
+    if not sp_group or sp_size <= 1:
+        return
+    try:
+        import transformers.modeling_flash_attention_utils as flash_utils
+        import transformers.integrations.flash_attention as flash_integration
+    except ImportError:
+        return
+    if not hasattr(flash_utils, "_flash_attention_forward"):
+        return
+    from functools import partial
+    patched_forward = partial(
+        ulysses_flash_attention_forward,
+        sp_group=sp_group,
+        sp_size=sp_size,
+    )
+    flash_utils._flash_attention_forward = patched_forward
+    if hasattr(flash_integration, "_flash_attention_forward"):
+        flash_integration._flash_attention_forward = patched_forward
+
+    logger.info_rank0(
+        "Patched transformers.modeling_flash_attention_utils._flash_attention_forward for SP size=%d",
+        sp_size,
+    )
+
+
 def ulysses_flash_attention_forward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,

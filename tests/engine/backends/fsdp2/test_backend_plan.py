@@ -24,6 +24,12 @@ class TaggedModule(nn.Module):
         super().__init__()
         self.tag = tag
 
+    def get_norm(self):
+        base_prefix = getattr(self, "base_model_prefix", "")
+        base = getattr(self, base_prefix, None) if base_prefix else None
+        norm = getattr(base, "norm", None) if isinstance(base, nn.Module) else None
+        return norm if isinstance(norm, nn.Module) else None
+
 
 class FinalNorm(TaggedModule):
     """Class name contains 'Norm' so _find_final_norm detects it as the tail norm."""
@@ -35,6 +41,14 @@ def module_tags(module):
     modules = module if isinstance(module, list) else [module]
     tags = [m.tag for m in modules]
     return tags[0] if len(tags) == 1 else tags
+
+
+def make_backend(*, mtp_enabled=False):
+    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.config = types.SimpleNamespace(
+        mtp=types.SimpleNamespace(enabled=mtp_enabled),
+    )
+    return backend
 
 
 class CheckpointBlock(TaggedModule):
@@ -59,7 +73,7 @@ def test_standalone_world_shard_skips_default_descendant_wrapping(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -96,7 +110,7 @@ def test_no_shard_matches_parameter_names(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -138,7 +152,7 @@ def test_no_shard_module_skips_descendant_wrapping(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -175,7 +189,7 @@ def test_default_policy_wraps_module_list_children(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -206,7 +220,7 @@ def test_global_cpu_offload_applies_to_all_fsdp_units(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -234,7 +248,7 @@ def test_carves_tail_unit_with_reshard_false_and_root(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -274,7 +288,7 @@ def test_tail_unit_uses_input_embedding_when_tied(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -316,7 +330,7 @@ def test_tail_unit_does_not_guess_lm_head_attr(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -366,7 +380,7 @@ def test_vlm_nested_norm_via_get_norm_joins_tail_unit(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -379,13 +393,13 @@ def test_vlm_nested_norm_via_get_norm_joins_tail_unit(monkeypatch):
     inner = TaggedModule("model")
     language_model = TaggedModule("language_model")
     language_model.norm = FinalNorm("norm")
+    language_model.embed_tokens = TaggedModule("embed")
     inner.language_model = language_model
     inner.visual = TaggedModule("visual")
     model.model = inner
     lm_head = TaggedModule("lm_head")
     model.lm_head = lm_head
-    embed = TaggedModule("embed")
-    model.get_input_embeddings = lambda: embed
+    model.get_input_embeddings = lambda: language_model.embed_tokens
 
     backend._shard_model(model, FSDPParallelPlan())
 
@@ -398,6 +412,44 @@ def test_vlm_nested_norm_via_get_norm_joins_tail_unit(monkeypatch):
     assert not any(tags == "norm" for tags, _ in calls)
 
 
+def test_mtp_keeps_vlm_norm_separate_from_reused_lm_head(monkeypatch):
+    calls = []
+
+    def fake_fully_shard(module, mesh, **kwargs):
+        calls.append((module_tags(module), kwargs.get("reshard_after_forward")))
+
+    import torch.distributed.fsdp as fsdp
+
+    monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
+
+    backend = make_backend(mtp_enabled=True)
+    backend._mesh = object()
+    backend._world_mesh = "world"
+    backend.mixed_precision = types.SimpleNamespace(value="no")
+    backend.reshard_after_forward = True
+    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.rank = 0
+    backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    model = VLMOuter("root")
+    model.model = TaggedModule("model")
+    model.model.language_model = TaggedModule("language_model")
+    model.model.language_model.norm = FinalNorm("norm")
+    model.model.language_model.embed_tokens = TaggedModule("embed")
+    model.model.visual = TaggedModule("visual")
+    model.lm_head = TaggedModule("lm_head")
+    model.get_input_embeddings = lambda: model.model.language_model.embed_tokens
+
+    plan = FSDPParallelPlan(
+        plan={"lm_head": FSDPPlanSpec(standalone_world_shard=True)}
+    )
+    backend._shard_model(model, plan)
+
+    assert ("norm", False) in calls
+    assert ("lm_head", False) in calls
+    assert (["norm", "lm_head"], False) not in calls
+
+
 def test_tail_unit_skips_modules_inside_explicit_parent(monkeypatch):
     calls = []
 
@@ -408,7 +460,7 @@ def test_tail_unit_skips_modules_inside_explicit_parent(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -445,7 +497,7 @@ def test_explicit_output_embedding_merges_with_tail_norm(monkeypatch):
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
@@ -475,7 +527,7 @@ def test_prepare_model_applies_activation_checkpointing_before_sharding():
     order = []
     model = TaggedModule("root")
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend.prefetch_manager = types.SimpleNamespace(
         setup=lambda model: order.append("prefetch")
     )
@@ -503,7 +555,7 @@ def test_prepare_model_applies_activation_checkpointing_before_sharding():
 def test_activation_checkpointing_patches_plan_targets(monkeypatch):
     from torchturbo.engine.config import ActivationCheckpointingConfig
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend.config = types.SimpleNamespace(
         activation_checkpointing=ActivationCheckpointingConfig(enabled=True)
     )
@@ -550,7 +602,7 @@ def test_activation_checkpointing_patches_plan_targets(monkeypatch):
 def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
     from torchturbo.engine.config import ActivationCheckpointingConfig
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend.config = types.SimpleNamespace(
         activation_checkpointing=ActivationCheckpointingConfig(enabled=True)
     )
@@ -584,17 +636,22 @@ def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
     assert x.requires_grad is False
 
 
-def test_activation_checkpointing_disabled_warns_and_skips_plan_targets():
+def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypatch):
     from torchturbo.engine.config import ActivationCheckpointingConfig
+    from torchturbo.engine.backends.fsdp2 import backend as backend_module
 
     warnings = []
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend.config = types.SimpleNamespace(
         activation_checkpointing=ActivationCheckpointingConfig(enabled=False)
     )
     backend.rank = 0
-    backend.logger = types.SimpleNamespace(
-        warning=lambda *args, **kwargs: warnings.append(args),
+    monkeypatch.setattr(
+        backend_module,
+        "logger",
+        types.SimpleNamespace(
+            warning_rank0=lambda *args, **kwargs: warnings.append(args),
+        ),
     )
 
     model = TaggedModule("root")

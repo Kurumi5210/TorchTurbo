@@ -7,8 +7,11 @@ from typing import Any, Iterable, Iterator, Optional
 import torch
 from torch import nn
 
-from ..engine.config import ParameterGroup
+from ..engine.config import EngineConfig, ParameterGroup
+from ..logging import get_logger
 from .weight_converter import BaseWeightConverter
+
+logger = get_logger(__name__)
 
 
 class SequenceParallelInputMode(str, Enum):
@@ -52,8 +55,29 @@ class TurboModel:
 
     @classmethod
     @contextmanager
-    def init_context(cls, config: Any) -> Iterator[None]:
-        """Temporarily adapt config while building the meta-device model."""
+    def init_context(
+        cls, config: Any, engine_config: EngineConfig
+    ) -> Iterator[None]:
+        """Adapt model config and temporary state for meta-device construction."""
+        n_mtp = getattr(config, "num_nextn_predict_layers", 0)
+        if engine_config.mtp.enabled:
+            if n_mtp > 0:
+                logger.info_rank0("MTP enabled: %d MTP layer(s) will be built", n_mtp)
+            else:
+                logger.warning_rank0(
+                    "MTP is enabled but model config has "
+                    "num_nextn_predict_layers=0 - nothing to enable."
+                )
+        elif hasattr(config, "num_nextn_predict_layers"):
+            if n_mtp > 0:
+                logger.info_rank0(
+                    "MTP off (default): stripping %d MTP layer(s) - "
+                    "their checkpoint weights will be skipped. "
+                    "Enable MTP in the engine config to retain them.",
+                    n_mtp,
+                )
+            config.num_nextn_predict_layers = 0
+
         state = cls._force_config_dtype_float32(config)
         try:
             yield
@@ -127,9 +151,11 @@ class TurboVLMModel(TurboModel):
 
     @classmethod
     @contextmanager
-    def init_context(cls, config: Any) -> Iterator[None]:
+    def init_context(
+        cls, config: Any, engine_config: EngineConfig
+    ) -> Iterator[None]:
         nested_state = {}
-        with super().init_context(config):
+        with super().init_context(config, engine_config):
             for name in cls.nested_config_names:
                 nested_config = getattr(config, name, None)
                 child_state = cls._force_config_dtype_float32(nested_config)

@@ -285,26 +285,6 @@ class TorchTurboEngine:
                 trust_remote_code=trust_remote_code,
             )
 
-        if self.config.mtp.enabled:
-            n_mtp = getattr(config, "num_nextn_predict_layers", 0)
-            if n_mtp > 0:
-                logger.info_rank0("MTP enabled: %d MTP layer(s) will be built", n_mtp)
-            else:
-                logger.warning_rank0(
-                    "--tt_enable_mtp passed but model config has "
-                    "num_nextn_predict_layers=0 — nothing to enable."
-                )
-        else:
-            if hasattr(config, "num_nextn_predict_layers"):
-                if config.num_nextn_predict_layers > 0:
-                    logger.info_rank0(
-                        "MTP off (default): stripping %d MTP layer(s) — "
-                        "their checkpoint weights will be skipped. "
-                        "Pass --tt_enable_mtp to enable.",
-                        config.num_nextn_predict_layers,
-                    )
-                config.num_nextn_predict_layers = 0
-
         if model_cls is None:
             model_cls = AutoModelForCausalLM
 
@@ -336,7 +316,7 @@ class TorchTurboEngine:
                 f"Got {turbo_model_cls.__name__}."
             )
 
-        with turbo_model_cls.init_context(config):
+        with turbo_model_cls.init_context(config, engine_config=self.config):
             logger.info_rank0("Building model on meta device: %s", model_name_or_path)
             with torch.device("meta"):
                 logger.info_rank0(

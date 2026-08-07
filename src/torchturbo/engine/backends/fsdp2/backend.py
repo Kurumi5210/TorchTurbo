@@ -547,9 +547,9 @@ class FSDP2Backend(BaseBackend):
         """Return optimized FSDP units before ``fully_shard``.
 
         This is a deterministic unit transform following Accelerate's FSDP2
-        layout: carve input embeddings, merge the final norm with the output
-        embedding tail, and keep root/tail params resident because their
-        backward all-gather cannot be hidden behind useful compute.
+        layout: carve input embeddings, conditionally merge the final norm with
+        the output embedding tail, and keep root/tail params resident because
+        their backward all-gather cannot be hidden behind useful compute.
         """
         # Start from explicit/default FSDP units collected by _shard_model.
         # The optimizer only appends or merges deterministic auto units.
@@ -608,9 +608,9 @@ class FSDP2Backend(BaseBackend):
         is_tied = input_weight is not None and input_weight is output_weight
         tail_embed = input_embed if is_tied else output_embed
 
-        # Final norm is merged with the tail unit when possible so the last
-        # small parameters stay resident with lm_head/output embedding.
+        # MTP calls lm_head repeatedly, so only merge the tail when MTP is off.
         final_norm = self._find_final_norm(model)
+        can_merge_tail = not self.config.mtp.enabled
 
         if not is_tied and can_add_auto_unit(input_embed):
             optimized.append(_FSDPUnit(modules=[input_embed], mesh=self._world_mesh))
@@ -624,13 +624,16 @@ class FSDP2Backend(BaseBackend):
             else None
         )
         if tail_embed_unit is not None:
-            if can_add_auto_unit(final_norm):
+            if can_merge_tail and can_add_auto_unit(final_norm):
                 tail_embed_unit.modules = [final_norm] + tail_embed_unit.modules
             tail_embed_unit.reshard_after_forward = False
         else:
             tail_modules = [
                 module
-                for module in (final_norm, tail_embed)
+                for module in (
+                    (final_norm if can_merge_tail else None),
+                    tail_embed,
+                )
                 if can_add_auto_unit(module)
             ]
             if tail_modules:
@@ -641,6 +644,15 @@ class FSDP2Backend(BaseBackend):
                         reshard_after_forward=False,
                     )
                 )
+
+        if not can_merge_tail and can_add_auto_unit(final_norm):
+            optimized.append(
+                _FSDPUnit(
+                    modules=[final_norm],
+                    mesh=self._world_mesh,
+                    reshard_after_forward=False,
+                )
+            )
 
         if can_add_auto_unit(model):
             optimized.append(

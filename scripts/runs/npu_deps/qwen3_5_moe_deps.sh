@@ -7,6 +7,7 @@ set -e
 pip config set global.index-url https://pypi.antfin-inc.com/simple/
 
 pip install transformers==4.57.3
+pip install safetensors==0.7.0
 
 # dependency of llama_factory
 pip install deepspeed==0.16.0

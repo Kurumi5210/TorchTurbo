@@ -11,11 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...engine import EngineConfig
-from ...engine.args import TorchTurboArgs, string_to_bool
-from ...engine.config import (
-    ENV_MAP,
-    MixedPrecisionPolicy,
-)
+from ...engine.args import TorchTurboArgs, get_arg_specs, string_to_bool
+from ...engine.config import MixedPrecisionPolicy
 from ...engine.hooks import TrainState
 from ...logging import get_logger
 
@@ -33,7 +30,7 @@ def build_config_from_lf_args(
     """Build an ``EngineConfig`` from LlamaFactory args.
 
     Priority (lowest → highest): defaults → LF args mapping → ``torchturbo_args``
-    → env vars(via ``EngineConfig.__post_init__``).
+    → env vars (merged by :func:`build_from_args`).
 
     Parameters
     ----------
@@ -60,7 +57,7 @@ def build_config_from_lf_args(
     config, raw_args = _build_config_from_args(
         training_args, finetuning_args, model_args, torchturbo_args, raw_args
     )
-    # Note: env vars are already applied by EngineConfig.__post_init__
+    # Note: env vars are already merged inside build_from_args.
 
     logger.info_rank0(
         "Built EngineConfig from LlamaFactory args: backend=%s, mp=%s",
@@ -92,7 +89,7 @@ def _build_config_from_args(
 
     # --- Mixed precision seed (bf16/fp16/fp8 from LF training args) ---
     # Only seed tt when the user did not pass --tt_mixed_precision; explicit tt
-    # value wins, env overrides still apply in EngineConfig.__post_init__.
+    # value wins; env overrides are merged later inside build_from_args.
     if tt.mixed_precision is None:
         mixed_precision_hint = MixedPrecisionPolicy.FP32
         if training_args is not None:
@@ -213,15 +210,6 @@ def _explicit_torchturbo_bool_arg(
     *,
     config_path: str | None = None,
 ) -> bool | None:
-    if config_path is not None:
-        for env_name, mapped_path in ENV_MAP.items():
-            if mapped_path != config_path:
-                continue
-            env_value = os.environ.get(env_name)
-            if env_value is not None:
-                return string_to_bool(env_value)
-            break
-
     flag = f"--tt_{name}"
     args = sys.argv[1:]
     i = 0
@@ -234,6 +222,22 @@ def _explicit_torchturbo_bool_arg(
                 return string_to_bool(str(args[i + 1]))
             return True
         i += 1
+
+    if config_path is not None:
+        config_file = getattr(torchturbo_args, "config_path", None) if torchturbo_args else None
+        if config_file:
+            from omegaconf import OmegaConf
+            file_conf = OmegaConf.load(config_file)
+            file_value = OmegaConf.select(file_conf.get("engine_config", file_conf), config_path)
+            if file_value is not None:
+                return string_to_bool(file_value)
+        for arg_spec in get_arg_specs():
+            if arg_spec.env_name is None or arg_spec.config_path != config_path:
+                continue
+            env_value = os.environ.get(arg_spec.env_name)
+            if env_value is not None:
+                return string_to_bool(env_value)
+            break
     return None
 
 

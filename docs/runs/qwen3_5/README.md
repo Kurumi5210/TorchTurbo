@@ -106,10 +106,10 @@ bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
 
 | 任务 | 脚本 |
 | --- | --- |
-| TEXT SFT | `scripts/runs/lf_qwen3_5_dense_text_sft.sh` |
-| TEXT CPT | `scripts/runs/lf_qwen3_5_dense_text_cpt.sh` |
-| MLLM SFT | `scripts/runs/lf_qwen3_5_dense_mllm_sft.sh` |
-| MLLM CPT | `scripts/runs/lf_qwen3_5_dense_mllm_cpt.sh` |
+| TEXT SFT | `scripts/runs/qwen3_5_dense/lf_text_sft.sh` |
+| TEXT CPT | `scripts/runs/qwen3_5_dense/lf_text_cpt.sh` |
+| MLLM SFT | `scripts/runs/qwen3_5_dense/lf_mllm_sft.sh` |
+| MLLM CPT | `scripts/runs/qwen3_5_dense/lf_mllm_cpt.sh` |
 
 ---
 

@@ -18,53 +18,18 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from argparse import ArgumentTypeError
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
+
+from omegaconf import OmegaConf
 
 from ..logging import get_logger
 from ..ops.base import OpPolicy
-from .args import TorchTurboArgs, string_to_bool
+from .args import TorchTurboArgs, get_arg_specs, string_to_bool
 
 logger = get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Env var overrides — applies to ALL adapters and direct usage
-# ---------------------------------------------------------------------------
-
-ENV_MAP: dict[str, str] = {
-    "TORCH_TURBO_BACKEND": "backend",
-    "TORCH_TURBO_MIXED_PRECISION": "mixed_precision",
-    "TORCH_TURBO_OP_POLICY": "ops.policy",
-    "TORCH_TURBO_GRADIENT_CHECKPOINTING": "activation_checkpointing.enabled",
-    "TORCH_TURBO_AC_USE_REENTRANT": "activation_checkpointing.use_reentrant",
-    "TORCH_TURBO_RESHARD_AFTER_FWD": "backend_config.reshard_after_forward",
-    "TORCH_TURBO_PREFETCH_STRATEGY": "backend_config.prefetch_strategy",
-    "TORCH_TURBO_PREFETCH_DIRECTION": "backend_config.prefetch_direction",
-    "TORCH_TURBO_FORWARD_PREFETCH_DEPTH": "backend_config.forward_prefetch_depth",
-    "TORCH_TURBO_BACKWARD_PREFETCH_DEPTH": "backend_config.backward_prefetch_depth",
-    "TORCH_TURBO_CPU_OFFLOAD": "backend_config.cpu_offload",
-    "TORCH_TURBO_SP_SIZE": "parallel",
-    "TORCH_TURBO_EP_SIZE": "parallel",
-}
-
-
-def _set_field(obj: Any, field_name: str, value: str) -> None:
-    """Set a field on a config object, coercing the string value to the right type."""
-    current = getattr(obj, field_name, None)
-    if isinstance(current, Enum):
-        setattr(obj, field_name, type(current)(value))
-    elif isinstance(current, int) and not isinstance(current, bool):
-        setattr(obj, field_name, int(value))
-    elif isinstance(current, bool):
-        setattr(obj, field_name, string_to_bool(value))
-    else:
-        try:
-            setattr(obj, field_name, string_to_bool(value))
-        except ArgumentTypeError:
-            setattr(obj, field_name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -343,50 +308,11 @@ class EngineConfig:
     """Catch-all for user-defined settings."""
 
     def __post_init__(self) -> None:
-        """Auto-create default backend_config, then apply env var overrides."""
+        """Create missing nested configuration objects."""
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
         if self.ops is None:
             self.ops = OpsConfig()
-        self.apply_env_overrides()
-
-    def _set_top_level(self, field_name: str, value: str) -> None:
-        """Set a top-level config field from a string value."""
-        if field_name == "backend":
-            self.backend = DistributedBackend(value)
-        elif field_name == "mixed_precision":
-            self.mixed_precision = MixedPrecisionPolicy(value)
-        elif field_name == "parallel" and "=" in value:
-            # Handles TORCH_TURBO_SP_SIZE, etc manually in apply_env_overrides
-            pass
-
-    def apply_env_overrides(self) -> None:
-        """Apply ``TORCH_TURBO_*`` env vars to this config."""
-        for env_key, config_path in ENV_MAP.items():
-            value = os.environ.get(env_key)
-            if value is None:
-                continue
-
-            if env_key in ("TORCH_TURBO_SP_SIZE", "TORCH_TURBO_EP_SIZE"):
-                if self.parallel_plan is None:
-                    from torchturbo.parallel import FSDPParallelPlan
-
-                    self.parallel_plan = FSDPParallelPlan()
-                attr_name = env_key.replace("TORCH_TURBO_", "").lower()
-                setattr(self.parallel_plan, attr_name, int(value))
-                continue
-
-            parts = config_path.split(".")
-            if len(parts) == 1:
-                self._set_top_level(parts[0], value)
-            else:
-                obj = getattr(self, parts[0], None)
-                if obj is not None:
-                    _set_field(obj, parts[1], value)
-
-        post_init = getattr(self.backend_config, "__post_init__", None)
-        if callable(post_init):
-            post_init()
 
     def _default_backend_config(self) -> Any:
         """Create the default config for the selected backend."""
@@ -595,7 +521,9 @@ class EngineConfig:
 # ---------------------------------------------------------------------------
 
 
-def build_from_args(torchturbo_args: TorchTurboArgs | None) -> EngineConfig:
+def build_from_args(
+    torchturbo_args: TorchTurboArgs | None = None,
+) -> EngineConfig:
     """Assemble an :class:`EngineConfig` purely from a :class:`TorchTurboArgs`.
 
     Every slice of the engine config is reconstructed from the parsed
@@ -608,6 +536,10 @@ def build_from_args(torchturbo_args: TorchTurboArgs | None) -> EngineConfig:
     argument. Adding a new ``--tt_*`` flag touches only ``engine/args.py`` +
     this builder, and every adapter picks it up.
 
+    The final config is built once from a merged dict with four layers:
+    ``TorchTurboArgs`` < ``TORCH_TURBO_*`` env < YAML/JSON file < explicit
+    ``--tt_*`` CLI flags.
+
     ``FSDPConfig`` / ``FSDPParallelPlan`` are imported lazily (mirroring
     :meth:`EngineConfig.__post_init__`) to avoid an import cycle: they live in
     ``torchturbo.engine.backends.fsdp2.config`` / ``torchturbo.parallel``,
@@ -619,122 +551,202 @@ def build_from_args(torchturbo_args: TorchTurboArgs | None) -> EngineConfig:
         Parsed ``--tt_*`` args (the single source of truth for turbo flags).
         ``None`` is treated as all-defaults.
     """
-    from torchturbo.engine.backends.fsdp2.config import FSDPConfig, ShardingStrategy
-    from torchturbo.parallel import FSDPParallelPlan
-
     tt = torchturbo_args or TorchTurboArgs()
+    arg_specs = get_arg_specs()
 
-    # --- Backend ---
-    backend = DistributedBackend.FSDP2
-    if tt.backend is not None:
-        backend = DistributedBackend(tt.backend)
+    # Layer 1: TorchTurboArgs (adapter-seeded values are the base layer).
+    fields = OmegaConf.create()
+    for arg_spec in arg_specs:
+        if arg_spec.args_name is None or arg_spec.config_path is None:
+            continue
+        value = getattr(tt, arg_spec.args_name)
+        if value is not None:
+            OmegaConf.update(fields, arg_spec.config_path, value, force_add=True)
+    # Defaults without a --tt_* flag (tt values above win via merge).
+    fields = OmegaConf.merge(
+        OmegaConf.create(
+            {
+                # --- Backend ---
+                "backend": "fsdp2",
+                # --- Mixed precision (adapter may have seeded tt.mixed_precision) ---
+                "mixed_precision": "fp32",
+                # --- Parallel plan (sp / ep) ---
+                "parallel_plan": {"sp_size": 1, "ep_size": 1},
+                # --- Backend config (prefetch from tt; cpu_offload resolved by adapter) ---
+                "backend_config": {"reshard_after_forward": True},
+            }
+        ),
+        fields,
+    )
 
-    # --- Mixed precision (adapter may have seeded tt.mixed_precision) ---
-    mixed_precision = MixedPrecisionPolicy.FP32
-    if tt.mixed_precision is not None:
-        mixed_precision = MixedPrecisionPolicy(tt.mixed_precision)
+    # Layer 2: TORCH_TURBO_* environment variables — applies to ALL adapters
+    # and direct usage.
+    for arg_spec in arg_specs:
+        if arg_spec.env_name is None or arg_spec.config_path is None:
+            continue
+        value = os.environ.get(arg_spec.env_name)
+        if value is None:
+            continue
+        if arg_spec.type is not None:
+            value = arg_spec.type(value)
+        OmegaConf.update(fields, arg_spec.config_path, value, force_add=True)
 
-    # --- Parallel plan (sp / ep) ---
+    # Layer 3: YAML/JSON config file.
+    config_from_file = OmegaConf.create()
+    if tt.config_path is not None:
+        config_from_file = OmegaConf.load(tt.config_path)
+        if "engine_config" in config_from_file:
+            config_from_file = config_from_file["engine_config"]
+
+    # Layer 4: explicitly supplied --tt_* CLI flags.
+    config_from_cli = OmegaConf.create()
+    for destination, value in tt.config_overrides.items():
+        for arg_spec in arg_specs:
+            if (
+                arg_spec.cli_name is None
+                or arg_spec.cli_name.lstrip("-") != destination
+                or arg_spec.config_path is None
+            ):
+                continue
+            OmegaConf.update(
+                config_from_cli, arg_spec.config_path, value, force_add=True
+            )
+            break
+
+    # Merge all layers into one dict, then build the config once.
+    fields = OmegaConf.to_container(
+        OmegaConf.merge(fields, config_from_file, config_from_cli), resolve=True
+    )
+
+    # Parallel plan (parse FQN -> FSDPPlanSpec mappings from the file).
+    from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
+
+    parallel_d = fields.get("parallel_plan") or {}
+    spec_fields = [f.name for f in dataclasses.fields(FSDPPlanSpec)]
     parallel_plan = FSDPParallelPlan(
-        sp_size=tt.sp_size if tt.sp_size is not None else 1,
-        ep_size=tt.ep_size if tt.ep_size is not None else 1,
+        plan={
+            fqn: FSDPPlanSpec(**{f: spec_d.get(f) for f in spec_fields})
+            for fqn, spec_d in (parallel_d.get("plan") or {}).items()
+        },
+        sp_size=parallel_d.get("sp_size", 1),
+        ep_size=parallel_d.get("ep_size", 1),
     )
 
-    # --- Backend config (prefetch from tt; cpu_offload resolved by adapter) ---
-    fsdp_config = _build_fsdp_config(tt)
-
-    # --- Activation checkpointing (enabled + reentrant both from tt) ---
-    ac_config = ActivationCheckpointingConfig(
-        enabled=bool(tt.gradient_checkpointing),
-        use_reentrant=bool(tt.ac_use_reentrant),
-    )
+    ac_d = dict(fields.get("activation_checkpointing") or {})
+    if "enabled" in ac_d:
+        ac_d["enabled"] = string_to_bool(ac_d["enabled"])
+    if "use_reentrant" in ac_d:
+        ac_d["use_reentrant"] = string_to_bool(ac_d["use_reentrant"])
+    comm_d = dict(fields.get("comm") or {})
+    if "overlap_comm_compute" in comm_d:
+        comm_d["overlap_comm_compute"] = string_to_bool(
+            comm_d["overlap_comm_compute"]
+        )
 
     config = EngineConfig(
-        backend=backend,
+        backend=DistributedBackend(fields["backend"]),
+        mixed_precision=MixedPrecisionPolicy(fields["mixed_precision"]),
         parallel_plan=parallel_plan,
-        mixed_precision=mixed_precision,
-        backend_config=fsdp_config,
-        activation_checkpointing=ac_config,
-        comm=CommConfig(overlap_comm_compute=False),
-        checkpoint=_build_checkpoint_config(tt),
-        ops=_build_ops_config(tt),
-        mtp=_build_mtp_config(tt),
-        freeze_policy=_build_freeze_policy(tt),
-        diffusion=_build_diffusion_config(tt),
+        ops=_build_ops_config(fields),
+        backend_config=_build_fsdp_config(fields),
+        activation_checkpointing=ActivationCheckpointingConfig(**ac_d),
+        comm=CommConfig(**comm_d),
+        checkpoint=_build_checkpoint_config(fields),
+        mtp=_build_mtp_config(fields),
+        freeze_policy=_build_freeze_policy(fields),
+        diffusion=_build_diffusion_config(fields),
         extra={},
     )
+
     logger.info_rank0(
         "Built EngineConfig from TorchTurboArgs: backend=%s, mp=%s, sp=%d, ep=%d",
         config.backend.value,
         config.mixed_precision.value,
-        parallel_plan.sp_size,
-        parallel_plan.ep_size,
+        config.parallel_plan.sp_size,
+        config.parallel_plan.ep_size,
     )
     return config
 
 
-def _build_fsdp_config(tt: TorchTurboArgs) -> "FSDPConfig":
-    """FSDPConfig from tt prefetch fields + tt.cpu_offload."""
+def _build_fsdp_config(fields: Mapping[str, Any]) -> Any:
+    """FSDPConfig from the merged config dict."""
     from torchturbo.engine.backends.fsdp2.config import FSDPConfig, ShardingStrategy
 
+    fsdp_d = fields.get("backend_config") or {}
     return FSDPConfig(
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        reshard_after_forward=True,
-        cpu_offload=bool(tt.cpu_offload),
-        pin_memory=True,
-        prefetch_strategy=tt.prefetch_strategy,
-        prefetch_direction=tt.prefetch_direction,
-        forward_prefetch_depth=tt.forward_prefetch_depth,
-        backward_prefetch_depth=tt.backward_prefetch_depth,
+        sharding_strategy=fsdp_d.get(
+            "sharding_strategy", ShardingStrategy.FULL_SHARD
+        ),
+        reshard_after_forward=string_to_bool(
+            fsdp_d.get("reshard_after_forward", True)
+        ),
+        cpu_offload=string_to_bool(fsdp_d.get("cpu_offload", False)),
+        pin_memory=string_to_bool(fsdp_d.get("pin_memory", True)),
+        prefetch_strategy=fsdp_d.get("prefetch_strategy", "auto"),
+        prefetch_direction=fsdp_d.get("prefetch_direction", "forward_backward"),
+        forward_prefetch_depth=fsdp_d.get("forward_prefetch_depth", 1),
+        backward_prefetch_depth=fsdp_d.get("backward_prefetch_depth", 1),
     )
 
 
-def _build_checkpoint_config(tt: TorchTurboArgs) -> CheckpointConfig:
-    """CheckpointConfig from the adapter-seeded model/output paths on tt."""
-    output_dir = tt.output_dir
+def _build_checkpoint_config(fields: Mapping[str, Any]) -> CheckpointConfig:
+    """CheckpointConfig from the merged config dict."""
+    ckpt_d = fields.get("checkpoint") or {}
     return CheckpointConfig(
-        hf_model_path=tt.model_path,
-        dcp_path=output_dir if output_dir else None,
+        hf_model_path=ckpt_d.get("hf_model_path"),
+        dcp_path=ckpt_d.get("dcp_path") or None,
+        save_format=ckpt_d.get("save_format", "dcp"),
     )
 
 
-def _build_ops_config(tt: TorchTurboArgs) -> OpsConfig:
-    """OpsConfig from the ``--tt_op_policy`` flag (default AUTO when unset)."""
-    if tt.op_policy is None:
+def _build_ops_config(fields: Mapping[str, Any]) -> OpsConfig:
+    """OpsConfig from the merged config dict."""
+    policy = (fields.get("ops") or {}).get("policy")
+    if policy is None:
         return OpsConfig()
-    return OpsConfig(policy=OpPolicy(str(tt.op_policy).lower()))
+    return OpsConfig(policy=OpPolicy(str(policy).lower()))
 
 
-def _build_mtp_config(tt: TorchTurboArgs) -> MTPConfig:
-    loss_scaling_factor = (
-        tt.mtp_loss_scaling_factor
-        if tt.mtp_loss_scaling_factor is not None
-        else MTPConfig().loss_scaling_factor
-    )
+def _build_mtp_config(fields: Mapping[str, Any]) -> MTPConfig:
+    """MTPConfig from the merged config dict (nested or flat keys)."""
+    mtp_d = dict(fields.get("mtp") or {})
+    if "enable_mtp" in fields:
+        mtp_d["enabled"] = fields["enable_mtp"]
+    if "mtp_loss_scaling_factor" in fields:
+        mtp_d["loss_scaling_factor"] = fields["mtp_loss_scaling_factor"]
+    loss_scaling_factor = mtp_d.get("loss_scaling_factor")
     return MTPConfig(
-        enabled=bool(tt.enable_mtp),
-        loss_scaling_factor=float(loss_scaling_factor),
+        enabled=string_to_bool(mtp_d.get("enabled", False)),
+        loss_scaling_factor=float(
+            loss_scaling_factor if loss_scaling_factor is not None else 0.1
+        ),
     )
 
 
-def _build_freeze_policy(tt: TorchTurboArgs) -> FreezePolicy:
-    groups: list[ParameterGroup] = []
-    if tt.freeze_vision_tower:
-        groups.append(ParameterGroup.VISION_TOWER)
-    if tt.freeze_multi_modal_projector:
-        groups.append(ParameterGroup.MULTI_MODAL_PROJECTOR)
-    if tt.freeze_language_model:
-        groups.append(ParameterGroup.LANGUAGE_MODEL)
-    return FreezePolicy(parameter_groups=tuple(groups))
+def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:
+    """FreezePolicy from the merged config dict."""
+    freeze_d = fields.get("freeze_policy") or {}
+    groups = [
+        name
+        for name, enabled in (
+            ("vision_tower", string_to_bool(freeze_d.get("vision_tower", False))),
+            (
+                "multi_modal_projector",
+                string_to_bool(freeze_d.get("multi_modal_projector", False)),
+            ),
+            ("language_model", string_to_bool(freeze_d.get("language_model", False))),
+        )
+        if enabled
+    ]
+    return FreezePolicy.from_list(groups)
 
 
-def _build_diffusion_config(tt: TorchTurboArgs) -> DiffusionConfig:
-    # BD/CAP config for block-diffusion (dLLM) training. Gated by the model's
-    # ``is_diffusion_model`` attribute — inert (cap_lambda=0) for non-diffusion
-    # models, so constructing it unconditionally here is safe for all adapters.
+def _build_diffusion_config(fields: Mapping[str, Any]) -> DiffusionConfig:
+    """DiffusionConfig from the merged config dict."""
+    diffusion_d = fields.get("diffusion") or {}
     return DiffusionConfig(
-        cap_lambda=float(tt.cap_lambda or 0.0),
-        bd_mask_low=float(tt.bd_mask_low),
-        bd_mask_high=float(tt.bd_mask_high),
-        bd_block_size=int(tt.bd_block_size),
+        cap_lambda=float(diffusion_d.get("cap_lambda") or 0.0),
+        bd_mask_low=float(diffusion_d.get("bd_mask_low", 0.3)),
+        bd_mask_high=float(diffusion_d.get("bd_mask_high", 0.8)),
+        bd_block_size=int(diffusion_d.get("bd_block_size", 32)),
     )

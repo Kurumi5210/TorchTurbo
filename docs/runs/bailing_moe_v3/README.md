@@ -85,7 +85,7 @@ if __name__ == "__main__":
 sh scripts/runs/npu_deps/bailing_v3_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/lf_bailing_v3_tiny_pt.sh
+sh scripts/runs/bailing_v3/lf_tiny_pt.sh
 ```
 
 ### SFT
@@ -93,7 +93,7 @@ sh scripts/runs/lf_bailing_v3_tiny_pt.sh
 sh scripts/runs/npu_deps/bailing_v3_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/lf_bailing_v3_tiny_sft.sh
+sh scripts/runs/bailing_v3/lf_tiny_sft.sh
 ```
 
 ### DPO
@@ -101,7 +101,7 @@ sh scripts/runs/lf_bailing_v3_tiny_sft.sh
 sh scripts/runs/npu_deps/bailing_v3_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/lf_bailing_v3_tiny_dpo.sh
+sh scripts/runs/bailing_v3/lf_tiny_dpo.sh
 ```
 
 ## 和 DeepSpeed 对比

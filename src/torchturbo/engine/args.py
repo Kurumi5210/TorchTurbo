@@ -19,7 +19,9 @@ The parsed args can later be retrieved::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from ..logging import LogLevel, get_logger
 
@@ -152,6 +154,322 @@ class TorchTurboArgs:
     forward_prefetch_depth: int = 1
     backward_prefetch_depth: int = 1
 
+    config_path: str | None = None
+    config_overrides: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TurboArgSpec:
+    """Describe one external TorchTurbo argument and its canonical config path."""
+
+    name: str
+    """Stable unique name inside the registry."""
+
+    config_path: str | None = None
+    """Canonical path in the merged mapping; None means runtime-only."""
+
+    args_name: str | None = None
+    """TorchTurboArgs field name; None for environment-only inputs."""
+
+    cli_name: str | None = None
+    """CLI option name including the '--' prefix; None means no CLI input."""
+
+    env_name: str | None = None
+    """Full TORCH_TURBO_* variable name; None means no ENV input."""
+
+    type: Callable[[str], Any] | None = None
+    """String-to-typed-value converter for CLI and env inputs; None means str."""
+
+    metavar: str | None = None
+    """Argparse metavar for the CLI option; None means argparse default."""
+
+    help: str | None = None
+    """Help/documentation text for the CLI option."""
+
+
+_TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
+    TurboArgSpec(
+        name="config_path",
+        args_name="config_path",
+        cli_name="--tt_config",
+        metavar="PATH",
+        help="TorchTurbo YAML or JSON configuration file.",
+    ),
+    # Engine inputs: top level
+    TurboArgSpec(
+        name="backend",
+        args_name="backend",
+        cli_name="--tt_backend",
+        env_name="TORCH_TURBO_BACKEND",
+        config_path="backend",
+        metavar="BACKEND",
+        help="Distributed backend (e.g. fsdp2). Replaces TORCH_TURBO_BACKEND.",
+    ),
+    TurboArgSpec(
+        name="mixed_precision",
+        args_name="mixed_precision",
+        cli_name="--tt_mixed_precision",
+        env_name="TORCH_TURBO_MIXED_PRECISION",
+        config_path="mixed_precision",
+        metavar="POLICY",
+        help="Mixed precision policy (bf16, fp16, fp32, fp8). "
+        "Replaces TORCH_TURBO_MIXED_PRECISION.",
+    ),
+    TurboArgSpec(
+        name="op_policy",
+        args_name="op_policy",
+        cli_name="--tt_op_policy",
+        env_name="TORCH_TURBO_OP_POLICY",
+        config_path="ops.policy",
+        metavar="POLICY",
+        help="Default op dispatch policy (auto, native, custom). "
+        "Replaces TORCH_TURBO_OP_POLICY.",
+    ),
+    TurboArgSpec(
+        name="sp_size",
+        args_name="sp_size",
+        cli_name="--tt_sp_size",
+        env_name="TORCH_TURBO_SP_SIZE",
+        config_path="parallel_plan.sp_size",
+        type=int,
+        metavar="SIZE",
+        help="Sequence parallelism group size. Replaces TORCH_TURBO_SP_SIZE.",
+    ),
+    TurboArgSpec(
+        name="ep_size",
+        args_name="ep_size",
+        cli_name="--tt_ep_size",
+        env_name="TORCH_TURBO_EP_SIZE",
+        config_path="parallel_plan.ep_size",
+        type=int,
+        metavar="SIZE",
+        help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
+    ),
+    TurboArgSpec(
+        name="gradient_checkpointing",
+        args_name="gradient_checkpointing",
+        cli_name="--tt_gradient_checkpointing",
+        env_name="TORCH_TURBO_GRADIENT_CHECKPOINTING",
+        config_path="activation_checkpointing.enabled",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Enable or disable TorchTurbo-owned activation checkpointing. "
+        "Replaces TORCH_TURBO_GRADIENT_CHECKPOINTING.",
+    ),
+    TurboArgSpec(
+        name="ac_use_reentrant",
+        args_name="ac_use_reentrant",
+        cli_name="--tt_ac_use_reentrant",
+        env_name="TORCH_TURBO_AC_USE_REENTRANT",
+        config_path="activation_checkpointing.use_reentrant",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Use reentrant activation checkpointing (use_reentrant=True) "
+        "instead of the default non-reentrant implementation. Reentrant "
+        "checkpointing tears down recomputed intermediates synchronously "
+        "within a step, reducing cross-step allocation peak for MoE/linear-"
+        "attention workloads. Replaces TORCH_TURBO_AC_USE_REENTRANT.",
+    ),
+    TurboArgSpec(
+        name="cpu_offload",
+        args_name="cpu_offload",
+        cli_name="--tt_cpu_offload",
+        env_name="TORCH_TURBO_CPU_OFFLOAD",
+        config_path="backend_config.cpu_offload",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Enable or disable FSDP CPU offload for wrapped units. "
+        "Replaces TORCH_TURBO_CPU_OFFLOAD.",
+    ),
+    TurboArgSpec(
+        name="prefetch_strategy",
+        args_name="prefetch_strategy",
+        cli_name="--tt_prefetch_strategy",
+        env_name="TORCH_TURBO_PREFETCH_STRATEGY",
+        config_path="backend_config.prefetch_strategy",
+        metavar="STRATEGY",
+        help="FSDP prefetch strategy: native|auto|expert_with_layer|"
+        "expert_lookahead. Replaces TORCH_TURBO_PREFETCH_STRATEGY.",
+    ),
+    TurboArgSpec(
+        name="prefetch_direction",
+        args_name="prefetch_direction",
+        cli_name="--tt_prefetch_direction",
+        env_name="TORCH_TURBO_PREFETCH_DIRECTION",
+        config_path="backend_config.prefetch_direction",
+        metavar="DIRECTION",
+        help="Prefetch direction: forward|forward_backward. "
+        "Replaces TORCH_TURBO_PREFETCH_DIRECTION.",
+    ),
+    TurboArgSpec(
+        name="forward_prefetch_depth",
+        args_name="forward_prefetch_depth",
+        cli_name="--tt_forward_prefetch_depth",
+        env_name="TORCH_TURBO_FORWARD_PREFETCH_DEPTH",
+        config_path="backend_config.forward_prefetch_depth",
+        type=int,
+        metavar="N",
+        help="How many upcoming layers each source prefetches in forward "
+        "(1 = next layer only). Higher trades peak memory for more overlap. "
+        "Replaces TORCH_TURBO_FORWARD_PREFETCH_DEPTH.",
+    ),
+    TurboArgSpec(
+        name="backward_prefetch_depth",
+        args_name="backward_prefetch_depth",
+        cli_name="--tt_backward_prefetch_depth",
+        env_name="TORCH_TURBO_BACKWARD_PREFETCH_DEPTH",
+        config_path="backend_config.backward_prefetch_depth",
+        type=int,
+        metavar="N",
+        help="How many previous layers each layer prefetches in backward "
+        "(1 = previous layer only). Only used with forward_backward direction. "
+        "Replaces TORCH_TURBO_BACKWARD_PREFETCH_DEPTH.",
+    ),
+    TurboArgSpec(
+        name="enable_mtp",
+        args_name="enable_mtp",
+        cli_name="--tt_enable_mtp",
+        config_path="mtp.enabled",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Build Multi-Token-Prediction (MTP) layers. "
+        "Accepts --tt_enable_mtp, --tt_enable_mtp true, or --tt_enable_mtp false. "
+        "Off by default.",
+    ),
+    TurboArgSpec(
+        name="mtp_loss_scaling_factor",
+        args_name="mtp_loss_scaling_factor",
+        cli_name="--tt_mtp_loss_scaling_factor",
+        config_path="mtp.loss_scaling_factor",
+        type=float,
+        metavar="FLOAT",
+        help="MTP loss weight. Ignored when MTP is off.",
+    ),
+    TurboArgSpec(
+        name="freeze_vision_tower",
+        args_name="freeze_vision_tower",
+        cli_name="--tt_freeze_vision_tower",
+        config_path="freeze_policy.vision_tower",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Freeze vision encoder parameters (requires_grad=False). "
+        "Accepts --tt_freeze_vision_tower, ... true, or ... false.",
+    ),
+    TurboArgSpec(
+        name="freeze_multi_modal_projector",
+        args_name="freeze_multi_modal_projector",
+        cli_name="--tt_freeze_multi_modal_projector",
+        config_path="freeze_policy.multi_modal_projector",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Freeze multi-modal projector parameters (requires_grad=False). "
+        "Accepts --tt_freeze_multi_modal_projector, ... true, or ... false.",
+    ),
+    TurboArgSpec(
+        name="freeze_language_model",
+        args_name="freeze_language_model",
+        cli_name="--tt_freeze_language_model",
+        config_path="freeze_policy.language_model",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Freeze language model parameters (requires_grad=False). "
+        "Accepts --tt_freeze_language_model, ... true, or ... false.",
+    ),
+    TurboArgSpec(
+        name="cap_lambda",
+        args_name="cap_lambda",
+        cli_name="--tt_cap_lambda",
+        config_path="diffusion.cap_lambda",
+        type=float,
+        metavar="FLOAT",
+        help="CAP/DPARALLEL confidence loss weight (entropy on correctly-"
+        "predicted tokens). 0 disables (default). Recommended: 2.0.",
+    ),
+    TurboArgSpec(
+        name="bd_mask_low",
+        args_name="bd_mask_low",
+        cli_name="--tt_bd_mask_low",
+        config_path="diffusion.bd_mask_low",
+        type=float,
+        metavar="FLOAT",
+        help="LLaDA2 BD per-sample noise ratio (sigma) lower bound (default 0.3). "
+        "Only affects the BD dataset path.",
+    ),
+    TurboArgSpec(
+        name="bd_mask_high",
+        args_name="bd_mask_high",
+        cli_name="--tt_bd_mask_high",
+        config_path="diffusion.bd_mask_high",
+        type=float,
+        metavar="FLOAT",
+        help="LLaDA2 BD per-sample noise ratio (sigma) upper bound (default 0.8). "
+        "Only affects the BD dataset path.",
+    ),
+    TurboArgSpec(
+        name="bd_block_size",
+        args_name="bd_block_size",
+        cli_name="--tt_bd_block_size",
+        config_path="diffusion.bd_block_size",
+        type=int,
+        metavar="INT",
+        help="LLaDA2 BD block size (block-diagonal attention granularity; "
+        "cutoff_len is ceil-aligned to it). Default 32. Only affects the "
+        "BD dataset path.",
+    ),
+    # Runtime-only CLI inputs
+    TurboArgSpec(
+        name="profiling",
+        args_name="profiling",
+        cli_name="--tt_profiling",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Enable NPU/CUDA profiling for the second step. "
+        "Outputs to {output_dir}/profiling/. "
+        "Accepts --tt_profiling, ... true, or ... false.",
+    ),
+    TurboArgSpec(
+        name="memory_snapshot_steps",
+        args_name="memory_snapshot_steps",
+        cli_name="--tt_memory_snapshot_steps",
+        type=int,
+        metavar="STEPS",
+        help="Number of optimizer steps to capture from training step 0. For "
+        "example, 3 captures the first 3 optimizer steps. Outputs to "
+        "{output_dir}/memory_snapshot/.",
+    ),
+    TurboArgSpec(
+        name="log_level",
+        args_name="log_level",
+        cli_name="--tt_log_level",
+        type=parse_log_level,
+        metavar="LEVEL",
+        help="TorchTurbo log level: DEBUG, INFO, WARNING, or ERROR.",
+    ),
+    # Environment-only Engine input
+    TurboArgSpec(
+        name="reshard_after_forward",
+        env_name="TORCH_TURBO_RESHARD_AFTER_FWD",
+        config_path="backend_config.reshard_after_forward",
+        type=string_to_bool,
+    ),
+    # Adapter-only Engine inputs
+    TurboArgSpec(
+        name="model_path",
+        args_name="model_path",
+        config_path="checkpoint.hf_model_path",
+    ),
+    TurboArgSpec(
+        name="output_dir",
+        args_name="output_dir",
+        config_path="checkpoint.dcp_path",
+    ),
+)
+
+
+def get_arg_specs() -> tuple[TurboArgSpec, ...]:
+    """Return all registered TorchTurbo argument specifications."""
+    return _TURBO_ARG_SPECS
+
 
 # ---------------------------------------------------------------------------
 # Argparse-based CLI parsing
@@ -164,220 +482,19 @@ def _build_parser() -> argparse.ArgumentParser:
         description="torchturbo arguments",
         add_help=False,
     )
-
-    parser.add_argument(
-        "--tt_backend",
-        type=str,
-        default=None,
-        metavar="BACKEND",
-        help="Distributed backend (e.g. fsdp2). Replaces TORCH_TURBO_BACKEND.",
-    )
-    parser.add_argument(
-        "--tt_mixed_precision",
-        type=str,
-        default=None,
-        metavar="POLICY",
-        help="Mixed precision policy (bf16, fp16, fp32, fp8). "
-        "Replaces TORCH_TURBO_MIXED_PRECISION.",
-    )
-    parser.add_argument(
-        "--tt_op_policy",
-        type=str,
-        default=None,
-        metavar="POLICY",
-        help="Default op dispatch policy (auto, native, custom). "
-        "Replaces TORCH_TURBO_OP_POLICY.",
-    )
-    parser.add_argument(
-        "--tt_sp_size",
-        type=int,
-        default=None,
-        metavar="SIZE",
-        help="Sequence parallelism group size. Replaces TORCH_TURBO_SP_SIZE.",
-    )
-    parser.add_argument(
-        "--tt_ep_size",
-        type=int,
-        default=None,
-        metavar="SIZE",
-        help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
-    )
-    parser.add_argument(
-        "--tt_gradient_checkpointing",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=True,
-        metavar="BOOL",
-        help="Enable or disable TorchTurbo-owned activation checkpointing. "
-        "Replaces TORCH_TURBO_GRADIENT_CHECKPOINTING.",
-    )
-    parser.add_argument(
-        "--tt_ac_use_reentrant",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Use reentrant activation checkpointing (use_reentrant=True) "
-        "instead of the default non-reentrant implementation. Reentrant "
-        "checkpointing tears down recomputed intermediates synchronously "
-        "within a step, reducing cross-step allocation peak for MoE/linear-"
-        "attention workloads. Replaces TORCH_TURBO_AC_USE_REENTRANT.",
-    )
-    parser.add_argument(
-        "--tt_cpu_offload",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Enable or disable FSDP CPU offload for wrapped units. "
-        "Replaces TORCH_TURBO_CPU_OFFLOAD.",
-    )
-    parser.add_argument(
-        "--tt_prefetch_strategy",
-        type=str,
-        default="auto",
-        metavar="STRATEGY",
-        help="FSDP prefetch strategy: native|auto|expert_with_layer|expert_lookahead. "
-        "Replaces TORCH_TURBO_PREFETCH_STRATEGY.",
-    )
-    parser.add_argument(
-        "--tt_prefetch_direction",
-        type=str,
-        default="forward_backward",
-        metavar="DIRECTION",
-        help="Prefetch direction: forward|forward_backward. "
-        "Replaces TORCH_TURBO_PREFETCH_DIRECTION.",
-    )
-    parser.add_argument(
-        "--tt_forward_prefetch_depth",
-        type=int,
-        default=1,
-        metavar="N",
-        help="How many upcoming layers each source prefetches in forward "
-        "(1 = next layer only). Higher trades peak memory for more overlap. "
-        "Replaces TORCH_TURBO_FORWARD_PREFETCH_DEPTH.",
-    )
-    parser.add_argument(
-        "--tt_backward_prefetch_depth",
-        type=int,
-        default=1,
-        metavar="N",
-        help="How many previous layers each layer prefetches in backward "
-        "(1 = previous layer only). Only used with forward_backward direction. "
-        "Replaces TORCH_TURBO_BACKWARD_PREFETCH_DEPTH.",
-    )
-    parser.add_argument(
-        "--tt_enable_mtp",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Build Multi-Token-Prediction (MTP) layers. "
-        "Accepts --tt_enable_mtp, --tt_enable_mtp true, or --tt_enable_mtp false. "
-        "Off by default.",
-    )
-    parser.add_argument(
-        "--tt_mtp_loss_scaling_factor",
-        type=float,
-        default=0.1,
-        metavar="FLOAT",
-        help="MTP loss weight. Ignored when MTP is off.",
-    )
-    parser.add_argument(
-        "--tt_freeze_vision_tower",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Freeze vision encoder parameters (requires_grad=False). "
-        "Accepts --tt_freeze_vision_tower, ... true, or ... false.",
-    )
-    parser.add_argument(
-        "--tt_freeze_multi_modal_projector",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Freeze multi-modal projector parameters (requires_grad=False). "
-        "Accepts --tt_freeze_multi_modal_projector, ... true, or ... false.",
-    )
-    parser.add_argument(
-        "--tt_freeze_language_model",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Freeze language model parameters (requires_grad=False). "
-        "Accepts --tt_freeze_language_model, ... true, or ... false.",
-    )
-    parser.add_argument(
-        "--tt_cap_lambda",
-        type=float,
-        default=0.0,
-        metavar="FLOAT",
-        help="CAP/DPARALLEL confidence loss weight (entropy on correctly-"
-             "predicted tokens). 0 disables (default). Recommended: 2.0.",
-    )
-    parser.add_argument(
-        "--tt_bd_mask_low",
-        type=float,
-        default=0.3,
-        metavar="FLOAT",
-        help="LLaDA2 BD per-sample noise ratio (sigma) lower bound (default 0.3). "
-             "Only affects the BD dataset path.",
-    )
-    parser.add_argument(
-        "--tt_bd_mask_high",
-        type=float,
-        default=0.8,
-        metavar="FLOAT",
-        help="LLaDA2 BD per-sample noise ratio (sigma) upper bound (default 0.8). "
-             "Only affects the BD dataset path.",
-    )
-    parser.add_argument(
-        "--tt_bd_block_size",
-        type=int,
-        default=32,
-        metavar="INT",
-        help="LLaDA2 BD block size (block-diagonal attention granularity; "
-             "cutoff_len is ceil-aligned to it). Default 32. Only affects the "
-             "BD dataset path.",
-    )
-    parser.add_argument(
-        "--tt_profiling",
-        type=string_to_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="BOOL",
-        help="Enable NPU/CUDA profiling for the second step. "
-        "Outputs to {output_dir}/profiling/. "
-        "Accepts --tt_profiling, ... true, or ... false.",
-    )
-    parser.add_argument(
-        "--tt_memory_snapshot_steps",
-        type=int,
-        default=None,
-        metavar="STEPS",
-        help="Number of optimizer steps to capture from training step 0. For "
-        "example, 3 captures the first 3 optimizer steps. Outputs to "
-        "{output_dir}/memory_snapshot/.",
-    )
-    parser.add_argument(
-        "--tt_log_level",
-        type=parse_log_level,
-        default=LogLevel.INFO,
-        metavar="LEVEL",
-        help="TorchTurbo log level: DEBUG, INFO, WARNING, or ERROR.",
-    )
-
+    for spec in get_arg_specs():
+        if spec.cli_name is None:
+            continue
+        kwargs = {
+            "type": spec.type,
+            "default": argparse.SUPPRESS,
+            "metavar": spec.metavar,
+            "help": spec.help,
+        }
+        if spec.type is string_to_bool:
+            kwargs["nargs"] = "?"
+            kwargs["const"] = True
+        parser.add_argument(spec.cli_name, **kwargs)
     return parser
 
 
@@ -387,6 +504,11 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
 
     This uses ``parse_known_args`` so that non-torchturbo arguments are
     left untouched and can be forwarded to the training framework.
+
+    The parser uses ``argparse.SUPPRESS``, so absent options never enter the
+    parsed namespace: ``TorchTurboArgs`` defaults fill in absent fields, while
+    ``config_overrides`` only ever contains explicitly supplied flags (the
+    highest-priority layer in :func:`build_from_args`).
 
     Parameters
     ----------
@@ -405,33 +527,29 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
     """
     parser = _build_parser()
     parsed, remaining = parser.parse_known_args(argv)
+    explicit = vars(parsed)
+    arg_specs = get_arg_specs()
 
-    args = TorchTurboArgs(
-        backend=parsed.tt_backend,
-        mixed_precision=parsed.tt_mixed_precision,
-        op_policy=parsed.tt_op_policy,
-        sp_size=parsed.tt_sp_size,
-        ep_size=parsed.tt_ep_size,
-        gradient_checkpointing=parsed.tt_gradient_checkpointing,
-        ac_use_reentrant=parsed.tt_ac_use_reentrant,
-        cpu_offload=parsed.tt_cpu_offload,
-        enable_mtp=parsed.tt_enable_mtp,
-        mtp_loss_scaling_factor=parsed.tt_mtp_loss_scaling_factor,
-        freeze_vision_tower=parsed.tt_freeze_vision_tower,
-        freeze_multi_modal_projector=parsed.tt_freeze_multi_modal_projector,
-        freeze_language_model=parsed.tt_freeze_language_model,
-        profiling=parsed.tt_profiling,
-        memory_snapshot_steps=parsed.tt_memory_snapshot_steps,
-        cap_lambda=parsed.tt_cap_lambda,
-        bd_mask_low=parsed.tt_bd_mask_low,
-        bd_mask_high=parsed.tt_bd_mask_high,
-        bd_block_size=parsed.tt_bd_block_size,
-        prefetch_strategy=parsed.tt_prefetch_strategy,
-        prefetch_direction=parsed.tt_prefetch_direction,
-        forward_prefetch_depth=parsed.tt_forward_prefetch_depth,
-        backward_prefetch_depth=parsed.tt_backward_prefetch_depth,
-        log_level=parsed.tt_log_level,
-    )
+    # Only explicitly supplied CLI args enter TorchTurboArgs; absent fields use dataclass defaults.
+    args_values = {
+        spec.args_name: explicit[spec.cli_name.lstrip("-")]
+        for spec in arg_specs
+        if spec.args_name is not None
+        and spec.cli_name is not None
+        and spec.cli_name.lstrip("-") in explicit
+    }
+    # Runtime-only args have no config_path; exclude them so they never touch EngineConfig.
+    runtime_destinations = {
+        spec.cli_name.lstrip("-")
+        for spec in arg_specs
+        if spec.config_path is None and spec.cli_name is not None
+    }
+    config_overrides = {
+        key: value
+        for key, value in explicit.items()
+        if key not in runtime_destinations
+    }
+    args = TorchTurboArgs(**args_values, config_overrides=config_overrides)
 
     if any(
         v is not None

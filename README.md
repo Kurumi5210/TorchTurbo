@@ -169,22 +169,26 @@ torchrun --nproc_per_node=8 scripts/runs/run_lf.py \
 
 ### 运行脚本
 
-常用训练脚本放在 `scripts/runs/`：
+常用训练脚本按模型分目录放在 `scripts/runs/`（`run_lf.py` / `run_swift.py` 为共享入口）：
 
 ```text
 scripts/runs/
 ├── run_lf.py
-├── lf_qwen3_moe_sft.sh
-├── lf_glm_moe_dsa_sft.sh
-└── lf_bailing_moe_v3_sft.sh
+├── run_swift.py
+├── qwen3_moe/
+│   └── lf_sft.sh
+├── glm5/
+│   └── lf_moe_dsa_sft.sh
+└── bailing_v3/
+    └── lf_sft.sh
 ```
 
 示例：
 
 ```bash
-bash scripts/runs/lf_qwen3_moe_sft.sh
-bash scripts/runs/lf_glm_moe_dsa_sft.sh
-bash scripts/runs/lf_bailing_moe_v3_sft.sh
+bash scripts/runs/qwen3_moe/lf_sft.sh
+bash scripts/runs/glm5/lf_moe_dsa_sft.sh
+bash scripts/runs/bailing_v3/lf_sft.sh
 ```
 
 这些脚本是当前 Ascend/NPU 环境下的启动模板。运行前通常需要检查：
@@ -246,7 +250,7 @@ docs/runs/
 3. 在 `parallel_plan.py` 中定义默认并行策略。
 4. 如有需要，添加 `configuration_*.py` 和 `modeling_*.py`。
 5. 如需 LlamaFactory template，添加 `lf_template.py`。
-6. 添加 `scripts/runs/` 启动脚本和 `docs/runs/` 运行文档。
+6. 添加 `scripts/runs/<model>/` 启动脚本和 `docs/runs/<model>/` 运行文档。
 
 最小包装类：
 

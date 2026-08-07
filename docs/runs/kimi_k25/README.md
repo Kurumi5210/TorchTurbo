@@ -84,5 +84,5 @@ if __name__ == "__main__":
 sh scripts/runs/npu_deps/kimi_k25_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/lf_kimi_k25_sft.sh
+sh scripts/runs/kimi_k25/lf_sft.sh
 ```

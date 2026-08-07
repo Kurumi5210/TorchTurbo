@@ -2,7 +2,7 @@
 
 ## 运行脚本
 
-`scripts/runs/lf_glm_moe_dsa_sft.sh`
+`scripts/runs/glm5/lf_moe_dsa_sft.sh`
 
 ## AIStudio 环境
 
@@ -101,7 +101,7 @@ if __name__ == "__main__":
 
 ```bash
 conda activate sftenv
-sh scripts/runs/lf_glm_moe_dsa_sft.sh
+sh scripts/runs/glm5/lf_moe_dsa_sft.sh
 ```
 
 ## torchturbo v2 对比

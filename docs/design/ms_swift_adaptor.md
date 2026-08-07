@@ -102,7 +102,7 @@ src/torchturbo/adapters/msswift/
 ├── pipeline.py          # TurboEnginePipelineMixin + TurboSwiftSft(SwiftSft): 构建引擎并 stash
 └── plugin.py            # --external_plugins / run_swift 入口: activate + 按 stages 遍历 swap pipeline
 scripts/runs/run_swift.py                                # torchrun worker 入口: import plugin → 剥离 --tt_* → sft_main()
-scripts/runs/gpu_swift_qwen3_5_moe_mllm_sft.sh           # 原生 swift sft 启动脚本
+scripts/runs/qwen3_5_moe/gpu_swift_mllm_sft.sh           # 原生 swift sft 启动脚本
 tests/adapters/msswift/{test_config,test_inputs_bridging,test_registry}.py
 ```
 
@@ -211,7 +211,7 @@ turbo 接管走 swift 的 HF 路径，参数用 HF 字段（`swift/trainers/argu
 | `MAX_PIXELS`/`VIDEO_MAX_PIXELS`/`FPS_MAX_FRAMES` | 共享(后端无关，swift mm_plugin 读) |
 | `--packing/--max_length/--save_strategy/--save_steps/--save_total_limit/--logging_steps/--num_train_epochs/--dataloader_num_workers/--dataset_num_proc/--load_from_cache_file/--add_non_thinking_prefix/--bf16` | 共享，同名沿用 |
 
-启动脚本见 `scripts/runs/gpu_swift_qwen3_5_moe_mllm_sft.sh`；worker 入口 `scripts/runs/run_swift.py`。
+启动脚本见 `scripts/runs/qwen3_5_moe/gpu_swift_mllm_sft.sh`；worker 入口 `scripts/runs/run_swift.py`。
 
 ---
 
@@ -284,7 +284,7 @@ turbo 接管走 swift 的 HF 路径，参数用 HF 字段（`swift/trainers/argu
 | 多模态视频键命名一致（`pixel_values_videos`/`video_grid_thw`） | GPU 实测对齐，不一致则在 bridge 做键名映射 |
 | 闭包局部类被 `dill` by-value pickle 时撞 `SwiftPipeline(ABC)` 的 `_abc._abc_data` | `TurboSwiftSft`/`TurboSftArguments`/loader 子类均为模块级（by-reference pickle） |
 
-> 本地无 torch/swift 完整环境，标「GPU 实测」项在 swift v4.1 上跑 `gpu_swift_qwen3_5_moe_mllm_sft.sh` 验证。
+> 本地无 torch/swift 完整环境，标「GPU 实测」项在 swift v4.1 上跑 `gpu_swift_mllm_sft.sh` 验证。
 
 ---
 

@@ -97,5 +97,5 @@ sh scripts/runs/npu_deps/qwen3_5_moe_swift_deps.sh
 
 运行训练
 ```bash
-sh scripts/runs/swift_qwen3_5_moe_mllm_sft.sh
+sh scripts/runs/qwen3_5_moe/swift_mllm_sft.sh
 ```

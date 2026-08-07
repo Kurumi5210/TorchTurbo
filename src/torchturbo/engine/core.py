@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import socket
 from typing import Any, Callable, Iterable, Optional
@@ -555,7 +556,17 @@ class TorchTurboEngine:
             if hasattr(engine_plan, "plan") and engine_plan.plan:
                 if not hasattr(plan, "plan") or plan.plan is None:
                     plan.plan = {}
-                plan.plan.update(engine_plan.plan)
+                for fqn, engine_spec in engine_plan.plan.items():
+                    base = plan.plan.get(fqn)
+                    if base is not None and dataclasses.is_dataclass(base):
+                        overrides = {}
+                        for f in dataclasses.fields(engine_spec):
+                            value = getattr(engine_spec, f.name)
+                            if value is not None:
+                                overrides[f.name] = value
+                        plan.plan[fqn] = dataclasses.replace(base, **overrides)
+                    else:
+                        plan.plan[fqn] = engine_spec
 
         logger.info_rank0(
             "Parallel Plan for %s (sp=%d, ep=%d)",

@@ -1,0 +1,70 @@
+# 使用方式
+#
+# LLaMA-Factory：
+#
+# torchrun --nproc_per_node=8 scripts/runs/run_lf.py \
+#     --tt_config scripts/runs/config_example.yaml \
+#     <LLaMA-Factory arguments>
+#
+# ms-swift：
+#
+# torchrun --nproc_per_node=8 scripts/runs/run_swift.py \
+#     --tt_config scripts/runs/config_example.yaml \
+#     <ms-swift arguments>
+#
+# Complete example of the EngineConfig fields consumed by --tt_config.
+engine_config:
+  backend: fsdp2
+
+  parallel_plan:
+    sp_size: 1
+    ep_size: 1
+    # Example FQN patches. Adjust these patterns to match the target model.
+    plan:
+      "model.language_model.layers.*":
+        activation_checkpoint: true
+      "model.visual.blocks.*":
+        activation_checkpoint: true
+      "model.visual":
+        standalone_world_shard: true
+      "model.language_model.embed_tokens":
+        standalone_world_shard: true
+      "lm_head":
+        standalone_world_shard: true
+      "mtp.layers.*":
+        activation_checkpoint: true
+      "**.expert":
+        no_shard: true
+
+  mixed_precision: bf16
+
+  ops:
+    policy: auto
+
+  backend_config:
+    reshard_after_forward: true
+    cpu_offload: false
+    pin_memory: true
+    prefetch_strategy: auto
+    prefetch_direction: forward_backward
+    forward_prefetch_depth: 1
+    backward_prefetch_depth: 1
+
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: false
+
+  mtp:
+    enabled: false
+    loss_scaling_factor: 0.1
+
+  freeze_policy:
+    vision_tower: false
+    multi_modal_projector: false
+    language_model: false
+
+  diffusion:
+    cap_lambda: 0.0
+    bd_mask_low: 0.3
+    bd_mask_high: 0.8
+    bd_block_size: 32

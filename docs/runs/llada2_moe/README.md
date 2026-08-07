@@ -11,10 +11,10 @@ LLaDA2.1 是**离散块扩散（Block Diffusion, BD）**模型，不是自回归
 bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
 
 # 2. 训练（单机 16 卡 / sp2 ep8 / 8K / gsm8k_bd）
-bash scripts/runs/lf_llada2_text_sft.sh
+bash scripts/runs/llada2/lf_text_sft.sh
 ```
 
-脚本：`scripts/runs/lf_llada2_text_sft.sh`，模型默认 `/mnt/sfs_turbo/models/LLaDA2.1-mini`，数据集默认 `gsm8k_bd`，也可使用 `science`。
+脚本：`scripts/runs/llada2/lf_text_sft.sh`，模型默认 `/mnt/sfs_turbo/models/LLaDA2.1-mini`，数据集默认 `gsm8k_bd`，也可使用 `science`。
 
 ## 二、关键训练参数
 

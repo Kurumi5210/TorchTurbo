@@ -2,7 +2,7 @@
 
 ## 运行脚本
 
-`scripts/runs/lf_deepseek_v4_sft.sh`
+`scripts/runs/deepseek_v4/lf_sft.sh`
 
 ## AIStudio 环境
 
@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
 ```bash
 sh scripts/runs/npu_deps/deepseek_v4_deps.sh
-sh scripts/runs/lf_deepseek_v4_sft.sh
+sh scripts/runs/deepseek_v4/lf_sft.sh
 ```
 
 ## torchturbo v2 对比

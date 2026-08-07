@@ -28,7 +28,7 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     shared :class:`TorchTurboArgs` as adapter-seeded values; all
     ``--tt_*``-driven slices (backend, sp/ep, AC, MTP, freeze, FSDP prefetch)
     are read back from it by :func:`build_from_args`. Env-var overrides are
-    applied by ``EngineConfig.__post_init__``.
+    merged inside ``build_from_args``.
     """
     _raise_if_unsupported(args)
 
@@ -43,7 +43,7 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
 
     # swift-native mixed-precision seed (bf16/fp16). Only seed tt when the user
     # did not pass --tt_mixed_precision; explicit tt value wins, env overrides
-    # still apply in EngineConfig.__post_init__.
+    # still apply inside build_from_args.
     if tt.mixed_precision is None:
         mixed_precision_hint = MixedPrecisionPolicy.FP32
         if getattr(args, "bf16", False):

@@ -2,7 +2,7 @@
 
 ## 运行脚本
 
-`scripts/runs/gpu_lf_qwen3_5_moe_text_sft.sh`
+`scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh`
 
 ## AIStudio 环境
 
@@ -48,7 +48,7 @@ RDMA = True
 REAL_CMD = (
     "cd /input/asystem/xiyun.wc/ && python qwen3_5.py && "
     "cd /input/asystem/xiyun.wc/torchturbo && bash scripts/runs/gpu_deps/qwen3_5_moe_deps.sh && "
-    "bash scripts/runs/gpu_lf_qwen3_5_moe_text_sft.sh"
+    "bash scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh"
 )
 
 run_command = f"rm -rf /usr/local/cuda/compat && sleep infinity || sleep infinity"
@@ -212,7 +212,7 @@ bash scripts/runs/gpu_deps/qwen3_5_moe_deps.sh
 运行训练
 ```bash
 cd /input/asystem/xiyun.wc/torchturbo
-bash scripts/runs/gpu_lf_qwen3_5_moe_text_sft.sh
+bash scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh
 ```
 
 ### swift运行命令
@@ -226,5 +226,5 @@ bash scripts/runs/gpu_deps/qwen3_5_moe_swift_deps.sh
 运行训练
 ```bash
 cd /input/asystem/xiyun.wc/torchturbo
-bash scripts/runs/gpu_swift_qwen3_5_moe_mllm_sft_debug.sh
+bash scripts/runs/qwen3_5_moe/gpu_swift_mllm_sft_debug.sh
 ```

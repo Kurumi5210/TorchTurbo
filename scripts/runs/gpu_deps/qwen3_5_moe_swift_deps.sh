@@ -27,5 +27,6 @@ pip install ms_swift==4.4.2
 pip install transformers==5.9.0
 pip install peft==0.18.0
 pip install datasets==5.0.1
+pip install binpacking==1.5.2
 
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

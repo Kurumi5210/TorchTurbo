@@ -272,7 +272,12 @@ class TurboTrainerMixin:
         for key in ("compute_loss_func", "loss_scale", "logits_to_keep"):
             inputs.pop(key, None)
 
-        loss, outputs = engine.backend.compute_loss(model, inputs, return_outputs=True)
+        loss, outputs = engine.backend.compute_loss(
+            model,
+            inputs,
+            return_outputs=True,
+            num_items_in_batch=num_items_in_batch
+        )
 
         # SP gathers loss to full length; scale back when HF gives no
         # num_items_in_batch.

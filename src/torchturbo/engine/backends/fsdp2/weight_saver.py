@@ -28,10 +28,12 @@ class ShardedParamManager:
         device_runtime,
         path=None,
         processing_class=None,
+        is_cpu_offload: bool = False,
     ):
         self.move_to_cpu = True
         self.model = model
         self.device_runtime = device_runtime
+        self.is_cpu_offload = is_cpu_offload
 
         self.rank = rank
         self.mesh = mesh
@@ -236,6 +238,32 @@ class ShardedParamManager:
             gpu_before, gpu_after, cpu_before, cpu_after,
         )
 
+    def _gather_full_tensor(self, param):
+        """Return ``param``'s full (replicated) tensor for saving, CPU-offload aware.
+
+        Stage the local shard onto the compute device first so
+        the all-gather runs on the device backend.
+        """
+        if not isinstance(param, DTensor):
+            return param
+        if not self.is_cpu_offload:
+            return param.full_tensor()
+
+        compute_device = self.device_runtime.device
+        local = param.to_local()
+        if local.device.type == compute_device.type:
+            return param.full_tensor()
+
+        staged = DTensor.from_local(
+            local.to(compute_device),
+            param.device_mesh,
+            param.placements,
+            run_check=False,
+            shape=param.shape,
+            stride=param.stride(),
+        )
+        return staged.full_tensor()
+
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()
@@ -255,10 +283,7 @@ class ShardedParamManager:
                 logger.debug_rank0("[saving] param: %s (original: %s)", clean_name, name)
             else:
                 logger.debug_rank0("[saving] param: %s", clean_name)
-            if isinstance(param, DTensor):
-                full_tensor = param.full_tensor()
-            else:
-                full_tensor = param
+            full_tensor = self._gather_full_tensor(param)
 
             # Merge LoRA deltas into the base weight without modifying the model.
             full_tensor = apply_lora_delta(
@@ -284,8 +309,7 @@ class ShardedParamManager:
             if self.param_converter.is_persist_buffer(clean_name):
                 hf_buffer_name = self.param_converter.convert_persist_buffer(clean_name)
                 logger.debug_rank0("[saving] buffer: %s -> %s", clean_name, hf_buffer_name)
-                if isinstance(buf, DTensor):
-                    buf = buf.full_tensor()
+                buf = self._gather_full_tensor(buf)
                 if hf_buffer_name in local_params:
                     full_sd[hf_buffer_name] = self._normalize_tensor(hf_buffer_name, buf)
                 del buf

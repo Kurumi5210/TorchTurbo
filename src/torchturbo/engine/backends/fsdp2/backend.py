@@ -458,6 +458,7 @@ class FSDP2Backend(BaseBackend):
             processing_class=None,
             weight_converter=weight_converter,
             device_runtime=self.device_runtime,
+            is_cpu_offload=self.fsdp_config.cpu_offload,
         )
         saver.save_model(output_dir)
 

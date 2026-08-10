@@ -18,6 +18,7 @@ from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
 from .hooks import TrainHook, TrainState
+from .metrics import MetricTracker
 from .utils import has_meta_tensor
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
@@ -192,6 +193,8 @@ class TorchTurboEngine:
             self.config = EngineConfig.from_dict(config)
         else:
             self.config = config
+
+        self.metric_tracker = MetricTracker()
 
         # Select distributed backend before configuring process-wide state.
         backend_name = self.config.backend.value
@@ -937,11 +940,59 @@ class TorchTurboEngine:
             dataloader_or_dataset,
         )
 
+    def _prepare_moe_runtime(
+        self,
+        model: nn.Module,
+        inputs: Any,
+        gradient_accumulation_steps: int,
+    ) -> None:
+        """Set AUX scale and inject the current MoE runtime inputs."""
+        from ..models.modules.moe.moe_layer import BaseMoELayer
+
+        moe_layers = [
+            module for module in model.modules() if isinstance(module, BaseMoELayer)
+        ]
+        if not moe_layers:
+            return
+
+        from ..models.modules.moe.moe_utils import MoEAuxLossAutoScaler
+
+        aux_loss_scale = (
+            1.0 / gradient_accumulation_steps if model.training else 1.0
+        )
+        MoEAuxLossAutoScaler.set_loss_scale(aux_loss_scale)
+
+        runtime_inputs = model.get_moe_runtime_inputs(
+            inputs, self._get_parallel_context()
+        )
+        for module in moe_layers:
+            module.set_runtime_inputs(runtime_inputs)
+
     def compute_loss(
-        self, model: nn.Module, inputs: Any, return_outputs: bool = False, **kwargs
+        self,
+        model: nn.Module,
+        inputs: Any,
+        return_outputs: bool = False,
+        num_items_in_batch: int | None = None,
+        gradient_accumulation_steps: int = 1,
+        **kwargs,
     ):
         """Compute the scalar loss for a single micro-batch."""
-        return self.backend.compute_loss(model, inputs, return_outputs, **kwargs)
+        self._prepare_moe_runtime(
+            model, inputs, gradient_accumulation_steps
+        )
+        result = self.backend.compute_loss(
+            model,
+            inputs,
+            return_outputs,
+            num_items_in_batch=num_items_in_batch,
+            **kwargs,
+        )
+        self.metric_tracker.collect(model)
+        return result
+
+    def report_metrics(self, logs: dict, gather: Callable) -> None:
+        self.metric_tracker.report(logs, gather)
 
     def compute_diffusion_loss(
         self,

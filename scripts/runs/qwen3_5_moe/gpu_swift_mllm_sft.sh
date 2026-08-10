@@ -143,6 +143,7 @@ TORCHRUN_FLAGS=(--nproc_per_node "${NPROC_PER_NODE}"
     --ddp_timeout 1800000000 \
     --tt_sp_size "${sp_size}" \
     --tt_ep_size "${ep_size}" \
+    --tt_moe_aux_loss_coeff 1e-6 \
     --tt_freeze_vision_tower true \
     --tt_freeze_multi_modal_projector true \
     --tt_ac_use_reentrant \

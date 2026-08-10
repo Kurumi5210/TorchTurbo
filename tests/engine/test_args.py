@@ -58,6 +58,26 @@ def test_parse_torchturbo_args_op_policy():
     assert args.op_policy == "custom"
 
 
+def test_parse_torchturbo_args_moe_aux_loss():
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import build_from_args
+
+    default_args, remaining = parse_torchturbo_args([])
+    assert default_args.moe_aux_loss_coeff == 0.0
+    assert build_from_args(default_args).moe.aux_loss_coeff == 0.0
+    assert remaining == []
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_moe_aux_loss_coeff", "0.01"]
+    )
+
+    assert args.moe_aux_loss_coeff == 0.01
+    assert remaining == []
+
+    config = build_from_args(args)
+    assert config.moe.aux_loss_coeff == 0.01
+
+
 def test_parse_torchturbo_args_gradient_checkpointing():
     from torchturbo.engine.args import parse_torchturbo_args
 

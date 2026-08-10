@@ -290,6 +290,7 @@ class FSDP2Backend(BaseBackend):
                     kwargs["hf_config"] = config
                     kwargs["ep_info"] = self.get_ep_info()
                     kwargs["sp_info"] = self.get_sp_info()
+                    kwargs["engine_config"] = self.config
                     new_module = spec.replace_module(submodule, **kwargs)
 
                     if new_module is not None and new_module is not submodule:
@@ -1221,7 +1222,6 @@ class FSDP2Backend(BaseBackend):
         assert labels is not None, "'labels' should not be None in inputs"
 
         num_items_in_batch = kwargs.get("num_items_in_batch", None)
-
         sp_size = self.get_sp_info()["sp_size"]
         sp_group = self.get_sp_info()["sp_group"]
         sp_rank = self.get_sp_info()["sp_rank"]

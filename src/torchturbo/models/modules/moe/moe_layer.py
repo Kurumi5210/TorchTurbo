@@ -24,6 +24,11 @@ class MoESubmodules:
     shared_experts: Union[ModuleSpec, type] = None
 
 
+@dataclass
+class MoERuntimeInputs:
+    padding_mask: torch.Tensor | None = None
+
+
 class BaseMoELayer(torch.nn.Module, ABC):
     """Base class for a mixture of experts layer."""
 
@@ -65,6 +70,10 @@ class BaseMoELayer(torch.nn.Module, ABC):
         self.shared_experts = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
+        self._runtime_inputs = MoERuntimeInputs()
+
+    def set_runtime_inputs(self, inputs: MoERuntimeInputs) -> None:
+        self._runtime_inputs = inputs
 
     @abstractmethod
     def forward(self, hidden_states, input_ids=None):
@@ -85,6 +94,7 @@ class MoELayer(BaseMoELayer):
         use_fused_permute_unpermute: Optional[bool] = False,
         use_te: Optional[bool] = False,
         layer_number: Optional[int] = None,
+        sp_group=None,
     ):
         self.use_fused_permute_unpermute = use_fused_permute_unpermute
         self.use_te = use_te
@@ -94,7 +104,11 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize router
-        self.router = TopKRouter(config=self.config, layer_number=self.layer_number)
+        self.router = TopKRouter(
+            config=self.config,
+            layer_number=self.layer_number,
+            sp_group=sp_group,
+        )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "alltoall":
@@ -131,7 +145,9 @@ class MoELayer(BaseMoELayer):
         # process MoE
         def custom_forward(hidden_states, input_ids=None):
             hidden_states_dtype = hidden_states.dtype
-            probs, routing_map, logits = self.router(hidden_states, input_ids)
+            probs, routing_map, logits = self.router(
+                hidden_states, input_ids, self._runtime_inputs.padding_mask
+            )
             if self.config.moe_router_score_function == "softmax":
                 probs = probs / probs.sum(dim=-1, keepdim=True)
             logits = logits.view(-1, logits.shape[-1])

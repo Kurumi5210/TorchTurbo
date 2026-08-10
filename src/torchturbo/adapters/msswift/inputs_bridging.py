@@ -17,20 +17,14 @@ paths run on correct, fixed-length inputs:
 3. **pad the batch to a FIXED length** — turbo's packing path wants a constant
    shape (Triton / flash-attn shape-cache; no unpad roundtrip), while swift
    padding-free packing emits variable lengths. Every sequence-length field is
-   padded to ``packing_length`` (rounded up to a multiple of ``sp_size``): the
-   padding is folded into the LAST packed sub-sequence (its tail), so
-   ``cu_seqlens`` gains no toy segment and ``labels=-100`` keeps it out of loss.
+   padded to ``packing_length`` (rounded up to a multiple of ``sp_size``).
+   ``attention_mask=0`` and ``labels=-100`` mark the padding tail.
 
 4. **[4, bsz, seq] position_ids** — turbo qwen3.5 expects ``row 0 = text
    positions`` (per-block reset) + ``rows 1-3 = 3D mrope``. swift collator stores
    them split (``position_ids=[3,b,s]`` mrope + ``text_position_ids=[1,b,s]``
    text). Once both are padded to the same length, prepend the text row.
 
-5. **attention_mask = None before the model** — turbo full-attn (flash) / GDN
-   consume attention_mask as 0/1 or None; turbos block-diagonals come from
-   ``position_ids`` (per-block reset) like the lf adapter, NOT from the integer
-   mask. Dropping the integer mask here avoids flash-attn treating integers as
-   additive bias → softmax overflow → forward NaN.
 """
 
 from __future__ import annotations
@@ -163,10 +157,10 @@ def resolve_fixed_packing_length(engine: Any) -> Optional[int]:
 
 
 def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
-    """Pad the batch to a FIXED length, folding padding into the last segment tail.
+    """Pad the batch to a fixed length with zero-valued mask padding.
 
     Every sequence-length field is padded so they agree at ``target_length``:
-    ``input_ids`` (0), ``attention_mask`` (last segment id, no new block),
+    ``input_ids`` (0), ``attention_mask`` (0),
     ``position_ids`` (each row continues from its OWN last position — rows
     differ, text ends higher than mrope), ``text_position_ids`` (continue its
     last text position), ``labels`` (-100, loss-ignored). Packed-seq params
@@ -184,18 +178,12 @@ def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
     pad = target_length - seq
     if pad <= 0:
         return inputs
-    device = input_ids.device
-
     inputs["input_ids"] = F.pad(input_ids, (0, pad), value=0)
 
-    # attention_mask: keep the last segment id for the padding (segment count
-    # unchanged) so cu_seqlens adds no toy segment.
     am = inputs.get("attention_mask")
-    last_seg_id = None
-    if am is not None:
-        last_seg_id = int(am.max().item())
-        pad_am = torch.full(am.shape[:-1] + (pad,), last_seg_id, dtype=am.dtype, device=am.device)
-        inputs["attention_mask"] = torch.cat((am, pad_am), dim=-1)
+    if am is None:
+        am = torch.ones_like(input_ids)
+    inputs["attention_mask"] = F.pad(am, (0, pad), value=0)
 
     # position_ids (mrope rows): each row continues from its OWN last position;
     # rows differ (text ends higher than mrope rows) so must not share one tail.
@@ -223,9 +211,8 @@ def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
     if ls is not None and torch.is_tensor(ls):
         inputs["loss_scale"] = F.pad(ls.float(), (0, pad), value=0.0)
 
-    # Re-derive cu_seq_lens_q/k + max_length_q/k from the padded text row so
-    # [-1] == target_length and the boundaries stay consistent with the padded
-    # attention_mask cu_seqlens (same reset-0 segmentation source).
+    # Re-derive full-attention metadata from the padded text row so its final
+    # boundary still covers the fixed physical length.
     tpos2 = inputs.get("text_position_ids")
     if tpos2 is not None:
         try:
@@ -253,10 +240,8 @@ def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
 def bridge_swift_inputs(inputs: dict, engine: Any) -> dict:
     """Full swift → turbo input bridge for one batch (called from _prepare_inputs).
 
-    Order matters: rebuild integer mask (drives nothing downstream once dropped,
-    but kept long enough for any cu_seqlens re-derivation parity) → fold
-    loss_scale → pad to fixed length (text + mrope rows + cu_seq_lens + [4,s]
-    position_ids) → drop the integer mask so the model never sees it as a bias.
+    Order matters: rebuild the packed attention mask, fold loss_scale, then pad
+    all sequence fields.
     """
     inputs = bridge_packed_inputs(inputs)
     inputs = bake_loss_scale_into_labels(inputs)

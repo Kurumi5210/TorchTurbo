@@ -58,6 +58,14 @@ def test_engine_config_to_dict_excludes_runtime_state():
     assert "device_runtime" not in data
 
 
+def test_engine_config_from_dict_parses_moe_config():
+    from torchturbo.engine.config import EngineConfig
+
+    cfg = EngineConfig.from_dict({"moe": {"aux_loss_coeff": 0.01}})
+
+    assert cfg.moe.aux_loss_coeff == 0.01
+
+
 def test_engine_config_env_enables_cpu_offload(monkeypatch):
     from torchturbo.engine.config import EngineConfig
 

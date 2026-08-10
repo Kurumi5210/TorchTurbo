@@ -43,7 +43,7 @@ model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
 # .jsonl path swift can load directly, e.g.:
 #   DATASET=/mnt/sfs_turbo/.../sampled_sft_data_0630_fixed.jsonl bash <this>
 #dataset=/mnt/aicompiler-a3/common/data/MedOneModel_debug_data/data_0630/sampled_sft_data_count_151372_0630_fixed.jsonl
-dataset=/mnt/sfs_turbo/torchturbo/datasets/sampled_sft_data_count_151372_0630_fixed.jsonl
+dataset=/mnt/sfs_turbo/torchturbo/datasets/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl
 #dataset=/mnt/sfs_turbo/data/data/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl
 
 dataset_num_proc=96            # swift --dataset_num_proc. multiprocess dataset.map is now safe:
@@ -121,6 +121,7 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --master_port "${MASTER_PORT}" \
     "${RUN_SWIFT}" \
     --tt_config "${SCRIPT_DIR}/swift_mllm_sft.yaml" \
+    --tt_moe_aux_loss_coeff 1e-6 \
     --model_type "${model_type}" \
     --model "${model_name_or_path}" \
     --template "${template}" \

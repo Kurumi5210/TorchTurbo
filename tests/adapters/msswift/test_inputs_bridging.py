@@ -211,6 +211,9 @@ def test_pad_batch_pads_all_seq_fields_to_target_and_labels_ignored():
     assert out["labels"].shape[-1] == 8
     assert out["attention_mask"].shape[-1] == 8
     assert out["position_ids"].shape[-1] == 8
+    assert out["attention_mask"].tolist() == [
+        [1, 1, 1, 1, 1, 0, 0, 0]
+    ]
     # Padded labels are loss-ignored; original labels preserved.
     assert out["labels"].tolist()[0][:5] == [10, 11, 12, 13, 14]
     assert out["labels"].tolist()[0][5:] == [-100, -100, -100]
@@ -223,8 +226,8 @@ def test_pad_batch_noop_when_already_at_target():
 
 
 def test_bridge_swift_inputs_end_to_end_with_packing_length():
-    # Full bridge on a packed batch: rebuild int mask, fold loss_scale, pad to
-    # the stashed packing length, drop the int mask before the model sees it.
+    # Full bridge on a packed batch: rebuild the packed mask, fold loss_scale,
+    # and pad to the stashed packing length.
     try:
         engine_registry.set_packing_length(8)
         inputs = {
@@ -240,5 +243,8 @@ def test_bridge_swift_inputs_end_to_end_with_packing_length():
         assert out["labels"].tolist()[0][0:5] == [10, -100, 12, 13, 14]
         assert "loss_scale" not in out                    # removed after folding
         assert out["position_ids"].shape[-1] == 8
+        assert out["attention_mask"].tolist() == [
+            [1, 1, 2, 2, 2, 0, 0, 0]
+        ]
     finally:
         engine_registry.clear()

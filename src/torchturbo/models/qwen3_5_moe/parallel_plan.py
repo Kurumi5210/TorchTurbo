@@ -13,7 +13,13 @@ def _is_qwen3_5_moe_module(module: Any) -> bool:
 
 
 def _replace_qwen3_5_moe_only(
-    original_module, hf_config, sp_info, ep_info, moe_submodules, **kwargs
+    original_module,
+    hf_config,
+    sp_info,
+    ep_info,
+    moe_submodules,
+    engine_config,
+    **kwargs,
 ):
     if not _is_qwen3_5_moe_module(original_module):
         return original_module
@@ -26,6 +32,7 @@ def _replace_qwen3_5_moe_only(
         hf_config=text_config,
         ep_size=ep_size,
         num_moe_experts=text_config.num_experts,
+        moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
     )
     moe_config = MoEConfig(**moe_config_kwargs)
 
@@ -33,6 +40,7 @@ def _replace_qwen3_5_moe_only(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_expert"):

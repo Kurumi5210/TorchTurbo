@@ -169,6 +169,13 @@ class MTPConfig:
 
 
 @dataclass
+class MoEConfig:
+    """MoE training configuration."""
+
+    aux_loss_coeff: float = 0.0
+
+
+@dataclass
 class DiffusionConfig:
     """Configuration for block-diffusion (BD) training.
 
@@ -298,6 +305,9 @@ class EngineConfig:
     mtp: MTPConfig = field(default_factory=MTPConfig)
     """Multi-Token-Prediction settings."""
 
+    moe: MoEConfig = field(default_factory=MoEConfig)
+    """MoE training settings."""
+
     freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
     """Policy for freezing semantic model parameter groups."""
 
@@ -413,6 +423,9 @@ class EngineConfig:
         # MTP
         mtp_config = cls._parse_mtp_config(d)
 
+        # MoE
+        moe_config = cls._parse_moe_config(d.get("moe", {}))
+
         # Freeze policy
         freeze_policy = cls._parse_freeze_policy(d.get("freeze_policy", {}))
 
@@ -446,6 +459,7 @@ class EngineConfig:
             "hf_model_path",
             "save_format",
             "mtp",
+            "moe",
             "enable_mtp",
             "mtp_loss_scaling_factor",
             "freeze_policy",
@@ -462,6 +476,7 @@ class EngineConfig:
             comm=comm,
             checkpoint=ckpt,
             mtp=mtp_config,
+            moe=moe_config,
             freeze_policy=freeze_policy,
             extra=extra,
         )
@@ -484,6 +499,16 @@ class EngineConfig:
         if mtp_d.get("loss_scaling_factor") is None:
             mtp_d["loss_scaling_factor"] = 0.1
         return MTPConfig(**mtp_d)
+
+    @staticmethod
+    def _parse_moe_config(value: Any) -> MoEConfig:
+        if isinstance(value, MoEConfig):
+            return value
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise TypeError("moe must be a dict or MoEConfig.")
+        return MoEConfig(**value)
 
     @staticmethod
     def _parse_freeze_policy(value: Any) -> FreezePolicy:
@@ -653,6 +678,7 @@ def build_from_args(
         comm=CommConfig(**comm_d),
         checkpoint=_build_checkpoint_config(fields),
         mtp=_build_mtp_config(fields),
+        moe=_build_moe_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         diffusion=_build_diffusion_config(fields),
         extra={},
@@ -721,6 +747,12 @@ def _build_mtp_config(fields: Mapping[str, Any]) -> MTPConfig:
             loss_scaling_factor if loss_scaling_factor is not None else 0.1
         ),
     )
+
+
+def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
+    """MoEConfig from the merged config dict."""
+    moe_d = fields.get("moe") or {}
+    return MoEConfig(aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)))
 
 
 def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:

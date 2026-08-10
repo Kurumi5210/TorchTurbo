@@ -21,6 +21,9 @@ from torchturbo.engine import (
 )
 from torchturbo.engine.backend_registry import _BACKENDS
 from torchturbo.engine.backends.fsdp2.config import FSDPConfig
+from torchturbo.models.base import TurboModel
+from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
+from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -170,6 +173,135 @@ class TestEngineSetup:
         engine = TorchTurboEngine()
         with pytest.raises(RuntimeError, match="prepare_model"):
             engine.prepare_optimizer(torch.optim.AdamW)
+
+    def test_compute_loss_collects_model_metrics(self):
+        register_backend("dummy", ProfilingBackend)
+        engine = TorchTurboEngine({"backend": "dummy"})
+        model = TinyModel()
+        model.pop_metrics = lambda: {"test_metric": torch.tensor(2.0)}
+
+        engine.compute_loss(model, {})
+        logs = {}
+        engine.report_metrics(logs, lambda value: value.reshape(1))
+
+        assert logs == {"test_metric": 2.0}
+
+    def test_compute_loss_sets_moe_runtime_inputs(self):
+        class RuntimeMoELayer(BaseMoELayer):
+            def __init__(self):
+                nn.Module.__init__(self)
+                self._runtime_inputs = MoERuntimeInputs()
+
+            def forward(self, hidden_states, input_ids=None):
+                return self._runtime_inputs.padding_mask
+
+        class RuntimeModel(TurboModel, nn.Module):
+            def __init__(self):
+                nn.Module.__init__(self)
+                self.moe = RuntimeMoELayer()
+
+            def get_moe_runtime_inputs(self, inputs, parallel_context):
+                return MoERuntimeInputs(padding_mask=inputs["padding_mask"])
+
+        class RuntimeBackend:
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return torch.tensor(0.0)
+
+            def get_dp_info(self):
+                return {"dp_rank": 0, "dp_size": 1, "dp_group": None}
+
+            def get_sp_info(self):
+                return {"sp_rank": 0, "sp_size": 1, "sp_group": None}
+
+            def get_ep_info(self):
+                return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
+
+        engine = object.__new__(TorchTurboEngine)
+        engine.backend = RuntimeBackend()
+        engine.metric_tracker = engine_core.MetricTracker()
+        model = RuntimeModel()
+        padding_mask = torch.tensor([[False, True]])
+
+        engine.compute_loss(model, {"padding_mask": padding_mask})
+
+        assert model.moe._runtime_inputs.padding_mask is padding_mask
+
+    @pytest.mark.parametrize(
+        ("training", "gradient_accumulation_steps", "expected_scale"),
+        [(True, 4, 0.25), (False, 4, 1.0)],
+    )
+    def test_compute_loss_sets_moe_aux_loss_scale(
+        self,
+        monkeypatch,
+        training,
+        gradient_accumulation_steps,
+        expected_scale,
+    ):
+        class RuntimeBackend:
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return torch.tensor(0.0)
+
+            def get_dp_info(self):
+                return {"dp_rank": 0, "dp_size": 1, "dp_group": None}
+
+            def get_sp_info(self):
+                return {"sp_rank": 0, "sp_size": 1, "sp_group": None}
+
+            def get_ep_info(self):
+                return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
+
+        class RuntimeMoELayer(BaseMoELayer):
+            def __init__(self):
+                nn.Module.__init__(self)
+
+            def forward(self, hidden_states, input_ids=None):
+                return hidden_states
+
+        class RuntimeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.moe = RuntimeMoELayer()
+
+            def get_moe_runtime_inputs(self, inputs, parallel_context):
+                return MoERuntimeInputs()
+
+        scales = []
+        monkeypatch.setattr(
+            MoEAuxLossAutoScaler,
+            "set_loss_scale",
+            lambda scale: scales.append(scale),
+        )
+        engine = object.__new__(TorchTurboEngine)
+        engine.backend = RuntimeBackend()
+        engine.metric_tracker = engine_core.MetricTracker()
+        model = RuntimeModel().train(training)
+
+        engine.compute_loss(
+            model,
+            {},
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+
+        assert scales == [expected_scale]
+
+    def test_compute_loss_skips_moe_setup_for_dense(self, monkeypatch):
+        class RuntimeBackend:
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                return torch.tensor(0.0)
+
+        scales = []
+        monkeypatch.setattr(
+            MoEAuxLossAutoScaler,
+            "set_loss_scale",
+            lambda scale: scales.append(scale),
+        )
+        engine = object.__new__(TorchTurboEngine)
+        engine.backend = RuntimeBackend()
+        engine.metric_tracker = engine_core.MetricTracker()
+
+        engine.compute_loss(TinyModel(), {})
+
+        assert scales == []
 
     def test_prepare_lr_scheduler(self):
         register_backend("dummy", DummyBackend)

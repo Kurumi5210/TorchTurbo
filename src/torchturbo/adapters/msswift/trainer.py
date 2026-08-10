@@ -7,7 +7,7 @@ is mixed ahead of swift's trainer base for any stage:
   re-wrap it.
 * ``create_optimizer`` — build via the engine (FSDP2-aware); ``create_scheduler``
   keeps HF's default around the engine optimizer.
-* ``compute_loss``  — ``engine.backend.compute_loss`` (with SP loss re-scale).
+* ``compute_loss``  — ``engine.compute_loss`` (with SP loss re-scale).
 * ``_prepare_inputs`` — bridge swift-packed inputs to turbo's forward contract
   (see :mod:`torchturbo.adapters.msswift.inputs_bridging`).
 * ``save_model`` — engine writes DCP weights; swift still records metadata.
@@ -264,6 +264,11 @@ class TurboTrainerMixin:
         engine = engine_registry.get_engine_or_none()
         return bridge_swift_inputs(inputs, engine)
 
+    def _report_engine_metrics(self, logs) -> None:
+        engine = engine_registry.get_engine_or_none()
+        if engine is not None:
+            engine.report_metrics(logs, self.accelerator.gather)
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         engine = engine_registry.get_engine_or_none()
         if engine is None:
@@ -272,11 +277,14 @@ class TurboTrainerMixin:
         for key in ("compute_loss_func", "loss_scale", "logits_to_keep"):
             inputs.pop(key, None)
 
-        loss, outputs = engine.backend.compute_loss(
+        loss, outputs = engine.compute_loss(
             model,
             inputs,
             return_outputs=True,
-            num_items_in_batch=num_items_in_batch
+            num_items_in_batch=num_items_in_batch,
+            gradient_accumulation_steps=(
+                self.current_gradient_accumulation_steps if model.training else 1
+            ),
         )
 
         # SP gathers loss to full length; scale back when HF gives no
@@ -285,6 +293,10 @@ class TurboTrainerMixin:
             loss = loss * engine.get_sp_info()["sp_size"]
 
         return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        self._report_engine_metrics(logs)
+        return super().log(logs, *args, **kwargs)
 
     def _save_model(self, output_dir=None, state_dict=None):
         # Weights are written by save_model() below; keep HF/swift from

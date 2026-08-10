@@ -38,6 +38,7 @@ from .config import (
     EngineConfig,
     FreezePolicy,
     MixedPrecisionPolicy,
+    MoEConfig,
     MTPConfig,
     OpsConfig,
     ParameterGroup,
@@ -46,6 +47,7 @@ from .config import (
 from .core import TorchTurboEngine
 from .distributed import init_process_group_if_needed
 from .hooks import TrainHook, TrainState
+from .metrics import MetricTracker
 
 
 __all__ = [
@@ -65,6 +67,8 @@ __all__ = [
     "EngineConfig",
     "FreezePolicy",
     "MixedPrecisionPolicy",
+    "MetricTracker",
+    "MoEConfig",
     "MTPConfig",
     "OpsConfig",
     "ParameterGroup",

@@ -11,7 +11,6 @@ import torch.nn as nn
 
 from ...logging import get_logger
 
-
 logger = get_logger(__name__)
 
 
@@ -352,7 +351,11 @@ class TorchTurboTrainerBase:
             **kwargs,
         )
 
+    def _report_engine_metrics(self, logs) -> None:
+        self._engine().report_metrics(logs, self._nested_gather)
+
     def log(self, logs, *args, **kwargs):
+        self._report_engine_metrics(logs)
         buf = getattr(self, "_mtp_loss_buf", None)
         count = buf["count"] if buf else 0
         if buf and count > 0 and buf["mtp"]:
@@ -401,12 +404,16 @@ class TorchTurboTrainerBase:
             )
 
         engine = self._engine()
-        num_items_in_batch = kwargs.get("num_items_in_batch", None)
+        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
 
-        loss, outputs = engine.backend.compute_loss(
+        loss, outputs = engine.compute_loss(
             model,
             inputs,
             return_outputs=True,
+            num_items_in_batch=num_items_in_batch,
+            gradient_accumulation_steps=(
+                self.current_gradient_accumulation_steps if model.training else 1
+            ),
             **kwargs,
         )
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional
 
 import torch
 from torch import nn
@@ -12,6 +12,9 @@ from ..logging import get_logger
 from .weight_converter import BaseWeightConverter
 
 logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from .modules.moe.moe_layer import MoERuntimeInputs
 
 
 class SequenceParallelInputMode(str, Enum):
@@ -99,6 +102,15 @@ class TurboModel:
 
     def on_materialized(self) -> None:
         """Hook called after parameters and buffers are on a real device."""
+
+    def get_moe_runtime_inputs(
+        self,
+        inputs: dict[str, Any],
+        parallel_context: dict[str, Any],
+    ) -> MoERuntimeInputs:
+        from .modules.moe.moe_layer import MoERuntimeInputs
+
+        return MoERuntimeInputs()
 
     def get_sequence_parallel_input_mode(self) -> SequenceParallelInputMode:
         return self.sequence_parallel_input_mode

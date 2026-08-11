@@ -46,6 +46,7 @@ class TrainState:
     # Per-step values (reset each step)
     batch: Any = None
     loss: torch.Tensor | None = None
+    outputs: Any = None
     grad_norm: float | None = None
 
     # Distributed / Parallel state

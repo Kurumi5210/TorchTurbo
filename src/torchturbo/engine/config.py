@@ -173,6 +173,7 @@ class MoEConfig:
     """MoE training configuration."""
 
     aux_loss_coeff: float = 0.0
+    z_loss_coeff: float = 0.0
 
 
 @dataclass
@@ -752,7 +753,10 @@ def _build_mtp_config(fields: Mapping[str, Any]) -> MTPConfig:
 def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     """MoEConfig from the merged config dict."""
     moe_d = fields.get("moe") or {}
-    return MoEConfig(aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)))
+    return MoEConfig(
+        aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
+        z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
+    )
 
 
 def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:

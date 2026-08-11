@@ -9,6 +9,7 @@ from .moe_utils import (
     MoEAuxLossAutoScaler,
     compute_routing_scores_for_aux_loss,
     mask_padding_tokens,
+    z_loss_func,
 )
 from .utils import topk_softmax_with_capacity
 
@@ -127,11 +128,7 @@ class TopKRouter(Router):
         total_num_tokens: torch.Tensor,
     ) -> torch.Tensor:
         probability_sum = scores.sum(dim=0)
-        sp_size = (
-            dist.get_world_size(self.sp_group)
-            if self.sp_group is not None and dist.get_world_size(self.sp_group) > 1
-            else 1
-        )
+        sp_size = dist.get_world_size(self.sp_group) if self.sp_group is not None else 1
         # FSDP averages replicated Router gradients across SP ranks.
         return (
             torch.sum(probability_sum * tokens_per_expert)
@@ -151,7 +148,8 @@ class TopKRouter(Router):
             return probs
 
         tokens_per_expert = routing_map_for_aux_loss.sum(dim=0)
-        if self.sp_group is not None and dist.get_world_size(self.sp_group) > 1:
+        sp_size = dist.get_world_size(self.sp_group) if self.sp_group is not None else 1
+        if sp_size > 1:
             dist.all_reduce(
                 tokens_per_expert, op=dist.ReduceOp.SUM, group=self.sp_group
             )
@@ -176,10 +174,58 @@ class TopKRouter(Router):
     ) -> torch.Tensor:
         """Attach the scaled AUX loss and record its metrics."""
         self._metrics = {
+            **(self._metrics or {}),
             "aux_loss": (aux_loss / aux_loss_coeff).detach(),
             "aux_loss_scaled": aux_loss.detach(),
         }
         return MoEAuxLossAutoScaler.apply(activation, aux_loss)
+
+    def apply_z_loss(
+        self,
+        logits: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply router z-loss through the MoE loss autoscaler."""
+        z_loss_coeff = self.config.moe_z_loss_coeff
+        if (
+            z_loss_coeff is None
+            or z_loss_coeff == 0.0
+            or not (self.training and torch.is_grad_enabled())
+        ):
+            return logits
+
+        if padding_mask is not None:
+            valid_mask = ~padding_mask.reshape(-1).bool()
+            local_num_tokens = valid_mask.sum()
+        else:
+            local_num_tokens = torch.tensor(
+                logits.shape[0], device=logits.device, dtype=torch.long
+            )
+        total_num_tokens = local_num_tokens.clone()
+
+        sp_size = dist.get_world_size(self.sp_group) if self.sp_group is not None else 1
+        if sp_size > 1:
+            dist.all_reduce(
+                total_num_tokens,
+                op=dist.ReduceOp.SUM,
+                group=self.sp_group,
+            )
+
+        local_z_loss = z_loss_func(
+            logits,
+            z_loss_coeff,
+            padding_mask=padding_mask,
+        )
+        # Convert the local mean to the global SP/FSDP-normalized contribution.
+        global_token_denominator = torch.clamp(total_num_tokens, min=1)
+        local_to_global_scale = sp_size * local_num_tokens / global_token_denominator
+        z_loss = local_z_loss * local_to_global_scale
+        self._metrics = {
+            **(self._metrics or {}),
+            "z_loss": (z_loss / z_loss_coeff).detach(),
+            "z_loss_scaled": z_loss.detach(),
+        }
+        return MoEAuxLossAutoScaler.apply(logits, z_loss)
 
     def pop_metrics(self) -> dict[str, torch.Tensor]:
         metrics = self._metrics or {}
@@ -207,6 +253,8 @@ class TopKRouter(Router):
         input_ids = input_ids.view(-1) if input_ids is not None else None
         if self.use_hash_routing and input_ids is None:
             raise ValueError("Hash routing requires input_ids.")
+
+        logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         if self.routing_type == "none":
             # A naive top-k routing without load balancing
@@ -238,6 +286,7 @@ class TopKRouter(Router):
                 padding_mask,
             )
             scores = self._apply_aux_loss(scores, aux_scores, aux_routing_map)
+
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():

@@ -13,7 +13,6 @@ from torchturbo.runtime import get_device_runtime
 
 from ...engine.config import ParameterGroup
 from ..base import TurboVLMModel
-from ..modules.moe.moe_layer import MoERuntimeInputs
 from ..registry import register_model
 from ..weight_converter import FusedExpertWeightConverter
 
@@ -295,24 +294,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 self.patch_mtp_for_sp(
                     Qwen3_5MoeMultiTokenPredictor, sp_group, sp_size, sp_rank
                 )
-
-    def get_moe_runtime_inputs(self, inputs, parallel_context):
-        attention_mask = inputs.get("attention_mask")
-        padding_mask = (
-            attention_mask.eq(0) if attention_mask is not None else None
-        )
-        sp_info = parallel_context["sp"]
-        if padding_mask is not None and sp_info["sp_size"] > 1:
-            from ..modules.attention.ulysses import slice_input_tensor
-
-            padding_mask = slice_input_tensor(
-                padding_mask,
-                dim=1,
-                group=sp_info["sp_group"],
-                rank=sp_info["sp_rank"],
-                padding=False,
-            )
-        return MoERuntimeInputs(padding_mask=padding_mask)
 
     @classmethod
     def patch_vision_attention_interface(cls):

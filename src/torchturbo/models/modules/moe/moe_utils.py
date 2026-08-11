@@ -43,6 +43,35 @@ def compute_routing_scores_for_aux_loss(
     return routing_map, scores
 
 
+def z_loss_func(
+    logits: torch.Tensor,
+    z_loss_coeff: float,
+    padding_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute ST-MoE z-loss over local valid tokens.
+
+    Args:
+        logits: Router logits of shape ``[num_tokens, num_experts]``.
+        z_loss_coeff: Z-loss coefficient.
+        padding_mask: True entries are excluded from the mean.
+
+    Returns:
+        Scalar z-loss including ``z_loss_coeff``.
+    """
+    logsum = torch.logsumexp(logits, dim=-1)
+    z_loss_values = torch.square(logsum)
+
+    if padding_mask is not None:
+        valid_mask = ~padding_mask.reshape(-1).bool()
+        z_loss_values = z_loss_values * valid_mask
+        num_valid_tokens = valid_mask.sum()
+        z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1)
+    else:
+        z_loss = z_loss_values.mean()
+
+    return z_loss * z_loss_coeff
+
+
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     loss_scale = 1.0
 

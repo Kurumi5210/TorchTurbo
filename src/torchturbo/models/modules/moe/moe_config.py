@@ -35,6 +35,8 @@ class MoEConfig:
     moe_router_load_balancing_type: str = "none"
     """Token-level auxiliary loss coefficient."""
     moe_aux_loss_coeff: float = 0.0
+    """Z-loss coefficient for router logits; 0.0 disables."""
+    moe_z_loss_coeff: float = 0.0
     """Number of experts to route to for each token."""
     moe_router_topk: int = 2
     """Number of groups to divide experts into for group-limited routing."""

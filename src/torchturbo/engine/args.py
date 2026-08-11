@@ -128,6 +128,7 @@ class TorchTurboArgs:
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
     moe_aux_loss_coeff: float = 0.0
+    moe_z_loss_coeff: float = 0.0
     freeze_vision_tower: bool = False
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
@@ -356,6 +357,15 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         help="Token-level MoE auxiliary loss coefficient.",
     ),
     TurboArgSpec(
+        name="moe_z_loss_coeff",
+        args_name="moe_z_loss_coeff",
+        cli_name="--tt_moe_z_loss_coeff",
+        config_path="moe.z_loss_coeff",
+        type=float,
+        metavar="FLOAT",
+        help="Z-loss coefficient for MoE router logits.",
+    ),
+    TurboArgSpec(
         name="freeze_vision_tower",
         args_name="freeze_vision_tower",
         cli_name="--tt_freeze_vision_tower",
@@ -572,6 +582,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.enable_mtp,
             args.mtp_loss_scaling_factor,
             args.moe_aux_loss_coeff,
+            args.moe_z_loss_coeff,
         ]
     ):
         logger.info_rank0("torchturbo CLI args: %s", args)

@@ -17,7 +17,7 @@ def _dtype_from_config(hf_config):
 
 
 def _replace_moe_only(
-    original_module, hf_config, sp_info, ep_info, moe_submodules, **kwargs
+    original_module, hf_config, sp_info, ep_info, moe_submodules, engine_config, **kwargs
 ):
     if not _is_moe_module(original_module):
         return original_module
@@ -30,6 +30,8 @@ def _replace_moe_only(
         ep_size=ep_size,
         num_moe_experts=hf_config.num_experts,
         params_dtype=_dtype_from_config(hf_config),
+        moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
+        moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_router_num_groups=hf_config.n_group,
         moe_router_group_topk=hf_config.topk_group,
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
@@ -46,6 +48,7 @@ def _replace_moe_only(
         ep_group=ep_group,
         submodules=moe_submodules,
         layer_number=layer_number,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_experts"):

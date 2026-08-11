@@ -785,9 +785,10 @@ class TorchTurboEngine:
         max_steps:
             If set, stop after this many optimizer steps.
         compute_loss_fn:
-            A callable ``(model, batch, state, return_outputs) -> loss_tensor``.
+            Loss callback accepting ``(model, batch, state)`` and optionally
+            ``return_outputs=...``.
         return_outputs:
-            If set, return outputs.
+            Store callback outputs on ``state.outputs`` when enabled.
         hooks:
             Additional hooks for this run.
         max_grad_norm:
@@ -859,7 +860,15 @@ class TorchTurboEngine:
 
                 # Forward
                 self._fire(all_hooks, "before_forward", state)
-                state.loss = loss_fn(self.model, batch, return_outputs, state)
+                loss_kwargs: dict[str, Any] = {"state": state}
+                if return_outputs:
+                    loss_kwargs["return_outputs"] = True
+                loss_result = loss_fn(self.model, batch, **loss_kwargs)
+                if return_outputs:
+                    state.loss, state.outputs = loss_result
+                else:
+                    state.loss = loss_result
+                    state.outputs = None
                 self._fire(all_hooks, "after_forward", state)
 
                 # Scale for gradient accumulation

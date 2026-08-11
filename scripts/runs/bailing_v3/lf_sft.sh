@@ -109,4 +109,5 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --ddp_timeout 1800000000 \
     --bf16 \
     --neat_packing \
+    --tt_moe_z_loss_coeff 1e-3 \
     --max_steps 50

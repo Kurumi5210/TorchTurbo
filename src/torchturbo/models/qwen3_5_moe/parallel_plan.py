@@ -33,6 +33,7 @@ def _replace_qwen3_5_moe_only(
         ep_size=ep_size,
         num_moe_experts=text_config.num_experts,
         moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
+        moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
     )
     moe_config = MoEConfig(**moe_config_kwargs)
 

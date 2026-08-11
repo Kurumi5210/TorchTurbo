@@ -110,7 +110,23 @@ class TurboModel:
     ) -> MoERuntimeInputs:
         from .modules.moe.moe_layer import MoERuntimeInputs
 
-        return MoERuntimeInputs()
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None or attention_mask.dim() != 2:
+            return MoERuntimeInputs()
+
+        padding_mask = attention_mask.eq(0)
+        sp_info = parallel_context["sp"]
+        if sp_info["sp_size"] > 1:
+            from .modules.attention.ulysses import slice_input_tensor
+
+            padding_mask = slice_input_tensor(
+                padding_mask,
+                dim=1,
+                group=sp_info["sp_group"],
+                rank=sp_info["sp_rank"],
+                padding=False,
+            )
+        return MoERuntimeInputs(padding_mask=padding_mask)
 
     def get_sequence_parallel_input_mode(self) -> SequenceParallelInputMode:
         return self.sequence_parallel_input_mode

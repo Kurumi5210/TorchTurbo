@@ -10,6 +10,7 @@ from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     compute_routing_scores_for_aux_loss,
+    z_loss_func,
 )
 from torchturbo.models.modules.moe.router import TopKRouter
 
@@ -176,7 +177,7 @@ def test_aux_loss_tracker_averages_layers(caplog):
 
     torch.testing.assert_close(torch.tensor(logs["aux_loss"]), expected)
     torch.testing.assert_close(torch.tensor(logs["aux_loss_scaled"]), expected * 0.1)
-    assert set(logs) == {"aux_loss", "aux_loss_scaled"}
+    assert {"aux_loss", "aux_loss_scaled"} <= set(logs)
 
 
 def test_aux_loss_tracker_reports_mtp_module_path_in_debug(caplog):
@@ -345,6 +346,65 @@ def test_sp_aux_loss_matches_unsharded(tmp_path):
     )
 
 
+def _run_sp_z_loss_test(rank: int, world_size: int, init_file: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        logits = torch.tensor(
+            [
+                [2.0, 0.0, -1.0, 0.5],
+                [8.0, -4.0, -3.0, -2.0],
+                [0.0, 1.0, 2.0, -0.5],
+                [-5.0, 7.0, -6.0, -4.0],
+                [1.5, 0.5, -0.5, 0.0],
+                [-2.0, 0.0, 1.0, 0.5],
+            ]
+        )
+        padding_mask = torch.tensor([False, True, False, False, True, True])
+        local_logits = logits.chunk(world_size)[rank].clone().requires_grad_()
+        local_padding_mask = padding_mask.chunk(world_size)[rank]
+
+        router = TopKRouter(
+            _router_config(
+                hidden_size=4,
+                moe_aux_loss_coeff=0.0,
+                moe_z_loss_coeff=0.1,
+            ),
+            sp_group=dist.group.WORLD,
+        )
+        attached_logits = router.apply_z_loss(local_logits, local_padding_mask)
+        (attached_logits * 0.0).sum().backward()
+
+        averaged_loss = router._metrics["z_loss_scaled"].clone()
+        dist.all_reduce(averaged_loss, op=dist.ReduceOp.SUM)
+        averaged_loss.div_(world_size)
+
+        reference_logits = logits.clone().requires_grad_()
+        reference_loss = z_loss_func(reference_logits, 0.1, padding_mask)
+        reference_loss.backward()
+
+        torch.testing.assert_close(averaged_loss, reference_loss)
+        torch.testing.assert_close(
+            local_logits.grad,
+            reference_logits.grad.chunk(world_size)[rank] * world_size,
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sp_z_loss_matches_global_valid_token_mean(tmp_path):
+    mp.spawn(
+        _run_sp_z_loss_test,
+        args=(2, str(tmp_path / "sp_z_loss")),
+        nprocs=2,
+        join=True,
+    )
+
+
 def _run_sp_moe_runtime_inputs_test(
     rank: int, world_size: int, init_file: str
 ) -> None:
@@ -355,12 +415,9 @@ def _run_sp_moe_runtime_inputs_test(
         world_size=world_size,
     )
     try:
-        from torchturbo.models.qwen3_5_moe.model import (
-            TurboQwen3_5MoeForConditionalGeneration,
-        )
+        from torchturbo.models.base import TurboModel
 
-        model = SimpleNamespace(
-        )
+        model = TurboModel()
         attention_mask = torch.tensor([[1, 0, 1, 1, 0, 0]])
         inputs = {"attention_mask": attention_mask}
         parallel_context = {
@@ -370,11 +427,7 @@ def _run_sp_moe_runtime_inputs_test(
                 "sp_rank": rank,
             }
         }
-        runtime_inputs = (
-            TurboQwen3_5MoeForConditionalGeneration.get_moe_runtime_inputs(
-                model, inputs, parallel_context
-            )
-        )
+        runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
         expected = attention_mask.eq(0).chunk(world_size, dim=1)[rank]
 
         assert inputs["attention_mask"] is attention_mask
@@ -383,7 +436,7 @@ def _run_sp_moe_runtime_inputs_test(
         dist.destroy_process_group()
 
 
-def test_qwen_moe_runtime_inputs_match_sp_shard(tmp_path):
+def test_base_moe_runtime_inputs_match_sp_shard(tmp_path):
     mp.spawn(
         _run_sp_moe_runtime_inputs_test,
         args=(2, str(tmp_path / "sp_moe_runtime_inputs")),
@@ -392,26 +445,49 @@ def test_qwen_moe_runtime_inputs_match_sp_shard(tmp_path):
     )
 
 
-def test_qwen_moe_runtime_inputs_use_attention_mask_for_lf():
-    from torchturbo.models.qwen3_5_moe.model import (
-        TurboQwen3_5MoeForConditionalGeneration,
-    )
+def test_base_moe_runtime_inputs_use_attention_mask():
+    from torchturbo.models.base import TurboModel
 
-    model = SimpleNamespace()
+    model = TurboModel()
     attention_mask = torch.tensor([[1, 1, 2, 2, 0, 0]])
     inputs = {"attention_mask": attention_mask}
     parallel_context = {
         "sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}
     }
 
-    runtime_inputs = (
-        TurboQwen3_5MoeForConditionalGeneration.get_moe_runtime_inputs(
-            model, inputs, parallel_context
-        )
-    )
+    runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
 
     assert inputs["attention_mask"] is attention_mask
     torch.testing.assert_close(runtime_inputs.padding_mask, attention_mask.eq(0))
+
+
+def test_moe_models_inherit_base_runtime_inputs():
+    from torchturbo.models.base import TurboModel
+    from torchturbo.models.bailing_hybrid.model import TurboBailingMoeV3ForCausalLM
+    from torchturbo.models.qwen3_5_moe.model import (
+        TurboQwen3_5MoeForConditionalGeneration,
+    )
+
+    assert (
+        TurboBailingMoeV3ForCausalLM.get_moe_runtime_inputs
+        is TurboModel.get_moe_runtime_inputs
+    )
+    assert (
+        TurboQwen3_5MoeForConditionalGeneration.get_moe_runtime_inputs
+        is TurboModel.get_moe_runtime_inputs
+    )
+
+
+def test_base_moe_runtime_inputs_ignore_additive_attention_mask():
+    from torchturbo.models.base import TurboModel
+
+    model = TurboModel()
+    inputs = {"attention_mask": torch.zeros(1, 1, 4, 4)}
+    parallel_context = {"sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}}
+
+    runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
+
+    assert runtime_inputs.padding_mask is None
 
 
 def _run_sp_group_isolation_test(rank: int, world_size: int, init_file: str) -> None:
@@ -476,4 +552,129 @@ def test_sp_aux_loss_is_scoped_to_sp_group(tmp_path):
         args=(4, str(tmp_path / "sp_aux_loss_groups")),
         nprocs=4,
         join=True,
+    )
+
+
+def test_z_loss_matches_st_moe_formula():
+    logits = torch.tensor(
+        [[2.0, 0.0, -1.0, 0.5], [0.0, 1.0, 2.0, -0.5], [1.0, 3.0, 0.0, -2.0]]
+    )
+    expected = torch.mean(torch.square(torch.logsumexp(logits, dim=-1))) * 0.1
+
+    actual = z_loss_func(logits, 0.1)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_z_loss_ignores_padding_tokens():
+    logits = torch.tensor(
+        [
+            [2.0, 0.0, -1.0, 0.5],
+            [8.0, -4.0, -3.0, -2.0],
+            [0.0, 1.0, 2.0, -0.5],
+            [-5.0, 7.0, -6.0, -4.0],
+        ],
+        requires_grad=True,
+    )
+    padding_mask = torch.tensor([False, True, False, True])
+
+    loss = z_loss_func(logits, 1.0, padding_mask)
+    loss.backward()
+
+    reference_logits = logits.detach()[~padding_mask].requires_grad_()
+    reference_loss = z_loss_func(reference_logits, 1.0)
+    reference_loss.backward()
+
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(logits.grad[~padding_mask], reference_logits.grad)
+    torch.testing.assert_close(
+        logits.grad[padding_mask], torch.zeros_like(logits.grad[padding_mask])
+    )
+
+
+def test_router_z_loss_does_not_change_forward_routing():
+    z_router = TopKRouter(
+        _router_config(
+            moe_aux_loss_coeff=0.0,
+            moe_z_loss_coeff=0.1,
+        )
+    )
+    plain_router = TopKRouter(
+        _router_config(
+            moe_aux_loss_coeff=0.0,
+            moe_z_loss_coeff=0.0,
+        )
+    )
+    weight = torch.arange(12, dtype=torch.float32).reshape(4, 3) / 10
+    z_router.weight.data.copy_(weight)
+    plain_router.weight.data.copy_(weight)
+    hidden_states = torch.randn(2, 3, 3)
+
+    z_probs, z_map, _ = z_router(hidden_states)
+    plain_probs, plain_map, _ = plain_router(hidden_states)
+
+    torch.testing.assert_close(z_probs, plain_probs)
+    torch.testing.assert_close(z_map, plain_map)
+
+
+def test_z_loss_autoscaler_adds_scaled_gradient():
+    logits = torch.randn(5, 4, requires_grad=True)
+    main_loss = logits.square().mean()
+    z_loss = z_loss_func(logits, 0.1)
+    expected_grad = torch.autograd.grad(
+        main_loss + z_loss * 0.25, logits, retain_graph=True
+    )[0]
+
+    MoEAuxLossAutoScaler.set_loss_scale(0.25)
+    attached = MoEAuxLossAutoScaler.apply(main_loss, z_loss)
+    attached.backward()
+
+    torch.testing.assert_close(attached, main_loss)
+    torch.testing.assert_close(logits.grad, expected_grad)
+    MoEAuxLossAutoScaler.set_loss_scale(1.0)
+
+
+def test_z_loss_disabled_when_coeff_zero():
+    router = TopKRouter(
+        _router_config(
+            moe_aux_loss_coeff=0.0,
+            moe_z_loss_coeff=0.0,
+        )
+    )
+    logits = torch.randn(2, 4, requires_grad=True)
+
+    out = router.apply_z_loss(logits)
+
+    assert out is logits
+    assert router.pop_metrics() == {}
+
+
+def test_z_loss_tracker_reports_both_losses():
+    tracker = MetricTracker()
+    router = TopKRouter(
+        _router_config(
+            moe_aux_loss_coeff=0.1,
+            moe_z_loss_coeff=0.01,
+        )
+    )
+    logits = torch.randn(2, 1, 4)
+
+    router.routing(logits)
+
+    expected_z_loss = torch.mean(
+        torch.square(torch.logsumexp(logits.reshape(-1, 4), dim=-1))
+    )
+    tracker.collect(router)
+    logs = {}
+    tracker.report(logs, lambda value: value.reshape(1))
+
+    assert {
+        "aux_loss",
+        "aux_loss_scaled",
+        "z_loss",
+        "z_loss_scaled",
+    } <= set(logs)
+    torch.testing.assert_close(torch.tensor(logs["z_loss"]), expected_z_loss)
+    torch.testing.assert_close(
+        torch.tensor(logs["z_loss_scaled"]), expected_z_loss * 0.01
     )

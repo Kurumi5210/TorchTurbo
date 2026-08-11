@@ -420,6 +420,41 @@ class TestEngineSetup:
 # ---------------------------------------------------------------------------
 
 class TestEngineFit:
+    def test_return_outputs_unpacks_loss(self):
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = TinyModel()
+        engine.optimizer = torch.optim.AdamW(engine.model.parameters(), lr=0.01)
+        engine.lr_scheduler = None
+        engine.hooks = []
+        engine.backend = type(
+            "RuntimeBackend",
+            (),
+            {
+                "get_sp_info": lambda self: {
+                    "sp_rank": 0,
+                    "sp_size": 1,
+                    "sp_group": None,
+                }
+            },
+        )()
+
+        def loss_with_outputs(model, batch, state, return_outputs=False):
+            predictions = model(batch)
+            loss = predictions.square().mean()
+            assert return_outputs
+            return loss, predictions
+
+        state = engine.fit(
+            make_data(1),
+            compute_loss_fn=loss_with_outputs,
+            return_outputs=True,
+            max_grad_norm=None,
+        )
+
+        assert isinstance(state.loss, torch.Tensor)
+        assert state.outputs.shape == (2, 1)
+        assert state.global_step == 1
+
     def test_basic_fit(self):
         register_backend("dummy", DummyBackend)
         engine = TorchTurboEngine({"backend": "dummy"})

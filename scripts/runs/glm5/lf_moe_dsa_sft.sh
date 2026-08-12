@@ -10,11 +10,6 @@ set -ex
 # source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /mnt/sfs_turbo/hw/dengshumin/CANN_2/ascend-toolkit/set_env.sh
 source /mnt/sfs_turbo/hw/dengshumin/CANN_2/nnal/atb/set_env.sh || true
-export HCCL_CONNECT_TIMEOUT=7200
-export HCCL_EXEC_TIMEOUT=7200
-export ASCEND_GLOBAL_LOG_LEVEL=3
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_ASYNC_ERROR_HANDLING=0
 export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG

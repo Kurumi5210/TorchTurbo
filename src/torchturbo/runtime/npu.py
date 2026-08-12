@@ -8,6 +8,21 @@ import torch
 from .base import BaseProfiler, DeviceRuntime, TurboDevice
 
 
+# Ascend environment variable reference:
+# https://www.hiascend.com/document/detail/zh/Pytorch/600/apiref/apilist/ptaoplist_001052.html
+_NPU_ENV_DEFAULTS = {
+    "HCCL_CONNECT_TIMEOUT": "7200",
+    "HCCL_EXEC_TIMEOUT": "7200",
+    "HCCL_EVENT_TIMEOUT": "14500",
+    "ACL_DEVICE_SYNC_TIMEOUT": "14400",
+    # AI_CPU is default for A3; AIV does not support multi-comm-domain parallelism.
+    "HCCL_OP_EXPANSION_MODE": "AI_CPU",
+    "ASCEND_GLOBAL_LOG_LEVEL": "3",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "HCCL_ASYNC_ERROR_HANDLING": "0",
+}
+
+
 class _NpuProfiler(BaseProfiler):
     def __init__(
         self,
@@ -104,6 +119,8 @@ class NpuRuntime(DeviceRuntime):
             return
         import torch_npu  # noqa: F401
         from torch_npu.contrib import transfer_to_npu as _  # noqa: F401
+        for name, value in _NPU_ENV_DEFAULTS.items():
+            os.environ.setdefault(name, value)
 
         self._initialized = True
 

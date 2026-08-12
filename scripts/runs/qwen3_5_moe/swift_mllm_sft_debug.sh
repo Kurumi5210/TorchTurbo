@@ -9,13 +9,6 @@ set -ex
 # --- Ascend env (mirrors lf_mllm_sft.sh; replaces the GPU
 #     PYTORCH_CUDA_ALLOC_CONF / NCCL_DEBUG block) ----------------------------
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-export HCCL_CONNECT_TIMEOUT=7200
-export HCCL_EXEC_TIMEOUT=7200
-# AI_CPU is default for A3; AIV does not support multi-comm-domain parallelism
-export HCCL_OP_EXPANSION_MODE="AI_CPU"
-export ASCEND_GLOBAL_LOG_LEVEL=3
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_ASYNC_ERROR_HANDLING=0
 export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
@@ -28,9 +21,7 @@ export VIDEO_MAX_PIXELS=${VIDEO_MAX_PIXELS:-50176}
 export FPS_MAX_FRAMES=${FPS_MAX_FRAMES:-12}
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-3072}
 export VIDEO_MAX_TOKEN_NUM=${VIDEO_MAX_TOKEN_NUM:-49}
-export HCCL_EVENT_TIMEOUT=7200
 export ASCEND_LAUNCH_BLOCKING=1
-export ACL_DEVICE_SYNC_TIMEOUT=3600
 
 if [ -z "$USER_NAME" ]; then
     echo "Error: USER_NAME is not set"

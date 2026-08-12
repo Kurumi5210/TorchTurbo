@@ -1,6 +1,7 @@
 """Tests for TorchTurboEngine one-stop-shop API."""
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,9 +15,6 @@ from torchturbo.engine import (
     FSDP2Backend,
     MixedPrecisionPolicy,
     TorchTurboEngine,
-    TrainHook,
-    TrainState,
-    get_available_backends,
     register_backend,
 )
 from torchturbo.engine.backend_registry import _BACKENDS
@@ -38,6 +36,18 @@ class TinyModel(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+class TinyLogitsModel(nn.Module):
+    """Small logits-producing model for the packed RL engine API tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids):
+        logits = input_ids.float().unsqueeze(-1) * self.weight
+        return SimpleNamespace(logits=logits)
 
 
 class DummyBackend(BaseBackend):
@@ -75,23 +85,6 @@ class ProfilingBackend(DummyBackend):
         return (loss, None) if return_outputs else loss
 
 
-class RecordingHook(TrainHook):
-    def __init__(self):
-        self.calls = []
-
-    def on_train_begin(self, state):
-        self.calls.append("on_train_begin")
-
-    def on_train_end(self, state):
-        self.calls.append("on_train_end")
-
-    def on_step_end(self, state):
-        self.calls.append(f"step:{state.global_step}")
-
-    def on_microbatch_end(self, state):
-        self.calls.append(f"microbatch:{state.global_step}")
-
-
 class RecordingProfiler:
     def __init__(self):
         self.calls = []
@@ -104,14 +97,6 @@ class RecordingProfiler:
 
     def stop(self):
         self.calls.append("stop")
-
-
-def mse_loss(model, batch, state):
-    return model(batch).pow(2).mean()
-
-
-def make_data(n=3):
-    return [torch.randn(2, 4) for _ in range(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +288,60 @@ class TestEngineSetup:
 
         assert scales == []
 
+    def test_forward_backward_batch_runs_forward_and_backward(self):
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = TinyLogitsModel()
+        engine.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
+
+        mb_item = {
+            "orig_mb": {"input_ids": torch.tensor([1, 2])},
+            "padded_mb": {"input_ids": torch.tensor([[1, 2]])},
+        }
+        calls = []
+
+        def process_fn(logits, ctx, loss_fn):
+            calls.append((tuple(logits.shape), ctx["mb_input"]))
+            return loss_fn(logits)
+
+        engine.forward_backward_batch(
+            [mb_item],
+            process_fn=process_fn,
+            loss_fn=lambda logits: logits.square().mean(),
+            loss_weight_fn=lambda _: torch.tensor(1.0),
+        )
+
+        assert len(calls) == 1
+        assert calls[0][0] == (2, 1)
+        assert engine.model.weight.grad is not None
+        assert torch.isfinite(engine.model.weight.grad)
+
+    def test_forward_backward_batch_forward_only_skips_backward(self):
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = TinyLogitsModel()
+        engine.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
+
+        mb_item = {
+            "orig_mb": {"input_ids": torch.tensor([1, 2])},
+            "padded_mb": {"input_ids": torch.tensor([[1, 2]])},
+        }
+        engine.forward_backward_batch(
+            [mb_item],
+            process_fn=lambda logits, _ctx, _loss_fn: logits.square().mean(),
+            loss_fn=lambda logits: logits.square().mean(),
+            loss_weight_fn=lambda _: torch.tensor(1.0),
+            forward_only=True,
+        )
+
+        assert engine.model.weight.grad is None
+
+    def test_fit_is_unsupported_compatibility_stub(self):
+        engine = object.__new__(TorchTurboEngine)
+
+        with pytest.raises(NotImplementedError, match="no longer supported"):
+            engine.fit([])
+
     def test_prepare_lr_scheduler(self):
         register_backend("dummy", DummyBackend)
         engine = TorchTurboEngine({"backend": "dummy"})
@@ -312,11 +351,6 @@ class TestEngineSetup:
         
         engine.prepare_lr_scheduler(torch.optim.lr_scheduler.StepLR, step_size=10)
         assert engine.lr_scheduler is not None
-
-    def test_fit_without_model_raises(self):
-        engine = TorchTurboEngine()
-        with pytest.raises(RuntimeError, match="prepare_model"):
-            engine.fit(make_data(), compute_loss_fn=mse_loss)
 
     def test_unknown_backend_raises(self):
         with pytest.raises(ValueError, match="Unknown"):
@@ -414,146 +448,6 @@ class TestEngineSetup:
         with pytest.raises(RuntimeError, match="No active profiler"):
             engine.step_profiling()
 
-
-# ---------------------------------------------------------------------------
-# Tests: Training (fit)
-# ---------------------------------------------------------------------------
-
-class TestEngineFit:
-    def test_return_outputs_unpacks_loss(self):
-        engine = object.__new__(TorchTurboEngine)
-        engine.model = TinyModel()
-        engine.optimizer = torch.optim.AdamW(engine.model.parameters(), lr=0.01)
-        engine.lr_scheduler = None
-        engine.hooks = []
-        engine.backend = type(
-            "RuntimeBackend",
-            (),
-            {
-                "get_sp_info": lambda self: {
-                    "sp_rank": 0,
-                    "sp_size": 1,
-                    "sp_group": None,
-                }
-            },
-        )()
-
-        def loss_with_outputs(model, batch, state, return_outputs=False):
-            predictions = model(batch)
-            loss = predictions.square().mean()
-            assert return_outputs
-            return loss, predictions
-
-        state = engine.fit(
-            make_data(1),
-            compute_loss_fn=loss_with_outputs,
-            return_outputs=True,
-            max_grad_norm=None,
-        )
-
-        assert isinstance(state.loss, torch.Tensor)
-        assert state.outputs.shape == (2, 1)
-        assert state.global_step == 1
-
-    def test_basic_fit(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        state = engine.fit(make_data(3), compute_loss_fn=mse_loss, num_epochs=1)
-        assert state.global_step == 3
-
-    def test_max_steps(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-
-        state = engine.fit(make_data(10), compute_loss_fn=mse_loss, max_steps=2)
-        assert state.global_step == 2
-
-    def test_subclass_compute_loss(self):
-        class MyEngine(TorchTurboEngine):
-            def compute_loss(self, model, batch, state):
-                return model(batch).pow(2).mean()
-
-        register_backend("dummy", DummyBackend)
-        engine = MyEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        state = engine.fit(make_data(3), num_epochs=1)
-        assert state.global_step == 3
-
-    def test_hooks_called(self):
-        hook = RecordingHook()
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        engine.fit(make_data(2), compute_loss_fn=mse_loss, hooks=[hook])
-        assert "on_train_begin" in hook.calls
-        assert "on_train_end" in hook.calls
-        assert "microbatch:0" in hook.calls
-        assert "step:1" in hook.calls
-        assert "microbatch:1" in hook.calls
-        assert "step:2" in hook.calls
-
-    def test_persistent_hooks(self):
-        hook = RecordingHook()
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.add_hook(hook)
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        engine.fit(make_data(1), compute_loss_fn=mse_loss)
-        assert "on_train_begin" in hook.calls
-
-    def test_early_stop(self):
-        class StopAt2(TrainHook):
-            def on_step_end(self, state):
-                if state.global_step >= 2:
-                    state.should_stop = True
-
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        state = engine.fit(make_data(10), compute_loss_fn=mse_loss, hooks=[StopAt2()])
-        assert state.global_step == 2
-
-    def test_gradient_accumulation(self):
-        hook = RecordingHook()
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        state = engine.fit(
-            make_data(4),
-            compute_loss_fn=mse_loss,
-            gradient_accumulation_steps=2,
-            hooks=[hook],
-        )
-        assert state.global_step == 2
-        # Data size 4, accum 2 => 4 microbatches, 2 steps
-        assert hook.calls.count("microbatch:0") == 2
-        assert hook.calls.count("microbatch:1") == 2
-        assert hook.calls.count("step:1") == 1
-        assert hook.calls.count("step:2") == 1
-
-    def test_multi_epoch(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
-        
-        state = engine.fit(make_data(2), compute_loss_fn=mse_loss, num_epochs=3)
-        assert state.global_step == 6
 
     def test_custom_backend(self):
         register_backend("dummy", DummyBackend)

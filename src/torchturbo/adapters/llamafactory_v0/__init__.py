@@ -11,15 +11,11 @@ Two usage paths:
     from torchturbo.adapters.llamafactory_v0 import (
         build_config_from_lf_args,
         compute_sft_loss,
-        LlamaFactoryHook,
     )
     from torchturbo.engine import TorchTurboEngine
 
-    config, _ = build_config_from_lf_args(training_args, model_args=model_args)
-    engine = TorchTurboEngine(config)
-    engine.prepare_optimizer(AdamW, lr=args.learning_rate)
-    engine.fit(dataloader, compute_loss_fn=compute_sft_loss,
-               hooks=[LlamaFactoryHook(training_args)])
+    The adapter creates the engine and patches LlamaFactory's native trainer;
+    call that trainer's ``train()`` method to start the run.
 """
 
 from __future__ import annotations
@@ -31,7 +27,6 @@ from ...engine import TorchTurboEngine
 from ...logging import get_logger
 from ...registry import BaseAdapter, register_adapter
 from .compat import is_llamafactory_v0
-from .hooks import LlamaFactoryHook
 from .patches import (
     AcceleratorPatch,
     CollatorPatch,
@@ -51,7 +46,6 @@ logger = get_logger(__name__)
 
 __all__ = [
     "LlamaFactoryV0Adapter",
-    "LlamaFactoryHook",
     "build_config_from_lf_args",
     "build_lora_config_from_lf_args",
     "compute_sft_loss",

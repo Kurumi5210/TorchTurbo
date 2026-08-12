@@ -136,11 +136,8 @@ class RunExpPatch(BasePatch):
             from .utils import (
                 build_config_from_lf_args,
                 build_lora_config_from_lf_args,
-                fsdp_options_from_raw_args,
-                resolve_cpu_offload,
                 strip_lora_args,
             )
-            from .hooks import LlamaFactoryHook
             from ...engine import TorchTurboEngine
             from ...engine.args import get_torchturbo_args
             from ...logging import logging_configure
@@ -152,7 +149,7 @@ class RunExpPatch(BasePatch):
             logging_configure(tt_args.log_level)
             logger.info_rank0("torchturbo CLI args: %s", tt_args)
 
-            model_args, data_args, training_args, finetuning_args, generating_args = (
+            model_args, data_args, training_args, finetuning_args, _generating_args = (
                 get_train_args(raw_args)
             )
             stage = getattr(finetuning_args, "stage", None)
@@ -211,13 +208,6 @@ class RunExpPatch(BasePatch):
             # Stash model/data args for downstream use (e.g. BDDataset in get_train_dataloader)
             engine._lf_model_args = model_args
             engine._lf_data_args = data_args
-
-            engine.add_hook(
-                LlamaFactoryHook(
-                    training_args=training_args,
-                    output_dir=getattr(training_args, "output_dir", "./output"),
-                )
-            )
 
             # Keep the current run's LoRA config on the adapter context.
             # LoadModelPatch reads it when LF calls from_pretrained.

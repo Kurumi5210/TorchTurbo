@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from ...engine import EngineConfig
 from ...engine.args import TorchTurboArgs, get_arg_specs, string_to_bool
 from ...engine.config import MixedPrecisionPolicy
-from ...engine.hooks import TrainState
 from ...logging import get_logger
 
 
@@ -552,7 +551,7 @@ def strip_lora_args(args: Any) -> Any:
 def compute_sft_loss(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
-    state: TrainState,
+    state: Any = None,
 ) -> torch.Tensor:
     """Standard SFT (supervised fine-tuning) loss.
 

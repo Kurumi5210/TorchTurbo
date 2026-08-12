@@ -279,20 +279,14 @@ class TorchTurboTrainerBase:
         )
 
     def train(self, *args, **kwargs):
-        from ...engine.hooks import TrainState
         from ...engine.args import get_torchturbo_args
 
         engine = self._engine()
-        sp_info = engine.backend.get_sp_info()
-        train_state = TrainState(
-            model=self.model,
-            optimizer=self.optimizer,
-            lr_scheduler=self.lr_scheduler,
-            num_epochs=int(getattr(self.args, "num_train_epochs", 1)),
-            max_steps=getattr(self.args, "max_steps", None),
-            sp_info=sp_info,
+        logger.info_rank0(
+            "LlamaFactory training started: %d epochs, max_steps=%s",
+            int(getattr(self.args, "num_train_epochs", 1)),
+            getattr(self.args, "max_steps", None),
         )
-        engine._fire(engine.hooks, "on_train_begin", train_state)
 
         tt_args = get_torchturbo_args()
         profiling_enabled = tt_args is not None and tt_args.profiling

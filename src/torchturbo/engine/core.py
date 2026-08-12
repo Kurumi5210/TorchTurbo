@@ -5,19 +5,20 @@ from __future__ import annotations
 import dataclasses
 import os
 import socket
-from typing import Any, Callable, Iterable, Optional
+from collections.abc import Callable, Iterable
+from typing import Any, Iterator, Optional
 
 import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from ..logging import get_logger
 from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
-from .hooks import TrainHook, TrainState
 from .metrics import MetricTracker
 from .utils import has_meta_tensor
 from torchturbo.adapters.rl.packed import (
@@ -145,8 +146,9 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
 class TorchTurboEngine:
     """One-stop-shop engine for distributed training.
 
-    Owns the full lifecycle: config → model sharding → optimizer →
-    training loop with hooks.
+    Owns model preparation, distributed sharding, optimizer setup, loss
+    computation, profiling, and checkpoint I/O.  Framework adapters keep
+    ownership of the trainer loop.
 
     Parameters
     ----------
@@ -167,22 +169,8 @@ class TorchTurboEngine:
             T_max=1000,
         )
 
-        # Train — provide compute_loss as a callable
-        engine.fit(
-            train_dataloader=dataloader,
-            compute_loss_fn=lambda model, batch, state: model(**batch).loss,
-            num_epochs=3,
-            hooks=[LoggingHook(), CheckpointHook()],
-        )
-
-        # Or subclass for more control
-        class MyEngine(TorchTurboEngine):
-            def compute_loss(self, model, batch, state):
-                return model(**batch).loss
-
-        engine = MyEngine(config)
-        engine.prepare_optimizer(AdamW, lr=1e-4)
-        engine.fit(dataloader, num_epochs=3)
+        # Framework adapters use the engine for model/optimizer/loss plumbing
+        # while retaining ownership of their native Trainer loop.
     """
 
     def __init__(self, config: EngineConfig | dict[str, Any] | None = None) -> None:
@@ -220,9 +208,6 @@ class TorchTurboEngine:
         self.model_name_or_path: str | None = None
         self.optimizer: Any = None
         self.lr_scheduler: Any = None
-
-        # Hooks (can be added before or after setup)
-        self.hooks: list[TrainHook] = []
 
         logger.info_rank0(
             "TorchTurboEngine initialized: backend=%s, device=%s",
@@ -580,18 +565,6 @@ class TorchTurboEngine:
         return plan
 
     # ------------------------------------------------------------------
-    # Hook management
-    # ------------------------------------------------------------------
-
-    def add_hook(self, hook: TrainHook) -> None:
-        """Register a training hook."""
-        self.hooks.append(hook)
-
-    def add_hooks(self, hooks: list[TrainHook]) -> None:
-        """Register multiple training hooks."""
-        self.hooks.extend(hooks)
-
-    # ------------------------------------------------------------------
     # Profiling
     # ------------------------------------------------------------------
 
@@ -701,7 +674,7 @@ class TorchTurboEngine:
             dataloader = engine.create_dataloader(
                 dataset, batch_size=4,
             )
-            engine.fit(dataloader, ...)
+            trainer.train()
 
         Parameters
         ----------
@@ -712,7 +685,7 @@ class TorchTurboEngine:
         batch_size:
             Per-rank micro-batch size.
         """
-        from torch.utils.data import DataLoader, DistributedSampler
+        from torch.utils.data import DataLoader
 
         dp_info = self.get_dp_info()
         sp_info = self.get_sp_info()
@@ -751,182 +724,38 @@ class TorchTurboEngine:
             **kwargs,
         )
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
-
     def fit(
         self,
         train_dataloader: Iterable,
         num_epochs: int = 1,
         max_steps: int | None = None,
         compute_loss_fn: Any = None,
-        return_outputs=False,
-        hooks: list[TrainHook] | None = None,
+        return_outputs: bool = False,
+        hooks: list[Any] | None = None,
         max_grad_norm: float | None = 1.0,
         gradient_accumulation_steps: int = 1,
-    ) -> TrainState:
-        """Run the training loop.
+    ) -> None:
+        """Compatibility stub for the removed engine-owned training loop.
 
-        **SP-aware**: Automatically detects ``sp_size`` from the resolved
-        parallel plan and adjusts ``gradient_accumulation_steps`` to
-        maintain the same global batch size.
-
-        If ``train_dataloader`` is a ``Dataset``, wraps it with an
-        SP-aware ``DistributedSampler``.  If it's already a ``DataLoader``,
-        uses it as-is (caller is responsible for SP-aware sampling).
-
-        Parameters
-        ----------
-        train_dataloader:
-            A ``DataLoader``, ``Dataset``, or any iterable that yields batches.
-        num_epochs:
-            Number of training epochs.
-        max_steps:
-            If set, stop after this many optimizer steps.
-        compute_loss_fn:
-            Loss callback accepting ``(model, batch, state)`` and optionally
-            ``return_outputs=...``.
-        return_outputs:
-            Store callback outputs on ``state.outputs`` when enabled.
-        hooks:
-            Additional hooks for this run.
-        max_grad_norm:
-            Gradient clipping norm.  ``None`` = no clipping.
-        gradient_accumulation_steps:
-            Number of micro-batches per optimizer step (before SP adjustment).
+        TODO: Remove this compatibility surface after downstream callers have
+        migrated to the native LlamaFactory or ms-swift Trainer loop.
         """
-        if self.model is None or self.optimizer is None:
-            raise RuntimeError("Call engine.prepare_optimizer() before engine.fit()")
-
-        # --- Auto-detect SP from parallel plan ---
-        sp_size = self.get_sp_info()["sp_size"]
-        if sp_size > 1:
-            original_grad_accum = gradient_accumulation_steps
-            gradient_accumulation_steps *= sp_size
-            logger.info_rank0(
-                "SP auto-adapt: sp_size=%d, gradient_accumulation_steps %d → %d",
-                sp_size,
-                original_grad_accum,
-                gradient_accumulation_steps,
-            )
-
-        # --- Wrap Dataset with SP-aware sampler if needed ---
-        train_dataloader = self._ensure_sp_dataloader(train_dataloader, sp_size)
-
-        # Merge per-run hooks with persistent hooks
-        all_hooks = self.hooks + (hooks or [])
-
-        # Resolve loss function
-        if compute_loss_fn is not None:
-            loss_fn = compute_loss_fn
-        else:
-            loss_fn = self.compute_loss
-
-        # Build state
-        state = TrainState(
-            model=self.model,
-            optimizer=self.optimizer,
-            lr_scheduler=self.lr_scheduler,
-            num_epochs=num_epochs,
-            max_steps=max_steps,
+        # TODO: Not used by current training flows (llamafactory/swift run their
+        # own Trainer loops); awaiting refactor.
+        del (
+            train_dataloader,
+            num_epochs,
+            max_steps,
+            compute_loss_fn,
+            return_outputs,
+            hooks,
+            max_grad_norm,
+            gradient_accumulation_steps,
         )
-
-        # --- Training loop ---
-        self._fire(all_hooks, "on_train_begin", state)
-        self.model.train()
-
-        for epoch in range(num_epochs):
-            state.epoch = epoch
-            self._fire(all_hooks, "on_epoch_begin", state)
-
-            # Update sampler epoch for proper shuffling
-            if hasattr(train_dataloader, "sampler") and hasattr(
-                train_dataloader.sampler, "set_epoch"
-            ):
-                train_dataloader.sampler.set_epoch(epoch)
-
-            accumulation_count = 0
-            is_step_start = True
-
-            for batch in train_dataloader:
-                state.batch = batch
-
-                if is_step_start:
-                    self._fire(all_hooks, "on_step_begin", state)
-                    is_step_start = False
-
-                self._fire(all_hooks, "on_microbatch_begin", state)
-
-                # Forward
-                self._fire(all_hooks, "before_forward", state)
-                loss_kwargs: dict[str, Any] = {"state": state}
-                if return_outputs:
-                    loss_kwargs["return_outputs"] = True
-                loss_result = loss_fn(self.model, batch, **loss_kwargs)
-                if return_outputs:
-                    state.loss, state.outputs = loss_result
-                else:
-                    state.loss = loss_result
-                    state.outputs = None
-                self._fire(all_hooks, "after_forward", state)
-
-                # Scale for gradient accumulation
-                if gradient_accumulation_steps > 1:
-                    state.loss = state.loss / gradient_accumulation_steps
-
-                # Backward
-                self._fire(all_hooks, "before_backward", state)
-                state.loss.backward()
-                self._fire(all_hooks, "after_backward", state)
-                self._fire(all_hooks, "on_microbatch_end", state)
-
-                accumulation_count += 1
-                if accumulation_count % gradient_accumulation_steps != 0:
-                    continue
-
-                # Optimizer step
-                state.skip_optimizer_step = False
-                self._fire(all_hooks, "before_optimizer_step", state)
-
-                if max_grad_norm is not None:
-                    state.grad_norm = self.backend.clip_grad_norm_(
-                        self.model.parameters(), max_grad_norm
-                    ).item()
-                    if not torch.isfinite(torch.tensor(state.grad_norm)):
-                        logger.warning_rank0("Non-finite grad norm — skipping step")
-                        state.skip_optimizer_step = True
-
-                if not state.skip_optimizer_step:
-                    self.optimizer.step()
-
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
-
-                self.optimizer.zero_grad()
-
-                self._fire(all_hooks, "after_optimizer_step", state)
-
-                state.global_step += 1
-                state.metrics["loss"] = state.loss.item() * gradient_accumulation_steps
-
-                self._fire(all_hooks, "on_step_end", state)
-                is_step_start = True
-
-                if state.should_stop:
-                    break
-                if max_steps is not None and state.global_step >= max_steps:
-                    break
-
-            self._fire(all_hooks, "on_epoch_end", state)
-
-            if state.should_stop or (
-                max_steps is not None and state.global_step >= max_steps
-            ):
-                break
-
-        self._fire(all_hooks, "on_train_end", state)
-        return state
+        raise NotImplementedError(
+            "TorchTurboEngine.fit() is no longer supported. "
+            "Use the LlamaFactory or ms-swift Trainer entry point instead."
+        )
 
     def get_sp_info(self) -> dict[str, Any]:
         """Get sequence-parallel rank, size and group."""
@@ -935,19 +764,6 @@ class TorchTurboEngine:
     def get_ep_info(self) -> dict[str, Any]:
         """Get expert-parallel rank, size and group."""
         return self.backend.get_ep_info()
-
-    def _ensure_sp_dataloader(self, dataloader_or_dataset: Any, sp_size: int) -> Any:
-        """Wrap a Dataset with SP-aware sampling, or return DataLoader as-is."""
-        from torch.utils.data import DataLoader, Dataset
-
-        if not isinstance(dataloader_or_dataset, Dataset):
-            # Already a DataLoader or custom iterable — use as-is
-            return dataloader_or_dataset
-
-        # Wrap Dataset with SP-aware DistributedSampler
-        return self.create_dataloader(
-            dataloader_or_dataset,
-        )
 
     def _prepare_moe_runtime(
         self,
@@ -1352,14 +1168,6 @@ class TorchTurboEngine:
 
         lines.append(sep)
         logger.debug_rank0("Parameter sharding map:\n%s", "\n".join(lines))
-
-    @staticmethod
-    def _fire(hooks: list[TrainHook], hook_name: str, state: TrainState) -> None:
-        """Call the named method on all hooks."""
-        for hook in hooks:
-            method = getattr(hook, hook_name, None)
-            if method is not None:
-                method(state)
 
     def __repr__(self) -> str:
         setup_status = "ready" if self.model is not None else "not setup"

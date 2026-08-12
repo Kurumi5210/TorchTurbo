@@ -253,7 +253,7 @@ turbo 接管走 swift 的 HF 路径，参数用 HF 字段（`swift/trainers/argu
 ### 8.4 SP / Ulysses（SFT 内）
 
 - `--tt_sp_size`/`--tt_ep_size` 进 `EngineConfig.parallel_plan`；`sequence_parallel_size=1` 关掉 swift 自带 SP。
-- `apply_ulysses_sp_patch(engine)`：trainer `__init__` 时（SP>1）把 `transformers.modeling_flash_attention_utils._flash_attention_forward` 指向 turbo ulysses 内核（幂等）。swift 跑自己的训练循环、engine hooks 不会触发，所以这里 eager 应用。
+- `apply_ulysses_sp_patch(engine)`：trainer `__init__` 时（SP>1）把 `transformers.modeling_flash_attention_utils._flash_attention_forward` 指向 turbo ulysses 内核（幂等）。swift 跑自己的训练循环，所以这里 eager 应用。
 - turbo 模型自身 `on_parallelized` 已做 SP 适配（如 `qwen3_5_moe.patch_*_for_sp`）。
 
 ### 8.5 MLLM / MTP（SFT 内）

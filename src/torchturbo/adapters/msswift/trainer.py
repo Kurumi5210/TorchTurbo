@@ -38,8 +38,8 @@ logger = get_logger(__name__)
 def apply_ulysses_sp_patch(engine: Any) -> bool:
     """Redirect global flash-attention to the Ulysses SP kernel when ``sp>1``.
 
-    swift runs its own training loop, so turbo's engine hooks never fire — the
-    SP attention patch is applied eagerly from the trainer init instead.
+    swift runs its own training loop, so the SP attention patch is applied
+    eagerly from the trainer init instead.
     Idempotent; a no-op when SP is off.  Returns whether the patch was applied.
     """
     try:
@@ -169,9 +169,8 @@ class TurboTrainerMixin:
         """Wrap swift's training loop with TorchTurbo profiling when
         ``--tt_profiling`` is set. Mirrors the llamafactory adapter.
 
-        swift owns the training loop (turbo engine hooks never fire — see
-        :func:`apply_ulysses_sp_patch`), so the profiler can't be driven by
-        engine hooks; instead attach an HF ``TrainerCallback`` whose
+        swift owns the training loop, so the profiler is driven by an HF
+        ``TrainerCallback`` whose
         ``on_step_end`` calls ``engine.step_profiling()`` once per optimizer
         step. ``start_profiling`` / ``stop_profiling`` bracket the whole loop;
         traces land under ``{output_dir}/profiling/``.

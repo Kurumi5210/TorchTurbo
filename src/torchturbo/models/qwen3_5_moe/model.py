@@ -331,7 +331,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
             # need SP (sequence parallel), so we bypass the Ulysses
             # all-to-all wrapper entirely. This also avoids interference
             # from _patch_ulysses_fa_for_sp's head-repeat logic and
-            # from LlamaFactoryHook's global _flash_attention_forward
             # monkey-patch (which routes through ulysses_fa with
             # sp_group/sp_size from the language model).
             attn_output = _flash_attention_forward(

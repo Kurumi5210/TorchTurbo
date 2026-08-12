@@ -21,5 +21,7 @@ pip install transformers==5.9.0
 pip install peft==0.18.0
 pip install datasets==5.0.1
 pip install qwen-vl-utils==0.0.14
+pip install binpacking==1.5.2
+pip install safetensors==0.7.0
 
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

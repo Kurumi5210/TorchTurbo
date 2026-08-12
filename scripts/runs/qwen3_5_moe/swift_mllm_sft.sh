@@ -30,8 +30,8 @@ fi
 # NPU-side paths (same checkpoint family the GPU debug script uses, just the
 # NPU-side /sfs_turbo mount — see lf_mllm_sft.sh).
 
-# model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-397B-A17B
-model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
+model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-397B-A17B
+# model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
 
 # swift MLLM SFT dataset id (the NPU debug MLLM dataset, same one lf_
 # _mllm_sft.sh targets). For an offline NPU box, override DATASET to a local
@@ -52,7 +52,7 @@ dataloader_num_workers=8       # swift args: --dataloader_num_workers
 model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
 template=qwen3_5               # swift's built-in (M)LLM template for qwen3.5
 
-seq_length=$((1024 * 4))
+seq_length=$((1024 * 32))
 tuner_type=full                # swift args: 'full' | 'lora' (megatron uses --finetune)
 
 # --- distributed-launch env (fed to torchrun below; swift's BaseArguments
@@ -73,7 +73,8 @@ export WORLD_SIZE=$((${NPUS_PER_NODE} * ${NNODES}))
 sp_size=4
 ep_size=8
 
-output_dir=/sfs_turbo/${USER_NAME}/ckpt/qwen35_35B/swift_sft_sp${sp_size}ep${ep_size}_node${NNODES}
+# output_dir=/sfs_turbo/${USER_NAME}/ckpt/qwen35_35B/swift_sft_sp${sp_size}ep${ep_size}_node${NNODES}
+output_dir=/mnt/aicompiler-a3/common/${USER_NAME}/ckpt/qwen35_35B/swift_sft_sp${sp_size}ep${ep_size}_node${NNODES}
 mkdir -p "$output_dir"
 log_file=$output_dir/log-$NODE_RANK.txt
 export ASCEND_PROCESS_LOG_PATH=${output_dir}/ascend_log
@@ -116,7 +117,6 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --master_port "${MASTER_PORT}" \
     "${RUN_SWIFT}" \
     --tt_config "${SCRIPT_DIR}/swift_mllm_sft.yaml" \
-    --tt_moe_aux_loss_coeff 1e-6 \
     --model_type "${model_type}" \
     --model "${model_name_or_path}" \
     --template "${template}" \

@@ -1141,23 +1141,26 @@ class LogCallbackPatch(BasePatch):
 
         def _patched_write_log(callback_self, output_dir, logs):
             gn = getattr(callback_self, "_tt_grad_norm", None)
-            if gn is not None:
-                new_logs = {}
-                for k, v in logs.items():
-                    new_logs[k] = v
-                    if k == "loss":
-                        new_logs["grad_norm"] = round(gn, 6)
+            mtp_loss = getattr(callback_self, "_tt_mtp_loss", None)
+            has_loss = "loss" in logs
+            if has_loss:
+                new_logs = dict(logs)
+                if gn is not None:
+                    new_logs["grad_norm"] = round(gn, 6)
+                if mtp_loss is not None:
+                    new_logs["mtp_loss"] = round(mtp_loss, 6)
                 logs = new_logs
             return _orig_write_log(callback_self, output_dir, logs)
 
         def _patched_on_log(callback_self, args, state, control, **kwargs):
             callback_self._tt_grad_norm = state.log_history[-1].get("grad_norm")
+            callback_self._tt_mtp_loss = state.log_history[-1].get("mtp_loss/0")
             self._original_on_log(callback_self, args, state, control, **kwargs)
 
         LogCallback.on_log = _patched_on_log
         LogCallback._write_log = _patched_write_log
         logger.info_rank0(
-            "LogCallbackPatch applied — grad_norm will be written to trainer_log.jsonl"
+            "LogCallbackPatch applied — grad_norm and mtp_loss will be written to trainer_log.jsonl"
         )
 
     def revert(self) -> None:

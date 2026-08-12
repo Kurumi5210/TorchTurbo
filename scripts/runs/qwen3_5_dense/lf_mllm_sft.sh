@@ -12,6 +12,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
+# AI_CPU is default for A3; AIV does not support multi-comm-domain parallelism
+export HCCL_OP_EXPANSION_MODE="AI_CPU"
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_ASYNC_ERROR_HANDLING=0
@@ -69,11 +71,11 @@ export WORLD_SIZE=$(($NPUS_PER_NODE * $NNODES))
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 
-export ASCEND_PROCESS_LOG_PATH=$output_dir/log
-
 model_basename=$(basename "$model_name_or_path")
 seq_length_k=$((seq_length / 1024))k
 output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/${model_basename}/lf/mllm_sft_seq${seq_length_k}_sp${sp_size}ep${ep_size}_node${NNODES}/
+
+export ASCEND_PROCESS_LOG_PATH=$output_dir/log
 
 mkdir -p $output_dir
 if [ -d $output_dir ]; then

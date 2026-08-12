@@ -49,11 +49,11 @@ export WORLD_SIZE=$(($NPUS_PER_NODE * $NNODES))
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 
-export ASCEND_PROCESS_LOG_PATH=$output_dir/log
-
 model_basename=$(basename "$model_name_or_path")
 seq_length_k=$((seq_length / 1024))k
 output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/${model_basename}/lf/text_sft_seq${seq_length_k}_sp${sp_size}ep${ep_size}_node${NNODES}/
+
+export ASCEND_PROCESS_LOG_PATH=$output_dir/log
 
 mkdir -p $output_dir
 if [ -d $output_dir ]; then

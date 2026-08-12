@@ -28,7 +28,7 @@ def torch_train():
     a3_aic_pcache = DataStore(store_name="ais-pcache-a3-common-aicompiler", mount_point="/mnt/aicompiler-a3/common")
     # ais-pcache-a3-common-antfinix2 	/mnt/antfinix2-a3/common
     km_conf = KMConf(
-        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-6968dbd2-20260612130916"
+        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-47d6e664-20260811151237"
     )
 
     labels={

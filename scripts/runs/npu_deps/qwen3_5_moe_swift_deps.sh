@@ -22,8 +22,4 @@ pip install peft==0.18.0
 pip install datasets==5.0.1
 pip install qwen-vl-utils==0.0.14
 
-# install packages related to npu triton
-pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl --no-deps
-pip install /mnt/sfs_turbo/torchturbo/stable/qwen3_5_deps/flash_linear_attention-0.5.2-py3-none-any.whl --no-deps
-
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

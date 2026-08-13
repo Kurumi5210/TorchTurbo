@@ -37,6 +37,7 @@ engine_config:
         no_shard: true
 
   mixed_precision: bf16
+  use_deterministic_algorithms: false
 
   ops:
     policy: auto

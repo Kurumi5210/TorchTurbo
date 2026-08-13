@@ -21,13 +21,6 @@ export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
-# # Deterministic computation
-# export HCCL_DETERMINISTIC=True
-# export LCCL_DETERMINISTIC=1
-# export CLOSE_MATMUL_K_SHIFT=1
-# export ATB_MATMUL_SHUFFLE_K_ENABLE=0
-# export ATB_LLM_LCOC_ENABLE=0
-
 if [ -z "$USER_NAME" ]; then
     echo "Error: USER_NAME is not set"
     exit 1

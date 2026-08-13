@@ -285,6 +285,9 @@ class EngineConfig:
     mixed_precision: MixedPrecisionPolicy = MixedPrecisionPolicy.BF16
     """Global mixed precision policy."""
 
+    use_deterministic_algorithms: bool = False
+    """Require deterministic algorithms for the selected device runtime."""
+
     ops: OpsConfig = field(default_factory=OpsConfig)
     """Op dispatch settings."""
 
@@ -320,6 +323,9 @@ class EngineConfig:
 
     def __post_init__(self) -> None:
         """Create missing nested configuration objects."""
+        self.use_deterministic_algorithms = string_to_bool(
+            self.use_deterministic_algorithms
+        )
         if self.backend_config is None:
             self.backend_config = self._default_backend_config()
         if self.ops is None:
@@ -342,6 +348,7 @@ class EngineConfig:
         """
         backend = DistributedBackend(d.get("backend", "fsdp2"))
         mp = MixedPrecisionPolicy(d.get("mixed_precision", "bf16"))
+        use_deterministic_algorithms = d.get("use_deterministic_algorithms", False)
 
         if "op_policy" in d:
             raise ValueError("op_policy is no longer supported; use ops.policy.")
@@ -434,6 +441,7 @@ class EngineConfig:
         known_keys = {
             "backend",
             "mixed_precision",
+            "use_deterministic_algorithms",
             "parallel",
             "fsdp",
             "backend_config",
@@ -471,6 +479,7 @@ class EngineConfig:
             backend=backend,
             parallel_plan=parallel_plan,
             mixed_precision=mp,
+            use_deterministic_algorithms=use_deterministic_algorithms,
             ops=ops,
             backend_config=backend_config,
             activation_checkpointing=ac,
@@ -672,6 +681,7 @@ def build_from_args(
     config = EngineConfig(
         backend=DistributedBackend(fields["backend"]),
         mixed_precision=MixedPrecisionPolicy(fields["mixed_precision"]),
+        use_deterministic_algorithms=fields.get("use_deterministic_algorithms", False),
         parallel_plan=parallel_plan,
         ops=_build_ops_config(fields),
         backend_config=_build_fsdp_config(fields),

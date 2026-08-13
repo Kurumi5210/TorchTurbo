@@ -33,13 +33,6 @@ dataset=science
 packing_mode=packing_sep
 finetuning_type=full
 
-# # Deterministic computation
-# export HCCL_DETERMINISTIC=True
-# export LCCL_DETERMINISTIC=1
-# export CLOSE_MATMUL_K_SHIFT=1
-# export ATB_MATMUL_SHUFFLE_K_ENABLE=0
-# export ATB_LLM_LCOC_ENABLE=0
-
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
 export PYTHONPATH=/opt/MindSpeed:$PYTHONPATH

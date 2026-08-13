@@ -58,6 +58,21 @@ def test_parse_torchturbo_args_op_policy():
     assert args.op_policy == "custom"
 
 
+def test_parse_torchturbo_args_use_deterministic_algorithms():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    default_args, _ = parse_torchturbo_args([])
+    assert default_args.use_deterministic_algorithms is False
+
+    enabled_args, _ = parse_torchturbo_args(["--tt_use_deterministic_algorithms"])
+    assert enabled_args.use_deterministic_algorithms is True
+    assert enabled_args.config_overrides == {"tt_use_deterministic_algorithms": True}
+
+    disabled_args, _ = parse_torchturbo_args(["--tt_use_deterministic_algorithms=false"])
+    assert disabled_args.use_deterministic_algorithms is False
+    assert disabled_args.config_overrides == {"tt_use_deterministic_algorithms": False}
+
+
 def test_parse_torchturbo_args_moe_aux_loss():
     from torchturbo.engine.args import parse_torchturbo_args
     from torchturbo.engine.config import build_from_args

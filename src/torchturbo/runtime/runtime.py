@@ -12,7 +12,6 @@ _AUTO_DETECT_ORDER: tuple[TurboDevice, ...] = (
     TurboDevice.CPU,
 )
 
-
 def _build_runtime(device: TurboDevice) -> DeviceRuntime:
     match device:
         case TurboDevice.CUDA:

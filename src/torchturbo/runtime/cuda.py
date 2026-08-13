@@ -74,6 +74,11 @@ class CudaRuntime(DeviceRuntime):
     turbo_device = TurboDevice.CUDA
     dist_backend = "nccl"
 
+    def use_deterministic_algorithms(self) -> None:
+        super().use_deterministic_algorithms()
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
     def initialize(self) -> None:
         return None
 

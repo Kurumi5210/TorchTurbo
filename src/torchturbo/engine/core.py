@@ -196,6 +196,8 @@ class TorchTurboEngine:
 
         # Resolve the process-wide device runtime before backend construction.
         self.device_runtime = get_device_runtime()
+        if self.config.use_deterministic_algorithms:
+            self.device_runtime.use_deterministic_algorithms()
         self.backend: BaseBackend = backend_cls(self.config, self.device_runtime)
         self._profiler: BaseProfiler | None = None
         self.ops = get_or_create_ops(

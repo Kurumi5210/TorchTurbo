@@ -56,6 +56,10 @@ class DeviceRuntime(ABC):
     def initialize(self) -> None:
         ...
 
+    def use_deterministic_algorithms(self) -> None:
+        """Enable PyTorch's deterministic algorithm mode."""
+        torch.use_deterministic_algorithms(True)
+
     @abstractmethod
     def current_device(self):
         ...

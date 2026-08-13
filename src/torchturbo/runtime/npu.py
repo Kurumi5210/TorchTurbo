@@ -22,6 +22,14 @@ _NPU_ENV_DEFAULTS = {
     "HCCL_ASYNC_ERROR_HANDLING": "0",
 }
 
+_NPU_DETERMINISTIC_ENV = {
+    "HCCL_DETERMINISTIC": "True",
+    "LCCL_DETERMINISTIC": "1",
+    "CLOSE_MATMUL_K_SHIFT": "1",
+    "ATB_MATMUL_SHUFFLE_K_ENABLE": "0",
+    "ATB_LLM_LCOC_ENABLE": "0",
+}
+
 
 class _NpuProfiler(BaseProfiler):
     def __init__(
@@ -123,6 +131,11 @@ class NpuRuntime(DeviceRuntime):
             os.environ.setdefault(name, value)
 
         self._initialized = True
+
+    def use_deterministic_algorithms(self) -> None:
+        super().use_deterministic_algorithms()
+        for name, value in _NPU_DETERMINISTIC_ENV.items():
+            os.environ[name] = value
 
     @property
     def _npu(self):

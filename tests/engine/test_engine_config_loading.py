@@ -422,6 +422,18 @@ def test_cli_op_policy_overrides_file(tmp_path):
     assert cfg.ops.policy is OpPolicy.AUTO
 
 
+def test_cli_use_deterministic_algorithms_overrides_file(tmp_path):
+    path = _write(tmp_path, "cfg.yaml", "use_deterministic_algorithms: true\n")
+
+    from_file = _build_from_argv(["--tt_config", path])
+    from_cli = _build_from_argv(
+        ["--tt_config", path, "--tt_use_deterministic_algorithms", "false"]
+    )
+
+    assert from_file.use_deterministic_algorithms is True
+    assert from_cli.use_deterministic_algorithms is False
+
+
 # ---------------------------------------------------------------------------
 # Freeze policy layering
 # ---------------------------------------------------------------------------

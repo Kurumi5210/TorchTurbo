@@ -82,6 +82,8 @@ class TorchTurboArgs:
         Distributed backend (``"fsdp2"``).
     mixed_precision:
         Mixed precision policy (``"bf16"``, ``"fp16"``, ``"fp32"``, ``"fp8"``).
+    use_deterministic_algorithms:
+        Require deterministic algorithms for the selected device runtime.
     op_policy:
         Default op dispatch policy (``"auto"``, ``"native"``, ``"custom"``).
     sp_size:
@@ -120,6 +122,7 @@ class TorchTurboArgs:
     backend: str | None = None
     mixed_precision: str | None = None
     op_policy: str | None = None
+    use_deterministic_algorithms: bool = False
     sp_size: int | None = None
     ep_size: int | None = None
     gradient_checkpointing: bool = True
@@ -226,6 +229,16 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         metavar="POLICY",
         help="Default op dispatch policy (auto, native, custom). "
         "Replaces TORCH_TURBO_OP_POLICY.",
+    ),
+    TurboArgSpec(
+        name="use_deterministic_algorithms",
+        args_name="use_deterministic_algorithms",
+        cli_name="--tt_use_deterministic_algorithms",
+        env_name="TORCH_TURBO_USE_DETERMINISTIC_ALGORITHMS",
+        config_path="use_deterministic_algorithms",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Require deterministic algorithms for the selected device runtime.",
     ),
     TurboArgSpec(
         name="sp_size",

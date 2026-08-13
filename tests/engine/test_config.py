@@ -41,6 +41,28 @@ def test_engine_config_from_dict_rejects_flat_op_policy():
         )
 
 
+@pytest.mark.parametrize("value", [False, "false", "f", "0"])
+def test_engine_config_normalizes_disabled_use_deterministic_algorithms(value):
+    from torchturbo.engine.config import EngineConfig
+
+    direct = EngineConfig(use_deterministic_algorithms=value)
+    from_dict = EngineConfig.from_dict({"use_deterministic_algorithms": value})
+
+    assert direct.use_deterministic_algorithms is False
+    assert from_dict.use_deterministic_algorithms is False
+
+
+@pytest.mark.parametrize("value", [True, "true", "t", "1"])
+def test_engine_config_normalizes_enabled_use_deterministic_algorithms(value):
+    from torchturbo.engine.config import EngineConfig
+
+    direct = EngineConfig(use_deterministic_algorithms=value)
+    from_dict = EngineConfig.from_dict({"use_deterministic_algorithms": value})
+
+    assert direct.use_deterministic_algorithms is True
+    assert from_dict.use_deterministic_algorithms is True
+
+
 def test_fsdp_cpu_offload_defaults_to_disabled():
     from torchturbo.engine.config import EngineConfig
 

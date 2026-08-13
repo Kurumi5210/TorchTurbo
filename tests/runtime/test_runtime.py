@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from torchturbo.runtime import (
     is_npu_available,
 )
 from torchturbo.runtime.cpu import CpuRuntime
+from torchturbo.runtime.npu import _NPU_DETERMINISTIC_ENV, NpuRuntime
 import torchturbo.runtime.runtime as runtime_impl
 
 
@@ -26,6 +28,7 @@ class FakeRuntime(DeviceRuntime):
         self._available = available
         self.available_calls = 0
         self.initialized = 0
+        self.deterministic_calls = 0
         self.profiler_calls = []
 
     @property
@@ -38,6 +41,9 @@ class FakeRuntime(DeviceRuntime):
 
     def initialize(self) -> None:
         self.initialized += 1
+
+    def use_deterministic_algorithms(self) -> None:
+        self.deterministic_calls += 1
 
     def current_device(self):
         return 0
@@ -118,6 +124,16 @@ def test_cpu_runtime_contract():
             profiling_enabled=True,
             memory_snapshot_steps=None,
         )
+
+
+def test_use_deterministic_algorithms_sets_process_state(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch, "use_deterministic_algorithms", calls.append)
+    runtime = NpuRuntime()
+    runtime.use_deterministic_algorithms()
+
+    assert calls == [True]
+    assert {name: os.environ[name] for name in _NPU_DETERMINISTIC_ENV} == _NPU_DETERMINISTIC_ENV
 
 
 def test_device_runtime_synchronize_stream():

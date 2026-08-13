@@ -237,6 +237,8 @@ class TurboTrainerMixin:
             _, optimizer_cls, optimizer_kwargs = opt_res
         else:
             optimizer_cls, optimizer_kwargs = opt_res
+        optimizer_kwargs = dict(optimizer_kwargs)
+        optimizer_kwargs["weight_decay"] = self.args.weight_decay
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
         self._optimizer_ori = self.optimizer
         return self.optimizer

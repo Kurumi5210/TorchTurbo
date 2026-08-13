@@ -137,9 +137,11 @@ class TorchTurboTrainerBase:
             self.args,
             self.model,
         )
+        optimizer_kwargs = dict(optimizer_kwargs)
         optimizer_kwargs.pop("params", None)
         optimizer_kwargs.pop("model", None)
         optimizer_kwargs.pop("optimizer_dict", None)
+        optimizer_kwargs["weight_decay"] = self.args.weight_decay
 
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
         logger.info_rank0(

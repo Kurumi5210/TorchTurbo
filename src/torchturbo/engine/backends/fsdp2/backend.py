@@ -1012,29 +1012,48 @@ class FSDP2Backend(BaseBackend):
             return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
 
     def prepare_optimizer(
-        self, model: nn.Module, optimizer_cls: type, **optimizer_kwargs
+        self,
+        model: nn.Module,
+        optimizer_cls: type,
+        *,
+        param_groups: list[dict[str, Any]] | None = None,
+        **optimizer_kwargs: Any,
     ) -> Any:
-        """For FSDP2, create the optimizer."""
-        params = []
-        moe_params = []
-        ignored_params = []
-        edp = self._mesh["edp"]
-        for param in model.parameters():
-            if not param.requires_grad:
-                continue
-            if hasattr(param, "device_mesh"):
-                if param.device_mesh == edp:
-                    moe_params.append(param)
-                else:
-                    params.append(param)
-            else:
-                ignored_params.append(param)
+        """Create the optimizer after splitting parameter groups by FSDP
+        topology.
+        """
+        if param_groups is None:
+            param_groups = [
+                {"params": [param for param in model.parameters() if param.requires_grad]}
+            ]
 
-        optimizer_params = [
-            {"params": params},
-            {"params": moe_params},
-            {"params": ignored_params},
-        ]
+        optimizer_params = []
+        edp = self._mesh["edp"]
+        for param_group in param_groups:
+            group_options = {
+                key: value for key, value in param_group.items() if key != "params"
+            }
+            params = []
+            moe_params = []
+            ignored_params = []
+            for param in param_group["params"]:
+                if not param.requires_grad:
+                    continue
+                if hasattr(param, "device_mesh"):
+                    if param.device_mesh == edp:
+                        moe_params.append(param)
+                    else:
+                        params.append(param)
+                else:
+                    ignored_params.append(param)
+
+            optimizer_params.extend(
+                [
+                    {"params": params, **group_options},
+                    {"params": moe_params, **group_options},
+                    {"params": ignored_params, **group_options},
+                ]
+            )
 
         return optimizer_cls(optimizer_params, **optimizer_kwargs)
 

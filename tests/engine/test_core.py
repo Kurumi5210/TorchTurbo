@@ -57,8 +57,16 @@ class DummyBackend(BaseBackend):
         model._dummy_sharded = True
         return model
 
-    def prepare_optimizer(self, model, optimizer_cls, **kw):
-        return optimizer_cls(model.parameters(), **kw)
+    def prepare_optimizer(
+        self,
+        model,
+        optimizer_cls,
+        *,
+        param_groups=None,
+        **kw,
+    ):
+        params = param_groups if param_groups is not None else model.parameters()
+        return optimizer_cls(params, **kw)
 
 
 class ProfilingBackend(DummyBackend):
@@ -151,7 +159,11 @@ class TestEngineSetup:
         model = TinyModel()
         engine.model = engine.backend.shard_model(model)
         
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
+        engine.prepare_optimizer(
+            torch.optim.AdamW,
+            lr=0.01,
+            weight_decay=0.0,
+        )
         assert engine.optimizer is not None
 
     def test_prepare_optimizer_without_model_raises(self):
@@ -347,7 +359,11 @@ class TestEngineSetup:
         engine = TorchTurboEngine({"backend": "dummy"})
         
         engine.model = engine.backend.shard_model(TinyModel())
-        engine.prepare_optimizer(torch.optim.AdamW, lr=0.01)
+        engine.prepare_optimizer(
+            torch.optim.AdamW,
+            lr=0.01,
+            weight_decay=0.0,
+        )
         
         engine.prepare_lr_scheduler(torch.optim.lr_scheduler.StepLR, step_size=10)
         assert engine.lr_scheduler is not None

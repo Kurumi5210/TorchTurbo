@@ -91,13 +91,14 @@ class BaseBackend(ABC):
 
     @abstractmethod
     def prepare_optimizer(
-        self, model: nn.Module, optimizer_cls: type, **optimizer_kwargs
+        self,
+        model: nn.Module,
+        optimizer_cls: type,
+        *,
+        param_groups: list[dict[str, Any]] | None = None,
+        **optimizer_kwargs: Any,
     ) -> Any:
-        """Create an optimizer compatible with this backend.
-
-        Some backends (e.g. Megatron) require engine-managed optimizers.
-        The default can just instantiate the class normally.
-        """
+        """Create an optimizer from engine-prepared parameter groups."""
 
     @abstractmethod
     def get_dp_info(self) -> dict[str, Any]:

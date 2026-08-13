@@ -163,6 +163,7 @@ class TorchTurboEngine:
         engine.prepare_optimizer(
             optimizer_cls=torch.optim.AdamW,
             lr=1e-4,
+            weight_decay=1e-2,
         )
         engine.prepare_lr_scheduler(
             scheduler_cls=CosineAnnealingLR,
@@ -460,12 +461,17 @@ class TorchTurboEngine:
     ) -> Any:
         """Create an optimizer for the prepared model.
 
-        Must be called **after** ``prepare_model()``.
+        Must be called **after** ``prepare_model()``. ``lr`` and
+        ``weight_decay`` must be passed explicitly.
 
         Example::
 
             model = engine.prepare_model("meta-llama/Llama-2-7b-hf")
-            optimizer = engine.prepare_optimizer(torch.optim.AdamW, lr=1e-4)
+            optimizer = engine.prepare_optimizer(
+                torch.optim.AdamW,
+                lr=1e-4,
+                weight_decay=1e-2,
+            )
 
         Returns the created optimizer (also stored as ``self.optimizer``).
         """
@@ -475,15 +481,60 @@ class TorchTurboEngine:
         if optimizer_cls is None:
             optimizer_cls = torch.optim.AdamW
 
-        kwargs.setdefault("lr", 1e-4)
-        kwargs.setdefault("betas", (0.9, 0.999))
-        kwargs.setdefault("weight_decay", 1e-2)
+        required_kwargs = ("lr", "weight_decay")
+        missing_kwargs = [
+            name for name in required_kwargs if name not in kwargs or kwargs[name] is None
+        ]
+        if missing_kwargs:
+            raise ValueError(
+                "prepare_optimizer requires explicit values for "
+                f"{', '.join(missing_kwargs)}."
+            )
 
+        param_groups = self._prepare_optimizer_param_groups(
+            weight_decay=kwargs["weight_decay"]
+        )
         self.optimizer = self.backend.prepare_optimizer(
-            self.model, optimizer_cls, **kwargs
+            self.model,
+            optimizer_cls,
+            param_groups=param_groups,
+            **kwargs,
         )
         logger.info_rank0("Created optimizer: %s", type(self.optimizer).__name__)
         return self.optimizer
+
+    def _prepare_optimizer_param_groups(
+        self,
+        *,
+        weight_decay: float,
+    ) -> list[dict[str, Any]]:
+        """Split trainable parameters into decay and no-decay optimizer groups."""
+        if self.model is None:
+            raise RuntimeError("No model prepared. Call engine.prepare_model() first.")
+
+        decay_params: list[nn.Parameter] = []
+        no_decay_params: list[nn.Parameter] = []
+        # Megatron Core default: biases and 1-D parameters do not decay.
+        # Reference: megatron.core.optimizer._get_param_groups
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.endswith(".bias") or param.ndim == 1:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        logger.info_rank0(
+            "Prepared optimizer parameter groups: decay=%d, no_decay=%d, "
+            "weight_decay=%s",
+            len(decay_params),
+            len(no_decay_params),
+            weight_decay,
+        )
+        return [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
 
     def prepare_lr_scheduler(
         self,
@@ -496,7 +547,11 @@ class TorchTurboEngine:
 
         Example::
 
-            optimizer = engine.prepare_optimizer(torch.optim.AdamW, lr=1e-4)
+            optimizer = engine.prepare_optimizer(
+                torch.optim.AdamW,
+                lr=1e-4,
+                weight_decay=1e-2,
+            )
             scheduler = engine.prepare_lr_scheduler(
                 CosineAnnealingLR, T_max=1000,
             )

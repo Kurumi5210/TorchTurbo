@@ -226,6 +226,15 @@ class TurboTrainerMixin:
         self.model_wrapped = model
         return model
 
+    def create_optimizer_and_scheduler(self, num_training_steps: int):
+        """Create the engine optimizer and scheduler.
+
+        Compatibility entry point for Transformers versions or external
+        callers that still use the combined optimizer/scheduler hook.
+        """
+        optimizer = self.create_optimizer()
+        self.create_scheduler(num_training_steps, optimizer=optimizer)
+
     def create_optimizer(self, model=None):
         engine = engine_registry.get_engine()
         opt_res = self.get_optimizer_cls_and_kwargs(self.args)

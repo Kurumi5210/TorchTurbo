@@ -23,6 +23,7 @@ export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=1 # 多流
+export TENSORBOARD_LOGGING_DIR=/home/admin/logs/tfevent
 # MLLM data-processing caps (read by swift's mm_plugin, not backend-specific).
 # Defaults here mirror the GPU debug script; override via the environment for
 # one-off adjustments.
@@ -155,7 +156,6 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --bf16 true \
     --dataloader_num_workers "${dataloader_num_workers}" \
     --report_to tensorboard \
-    --logging_dir /home/admin/logs/tfevent \
     --output_dir "${output_dir}" \
     --ddp_timeout 1800000000 \
     --tt_sp_size "${sp_size}" \

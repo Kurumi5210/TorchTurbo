@@ -500,7 +500,7 @@ class TorchTurboEngine:
             param_groups=param_groups,
             **kwargs,
         )
-        logger.info_rank0("Created optimizer: %s", type(self.optimizer).__name__)
+        logger.info_rank0("Created optimizer: %s with kwargs: %s", type(self.optimizer).__name__, kwargs)
         return self.optimizer
 
     def _prepare_optimizer_param_groups(

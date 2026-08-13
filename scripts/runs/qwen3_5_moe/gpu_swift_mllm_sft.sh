@@ -131,6 +131,8 @@ TORCHRUN_FLAGS=(--nproc_per_node "${NPROC_PER_NODE}"
     --learning_rate 1e-5 \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs '{"min_lr":1e-7}' \
+    --weight_decay 0.1 \
+    --adam_beta2 0.95 \
     --warmup_ratio 0.05 \
     --logging_steps 1 \
     --save_strategy steps \

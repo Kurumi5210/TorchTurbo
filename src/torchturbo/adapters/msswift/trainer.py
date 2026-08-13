@@ -11,7 +11,7 @@ is mixed ahead of swift's trainer base for any stage:
 * ``_prepare_inputs`` — bridge swift-packed inputs to turbo's forward contract
   (see :mod:`torchturbo.adapters.msswift.inputs_bridging`).
 * ``save_model`` — engine writes DCP weights; swift still records metadata.
-* ``get_train_dataloader`` — engine SP-aware sampler when ``sp_size > 1``.
+* ``get_train_dataloader`` — engine SP-aware sampler for all ``sp_size``.
 
 :func:`make_turbo_seq2seq_trainer` combines it with swift's
 :class:`Seq2SeqTrainer` for the SFT stage. A future RLHF stage would combine it
@@ -325,39 +325,29 @@ class TurboTrainerMixin:
 
     def get_train_dataloader(self, skip_batches=0):
         engine = engine_registry.get_engine_or_none()
-        sp_size = engine.get_sp_info().get("sp_size", 1) if engine is not None else 1
-        if engine is not None and sp_size > 1 and self.train_dataset is not None:
-            # turbo's SP sampler (GatherAndInnerLoopSPDistributedSampler) yields
-            # sp_size× more samples per rank than a standard DistributedSampler:
-            # every SP group of sp_size ranks jointly consumes sp_size samples
-            # per iteration block, so each rank iterates over sp_size samples
-            # per logical SP step (sp_size micro-batches feed one all-gather
-            # / scatter sequence step). Without compensation the HF step count
-            # (len(dataloader) // gradient_accumulation_steps) is inflated by
-            # sp_size — e.g. sp=2 doubled steps 1019 -> 2040 vs the megatron
-            # path. Scale gradient_accumulation_steps by sp_size ONCE so the
-            # effective global batch size / step count match the non-SP path.
-            # Mirrors the llamafactory adapter's get_train_dataloader.
-            args = self.args
-            if not getattr(args, "_torchturbo_sp_adjusted", False):
-                orig = args.gradient_accumulation_steps
-                args.gradient_accumulation_steps = orig * sp_size
-                args._torchturbo_sp_adjusted = True
-                logger.info_rank0(
-                    "SP=%d: gradient_accumulation_steps %d -> %d (step count "
-                    "compensated)",
-                    sp_size, orig, args.gradient_accumulation_steps,
-                )
-            return engine.create_dataloader(
-                self.train_dataset,
-                batch_size=self._train_batch_size,
-                shuffle=self.args.train_dataloader_shuffle,
-                collate_fn=self.data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-                drop_last=True,
-            )
-        return super().get_train_dataloader(skip_batches=skip_batches)
+        if engine is None or self.train_dataset is None:
+            return super().get_train_dataloader(skip_batches=skip_batches)
+
+        sp_size = engine.get_sp_info().get("sp_size", 1)
+
+        # scale gradient_accumulation_steps by sp_size
+        args = self.args
+        orig = args.gradient_accumulation_steps
+        args.gradient_accumulation_steps = orig * sp_size
+        logger.info_rank0(
+            "SP=%d: gradient_accumulation_steps %d -> %d (step count "
+            "compensated)",
+            sp_size, orig, args.gradient_accumulation_steps,
+        )
+        return engine.create_dataloader(
+            self.train_dataset,
+            batch_size=self._train_batch_size,
+            shuffle=self.args.train_dataloader_shuffle,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=True,
+        )
 
 
 def make_turbo_seq2seq_trainer():

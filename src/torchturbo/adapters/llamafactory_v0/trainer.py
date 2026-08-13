@@ -176,19 +176,15 @@ class TorchTurboTrainerBase:
         engine = self._engine()
         args = self.args
         sp_size = engine.get_sp_info()["sp_size"]
-        if sp_size <= 1:
-            return super().get_train_dataloader()
 
-        if not getattr(args, "_torchturbo_sp_adjusted", False):
-            orig = args.gradient_accumulation_steps
-            args.gradient_accumulation_steps = orig * sp_size
-            args._torchturbo_sp_adjusted = True
-            logger.info_rank0(
-                "SP=%d: gradient_accumulation_steps %d -> %d",
-                sp_size,
-                orig,
-                args.gradient_accumulation_steps,
-            )
+        orig = args.gradient_accumulation_steps
+        args.gradient_accumulation_steps = orig * sp_size
+        logger.info_rank0(
+            "SP=%d: gradient_accumulation_steps %d -> %d",
+            sp_size,
+            orig,
+            args.gradient_accumulation_steps,
+        )
 
         finetuning_args = getattr(self, "finetuning_args", None)
         disable_shuffling = bool(
@@ -261,14 +257,12 @@ class TorchTurboTrainerBase:
         )
 
         # ga *= sp_size must run — compute_diffusion_loss does /ga expecting the SP factor.
-        if sp_size > 1 and not getattr(args, "_torchturbo_sp_adjusted", False):
-            orig_ga = args.gradient_accumulation_steps
-            args.gradient_accumulation_steps = orig_ga * sp_size
-            args._torchturbo_sp_adjusted = True
-            logger.info_rank0(
-                "BD SP=%d: gradient_accumulation_steps %d -> %d",
-                sp_size, orig_ga, args.gradient_accumulation_steps,
-            )
+        orig_ga = args.gradient_accumulation_steps
+        args.gradient_accumulation_steps = orig_ga * sp_size
+        logger.info_rank0(
+            "BD SP=%d: gradient_accumulation_steps %d -> %d",
+            sp_size, orig_ga, args.gradient_accumulation_steps,
+        )
 
         return engine.create_dataloader(
             dataset=dataset,

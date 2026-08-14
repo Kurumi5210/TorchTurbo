@@ -870,8 +870,11 @@ class TorchTurboEngine:
             num_items_in_batch=num_items_in_batch,
             **kwargs,
         )
-        self.metric_tracker.collect(model)
         return result
+
+    def collect_metrics(self, model: nn.Module) -> None:
+        """Collect metrics currently pending on ``model``."""
+        self.metric_tracker.collect(model)
 
     def report_metrics(self, logs: dict, gather: Callable) -> None:
         self.metric_tracker.report(logs, gather)

@@ -341,6 +341,14 @@ class TorchTurboTrainerBase:
             **kwargs,
         )
 
+    def training_step(self, model, inputs, *args, **kwargs):
+        """Collect engine metrics after backward completes."""
+        result = super().training_step(model, inputs, *args, **kwargs)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.collect_metrics(model)
+        return result
+
     def _report_engine_metrics(self, logs) -> None:
         self._engine().report_metrics(logs, self._nested_gather)
 

@@ -171,7 +171,23 @@ class TestEngineSetup:
         with pytest.raises(RuntimeError, match="prepare_model"):
             engine.prepare_optimizer(torch.optim.AdamW)
 
-    def test_compute_loss_collects_model_metrics(self):
+    def test_compute_loss_defers_eval_metrics_until_explicit_collect(self):
+        register_backend("dummy", ProfilingBackend)
+        engine = TorchTurboEngine({"backend": "dummy"})
+        model = TinyModel().eval()
+        model.pop_metrics = lambda: {"test_metric": torch.tensor(2.0)}
+
+        engine.compute_loss(model, {})
+        logs = {}
+        engine.report_metrics(logs, lambda value: value.reshape(1))
+        assert logs == {}
+
+        engine.collect_metrics(model)
+        engine.report_metrics(logs, lambda value: value.reshape(1))
+
+        assert logs == {"test_metric": 2.0}
+
+    def test_compute_loss_defers_training_metrics_until_explicit_collect(self):
         register_backend("dummy", ProfilingBackend)
         engine = TorchTurboEngine({"backend": "dummy"})
         model = TinyModel()
@@ -180,7 +196,10 @@ class TestEngineSetup:
         engine.compute_loss(model, {})
         logs = {}
         engine.report_metrics(logs, lambda value: value.reshape(1))
+        assert logs == {}
 
+        engine.collect_metrics(model)
+        engine.report_metrics(logs, lambda value: value.reshape(1))
         assert logs == {"test_metric": 2.0}
 
     def test_compute_loss_sets_moe_runtime_inputs(self):

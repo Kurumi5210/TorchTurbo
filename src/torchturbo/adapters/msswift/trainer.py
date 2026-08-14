@@ -304,6 +304,14 @@ class TurboTrainerMixin:
 
         return (loss, outputs) if return_outputs else loss
 
+    def training_step(self, model, inputs, *args, **kwargs):
+        """Collect engine metrics after backward completes."""
+        result = super().training_step(model, inputs, *args, **kwargs)
+        engine = engine_registry.get_engine_or_none()
+        if engine is not None:
+            engine.collect_metrics(model)
+        return result
+
     def log(self, logs, *args, **kwargs):
         self._report_engine_metrics(logs)
         return super().log(logs, *args, **kwargs)

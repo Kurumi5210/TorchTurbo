@@ -11,6 +11,7 @@ Precedence is: CLI > file > env > TorchTurboArgs.
 """
 
 import json
+import textwrap
 
 import pytest
 import yaml
@@ -49,6 +50,10 @@ def _write(tmp_path, name: str, content: str) -> str:
     path = tmp_path / name
     path.write_text(content, encoding="utf-8")
     return str(path)
+
+
+def _engine_config(content: str) -> str:
+    return "engine_config:\n" + textwrap.indent(content, "  ")
 
 
 def _build_from_argv(argv: list[str]) -> EngineConfig:
@@ -168,21 +173,24 @@ def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     assert cfg.activation_checkpointing.enabled is False
 
 
-def test_build_from_json_without_wrapper(tmp_path):
+def test_config_without_engineconfig_wrapper_raises(tmp_path):
     data = {
         "mixed_precision": "fp32",
         "parallel_plan": {"sp_size": 3},
     }
-    cfg = _build_from_argv(
-        ["--tt_config", _write(tmp_path, "cfg.json", json.dumps(data))]
-    )
+    path = _write(tmp_path, "cfg.json", json.dumps(data))
 
-    assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
-    assert cfg.parallel_plan.sp_size == 3
+    with pytest.raises(
+        ValueError,
+        match="Unknown key outside engine_config: mixed_precision",
+    ):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_empty_config_file_is_noop(tmp_path):
-    cfg = _build_from_argv(["--tt_config", _write(tmp_path, "empty.yaml", "")])
+    cfg = _build_from_argv(
+        ["--tt_config", _write(tmp_path, "empty.yaml", "engine_config: {}\n")]
+    )
 
     assert cfg.parallel_plan.sp_size == 1
     assert cfg.activation_checkpointing.enabled is True
@@ -201,12 +209,36 @@ def test_malformed_yaml_raises(tmp_path):
         )
 
 
-def test_unknown_top_level_field_is_ignored(tmp_path):
-    cfg = _build_from_argv(
-        ["--tt_config", _write(tmp_path, "unknown.yaml", "bogus: 1\n")]
+def test_unknown_top_level_field_raises(tmp_path):
+    path = _write(tmp_path, "unknown.yaml", "bogus: 1\n")
+
+    with pytest.raises(ValueError, match="Unknown key outside engine_config: bogus"):
+        _build_from_argv(["--tt_config", path])
+
+
+def test_unknown_root_sibling_with_engineconfig_wrapper_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "unknown_root_sibling.yaml",
+        "engine_config:\n  backend: fsdp2\nbogus: 1\n",
     )
 
-    assert "bogus" not in cfg.extra
+    with pytest.raises(
+        ValueError,
+        match="Unknown key outside engine_config: bogus",
+    ):
+        _build_from_argv(["--tt_config", path])
+
+
+def test_unknown_nested_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("backend_config:\n  cpu_offloda: true\n"),
+    )
+
+    with pytest.raises(ValueError, match="Unknown key: backend_config.cpu_offloda"):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_oc_env_interpolation_resolves(tmp_path, monkeypatch):
@@ -214,7 +246,9 @@ def test_oc_env_interpolation_resolves(tmp_path, monkeypatch):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "checkpoint:\n  hf_model_path: ${oc.env:TT_MODEL_NAME_OR_PATH}\n",
+        _engine_config(
+            "checkpoint:\n  hf_model_path: ${oc.env:TT_MODEL_NAME_OR_PATH}\n"
+        ),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
@@ -228,7 +262,9 @@ def test_oc_env_interpolation_without_env_raises(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "checkpoint:\n  hf_model_path: ${oc.env:TT_MODEL_NAME_OR_PATH}\n",
+        _engine_config(
+            "checkpoint:\n  hf_model_path: ${oc.env:TT_MODEL_NAME_OR_PATH}\n"
+        ),
     )
 
     with pytest.raises(InterpolationResolutionError):
@@ -256,7 +292,7 @@ def test_file_overrides_env(monkeypatch, tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "parallel_plan:\n  sp_size: 4\nmixed_precision: fp16\n",
+        _engine_config("parallel_plan:\n  sp_size: 4\nmixed_precision: fp16\n"),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
@@ -269,7 +305,9 @@ def test_cli_overrides_file(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "parallel_plan:\n  sp_size: 4\nactivation_checkpointing:\n  enabled: true\n",
+        _engine_config(
+            "parallel_plan:\n  sp_size: 4\nactivation_checkpointing:\n  enabled: true\n"
+        ),
     )
 
     cfg = _build_from_argv(
@@ -295,7 +333,8 @@ def test_full_four_layer_precedence(monkeypatch, tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   sp_size: 4
 activation_checkpointing:
@@ -303,7 +342,8 @@ activation_checkpointing:
 mixed_precision: fp16
 ops:
   policy: custom
-""",
+"""
+        ),
     )
 
     cfg = _build_from_argv(
@@ -336,7 +376,8 @@ def test_partial_nested_overrides_keep_unset_base_values(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 backend_config:
   cpu_offload: true
 diffusion:
@@ -345,7 +386,8 @@ checkpoint:
   dcp_path: /file/out
 mtp:
   enabled: true
-""",
+"""
+        ),
     )
 
     cfg = build_from_args(
@@ -366,16 +408,17 @@ mtp:
     assert cfg.mtp.loss_scaling_factor == 0.1
 
 
-def test_file_checkpoint_fully_overrides_adapter_seeded_paths(tmp_path):
+def test_file_checkpoint_overrides_adapter_seeded_paths(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 checkpoint:
   hf_model_path: /file/model
   dcp_path: /file/out
-  save_format: hf
-""",
+"""
+        ),
     )
 
     cfg = build_from_args(
@@ -388,11 +431,11 @@ checkpoint:
 
     assert cfg.checkpoint.hf_model_path == "/file/model"
     assert cfg.checkpoint.dcp_path == "/file/out"
-    assert cfg.checkpoint.save_format == "hf"
+    assert cfg.checkpoint.save_format == "dcp"
 
 
 def test_tt_mtp_values_kept_when_file_only_touches_enabled(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "mtp:\n  enabled: false\n")
+    path = _write(tmp_path, "cfg.yaml", _engine_config("mtp:\n  enabled: false\n"))
 
     cfg = build_from_args(
         TorchTurboArgs(
@@ -407,7 +450,7 @@ def test_tt_mtp_values_kept_when_file_only_touches_enabled(tmp_path):
 
 
 def test_cli_mtp_overrides_file(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "mtp:\n  enabled: true\n")
+    path = _write(tmp_path, "cfg.yaml", _engine_config("mtp:\n  enabled: true\n"))
 
     cfg = _build_from_argv(["--tt_config", path, "--tt_enable_mtp", "false"])
 
@@ -415,7 +458,7 @@ def test_cli_mtp_overrides_file(tmp_path):
 
 
 def test_cli_op_policy_overrides_file(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "ops:\n  policy: custom\n")
+    path = _write(tmp_path, "cfg.yaml", _engine_config("ops:\n  policy: custom\n"))
 
     cfg = _build_from_argv(["--tt_config", path, "--tt_op_policy", "auto"])
 
@@ -423,7 +466,11 @@ def test_cli_op_policy_overrides_file(tmp_path):
 
 
 def test_cli_use_deterministic_algorithms_overrides_file(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "use_deterministic_algorithms: true\n")
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("use_deterministic_algorithms: true\n"),
+    )
 
     from_file = _build_from_argv(["--tt_config", path])
     from_cli = _build_from_argv(
@@ -445,30 +492,15 @@ def test_tt_freeze_flags_kept_without_file_or_cli():
     assert cfg.freeze_policy.parameter_groups == (ParameterGroup.LANGUAGE_MODEL,)
 
 
-def test_legacy_file_freeze_groups_do_not_override_tt_freeze_flags(tmp_path):
+def test_file_freeze_parameter_groups_raise(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "freeze_policy:\n  parameter_groups: [vision_tower]\n",
+        _engine_config("freeze_policy:\n  parameter_groups: [vision_tower]\n"),
     )
 
-    cfg = build_from_args(
-        TorchTurboArgs(freeze_language_model=True, config_path=path)
-    )
-
-    assert cfg.freeze_policy.parameter_groups == (ParameterGroup.LANGUAGE_MODEL,)
-
-
-def test_cli_freeze_replaces_file_freeze_groups(tmp_path):
-    path = _write(
-        tmp_path,
-        "cfg.yaml",
-        "freeze_policy:\n  parameter_groups: [vision_tower]\n",
-    )
-
-    cfg = _build_from_argv(["--tt_config", path, "--tt_freeze_language_model"])
-
-    assert cfg.freeze_policy.parameter_groups == (ParameterGroup.LANGUAGE_MODEL,)
+    with pytest.raises(ValueError, match="Unknown key: freeze_policy.parameter_groups"):
+        build_from_args(TorchTurboArgs(freeze_language_model=True, config_path=path))
 
 
 def test_explicit_false_freeze_clears_all_groups(tmp_path):
@@ -488,7 +520,8 @@ def test_file_parallel_plan_parsed_into_fsdp_plan_specs(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   sp_size: 4
   plan:
@@ -496,7 +529,8 @@ parallel_plan:
       activation_checkpoint: true
     "model.visual":
       standalone_world_shard: true
-""",
+"""
+        ),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
@@ -511,12 +545,14 @@ def test_file_plan_without_sp_ep_keeps_tt_values(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   plan:
     "model.layers.*":
       activation_checkpoint: true
-""",
+"""
+        ),
     )
 
     cfg = build_from_args(
@@ -537,7 +573,7 @@ def test_config_sp_ep_override_model_default_plan(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "parallel_plan:\n  sp_size: 2\n  ep_size: 8\n",
+        _engine_config("parallel_plan:\n  sp_size: 2\n  ep_size: 8\n"),
     )
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
@@ -550,12 +586,14 @@ def test_config_disables_model_default_activation_checkpoint(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   plan:
     "model.language_model.layers.*":
       activation_checkpoint: false
-""",
+"""
+        ),
     )
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
@@ -571,12 +609,14 @@ def test_config_disables_model_default_standalone_world_shard(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   plan:
     "model.visual":
       standalone_world_shard: false
-""",
+"""
+        ),
     )
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
@@ -588,12 +628,14 @@ def test_config_adds_plan_entry_missing_from_model_default(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   plan:
     "model.new_module":
       activation_checkpoint: true
-""",
+"""
+        ),
     )
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
@@ -607,12 +649,14 @@ def test_config_no_shard_conflicts_with_model_placement(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   plan:
     "model.language_model.layers.*.mlp.experts":
       no_shard: true
-""",
+"""
+        ),
     )
 
     with pytest.raises(ValueError, match="mutually exclusive"):
@@ -625,7 +669,8 @@ def test_sample_style_config_patches_model_default_without_losing_defaults(
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   sp_size: 2
   ep_size: 8
@@ -640,7 +685,8 @@ parallel_plan:
       standalone_world_shard: true
     "mtp.layers.*":
       activation_checkpoint: true
-""",
+"""
+        ),
     )
 
     plan = _resolve_engine_plan(_build_from_argv(["--tt_config", path]))
@@ -673,18 +719,17 @@ def test_invalid_env_backend_raises(monkeypatch):
 
 
 def test_null_mixed_precision_in_file_raises(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "mixed_precision: null\n")
+    path = _write(tmp_path, "cfg.yaml", _engine_config("mixed_precision: null\n"))
 
     with pytest.raises(ValueError):
         _build_from_argv(["--tt_config", path])
 
 
-def test_flat_op_policy_in_file_is_ignored(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "op_policy: native\n")
+def test_flat_op_policy_in_file_raises(tmp_path):
+    path = _write(tmp_path, "cfg.yaml", _engine_config("op_policy: native\n"))
 
-    cfg = _build_from_argv(["--tt_config", path])
-
-    assert cfg.ops.policy is OpPolicy.AUTO
+    with pytest.raises(ValueError, match="Unknown key: op_policy"):
+        _build_from_argv(["--tt_config", path])
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +743,7 @@ def test_flat_op_policy_in_file_is_ignored(tmp_path):
     "applies EngineConfig fields; flat keys are silently dropped",
 )
 def test_flat_parallel_keys_in_file_are_applied(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "sp_size: 4\nep_size: 2\n")
+    path = _write(tmp_path, "cfg.yaml", _engine_config("sp_size: 4\nep_size: 2\n"))
 
     cfg = _build_from_argv(["--tt_config", path])
 
@@ -706,12 +751,11 @@ def test_flat_parallel_keys_in_file_are_applied(tmp_path):
     assert cfg.parallel_plan.ep_size == 2
 
 
-def test_flat_mtp_keys_in_file_are_applied(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "enable_mtp: true\n")
+def test_flat_mtp_keys_in_file_raise(tmp_path):
+    path = _write(tmp_path, "cfg.yaml", _engine_config("enable_mtp: true\n"))
 
-    cfg = _build_from_argv(["--tt_config", path])
-
-    assert cfg.mtp.enabled is True
+    with pytest.raises(ValueError, match="Unknown key: enable_mtp"):
+        _build_from_argv(["--tt_config", path])
 
 
 @pytest.mark.xfail(
@@ -720,7 +764,7 @@ def test_flat_mtp_keys_in_file_are_applied(tmp_path):
     "applies EngineConfig fields; flat keys are silently dropped",
 )
 def test_flat_checkpoint_keys_in_file_are_applied(tmp_path):
-    path = _write(tmp_path, "cfg.yaml", "dcp_path: /file/out\n")
+    path = _write(tmp_path, "cfg.yaml", _engine_config("dcp_path: /file/out\n"))
 
     cfg = _build_from_argv(["--tt_config", path])
 
@@ -736,7 +780,7 @@ def test_legacy_parallel_key_in_file_is_applied(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "parallel:\n  sp_size: 4\n",
+        _engine_config("parallel:\n  sp_size: 4\n"),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
@@ -753,7 +797,7 @@ def test_legacy_fsdp_key_in_file_is_applied(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        "fsdp:\n  cpu_offload: true\n",
+        _engine_config("fsdp:\n  cpu_offload: true\n"),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
@@ -761,22 +805,38 @@ def test_legacy_fsdp_key_in_file_is_applied(tmp_path):
     assert cfg.backend_config.cpu_offload is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="unknown plan spec keys are silently ignored and produce an "
-    "all-None FSDPPlanSpec instead of raising like unknown top-level keys",
-)
 def test_unknown_plan_spec_field_raises(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        """\
+        _engine_config(
+            """\
 parallel_plan:
   plan:
     "model.layers.*":
       activation_checkpointing: true
-""",
+"""
+        ),
     )
 
-    with pytest.raises(ValueError, match="Unknown"):
+    with pytest.raises(ValueError, match="activation_checkpointing"):
+        _build_from_argv(["--tt_config", path])
+
+
+def test_unknown_plan_spec_nested_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            """\
+parallel_plan:
+  plan:
+    "model.layers.*":
+      activation_checkpoint: true
+      typo_flag: true
+"""
+        ),
+    )
+
+    with pytest.raises(ValueError, match="typo_flag"):
         _build_from_argv(["--tt_config", path])

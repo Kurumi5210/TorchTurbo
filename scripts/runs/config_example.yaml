@@ -45,7 +45,6 @@ engine_config:
   backend_config:
     reshard_after_forward: true
     cpu_offload: false
-    pin_memory: true
     prefetch_strategy: auto
     prefetch_direction: forward_backward
     forward_prefetch_depth: 1

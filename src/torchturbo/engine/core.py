@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import socket
 from collections.abc import Callable, Iterable
@@ -204,13 +205,13 @@ class TorchTurboEngine:
             device_runtime=self.device_runtime,
             default_policy=self.config.ops.policy,
         )
-        self.ops.log_ops_selection()
 
         # These are set by setup()
         self.model: nn.Module | None = None
         self.model_name_or_path: str | None = None
         self.optimizer: Any = None
         self.lr_scheduler: Any = None
+        self.parallel_plan: Any = None
 
         logger.info_rank0(
             "TorchTurboEngine initialized: backend=%s, device=%s",
@@ -318,6 +319,7 @@ class TorchTurboEngine:
 
                 # Resolve parallel plan
                 parallel_plan = self._resolve_parallel_plan(model)
+                self.parallel_plan = parallel_plan
 
                 # Prepare model via backend (module replacement → LoRA → sharding).
                 logger.info_rank0("Sharding model via %s backend", self.config.backend.value)
@@ -427,11 +429,33 @@ class TorchTurboEngine:
         if dist.is_initialized():
             dist.barrier()
 
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            logger.info_rank0("Model prepared: %s (%s)", type(model).__name__, torch_dtype)
-            self._log_model_info(model)
+        self._log_info()
 
         return model
+
+    def _log_info(self) -> None:
+        self.config.parallel_plan = self.parallel_plan
+        engine_config = dataclasses.asdict(self.config)
+        for spec in engine_config["parallel_plan"]["plan"].values():
+            spec.pop("module_kwargs", None)
+
+        logger.info_rank0("TorchTurbo engine summary:")
+        logger.info_rank0(
+            "EngineConfig:\n%s",
+            json.dumps(
+                engine_config,
+                indent=2,
+                default=lambda value: (
+                    getattr(value, "__name__", type(value).__name__)
+                    if callable(value)
+                    else str(value)
+                ),
+            ),
+        )
+
+        self.ops.log_ops_selection()
+
+        self._log_model_info(self.model)
 
     def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
         self.backend.save_model(
@@ -580,17 +604,8 @@ class TorchTurboEngine:
             )
 
         plan = type(model).get_default_parallel_plan()
-        logger.info_rank0(
-            "Auto-discovered default parallel plan from %s "
-            "(plan_keys=%d, sp=%d, ep=%d)",
-            type(model).__name__,
-            len(getattr(plan, "plan", {})),
-            getattr(plan, "sp_size", 1),
-            getattr(plan, "ep_size", 1),
-        )
 
         if self.config.parallel_plan is not None:
-            logger.info_rank0("Overriding parallel plan with engine config")
             engine_plan = self.config.parallel_plan
 
             for attr in ["sp_size", "ep_size"]:
@@ -613,12 +628,6 @@ class TorchTurboEngine:
                     else:
                         plan.plan[fqn] = engine_spec
 
-        logger.info_rank0(
-            "Parallel Plan for %s (sp=%d, ep=%d)",
-            type(model).__name__,
-            getattr(plan, "sp_size", 1),
-            getattr(plan, "ep_size", 1),
-        )
         return plan
 
     # ------------------------------------------------------------------
@@ -1190,7 +1199,7 @@ class TorchTurboEngine:
             return
 
         # --- Architecture ---
-        logger.debug_rank0("Model architecture:\n%s", model)
+        logger.info_rank0("Model architecture:\n%s", model)
 
         # --- Sharding table ---
         try:
@@ -1227,7 +1236,7 @@ class TorchTurboEngine:
             )
 
         lines.append(sep)
-        logger.debug_rank0("Parameter sharding map:\n%s", "\n".join(lines))
+        logger.info_rank0("Parameter sharding map:\n%s", "\n".join(lines))
 
     def __repr__(self) -> str:
         setup_status = "ready" if self.model is not None else "not setup"

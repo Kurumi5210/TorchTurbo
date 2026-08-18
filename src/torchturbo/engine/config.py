@@ -629,9 +629,17 @@ def build_from_args(
     # Layer 3: YAML/JSON config file.
     config_from_file = OmegaConf.create()
     if tt.config_path is not None:
-        config_from_file = OmegaConf.load(tt.config_path)
-        if "engine_config" in config_from_file:
-            config_from_file = config_from_file["engine_config"]
+        raw_config_from_file = OmegaConf.load(tt.config_path)
+        unknown_root_keys = set(raw_config_from_file) - {"engine_config"}
+        if unknown_root_keys:
+            key = sorted(unknown_root_keys)[0]
+            raise ValueError(
+                f"Unknown key outside engine_config: {key}. "
+                "Put TorchTurbo config fields under engine_config."
+            )
+        config_from_file = raw_config_from_file["engine_config"]
+        config_data = OmegaConf.to_container(config_from_file, resolve=False) or {}
+        _validate_config_file(config_data)
 
     # Layer 4: explicitly supplied --tt_* CLI flags.
     config_from_cli = OmegaConf.create()
@@ -703,6 +711,33 @@ def build_from_args(
         config.parallel_plan.ep_size,
     )
     return config
+
+
+def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()) -> None:
+    allowed = {
+        spec.config_path
+        for spec in get_arg_specs()
+        if spec.config_path is not None
+    }
+
+    for key, value in data.items():
+        parts = (*parents, key)
+        path = ".".join(parts)
+        if parts == ("parallel_plan", "plan"):
+            from torchturbo.parallel import FSDPPlanSpec
+
+            plan_fields = {f.name for f in dataclasses.fields(FSDPPlanSpec)}
+            for fqn, spec in value.items():
+                if unknown := set(spec) - plan_fields:
+                    raise ValueError(
+                        "Unknown key: "
+                        + ".".join((*parts, str(fqn), sorted(unknown)[0]))
+                    )
+            continue
+        if not any(path == item or item.startswith(path + ".") for item in allowed):
+            raise ValueError(f"Unknown key: {path}")
+        if isinstance(value, Mapping):
+            _validate_config_file(value, parts)
 
 
 def _build_fsdp_config(fields: Mapping[str, Any]) -> Any:

@@ -879,6 +879,8 @@ class TorchTurboEngine:
             num_items_in_batch=num_items_in_batch,
             **kwargs,
         )
+        if return_outputs:
+            self._record_mtp_outputs(result[1], gradient_accumulation_steps)
         return result
 
     def collect_metrics(self, model: nn.Module) -> None:
@@ -905,6 +907,40 @@ class TorchTurboEngine:
         return self.backend.compute_diffusion_loss(
             model, inputs, ga=ga, return_outputs=return_outputs, **kwargs
         )
+
+    # ------------------------------------------------------------------
+    # MTP loss recording (reported via the shared metric_tracker)
+    # ------------------------------------------------------------------
+
+    def _record_mtp_outputs(
+        self, outputs: Any, gradient_accumulation_steps: int
+    ) -> None:
+        """Record MTP losses stamped on ``outputs`` into ``metric_tracker``.
+
+        The backend sets ``outputs.mtp_loss`` (a list of per-head losses) plus
+        optional ``mtp_loss_scaled`` / ``main_loss`` when MTP (multi-token
+        prediction) is enabled.
+        """
+        mtp_loss = getattr(outputs, "mtp_loss", None)
+        if not mtp_loss:
+            return
+
+        scale = float(gradient_accumulation_steps)
+        metrics: dict[str, torch.Tensor] = {
+            f"mtp_loss/{i}": m * scale for i, m in enumerate(mtp_loss)
+        }
+        # Per-micro-batch mean across heads; the tracker's reduction of this
+        # equals the mean of the per-head ``mtp_loss/{i}`` series.
+        metrics["mtp_loss/avg"] = (sum(mtp_loss) / len(mtp_loss)) * scale
+
+        main_loss = getattr(outputs, "main_loss", None)
+        if main_loss is not None:
+            metrics["mtp_loss/main"] = main_loss * scale
+        scaled_loss = getattr(outputs, "mtp_loss_scaled", None)
+        if scaled_loss is not None:
+            metrics["mtp_loss/scaled"] = scaled_loss * scale
+
+        self.metric_tracker.record(metrics)
 
     # ------------------------------------------------------------------
     # forward / backward API for RL

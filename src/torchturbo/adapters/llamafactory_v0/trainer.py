@@ -354,42 +354,6 @@ class TorchTurboTrainerBase:
 
     def log(self, logs, *args, **kwargs):
         self._report_engine_metrics(logs)
-        buf = getattr(self, "_mtp_loss_buf", None)
-        count = buf["count"] if buf else 0
-        if buf and count > 0 and buf["mtp"]:
-            # mirror HF Trainer's tr_loss reduction
-            grad_accum = self.args.gradient_accumulation_steps
-            opt_steps = count / grad_accum if grad_accum else count
-
-            per_layer = []
-            for acc in buf["mtp"]:
-                gathered = self._nested_gather(acc)
-                per_layer.append(gathered.mean().item() / opt_steps)
-            for i, mean_value in enumerate(per_layer):
-                logs[f"mtp_loss/{i}"] = round(mean_value, 4)
-            logs["mtp_loss/avg"] = round(
-                sum(per_layer) / len(per_layer), 4
-            )
-            if buf["main"] is not None:
-                logs["mtp_loss/main"] = round(
-                    self._nested_gather(buf["main"]).mean().item() / opt_steps,
-                    4,
-                )
-            if buf["scaled"] is not None:
-                logs["mtp_loss/scaled"] = round(
-                    self._nested_gather(buf["scaled"]).mean().item()
-                    / opt_steps,
-                    4,
-                )
-
-            for acc in buf["mtp"]:
-                acc.zero_()
-            if buf["main"] is not None:
-                buf["main"].zero_()
-            if buf["scaled"] is not None:
-                buf["scaled"].zero_()
-            buf["count"] = 0
-
         return super().log(logs, *args, **kwargs)
 
     def _compute_causal_lm_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -420,8 +384,6 @@ class TorchTurboTrainerBase:
             loss = loss * sp_size
             outputs.loss = loss
 
-        self._record_mtp_outputs(outputs)
-
         return (loss, outputs) if return_outputs else loss
 
     def _compute_diffusion_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -436,41 +398,7 @@ class TorchTurboTrainerBase:
         loss, outputs = engine.compute_diffusion_loss(
             model, inputs, ga=ga, return_outputs=True, **kwargs
         )
-        self._record_mtp_outputs(outputs)  # no-op for BD (no mtp_loss attr)
         return (loss, outputs) if return_outputs else loss
-
-    def _record_mtp_outputs(self, outputs) -> None:
-        mtp_loss = getattr(outputs, "mtp_loss", None)
-        if not mtp_loss:
-            return
-
-        buf = getattr(self, "_mtp_loss_buf", None)
-        if buf is None:
-            buf = {"mtp": None, "main": None, "scaled": None, "count": 0}
-            self._mtp_loss_buf = buf
-
-        device = mtp_loss[0].device
-        if buf["mtp"] is None:
-            buf["mtp"] = [
-                torch.zeros((), device=device, dtype=torch.float32)
-                for _ in mtp_loss
-            ]
-        for acc, m in zip(buf["mtp"], mtp_loss):
-            acc.add_(m.detach().float())
-
-        main_loss = getattr(outputs, "main_loss", None)
-        if main_loss is not None:
-            if buf["main"] is None:
-                buf["main"] = torch.zeros((), device=device, dtype=torch.float32)
-            buf["main"].add_(main_loss.detach().float())
-
-        scaled_loss = getattr(outputs, "mtp_loss_scaled", None)
-        if scaled_loss is not None:
-            if buf["scaled"] is None:
-                buf["scaled"] = torch.zeros((), device=device, dtype=torch.float32)
-            buf["scaled"].add_(scaled_loss.detach().float())
-
-        buf["count"] += 1
 
 
 class TorchTurboDPOTrainer(TorchTurboTrainerBase):

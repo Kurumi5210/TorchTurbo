@@ -2398,7 +2398,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         ```"""
 
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=None if inputs_embeds is not None else input_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,

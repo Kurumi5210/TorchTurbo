@@ -435,20 +435,25 @@ class TorchTurboEngine:
 
     def _log_info(self) -> None:
         self.config.parallel_plan = self.parallel_plan
-        engine_config = dataclasses.asdict(self.config)
-        for spec in engine_config["parallel_plan"]["plan"].values():
-            spec.pop("module_kwargs", None)
 
         logger.info_rank0("TorchTurbo engine summary:")
         logger.info_rank0(
             "EngineConfig:\n%s",
             json.dumps(
-                engine_config,
+                vars(self.config),
                 indent=2,
                 default=lambda value: (
-                    getattr(value, "__name__", type(value).__name__)
-                    if callable(value)
-                    else str(value)
+                    {
+                        field.name: getattr(value, field.name)
+                        for field in dataclasses.fields(value)
+                        if field.name != "module_kwargs"
+                    }
+                    if dataclasses.is_dataclass(value)
+                    else (
+                        getattr(value, "__name__", type(value).__name__)
+                        if callable(value)
+                        else str(value)
+                    )
                 ),
             ),
         )

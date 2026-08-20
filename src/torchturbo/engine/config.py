@@ -83,13 +83,24 @@ class MixedPrecisionConfig:
 
 @dataclass
 class OpsConfig:
-    """Op dispatch configuration."""
+    """Op dispatch policy and optional per-op overrides."""
 
     policy: OpPolicy = OpPolicy.AUTO
+    overrides: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.policy, OpPolicy):
             raise TypeError("OpsConfig.policy must be an OpPolicy.")
+        if not isinstance(self.overrides, dict):
+            raise TypeError("OpsConfig.overrides must be a dict.")
+        if any(
+            not isinstance(op_name, str) or not isinstance(impl_name, str)
+            for op_name, impl_name in self.overrides.items()
+        ):
+            raise TypeError(
+                "OpsConfig.overrides must map op names to implementation names."
+            )
+        self.overrides = dict(self.overrides)
 
 
 @dataclass
@@ -773,10 +784,12 @@ def _build_checkpoint_config(fields: Mapping[str, Any]) -> CheckpointConfig:
 
 def _build_ops_config(fields: Mapping[str, Any]) -> OpsConfig:
     """OpsConfig from the merged config dict."""
-    policy = (fields.get("ops") or {}).get("policy")
-    if policy is None:
-        return OpsConfig()
-    return OpsConfig(policy=OpPolicy(str(policy).lower()))
+    ops_d = fields.get("ops") or {}
+    policy = OpPolicy(str(ops_d.get("policy", OpPolicy.AUTO.value)).lower())
+    return OpsConfig(
+        policy=policy,
+        overrides=ops_d.get("overrides", {}),
+    )
 
 
 def _build_mtp_config(fields: Mapping[str, Any]) -> MTPConfig:

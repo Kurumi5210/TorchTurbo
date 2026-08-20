@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
@@ -30,12 +31,21 @@ class OpDispatcher:
         device_runtime: DeviceRuntime,
         registry: OpRegistry,
         default_policy: OpPolicy = OpPolicy.AUTO,
+        overrides: Mapping[str, str] | None = None,
     ) -> None:
         if not isinstance(default_policy, OpPolicy):
             raise TypeError("default_policy must be an OpPolicy.")
         self.registry = registry
         self._device_runtime = device_runtime
         self._default_policy = default_policy
+        self._overrides = dict(overrides or {})
+        if any(
+            not isinstance(op_name, str) or not isinstance(impl_name, str)
+            for op_name, impl_name in self._overrides.items()
+        ):
+            raise TypeError(
+                "overrides must map op names to implementation names."
+            )
         self._impls: dict[str, OpImpl] = {}
         self._impl_classes: dict[str, type[OpImpl]] = {}
         self._candidate_impl_cache: dict[
@@ -51,6 +61,10 @@ class OpDispatcher:
     @property
     def default_policy(self) -> OpPolicy:
         return self._default_policy
+
+    @property
+    def overrides(self) -> dict[str, str]:
+        return dict(self._overrides)
 
     def _index_provider_module(
         self,
@@ -95,11 +109,18 @@ class OpDispatcher:
         specs = self.registry.list(
             spec_filter=lambda spec: not spec.devices or device in spec.devices
         )
-        op_names = sorted({spec.op_name for spec in specs})
-        for op_name in op_names:
+        op_names = {spec.op_name for spec in specs}
+        op_names.update(self._overrides)
+        for op_name in sorted(op_names):
+            override = self._overrides.get(op_name)
             try:
-                self._candidate_impl(op_name, device)
+                self._candidate_impl(op_name, device, impl=override)
             except RuntimeError as exc:
+                if override is not None:
+                    raise RuntimeError(
+                        f"Invalid override for op {op_name!r}: "
+                        f"{override!r}. {exc}"
+                    ) from exc
                 self._unresolved_ops[op_name] = str(exc)
 
     def _candidate_key(
@@ -187,19 +208,24 @@ class OpDispatcher:
         return impl
 
     def log_ops_selection(self) -> None:
-        """Log the implementations selected for this dispatcher."""
-        default_candidates = {
+        """Log the selected ops for this dispatcher."""
+        selected_candidates = {
             op_name: candidate
             for (op_name, _, impl_name), candidate in self._candidate_impl_cache.items()
-            if impl_name is None
+            if impl_name == self._overrides.get(op_name)
         }
-        op_names = sorted(set(default_candidates) | set(self._unresolved_ops))
+        op_names = sorted(set(selected_candidates) | set(self._unresolved_ops))
         rows: list[tuple[str, str, str, str, str]] = []
         for op_name in op_names:
-            candidate = default_candidates.get(op_name)
+            candidate = selected_candidates.get(op_name)
             if candidate is None:
                 rows.append((op_name, "-", "-", "-", "unavailable"))
                 continue
+
+            if op_name in self._overrides:
+                status = "overridden"
+            else:
+                status = "fallback" if candidate.fallback else "selected"
 
             rows.append(
                 (
@@ -207,7 +233,7 @@ class OpDispatcher:
                     candidate.spec.impl_name,
                     candidate.spec.kind.value,
                     str(candidate.spec.priority),
-                    "fallback" if candidate.fallback else "selected",
+                    status,
                 )
             )
 
@@ -255,7 +281,12 @@ class OpDispatcher:
         **kwargs: Any,
     ):
         device = self._device_runtime.turbo_device
-        impl_obj = self._candidate_impl(op_name, device, impl=impl)
+        selected_impl = (
+            impl
+            if impl is not None
+            else self._overrides.get(op_name)
+        )
+        impl_obj = self._candidate_impl(op_name, device, impl=selected_impl)
         return impl_obj(*args, **kwargs)
 
     def rms_norm(

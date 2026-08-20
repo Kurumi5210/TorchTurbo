@@ -253,15 +253,21 @@ Provider 文件名不应以 `_` 开头；实现类应直接定义在 provider �
 
 ### 实现选择
 
-默认选择按以下步骤进行：
+Dispatcher 按以下顺序选择实现：
 
-1. 过滤相同 `op_name`；
-2. 保留 `devices=()` 或包含当前 `TurboDevice` 的实现；
-3. 根据 `OpPolicy` 过滤实现类型；
-4. 按 `priority` 从高到低排序；
-5. 同优先级时，设备专用实现优先于通用实现，custom 优先于 native；
-6. 依次调用 `available()`，选择第一个可用实现；
-7. 按 `(op_name, device, explicit_impl)` 缓存选择结果。
+1. 如果调用点传入了 `impl=`，直接使用该实现；
+2. 否则，如果 `OpsConfig.overrides` 为当前 op 指定了实现，使用配置中的实现；
+3. 如果没有显式指定实现，进入自动选择：
+   - **3.1 设备过滤**：保留当前 op 中 `devices=()` 或包含当前
+     `TurboDevice` 的实现；
+   - **3.2 Policy 过滤**：根据 `OpPolicy` 保留 native、custom 或两者；
+   - **3.3 优先级排序**：按 `priority` 从高到低排序；
+   - **3.4 同优先级排序**：设备专用实现优先于通用实现，custom 优先于 native；
+   - **3.5 可用性检查**：依次调用 `available()`，选择第一个可用实现。
+
+前两种属于显式选择，不会再比较其他实现；指定的实现与当前 op 或设备不匹配，
+或者依赖不可用时会直接报错，不会自动换用其他实现。调用点 `impl=` 只影响当前调用，
+优先级高于配置覆盖。
 
 `priority=0` 通常用于 native 基准实现，设备加速实现通常使用更高优先级，例如
 `50` 或 `100`。优先级表达同一策略内的实现偏好，不能改变严格 policy 的边界。
@@ -294,8 +300,8 @@ output = ops.rms_norm(
 ### 进程级 Dispatcher
 
 `TorchTurboEngine` 使用 `get_or_create_ops()` 创建进程级 Dispatcher。后续 Engine
-只有在 device 和 policy 都一致时才能复用它；冲突配置会报错，避免已经构造的
-模型在运行中悄悄切换实现。
+只有在 device、policy 和 per-op overrides 都一致时才能复用它；
+冲突配置会报错，避免已经构造的模型在运行中悄悄切换实现。
 
 `from torchturbo.ops import ops` 得到的是延迟代理。真正调用时它会访问进程级
 Dispatcher，因此必须先完成以下任一初始化：
@@ -528,7 +534,12 @@ from torchturbo.ops import OpPolicy
 
 
 config = EngineConfig(
-    ops=OpsConfig(policy=OpPolicy.AUTO),
+    ops=OpsConfig(
+        policy=OpPolicy.AUTO,
+        overrides={
+            "rms_norm": "torch_rms_norm",
+        },
+    ),
 )
 ```
 
@@ -539,6 +550,9 @@ config = EngineConfig.from_dict(
     {
         "ops": {
             "policy": "native",
+            "overrides": {
+                "rms_norm": "torch_rms_norm",
+            },
         },
     }
 )
@@ -550,6 +564,10 @@ config = EngineConfig.from_dict(
 python your_entry.py --tt_op_policy custom
 TORCH_TURBO_OP_POLICY=native python your_entry.py
 ```
+
+`overrides` 按 op 名称指定具体 `impl_name`，并由 Engine 交给进程级 Dispatcher。
+配置覆盖不会 fallback，无效时 Dispatcher 初始化直接报错。Dispatcher 只发现
+native 和当前 Runtime 的 provider，因此只能配置与当前 Runtime 匹配的实现。
 
 ### 7. 添加测试
 

@@ -143,6 +143,59 @@ def test_engine_config_from_dict_parses_ops_policy():
     assert from_enum.ops.policy is OpPolicy.CUSTOM
 
 
+def test_engine_config_from_dict_parses_per_op_overrides():
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.ops.base import OpPolicy
+
+    cfg = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "ops": {
+                "policy": "auto",
+                "overrides": {
+                    "rms_norm": "torch_rms_norm",
+                    "grouped_matmul": "grouped_gemm",
+                },
+            },
+        }
+    )
+
+    assert cfg.ops.policy is OpPolicy.AUTO
+    assert cfg.ops.overrides == {
+        "rms_norm": "torch_rms_norm",
+        "grouped_matmul": "grouped_gemm",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [None, [], {"rms_norm": 1}, {1: "torch_rms_norm"}],
+)
+def test_ops_config_rejects_invalid_overrides(overrides):
+    from torchturbo.engine.config import OpsConfig
+
+    with pytest.raises(TypeError, match="OpsConfig.overrides"):
+        OpsConfig(overrides=overrides)
+
+
+def test_ops_config_copies_overrides():
+    from torchturbo.engine.config import OpsConfig
+
+    overrides = {"rms_norm": "torch_rms_norm"}
+    config = OpsConfig(overrides=overrides)
+    overrides["rms_norm"] = "other"
+
+    assert config.overrides == {"rms_norm": "torch_rms_norm"}
+
+
+@pytest.mark.parametrize("overrides", [None, []])
+def test_build_ops_config_rejects_falsey_invalid_overrides(overrides):
+    from torchturbo.engine.config import _build_ops_config
+
+    with pytest.raises(TypeError, match="OpsConfig.overrides"):
+        _build_ops_config({"ops": {"overrides": overrides}})
+
+
 def test_engine_config_json_round_trip_restores_ops_policy():
     from torchturbo.engine.config import EngineConfig
     from torchturbo.engine.config import OpsConfig
@@ -154,6 +207,23 @@ def test_engine_config_json_round_trip_restores_ops_policy():
     restored = EngineConfig.from_dict(serialized)
 
     assert restored.ops.policy is OpPolicy.NATIVE
+
+
+def test_engine_config_json_round_trip_restores_per_op_overrides():
+    from torchturbo.engine.config import EngineConfig, OpsConfig
+
+    original = EngineConfig(
+        ops=OpsConfig(
+            overrides={
+                "rms_norm": "torch_rms_norm",
+                "swiglu": "torch_swiglu",
+            }
+        )
+    )
+    serialized = json.loads(json.dumps(original.to_dict()))
+    restored = EngineConfig.from_dict(serialized)
+
+    assert restored.ops.overrides == original.ops.overrides
 
 
 def test_freeze_policy_direct_constructor_accepts_parameter_groups():

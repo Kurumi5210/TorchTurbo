@@ -41,6 +41,8 @@ engine_config:
 
   ops:
     policy: auto
+    overrides:
+      rms_norm: torch_rms_norm
 
   backend_config:
     reshard_after_forward: true

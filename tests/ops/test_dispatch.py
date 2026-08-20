@@ -358,6 +358,210 @@ def test_dispatcher_caches_selected_impl_after_first_resolution(monkeypatch):
     assert CachedAddImpl.available_calls == 1
 
 
+def test_dispatcher_uses_config_override_and_call_override(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="torchturbo.ops.dispatcher")
+    registry = OpRegistry()
+    overridden = OpSpec(
+        op_name="add",
+        impl_name="overridden_add",
+        kind=OpImplKind.CUSTOM,
+        priority=100,
+        devices=(TurboDevice.CPU,),
+    )
+    call_override = OpSpec(
+        op_name="add",
+        impl_name="call_override_add",
+        kind=OpImplKind.NATIVE,
+        priority=0,
+        devices=(TurboDevice.CPU,),
+    )
+    registry.register(overridden)
+    registry.register(call_override)
+
+    class OverriddenAddImpl(OpImpl):
+        def __call__(self, x):
+            return x + 10
+
+    class CallOverrideAddImpl(OpImpl):
+        def __call__(self, x):
+            return x + 20
+
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {
+            overridden.impl_name: OverriddenAddImpl,
+            call_override.impl_name: CallOverrideAddImpl,
+        },
+    )
+    dispatcher = OpDispatcher(
+        registry=registry,
+        device_runtime=CpuRuntime(),
+        default_policy=OpPolicy.NATIVE,
+        overrides={"add": overridden.impl_name},
+    )
+
+    x = torch.tensor([1.0])
+    assert torch.equal(dispatcher.add(x), torch.tensor([11.0]))
+    assert torch.equal(
+        dispatcher.add(x, impl=call_override.impl_name), torch.tensor([21.0])
+    )
+    assert dispatcher.overrides == {"add": "overridden_add"}
+    dispatcher.log_ops_selection()
+    assert "overridden" in caplog.text
+
+
+def test_dispatcher_rejects_invalid_override(monkeypatch):
+    registry = OpRegistry()
+    spec = OpSpec(
+        op_name="add",
+        impl_name="native_add",
+        kind=OpImplKind.NATIVE,
+        priority=0,
+        devices=(TurboDevice.CPU,),
+    )
+    registry.register(spec)
+
+    class NativeAddImpl(OpImpl):
+        def __call__(self, x):
+            return x
+
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {spec.impl_name: NativeAddImpl},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Invalid override.*No OpSpec registered",
+    ):
+        OpDispatcher(
+            registry=registry,
+            device_runtime=CpuRuntime(),
+            overrides={"add": "missing_add"},
+        )
+
+
+def test_dispatcher_rejects_impl_overridden_for_different_op(monkeypatch):
+    registry = OpRegistry()
+    spec = OpSpec(
+        op_name="multiply",
+        impl_name="native_multiply",
+        kind=OpImplKind.NATIVE,
+        priority=0,
+        devices=(TurboDevice.CPU,),
+    )
+    registry.register(spec)
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Invalid override.*registered for op 'multiply'",
+    ):
+        OpDispatcher(
+            registry=registry,
+            device_runtime=CpuRuntime(),
+            overrides={"add": spec.impl_name},
+        )
+
+
+def test_dispatcher_rejects_impl_unsupported_on_current_device(monkeypatch):
+    registry = OpRegistry()
+    spec = OpSpec(
+        op_name="add",
+        impl_name="npu_add",
+        kind=OpImplKind.CUSTOM,
+        priority=0,
+        devices=(TurboDevice.NPU,),
+    )
+    registry.register(spec)
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Invalid override.*does not support device=cpu",
+    ):
+        OpDispatcher(
+            registry=registry,
+            device_runtime=CpuRuntime(),
+            overrides={"add": spec.impl_name},
+        )
+
+
+def test_dispatcher_rejects_unavailable_override(monkeypatch):
+    registry = OpRegistry()
+    spec = OpSpec(
+        op_name="add",
+        impl_name="unavailable_add",
+        kind=OpImplKind.CUSTOM,
+        priority=0,
+        devices=(TurboDevice.CPU,),
+    )
+    registry.register(spec)
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {spec.impl_name: UnavailableAddImpl},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Invalid override.*unavailable=\['unavailable_add'\]",
+    ):
+        OpDispatcher(
+            registry=registry,
+            device_runtime=CpuRuntime(),
+            overrides={"add": spec.impl_name},
+        )
+
+
+def test_dispatcher_rejects_override_for_unknown_op(monkeypatch):
+    registry = OpRegistry()
+    spec = OpSpec(
+        op_name="add",
+        impl_name="native_add",
+        kind=OpImplKind.NATIVE,
+        priority=0,
+        devices=(TurboDevice.CPU,),
+    )
+    registry.register(spec)
+    monkeypatch.setattr(
+        OpDispatcher,
+        "_load_provider_impl_classes",
+        lambda self, device: {},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Invalid override.*not 'aardvark'",
+    ):
+        OpDispatcher(
+            registry=registry,
+            device_runtime=CpuRuntime(),
+            overrides={"aardvark": spec.impl_name},
+        )
+
+
+def test_process_dispatcher_rejects_different_overrides():
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible configuration.*overrides",
+    ):
+        get_or_create_ops(
+            device_runtime=CpuRuntime(),
+            overrides={"rms_norm": "torch_rms_norm"},
+        )
+
+
 def test_dispatcher_logs_selected_ops(caplog):
     caplog.set_level(logging.INFO, logger="torchturbo.ops.dispatcher")
 

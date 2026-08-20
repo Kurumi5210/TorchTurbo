@@ -204,6 +204,7 @@ class TorchTurboEngine:
         self.ops = get_or_create_ops(
             device_runtime=self.device_runtime,
             default_policy=self.config.ops.policy,
+            overrides=self.config.ops.overrides,
         )
 
         # These are set by setup()

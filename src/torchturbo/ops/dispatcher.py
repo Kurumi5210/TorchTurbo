@@ -323,6 +323,24 @@ class OpDispatcher:
             impl=impl,
         )
 
+    def matmul_add(
+        self,
+        accumulator,
+        lhs,
+        rhs,
+        *,
+        transpose_lhs: bool = False,
+        impl: str | None = None,
+    ):
+        return self._dispatch(
+            "matmul_add",
+            accumulator,
+            lhs,
+            rhs,
+            transpose_lhs=transpose_lhs,
+            impl=impl,
+        )
+
     def gated_activation(
         self,
         x,

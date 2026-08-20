@@ -170,6 +170,7 @@ class MTPConfig:
 
     enabled: bool = False
     loss_scaling_factor: float = 0.1
+    log_loss: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.enabled, str):
@@ -177,6 +178,45 @@ class MTPConfig:
         else:
             self.enabled = bool(self.enabled)
         self.loss_scaling_factor = float(self.loss_scaling_factor)
+        if self.loss_scaling_factor < 0:
+            raise ValueError(
+                "MTP loss_scaling_factor must be non-negative, got "
+                f"{self.loss_scaling_factor}"
+            )
+        if isinstance(self.log_loss, str):
+            self.log_loss = string_to_bool(self.log_loss)
+        else:
+            self.log_loss = bool(self.log_loss)
+
+
+@dataclass
+class LossChunkConfig:
+    """Chunked fused ``lm_head`` + cross-entropy configuration.
+
+    When enabled, the model returns its final hidden states without running the
+    ``lm_head``. The backend then computes linear + cross-entropy in flattened
+    token chunks, so it never materializes full ``[tokens, vocab]`` logits.
+    """
+
+    enabled: bool = False
+    """Enable chunked linear cross-entropy during training."""
+
+    chunk_size: int = 1024
+    """Flattened tokens per chunk."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.enabled, str):
+            self.enabled = string_to_bool(self.enabled)
+        else:
+            self.enabled = bool(self.enabled)
+        self.chunk_size = int(self.chunk_size)
+        self.validate()
+
+    def validate(self) -> None:
+        if self.chunk_size <= 0:
+            raise ValueError(
+                f"loss_chunk.chunk_size must be positive, got {self.chunk_size}"
+            )
 
 
 @dataclass
@@ -323,6 +363,9 @@ class EngineConfig:
     moe: MoEConfig = field(default_factory=MoEConfig)
     """MoE training settings."""
 
+    loss_chunk: LossChunkConfig = field(default_factory=LossChunkConfig)
+    """Chunked fused ``lm_head`` + CE settings."""
+
     freeze_policy: FreezePolicy = field(default_factory=FreezePolicy)
     """Policy for freezing semantic model parameter groups."""
 
@@ -341,6 +384,8 @@ class EngineConfig:
             self.backend_config = self._default_backend_config()
         if self.ops is None:
             self.ops = OpsConfig()
+        if self.loss_chunk is None:
+            self.loss_chunk = LossChunkConfig()
 
     def _default_backend_config(self) -> Any:
         """Create the default config for the selected backend."""
@@ -445,6 +490,9 @@ class EngineConfig:
         # MoE
         moe_config = cls._parse_moe_config(d.get("moe", {}))
 
+        # Chunked fused lm_head + CE
+        loss_chunk_config = cls._parse_loss_chunk_config(d)
+
         # Freeze policy
         freeze_policy = cls._parse_freeze_policy(d.get("freeze_policy", {}))
 
@@ -482,6 +530,10 @@ class EngineConfig:
             "moe",
             "enable_mtp",
             "mtp_loss_scaling_factor",
+            "mtp_log_loss",
+            "loss_chunk",
+            "enable_chunk_loss",
+            "loss_chunk_size",
             "freeze_policy",
         }
         extra = {k: v for k, v in d.items() if k not in known_keys}
@@ -498,9 +550,27 @@ class EngineConfig:
             checkpoint=ckpt,
             mtp=mtp_config,
             moe=moe_config,
+            loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
             extra=extra,
         )
+
+    @staticmethod
+    def _parse_loss_chunk_config(d: dict[str, Any]) -> LossChunkConfig:
+        chunk_d = d.get("loss_chunk", {})
+        if isinstance(chunk_d, LossChunkConfig):
+            return chunk_d
+        if chunk_d is None:
+            chunk_d = {}
+        if not isinstance(chunk_d, dict):
+            raise TypeError("loss_chunk must be a dict or LossChunkConfig.")
+
+        chunk_d = dict(chunk_d)
+        if "enable_chunk_loss" in d:
+            chunk_d["enabled"] = d["enable_chunk_loss"]
+        if "loss_chunk_size" in d:
+            chunk_d["chunk_size"] = d["loss_chunk_size"]
+        return LossChunkConfig(**chunk_d)
 
     @staticmethod
     def _parse_mtp_config(d: dict[str, Any]) -> MTPConfig:
@@ -517,6 +587,8 @@ class EngineConfig:
             mtp_d["enabled"] = d["enable_mtp"]
         if "mtp_loss_scaling_factor" in d:
             mtp_d["loss_scaling_factor"] = d["mtp_loss_scaling_factor"]
+        if "mtp_log_loss" in d:
+            mtp_d["log_loss"] = d["mtp_log_loss"]
         if mtp_d.get("loss_scaling_factor") is None:
             mtp_d["loss_scaling_factor"] = 0.1
         return MTPConfig(**mtp_d)
@@ -709,6 +781,7 @@ def build_from_args(
         checkpoint=_build_checkpoint_config(fields),
         mtp=_build_mtp_config(fields),
         moe=_build_moe_config(fields),
+        loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
         diffusion=_build_diffusion_config(fields),
         extra={},
@@ -805,6 +878,16 @@ def _build_mtp_config(fields: Mapping[str, Any]) -> MTPConfig:
         loss_scaling_factor=float(
             loss_scaling_factor if loss_scaling_factor is not None else 0.1
         ),
+        log_loss=string_to_bool(mtp_d.get("log_loss", False)),
+    )
+
+
+def _build_loss_chunk_config(fields: Mapping[str, Any]) -> LossChunkConfig:
+    """LossChunkConfig from the merged config dict."""
+    chunk_d = fields.get("loss_chunk") or {}
+    return LossChunkConfig(
+        enabled=chunk_d.get("enabled", fields.get("enable_chunk_loss", False)),
+        chunk_size=chunk_d.get("chunk_size", fields.get("loss_chunk_size", 1024)),
     )
 
 

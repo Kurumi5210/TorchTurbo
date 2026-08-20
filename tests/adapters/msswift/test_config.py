@@ -145,16 +145,25 @@ def test_no_freeze_default():
 
 
 def test_mtp_config_mapping():
-    _set_tt(enable_mtp=True, mtp_loss_scaling_factor=0.3)
+    _set_tt(enable_mtp=True, mtp_loss_scaling_factor=0.3, mtp_log_loss=True)
     cfg = build_config_from_swift_args(_base_args())
     assert cfg.mtp.enabled is True
     assert cfg.mtp.loss_scaling_factor == pytest.approx(0.3)
+    assert cfg.mtp.log_loss is True
 
 
 def test_mtp_off_default():
     _set_tt()
     cfg = build_config_from_swift_args(_base_args())
     assert cfg.mtp.enabled is False
+    assert cfg.mtp.log_loss is False
+
+
+def test_chunked_loss_config_mapping():
+    _set_tt(enable_chunk_loss=True, loss_chunk_size=384)
+    cfg = build_config_from_swift_args(_base_args())
+    assert cfg.loss_chunk.enabled is True
+    assert cfg.loss_chunk.chunk_size == 384
 
 
 def test_activation_checkpointing_owned_by_engine():

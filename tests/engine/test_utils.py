@@ -1,9 +1,33 @@
 """Tests for dependency-light engine utilities."""
 
+import pytest
 import torch
 import torch.nn as nn
 
-from torchturbo.engine.utils import has_meta_tensor, strip_peft_prefix
+from torchturbo.engine.utils import (
+    has_meta_tensor,
+    strip_peft_prefix,
+    validate_signature,
+)
+
+
+def test_validate_signature_requires_explicit_keyword_with_exact_default():
+    def supported(*, flag=False):
+        pass
+
+    def kwargs_only(**kwargs):
+        pass
+
+    def wrong_default(*, flag=0):
+        pass
+
+    def positional_only(flag=False, /):
+        pass
+
+    validate_signature(supported, flag=False)
+    for function in (kwargs_only, wrong_default, positional_only):
+        with pytest.raises(TypeError, match="flag"):
+            validate_signature(function, flag=False)
 
 
 def test_strip_peft_prefix_normalizes_wrapped_names():

@@ -1,13 +1,14 @@
 """FSDP2 distributed backend — ``torch.distributed.fsdp.fully_shard``."""
 
 import functools
-import os
 from dataclasses import dataclass
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch.distributed as dist
 import torch
 import torch.nn as nn
+
 try:
     from torch.nn.utils import clip_grads_with_norm_, get_total_norm
 except ImportError:  # pragma: no cover - torch<2.9 compatibility
@@ -16,14 +17,14 @@ except ImportError:  # pragma: no cover - torch<2.9 compatibility
         _get_total_norm as get_total_norm,
     )
 
+from torchturbo.models.base import SequenceParallelInputMode
 from torchturbo.models.modules.attention.ulysses import (
     slice_input_tensor,
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
 from torchturbo.models.modules.comm import all_gather_tensor
-from torchturbo.models.base import SequenceParallelInputMode
-from torchturbo.ops import ops
+from torchturbo.models.modules.loss import chunk_loss, logits_loss
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
@@ -32,6 +33,7 @@ from torchturbo.parallel import (
 from torchturbo.runtime import DeviceRuntime
 from torchturbo.engine.utils import strip_peft_prefix
 from torchturbo.utils.flash_attn_utils import get_unpad_data
+from torchturbo.utils.torch_utils import torch_version
 
 from ...backend_registry import register_backend
 from ...config import EngineConfig
@@ -42,6 +44,23 @@ from .config import FSDPConfig
 from .prefetch import FSDPPrefetchManager
 
 logger = get_logger(__name__)
+
+if torch_version() >= (2, 6, 0):
+    from torch.distributed.fsdp._fully_shard import (
+        FSDPModule,
+        register_fsdp_forward_method,
+    )
+else:  # pragma: no cover - torch<2.6 compatibility
+    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+
+    try:  # pragma: no cover - torch<2.6 compatibility
+        from torch.distributed._composable.fsdp.fully_shard import (
+            register_fsdp_forward_method,
+        )
+    except ImportError:  # pragma: no cover - older torch compatibility
+        register_fsdp_forward_method = None
+
+from torch.distributed.tensor import DTensor
 
 
 @dataclass
@@ -592,8 +611,8 @@ class FSDP2Backend(BaseBackend):
             except (NotImplementedError, AttributeError):
                 pass
 
-        # Output embedding (turbo ``get_output_embeddings`` -> ``get_lm_head`` by
-        # default, overridable per model; non-turbo models keep HF's API).
+        # Output embedding (``get_output_embeddings`` delegates to
+        # ``get_lm_head`` by default and remains overridable per model).
         output_embed = None
         get_output_embeddings = getattr(model, "get_output_embeddings", None)
         if callable(get_output_embeddings):
@@ -610,9 +629,22 @@ class FSDP2Backend(BaseBackend):
         is_tied = input_weight is not None and input_weight is output_weight
         tail_embed = input_embed if is_tied else output_embed
 
+        loss_chunk_enabled = self.config.loss_chunk.enabled
+        lm_head = model.get_lm_head()
+        if loss_chunk_enabled and is_tied:
+            raise ValueError(
+                "chunked LM loss does not support tied input/output "
+                "embeddings. Disable it (--tt_enable_chunk_loss false) or "
+                "untie the embeddings."
+            )
+
         # MTP calls lm_head repeatedly, so only merge the tail when MTP is off.
         final_norm = self._find_final_norm(model)
         can_merge_tail = not self.config.mtp.enabled
+        split_lm_head_tail = (
+            loss_chunk_enabled and not is_tied and tail_embed is lm_head
+        )
+        merge_norm_with_tail = can_merge_tail and not split_lm_head_tail
 
         if not is_tied and can_add_auto_unit(input_embed):
             optimized.append(_FSDPUnit(modules=[input_embed], mesh=self._world_mesh))
@@ -626,14 +658,14 @@ class FSDP2Backend(BaseBackend):
             else None
         )
         if tail_embed_unit is not None:
-            if can_merge_tail and can_add_auto_unit(final_norm):
+            if merge_norm_with_tail and can_add_auto_unit(final_norm):
                 tail_embed_unit.modules = [final_norm] + tail_embed_unit.modules
             tail_embed_unit.reshard_after_forward = False
         else:
             tail_modules = [
                 module
                 for module in (
-                    (final_norm if can_merge_tail else None),
+                    (final_norm if merge_norm_with_tail else None),
                     tail_embed,
                 )
                 if can_add_auto_unit(module)
@@ -647,7 +679,7 @@ class FSDP2Backend(BaseBackend):
                     )
                 )
 
-        if not can_merge_tail and can_add_auto_unit(final_norm):
+        if not merge_norm_with_tail and can_add_auto_unit(final_norm):
             optimized.append(
                 _FSDPUnit(
                     modules=[final_norm],
@@ -842,6 +874,85 @@ class FSDP2Backend(BaseBackend):
                 no_shard_params.add(param)
 
         return no_shard_params, no_shard_modules
+
+    def _prepare_chunk_loss_lm_head(
+        self, model: nn.Module, reference: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the full LM-head weight, FSDP input, and fallback anchor."""
+        lm_head = model.get_lm_head()
+        if not isinstance(lm_head, nn.Linear):
+            raise RuntimeError(
+                "chunked linear CE requires model.get_lm_head() to return "
+                f"nn.Linear, got {type(lm_head).__name__}"
+            )
+        if lm_head.bias is not None:
+            raise NotImplementedError(
+                "chunked linear CE does not support lm_head bias"
+            )
+
+        if isinstance(lm_head, FSDPModule):
+            if register_fsdp_forward_method is None:
+                raise RuntimeError(
+                    "chunked LM loss requires a PyTorch FSDP build with "
+                    "register_fsdp_forward_method"
+                )
+
+            # The chunked loss reads the full weight after this synthetic
+            # forward, so the standalone head must remain unsharded until
+            # FSDP's post-backward callback consumes its accumulated gradient.
+            lm_head.set_reshard_after_forward(False, recurse=False)
+            method_name = "_tt_prepare_chunk_loss_input"
+            if not hasattr(lm_head, method_name):
+
+                def prepare_chunk_loss_input(
+                    module: nn.Module, reference: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+                    weight = getattr(module, "weight", None)
+                    if not isinstance(weight, torch.Tensor):
+                        raise TypeError(
+                            "chunked LM loss requires the LM head to expose "
+                            "a tensor weight"
+                        )
+                    # Return the FSDP-wrapped input so chunk loss itself passes
+                    # through RegisterPostBackwardFunction. This makes the
+                    # standalone head reduce-scatter and reshard immediately
+                    # after chunk loss produces its weight gradient, instead
+                    # of waiting for the root final callback.
+                    loss_anchor = reference.new_zeros(
+                        (),
+                        requires_grad=(
+                            weight.requires_grad and not reference.requires_grad
+                        ),
+                    )
+                    return reference, loss_anchor
+
+                setattr(
+                    lm_head,
+                    method_name,
+                    MethodType(prepare_chunk_loss_input, lm_head),
+                )
+                register_fsdp_forward_method(lm_head, method_name)
+
+            # FSDP's root pre-forward requires at least one positional input.
+            prepared_reference, loss_anchor = getattr(lm_head, method_name)(
+                reference
+            )
+        else:
+            # Keep the caller branch-free. This constant has no autograd edge
+            # and is negligible compared with the chunked projection itself.
+            prepared_reference = reference
+            loss_anchor = lm_head.weight.new_zeros(())
+
+        weight = lm_head.weight
+        if isinstance(weight, DTensor):
+            raise RuntimeError(
+                "lm_head.weight is still sharded; chunked LM loss needs "
+                "the full [vocab, hidden] matrix. Give the LM head its own "
+                "unit in the parallel plan."
+            )
+        if not isinstance(weight, torch.Tensor):
+            raise TypeError("lm_head weight must be a tensor")
+        return weight, prepared_reference, loss_anchor
 
     def _shard_model(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
         named_modules = list(model.named_modules())
@@ -1270,151 +1381,223 @@ class FSDP2Backend(BaseBackend):
             )
         assert pad_size == 0, "must be"
 
-        outputs = model(**inputs)
-        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+        use_chunked_loss = self.config.loss_chunk.enabled and model.training
+        mtp_loss_scale = self.config.mtp.loss_scaling_factor
+        forward_kwargs = {"skip_lm_head": True} if use_chunked_loss else {}
+        outputs = model(**inputs, **forward_kwargs)
 
-        # Main path loss
-        loss = self._compute_ce_loss_sp(
-            logits=logits,
+        total_loss, component_losses = self._compute_lm_loss_with_sp(
+            model=model,
+            outputs=outputs,
             labels=labels,
-            shift_extra=0,
+            use_chunked_loss=use_chunked_loss,
             sp_size=sp_size,
             sp_group=sp_group,
             sp_rank=sp_rank,
             num_items_in_batch=num_items_in_batch,
+            mtp_loss_scale=mtp_loss_scale,
         )
+        mtp_losses = component_losses[1:]
 
-        # MTP path loss
-        # use the same SP-aware CE helper as the main path.
-        mtp_logits_list = getattr(outputs, "mtp_logits", None)
-        mtp_losses: list[torch.Tensor] = []
-        if self.config.mtp.enabled and mtp_logits_list:
-            for i, mtp_logits in enumerate(mtp_logits_list):
-                # i-th MTP head predicts token_{t + i + 2}, so shift labels
-                # (i + 1) extra positions vs the main path.
-                mtp_loss_i = self._compute_ce_loss_sp(
-                    logits=mtp_logits,
-                    labels=labels,
-                    shift_extra=i + 1,
-                    sp_size=sp_size,
-                    sp_group=sp_group,
-                    sp_rank=sp_rank,
-                    num_items_in_batch=num_items_in_batch,
+        if self.config.mtp.log_loss:
+            for index, mtp_loss in enumerate(mtp_losses):
+                logger.info_rank0(
+                    "MTP loss: sp_rank=%d index=%d raw_loss=%.6f",
+                    sp_rank,
+                    index,
+                    mtp_loss.item(),
                 )
-                mtp_losses.append(mtp_loss_i)
-                if int(os.environ.get('TORCH_TURBO_DEBUG_MTP', '0')):
-                    rank = torch.distributed.get_rank()
-                    with torch.no_grad():
-                        logger.debug(
-                            "[TORCH_TURBO_DEBUG_MTP_LOSS] rank=%d "
-                            "sp_rank=%d head=%d raw_mtp_loss=%.6f",
-                            rank,
-                            sp_rank,
-                            i,
-                            mtp_loss_i.item(),
-                        )
 
-        scaling = float(self.config.mtp.loss_scaling_factor)
-        scaled_mtp_total = None
-
-        if mtp_losses and scaling > 0.0:
-            scaled_mtp_total = sum(mtp_losses) * scaling
-            total_loss = loss + scaled_mtp_total
-        else:
-            total_loss = loss
-
-        # Stash diagnostics on outputs for LogMTPPatch to read.
         outputs.loss = total_loss
-        outputs.main_loss = loss.detach()
+        outputs.main_loss = component_losses[0].detach()
         if mtp_losses:
-            outputs.mtp_loss = [m.detach() for m in mtp_losses]
+            outputs.mtp_loss = [loss.detach() for loss in mtp_losses]
             outputs.mtp_loss_scaled = (
-                scaled_mtp_total.detach()
-                if scaled_mtp_total is not None
-                else torch.zeros((), device=loss.device, dtype=loss.dtype)
-            )
+                sum(mtp_losses) * mtp_loss_scale
+            ).detach()
         return (total_loss, outputs) if return_outputs else total_loss
 
-
-    def _compute_ce_loss_sp(
-        self,
-        logits: torch.Tensor,
+    @staticmethod
+    def _prepare_loss_labels(
+        predictions: list[torch.Tensor],
         labels: torch.Tensor,
-        shift_extra: int,
+        *,
         sp_size: int,
         sp_group: Any,
         sp_rank: int,
-        num_items_in_batch: int | None,
-    ) -> torch.Tensor:
-        """Shared SP-aware shifted-CE loss helper.
+        num_items_in_batch: int | torch.Tensor | None,
+        ignore_index: int = -100,
+    ) -> tuple[list[torch.Tensor], list[float | torch.Tensor]]:
+        """Build shifted labels and normalizers for each LM prediction stream.
 
-        Parameters
-        ----------
-        logits:
-            ``(B, T/sp_size, V)`` — already SP-local.
-        labels:
-            ``(B, T)`` — full sequence labels (caller passes the same tensor
-            for main and MTP paths).
-        shift_extra:
-            Extra positions to shift left.  Main path uses ``0`` (just the
-            standard "predict next token" shift).  i-th MTP head uses
-            ``i + 1`` (predict token at t+i+2 instead of t+1).
+        When supplied, ``num_items_in_batch`` must be a positive global count of
+        valid tokens. This is a caller precondition, not a value checked here
+        for device tensors: a zero value can produce a zero denominator and a
+        NaN loss. Device tensors remain on device to avoid a synchronizing branch.
         """
-        ignore_index = -100
+        use_num_items = num_items_in_batch is not None
+        num_items_normalizer: float | torch.Tensor | None = None
+        if use_num_items:
+            world_size = dist.get_world_size()
+            if torch.is_tensor(num_items_in_batch):
+                if num_items_in_batch.numel() != 1:
+                    raise ValueError(
+                        "num_items_in_batch must be a scalar tensor, got shape "
+                        f"{tuple(num_items_in_batch.shape)}"
+                    )
+                # The caller supplies a positive count. Preserve the exact
+                # floor-division and SP/world-size scaling on the device.
+                num_items_local = torch.div(
+                    num_items_in_batch, sp_size, rounding_mode="floor"
+                )
+                num_items_normalizer = num_items_local * sp_size / world_size
+            else:
+                num_items_value = int(num_items_in_batch)
+                # A fully masked microbatch can contribute zero. A zero
+                # step-level count means the whole optimizer step has no
+                # supervision and is invalid.
+                if num_items_value <= 0:
+                    raise ValueError(
+                        "num_items_in_batch must be positive, got "
+                        f"{num_items_value}"
+                    )
+                num_items_local = num_items_value // sp_size
+                if num_items_local <= 0:
+                    raise ValueError(
+                        "num_items_in_batch yields 0 valid tokens per SP rank "
+                        f"(num_items_in_batch={num_items_value}, "
+                        f"sp_size={sp_size}); the loss has no denominator"
+                    )
+                num_items_normalizer = (
+                    float(num_items_local * sp_size) / float(world_size)
+                )
 
-        # Shift labels by (1 + shift_extra) positions to the left.
-        labels = nn.functional.pad(labels, (0, 1 + shift_extra), value=ignore_index)
-        labels = labels[..., 1 + shift_extra :].contiguous()
-        label_num = (labels != ignore_index).sum()
-        if sp_size > 1:
-            labels = slice_input_tensor(
-                labels,
-                dim=1,
-                group=sp_group,
-                rank=sp_rank,
-                padding=False,
-                sp_mode="ulysses",
+        shifted_labels: list[torch.Tensor] = []
+        normalizers: list[float | torch.Tensor] = []
+        for shift_extra, prediction in enumerate(predictions):
+            labels_i = nn.functional.pad(
+                labels, (0, 1 + shift_extra), value=ignore_index
             )
+            labels_i = labels_i[..., 1 + shift_extra :].contiguous()
+            # Count before SP slicing because the denominator covers the full
+            # sequence. A fully masked stream uses one as a neutral denominator.
+            label_num = (
+                None
+                if use_num_items
+                else (labels_i != ignore_index).sum().clamp(min=1)
+            )
+            if sp_size > 1:
+                labels_i = slice_input_tensor(
+                    labels_i,
+                    dim=1,
+                    group=sp_group,
+                    rank=sp_rank,
+                    padding=False,
+                    sp_mode="ulysses",
+                )
+            shifted_labels.append(labels_i.to(prediction.device))
+            normalizers.append(
+                num_items_normalizer
+                if use_num_items
+                else label_num * sp_size
+            )
+        return shifted_labels, normalizers
 
-        labels = labels.view(-1).to(logits.device)
-        logits = logits.view(-1, logits.size(-1))
-        loss = ops.cross_entropy_loss(
-            logits,
-            labels,
-            reduction="sum",
-            ignore_index=ignore_index,
-        )
+    def _compute_lm_loss_with_sp(
+        self,
+        model: nn.Module,
+        outputs: Any,
+        labels: torch.Tensor,
+        use_chunked_loss: bool,
+        sp_size: int,
+        sp_group: Any,
+        sp_rank: int,
+        num_items_in_batch: int | torch.Tensor | None,
+        mtp_loss_scale: float,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Select the LM loss path and handle its SP-specific preparation.
+
+        Returns the scaled total plus ``1 + num_mtp`` detached per-stream
+        losses, main path first.
+        """
+        if use_chunked_loss:
+            if getattr(outputs, "logits", None) is not None:
+                raise RuntimeError(
+                    "chunked LM loss is enabled, but the model ignored "
+                    "skip_lm_head=True and still returned logits"
+                )
+            main_hidden_state = getattr(outputs, "last_hidden_state", None)
+            if main_hidden_state is None:
+                raise RuntimeError(
+                    "chunked LM loss requires `last_hidden_state` in model "
+                    f"outputs, but it was not found in {type(outputs).__name__}"
+                )
+            hidden_states = [main_hidden_state]
+            mtp_hidden_states = getattr(outputs, "mtp_hidden_states", None)
+            if self.config.mtp.enabled and mtp_hidden_states:
+                hidden_states.extend(mtp_hidden_states)
+
+            shifted_labels, normalizers = self._prepare_loss_labels(
+                hidden_states,
+                labels,
+                sp_size=sp_size,
+                sp_group=sp_group,
+                sp_rank=sp_rank,
+                num_items_in_batch=num_items_in_batch,
+            )
+            loss_scales = [1.0] + [mtp_loss_scale] * (len(hidden_states) - 1)
+            (
+                lm_head_weight,
+                hidden_states[0],
+                loss_anchor,
+            ) = self._prepare_chunk_loss_lm_head(model, hidden_states[0])
+            total_loss, component_losses = chunk_loss(
+                hidden_states,
+                shifted_labels,
+                lm_head=lm_head_weight,
+                normalizers=normalizers,
+                loss_scales=loss_scales,
+                chunk_size=self.config.loss_chunk.chunk_size,
+            )
+            # The anchor is always zero. It only requires grad when the main
+            # hidden state is detached, where the wrapped positional input
+            # cannot trigger FSDP's callbacks (for example, head-only training).
+            total_loss = total_loss + loss_anchor.to(total_loss.dtype)
+        else:
+            main_logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            if main_logits is None:
+                raise RuntimeError(
+                    "model forward returned no logits on the regular CE path"
+                )
+            logits = [main_logits]
+            mtp_logits = getattr(outputs, "mtp_logits", None)
+            if self.config.mtp.enabled and mtp_logits:
+                logits.extend(mtp_logits)
+
+            shifted_labels, normalizers = self._prepare_loss_labels(
+                logits,
+                labels,
+                sp_size=sp_size,
+                sp_group=sp_group,
+                sp_rank=sp_rank,
+                num_items_in_batch=num_items_in_batch,
+            )
+            loss_scales = [1.0] + [mtp_loss_scale] * (len(logits) - 1)
+            total_loss, component_losses = logits_loss(
+                logits,
+                shifted_labels,
+                normalizers=normalizers,
+                loss_scales=loss_scales,
+            )
 
         if sp_size > 1 and sp_group is not None:
-            # Keep SP loss reduction in the autograd graph.  A plain
-            # dist.all_reduce updates the scalar value but drops remote loss
-            # contributions during backward.
-            loss = torch.distributed.nn.all_reduce(
-                loss, op=dist.ReduceOp.SUM, group=sp_group
+            total_loss = torch.distributed.nn.all_reduce(
+                total_loss, op=dist.ReduceOp.SUM, group=sp_group
             )
+            component_losses = component_losses.clone()
+            dist.all_reduce(component_losses, op=dist.ReduceOp.SUM, group=sp_group)
 
-        # Final loss — two paths matching HF Trainer convention:
-        if num_items_in_batch:
-            # New-style: use num_items_in_batch as denominator.
-            # This is the total valid token count across all GA micro-batches,
-            # passed down by HF Trainer for correct gradient accumulation.
-
-            # Repeated calculation in SP group
-            num_items_in_batch = num_items_in_batch // sp_size
-            loss /= num_items_in_batch
-
-            loss /= sp_size
-            # Scale by world_size to match HF Trainer's
-            # average_tokens_across_devices convention.
-            world_size = dist.get_world_size()
-            loss = loss * world_size
-        else:
-            # Old-style: local mean, no num_processes scaling.
-            # HF Trainer will divide by gradient_accumulation_steps itself.
-            loss /= label_num
-            loss /= sp_size
-
-        return loss
+        return total_loss, tuple(component_losses.unbind())
 
     def compute_diffusion_loss(self, model, inputs, ga: int = 1, return_outputs: bool = False, **kwargs):
         """Block-diffusion loss — unshifted masked CE over ``[noisy | clean]``.

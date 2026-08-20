@@ -100,11 +100,19 @@ def test_provider_modules_are_discovered_from_provider_packages():
     assert "torchturbo.ops.providers.cuda.swiglu" in cuda_modules
     assert "torchturbo.ops.providers.cuda.cross_entropy_loss" in cuda_modules
     assert "torchturbo.ops.providers.npu.swiglu" in npu_modules
+    assert (
+        "torchturbo.ops.providers.npu.matmul_add"
+        in npu_modules
+    )
     assert "torchturbo.ops.providers.npu.cross_entropy_loss" in npu_modules
     assert "torchturbo.ops.providers.npu.moe_token_permutation" in npu_modules
     assert "torchturbo.ops.providers.npu.moe_token_unpermutation" in npu_modules
     assert "torchturbo.ops.providers.npu.rotary_position_embedding" in npu_modules
     assert "torchturbo.ops.providers.native.cross_entropy_loss" in cpu_modules
+    assert (
+        "torchturbo.ops.providers.native.matmul_add"
+        in cpu_modules
+    )
 
 
 def test_custom_policy_errors_when_no_cpu_custom_impl_exists():
@@ -178,6 +186,22 @@ def test_cross_entropy_loss_uses_reference_fallback_on_cpu():
     expected = F.cross_entropy(logits, labels, reduction="sum")
 
     assert torch.allclose(actual, expected)
+
+
+def test_matmul_add_uses_reference_fallback_on_cpu():
+    lhs = torch.randn(3, 5, dtype=torch.bfloat16)
+    rhs = torch.randn(3, 4, dtype=torch.bfloat16)
+    accumulator = torch.zeros(5, 4, dtype=torch.float32)
+
+    get_ops().matmul_add(
+        accumulator,
+        lhs,
+        rhs,
+        transpose_lhs=True,
+    )
+    expected = lhs.float().t().matmul(rhs.float())
+
+    assert torch.allclose(accumulator, expected)
 
 
 def test_registry_register_is_idempotent_by_impl_name():

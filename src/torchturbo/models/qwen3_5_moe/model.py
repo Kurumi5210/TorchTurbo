@@ -3,10 +3,16 @@ from typing_extensions import override
 
 import torch
 
-
 from transformers import AutoModelForImageTextToText
+from transformers.cache_utils import Cache
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, can_return_tuple
 
-from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
+from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeCausalLMOutputWithPast,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5MoeModelOutputWithPast,
+)
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
 from torchturbo.runtime import get_device_runtime
@@ -85,6 +91,103 @@ class TurboQwen3_5MoeForConditionalGeneration(
             config.vision_config._attn_implementation = "flash_attention_2"
         super().__init__(config)
         self._post_init_patches()
+
+    @can_return_tuple
+    @override
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        skip_lm_head: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple | Qwen3_5MoeCausalLMOutputWithPast | Qwen3_5MoeModelOutputWithPast:
+        """Optionally return pre-head states for TorchTurbo chunked LM loss."""
+        if not skip_lm_head:
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                cache_position=cache_position,
+                logits_to_keep=logits_to_keep,
+                return_dict=True,
+                **kwargs,
+            )
+
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs[0]
+
+        mtp_hidden_states = None
+        if self.mtp is not None and self.training and input_ids is not None:
+            mtp_position_ids = (
+                position_ids[0]
+                if position_ids is not None
+                and position_ids.ndim == 3
+                and position_ids.shape[0] == 4
+                else position_ids
+            )
+            position_embeddings = None
+            if position_ids is not None:
+                rotary_position_ids = (
+                    position_ids[1:]
+                    if position_ids.ndim == 3 and position_ids.shape[0] == 4
+                    else position_ids
+                )
+                position_embeddings = self.model.language_model.rotary_emb(
+                    hidden_states, rotary_position_ids
+                )
+            mtp_hidden_states = self.mtp(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                embed_tokens=self.model.language_model.embed_tokens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=mtp_position_ids,
+                pad_token_id=int(
+                    getattr(self.config.text_config, "pad_token_id", 0) or 0
+                ),
+            )
+
+        return Qwen3_5MoeModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            rope_deltas=outputs.rope_deltas,
+            router_logits=outputs.router_logits,
+            mtp_hidden_states=mtp_hidden_states,
+        )
 
     @classmethod
     def get_default_parallel_plan(cls, **kwargs):

@@ -161,9 +161,18 @@ def test_turbo_sft_arguments_structure():
     # TurboSftArguments (which declares only swift-native fields). The launcher
     # strips --tt_* from sys.argv before swift's parser runs.
     turbo_fields = set(TorchTurboArgs.__dataclass_fields__.keys())
-    for name in ("sp_size", "ep_size", "gradient_checkpointing",
-                 "ac_use_reentrant", "enable_mtp", "freeze_vision_tower",
-                 "cpu_offload"):
+    for name in (
+        "sp_size",
+        "ep_size",
+        "gradient_checkpointing",
+        "ac_use_reentrant",
+        "enable_mtp",
+        "mtp_log_loss",
+        "enable_chunk_loss",
+        "loss_chunk_size",
+        "freeze_vision_tower",
+        "cpu_offload",
+    ):
         assert name in turbo_fields, f"missing TorchTurboArgs field {name!r}"
 
     swift_field_names = set(cls.__dataclass_fields__.keys())

@@ -169,3 +169,35 @@ def test_parse_torchturbo_args_freeze_flags():
     assert args.freeze_vision_tower is True
     assert args.freeze_multi_modal_projector is True
     assert args.freeze_language_model is False
+
+
+def test_parse_torchturbo_args_chunked_loss():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, remaining = parse_torchturbo_args([])
+    assert args.enable_chunk_loss is False
+    assert args.loss_chunk_size is None
+    assert remaining == []
+
+    args, remaining = parse_torchturbo_args(
+        [
+            "--tt_enable_chunk_loss",
+            "--tt_loss_chunk_size",
+            "384",
+            "--other",
+        ]
+    )
+    assert args.enable_chunk_loss is True
+    assert args.loss_chunk_size == 384
+    assert remaining == ["--other"]
+
+
+def test_parse_torchturbo_args_mtp_log_loss():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_mtp_log_loss", "--other"]
+    )
+
+    assert args.mtp_log_loss is True
+    assert remaining == ["--other"]

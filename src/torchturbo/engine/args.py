@@ -106,6 +106,8 @@ class TorchTurboArgs:
         loss.  Defaults to ``0.1`` (Megatron-LM default).  Ignored when MTP
         is off.  Set ``0`` to keep MTP forward (for logging) but exclude it
         from gradients.
+    mtp_log_loss:
+        Log each raw MTP loss at info level. Defaults to ``False``.
     bd_mask_low:
         LLaDA2 block-diffusion per-sample noise ratio (sigma) lower bound.
         Defaults to ``0.3``.
@@ -115,6 +117,11 @@ class TorchTurboArgs:
         LLaDA2 block-diffusion block size (the BD block-diagonal attention
         granularity and the unit ``cutoff_len`` is ceil-aligned to). Defaults to
         ``32`` (dFactory/LLaDA2 default). Only affects the BD dataset path.
+    enable_chunk_loss:
+        Enable chunked fused ``lm_head`` + cross-entropy during training.
+    loss_chunk_size:
+        Flattened tokens per loss chunk. Defaults to ``1024`` when chunked
+        loss is enabled.
     log_level:
         TorchTurbo log level. Defaults to ``LogLevel.INFO``.
     """
@@ -132,6 +139,9 @@ class TorchTurboArgs:
     mtp_loss_scaling_factor: float | None = 0.1
     moe_aux_loss_coeff: float = 0.0
     moe_z_loss_coeff: float = 0.0
+    mtp_log_loss: bool = False
+    enable_chunk_loss: bool = False
+    loss_chunk_size: int | None = None
     freeze_vision_tower: bool = False
     freeze_multi_modal_projector: bool = False
     freeze_language_model: bool = False
@@ -379,6 +389,33 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         help="Z-loss coefficient for MoE router logits.",
     ),
     TurboArgSpec(
+        name="mtp_log_loss",
+        args_name="mtp_log_loss",
+        cli_name="--tt_mtp_log_loss",
+        config_path="mtp.log_loss",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Log each raw MTP loss at info level. Off by default.",
+    ),
+    TurboArgSpec(
+        name="enable_chunk_loss",
+        args_name="enable_chunk_loss",
+        cli_name="--tt_enable_chunk_loss",
+        config_path="loss_chunk.enabled",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Enable chunked lm_head + cross-entropy during training.",
+    ),
+    TurboArgSpec(
+        name="loss_chunk_size",
+        args_name="loss_chunk_size",
+        cli_name="--tt_loss_chunk_size",
+        config_path="loss_chunk.chunk_size",
+        type=int,
+        metavar="TOKENS",
+        help="Flattened tokens per loss chunk. Defaults to 1024.",
+    ),
+    TurboArgSpec(
         name="freeze_vision_tower",
         args_name="freeze_vision_tower",
         cli_name="--tt_freeze_vision_tower",
@@ -596,6 +633,9 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.mtp_loss_scaling_factor,
             args.moe_aux_loss_coeff,
             args.moe_z_loss_coeff,
+            args.mtp_log_loss,
+            args.enable_chunk_loss,
+            args.loss_chunk_size,
         ]
     ):
         logger.info_rank0("torchturbo CLI args: %s", args)

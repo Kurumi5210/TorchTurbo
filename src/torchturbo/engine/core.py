@@ -21,7 +21,7 @@ from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
 from .metrics import MetricTracker
-from .utils import has_meta_tensor
+from .utils import has_meta_tensor, validate_signature
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
     get_packed_mb_orig,
@@ -309,6 +309,15 @@ class TorchTurboEngine:
                 "TorchTurboModel classes must also inherit transformers.PreTrainedModel. "
                 f"Got {turbo_model_cls.__name__}."
             )
+        if self.config.loss_chunk.enabled:
+            try:
+                validate_signature(turbo_model_cls.forward, skip_lm_head=False)
+            except TypeError as exc:
+                raise TypeError(
+                    "chunked LM loss requires "
+                    f"{turbo_model_cls.__name__}.forward to explicitly declare "
+                    "the keyword parameter skip_lm_head=False"
+                ) from exc
 
         with turbo_model_cls.init_context(config, engine_config=self.config):
             logger.info_rank0("Building model on meta device: %s", model_name_or_path)

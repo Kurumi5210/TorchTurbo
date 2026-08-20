@@ -262,12 +262,17 @@ def test_engine_config_from_dict_parses_mtp_config():
     cfg = EngineConfig.from_dict(
         {
             "backend": "fsdp2",
-            "mtp": {"enabled": True, "loss_scaling_factor": 0.25},
+            "mtp": {
+                "enabled": True,
+                "loss_scaling_factor": 0.25,
+                "log_loss": True,
+            },
         }
     )
 
     assert cfg.mtp.enabled is True
     assert cfg.mtp.loss_scaling_factor == 0.25
+    assert cfg.mtp.log_loss is True
 
 
 def test_engine_config_from_dict_parses_flat_mtp_fields():
@@ -278,8 +283,96 @@ def test_engine_config_from_dict_parses_flat_mtp_fields():
             "backend": "fsdp2",
             "enable_mtp": "true",
             "mtp_loss_scaling_factor": None,
+            "mtp_log_loss": "true",
         }
     )
 
     assert cfg.mtp.enabled is True
     assert cfg.mtp.loss_scaling_factor == 0.1
+    assert cfg.mtp.log_loss is True
+
+
+def test_mtp_config_rejects_negative_loss_scale():
+    from torchturbo.engine.config import MTPConfig
+
+    with pytest.raises(ValueError, match="loss_scaling_factor must be non-negative"):
+        MTPConfig(loss_scaling_factor=-0.1)
+
+
+def test_loss_chunk_config_disabled_by_default():
+    from torchturbo.engine.config import EngineConfig
+
+    cfg = EngineConfig.from_dict({"backend": "fsdp2"})
+
+    assert cfg.loss_chunk.enabled is False
+    assert cfg.loss_chunk.chunk_size == 1024
+
+
+def test_loss_chunk_config_explicit_and_default_sizes():
+    from torchturbo.engine.config import LossChunkConfig
+
+    explicit = LossChunkConfig(enabled=True, chunk_size=256)
+    default = LossChunkConfig(enabled=True)
+
+    assert explicit.chunk_size == 256
+    assert default.chunk_size == 1024
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_loss_chunk_config_rejects_non_positive_size(chunk_size):
+    from torchturbo.engine.config import LossChunkConfig
+
+    with pytest.raises(ValueError, match="positive"):
+        LossChunkConfig(enabled=True, chunk_size=chunk_size)
+
+
+def test_loss_chunk_config_allows_size_while_disabled():
+    from torchturbo.engine.config import LossChunkConfig
+
+    config = LossChunkConfig(enabled=False, chunk_size=256)
+
+    assert config.enabled is False
+    assert config.chunk_size == 256
+
+
+def test_chunk_size_cli_mapping_does_not_enable_chunked_loss():
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
+
+    config = build_from_args(TorchTurboArgs(loss_chunk_size=256))
+
+    assert config.loss_chunk.enabled is False
+    assert config.loss_chunk.chunk_size == 256
+
+
+def test_engine_config_from_dict_parses_chunked_loss():
+    from torchturbo.engine.config import EngineConfig
+
+    nested = EngineConfig.from_dict(
+        {"backend": "fsdp2", "loss_chunk": {"enabled": True}}
+    )
+    flat = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "enable_chunk_loss": "true",
+            "loss_chunk_size": 320,
+        }
+    )
+
+    assert nested.loss_chunk.enabled is True
+    assert nested.loss_chunk.chunk_size == 1024
+    assert flat.loss_chunk.enabled is True
+    assert flat.loss_chunk.chunk_size == 320
+
+
+def test_loss_chunk_has_no_env_overrides():
+    """Chunked loss is CLI/dict only: no env var may switch it on."""
+    from torchturbo.engine.args import get_arg_specs
+
+    assert not [
+        spec
+        for spec in get_arg_specs()
+        if spec.env_name is not None
+        and spec.config_path is not None
+        and spec.config_path.startswith("loss_chunk")
+    ]

@@ -68,12 +68,17 @@ def test_build_config_maps_mtp_args_to_engine_config():
     training_args = types.SimpleNamespace(
         fsdp=[], fsdp_config={}, gradient_checkpointing=True
     )
-    tt = TorchTurboArgs(enable_mtp=True, mtp_loss_scaling_factor=0.3)
+    tt = TorchTurboArgs(
+        enable_mtp=True,
+        mtp_loss_scaling_factor=0.3,
+        mtp_log_loss=True,
+    )
 
     cfg, _ = build_config_from_lf_args(training_args=training_args, torchturbo_args=tt)
 
     assert cfg.mtp.enabled is True
     assert cfg.mtp.loss_scaling_factor == 0.3
+    assert cfg.mtp.log_loss is True
 
 
 def test_build_config_maps_op_policy_to_engine_config():

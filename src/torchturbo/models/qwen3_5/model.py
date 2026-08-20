@@ -55,6 +55,10 @@ class TurboQwen3_5ForConditionalGeneration(
     multi_modal_projector_module_names = ("model.visual.merger",)
     language_model_module_names = ("model.language_model",)
 
+    @property
+    def visual(self):
+        return self.model.visual
+
     def get_parameter_groups(self):
         groups = super().get_parameter_groups()
         groups[ParameterGroup.VISION_TOWER] = (

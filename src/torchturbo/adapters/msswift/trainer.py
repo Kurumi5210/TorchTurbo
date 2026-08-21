@@ -26,8 +26,7 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
-from functools import partial, wraps
+from functools import partial
 from typing import Any
 
 from ...logging import get_logger
@@ -196,49 +195,10 @@ class TurboTrainerMixin:
                 memory_snapshot_steps,
             )
         try:
-            with self._preserve_chunked_loss_post_encode_kwarg(engine):
-                return super().train(*args, **kwargs)
+            return super().train(*args, **kwargs)
         finally:
             if profiling_enabled or memory_snapshot_steps is not None:
                 engine.stop_profiling()
-
-    @contextmanager
-    def _preserve_chunked_loss_post_encode_kwarg(self, engine):
-        """Preserve ``skip_lm_head`` across Swift's multimodal encoding.
-
-        Swift's ``Template.pre_forward_hook`` uses the result of
-        ``_post_encode`` as the model kwargs and restores only a fixed
-        allowlist from the original inputs. The adapter-owned
-        ``skip_lm_head`` argument is therefore added to the transformed
-        kwargs at the ``_post_encode`` boundary.
-        """
-        if engine is None or not engine.config.loss_chunk.enabled:
-            yield
-            return
-
-        template = getattr(self, "template", None)
-        original_post_encode = getattr(template, "_post_encode", None)
-        if template is None or original_post_encode is None:
-            yield
-            return
-
-        @wraps(original_post_encode)
-        def post_encode(model, inputs):
-            encoded = original_post_encode(model, inputs)
-            if "skip_lm_head" in inputs:
-                encoded = dict(encoded)
-                encoded["skip_lm_head"] = inputs["skip_lm_head"]
-            return encoded
-
-        had_own_post_encode = "_post_encode" in vars(template)
-        template._post_encode = post_encode
-        try:
-            yield
-        finally:
-            if had_own_post_encode:
-                template._post_encode = original_post_encode
-            else:
-                del template._post_encode
 
     def _make_torchturbo_profiling_callback(self):
         """HF ``TrainerCallback`` that advances TorchTurbo profiling per step.

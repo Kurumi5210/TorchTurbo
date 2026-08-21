@@ -64,7 +64,7 @@ dataloader_num_workers=8       # swift args: --dataloader_num_workers
 model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
 template=qwen3_5               # swift's built-in (M)LLM template for qwen3.5
 
-seq_length=$((1024 * 4))
+seq_length=$((1024 * 32))
 tuner_type=full                # swift args: 'full' | 'lora' (megatron uses --finetune)
 
 # --- distributed-launch env (fed to torchrun below; swift's BaseArguments
@@ -82,7 +82,7 @@ export WORLD_SIZE=$((${NPUS_PER_NODE} * ${NNODES}))
 # turbo-owned parallelism (engine/backend FSDP2 plan). NOTE: turbo owns
 # sequence + expert parallelism, so swift's `--sequence_parallel` is left off.
 # Qwen3.5-35B-A3B: linear_num_value_heads=32, max SP=32.
-sp_size=4
+sp_size=2
 ep_size=8
 
 output_dir=/sfs_turbo/${USER_NAME}/ckpt/qwen35_35B/swift_sft_sp${sp_size}ep${ep_size}_node${NNODES}
@@ -164,4 +164,5 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --tt_freeze_vision_tower true \
     --tt_freeze_multi_modal_projector true \
     --tt_ac_use_reentrant \
+    --tt_enable_chunk_loss \
     2>&1 | tee "$log_file"

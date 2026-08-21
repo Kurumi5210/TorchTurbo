@@ -4,10 +4,9 @@
 # Same as swift_mllm_sft_debug.sh but enables Multi-Token Prediction heads.
 # MTP needs raw input_ids to re-embed the shifted next token every layer, but
 # swift's pre_forward_hook fuses vision into inputs_embeds and pops input_ids.
-# The qwen3_5_mtp template (src/torchturbo/models/qwen3_5_moe/swift_template.py)
-# keeps _post_encode intact and re-injects input_ids after the hook, so turbo's
-# MTP heads see it. Use --template qwen3_5_mtp when --tt_enable_mtp is on;
-# plain qwen3_5 is reserved for non-MTP runs.
+# The turbo-wrapped qwen3_5 template (src/torchturbo/models/qwen3_5/swift_template.py)
+# re-injects input_ids after the hook so turbo's MTP heads see it. Just use
+# --template qwen3_5 (no separate MTP template).
 #
 
 set -o pipefail
@@ -63,9 +62,9 @@ dataset_num_proc=96            # swift --dataset_num_proc
 dataloader_num_workers=8       # swift args: --dataloader_num_workers
 
 model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
-template=qwen3_5_mtp           # MTP-aware swift template: re-injects input_ids after the hook
+template=qwen3_5               # turbo-wrapped: re-injects input_ids after the hook for MTP
 
-seq_length=$((1024 * 4))
+seq_length=$((1024 * 32))
 tuner_type=full                # swift args: 'full' | 'lora' (megatron uses --finetune)
 
 # --- distributed-launch env (fed to torchrun below; swift's BaseArguments
@@ -81,7 +80,7 @@ export WORLD_SIZE=$((${NPUS_PER_NODE} * ${NNODES}))
 # turbo-owned parallelism (engine/backend FSDP2 plan). NOTE: turbo owns
 # sequence + expert parallelism, so swift's `--sequence_parallel` is left off.
 # Qwen3.5-35B-A3B: linear_num_value_heads=32, max SP=32.
-sp_size=4
+sp_size=2
 ep_size=8
 
 output_dir=/sfs_turbo/${USER_NAME}/ckpt/qwen35_35B/swift_sft_mtp_sp${sp_size}ep${ep_size}_node${NNODES}
@@ -161,4 +160,5 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --tt_ac_use_reentrant \
     --tt_enable_mtp true \
     --tt_mtp_loss_scaling_factor 0.1 \
+    --tt_enable_chunk_loss \
     2>&1 | tee "$log_file"

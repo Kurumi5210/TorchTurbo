@@ -115,7 +115,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
         """Optionally return pre-head states for TorchTurbo chunked LM loss."""
         if not skip_lm_head:
             return super().forward(
-                input_ids=input_ids,
+                input_ids=None if inputs_embeds is not None else input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -133,7 +133,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
             )
 
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=None if inputs_embeds is not None else input_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,

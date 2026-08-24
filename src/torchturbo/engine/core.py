@@ -1043,7 +1043,10 @@ class TorchTurboEngine:
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         temperature: float = 1.0,
         forward_only: bool = False,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        auxiliary_loss_fn: Optional[
+            Callable[[Any, dict[str, Any], float], torch.Tensor]
+        ] = None,
     ) -> None:
         """Run packed-token forward and optional backward over micro-batches."""
 
@@ -1055,7 +1058,8 @@ class TorchTurboEngine:
 
         for mb_idx, mb_item in enumerate(mb_list):
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            logits = self._forward_microbatch(inputs)
+            outputs = self._forward_microbatch(inputs)
+            logits = self._get_main_logits(outputs)
 
             if process_fn is None:
                 logprobs, entropy = (
@@ -1074,22 +1078,27 @@ class TorchTurboEngine:
             else:
                 loss = process_fn(logits, ctx, loss_fn)
 
-            loss = self._scale_loss(
+            scaled_policy_loss = self._scale_loss(
                 loss,
                 ctx,
                 total_loss_weight,
                 loss_multiplier,
                 loss_weight_fn,
             )
+            total_loss = scaled_policy_loss
 
-            if not forward_only and loss is not None:
+            if not forward_only and auxiliary_loss_fn is not None:
+                auxiliary_loss = auxiliary_loss_fn(outputs, ctx, loss_multiplier)
+                total_loss = total_loss + auxiliary_loss
+
+            if not forward_only:
                 if mb_idx == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
                     logger.info_rank0(
                         "packed mb[%d] before backward, loss=%.6f",
                         mb_idx,
-                        loss.item(),
+                        total_loss.item(),
                     )
-                self._backward_loss(loss)
+                self._backward_loss(total_loss)
 
     @torch.no_grad()
     def compute_logprobs(
@@ -1106,7 +1115,8 @@ class TorchTurboEngine:
         all_logprobs = []
         for mb_item in mb_list:
             inputs, ctx = prepare_packed_mb_inputs(mb_item)
-            logits = self._forward_microbatch(inputs)
+            outputs = self._forward_microbatch(inputs)
+            logits = self._get_main_logits(outputs)
             logprobs, _ = self._compute_logrobs_and_entropy(
                 logits,
                 ctx,
@@ -1116,8 +1126,11 @@ class TorchTurboEngine:
             all_logprobs.append(logprobs.cpu())
         return torch.cat(all_logprobs, dim=0)
 
-    def _forward_microbatch(self, inputs: dict[str, Any]) -> torch.Tensor:
-        outputs = self.model(**inputs)
+    def _forward_microbatch(self, inputs: dict[str, Any]) -> Any:
+        return self.model(**inputs)
+
+    @staticmethod
+    def _get_main_logits(outputs: Any) -> torch.Tensor:
         logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
         return logits.squeeze(0)
 

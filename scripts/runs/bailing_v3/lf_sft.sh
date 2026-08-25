@@ -79,6 +79,7 @@ export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_config "${SCRIPT_DIR}/lf_sft.yaml" \
+    --report_to tensorboard \
     --disable_shuffling \
     --stage sft \
     --model_name_or_path $model_name_or_path \

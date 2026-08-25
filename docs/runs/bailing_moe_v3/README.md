@@ -27,7 +27,7 @@ def torch_train():
     a3_aic_pcache = DataStore(store_name="ais-pcache-a3-common-aicompiler", mount_point="/mnt/aicompiler-a3/common")
     km_conf = KMConf(
         # bailing moe v3
-        image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64"
+        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-0b9af7b5-20260824140737"
     )
 
     labels={

@@ -84,6 +84,7 @@ export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPAT
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_config "${SCRIPT_DIR}/lf_sft.yaml" \
+    --report_to tensorboard \
     --disable_shuffling \
     --stage sft \
     --model_name_or_path $model_name_or_path \

@@ -31,7 +31,7 @@ def torch_train():
     a3_storage_sfs = DataStore(mount_point="/storage", store_name="wl02-02-aidc-aicompiler-sfs")
     km_conf = KMConf(
         # deepseek v4
-        image="hcr.meta-wulan01.hw-wulan.local/aii/aistudio:17940140-20260427141323_aarch64"
+        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-0b9af7b5-20260824140737"
     )
 
     labels={

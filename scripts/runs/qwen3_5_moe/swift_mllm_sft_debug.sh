@@ -1,7 +1,5 @@
 #!/bin/sh
-# Qwen3.5-MoE (M)LLM SFT with torchturbo via ms-swift — turbo接管 model build + training.
-# Ascend NPU counterpart of gpu_swift_mllm_sft_debug.sh.
-#
+# Qwen3.5-MoE (M)LLM SFT with torchturbo via ms-swift
 
 set -o pipefail
 set -ex
@@ -32,33 +30,20 @@ export VIDEO_MAX_PIXELS=${VIDEO_MAX_PIXELS:-50176}
 export FPS_MAX_FRAMES=${FPS_MAX_FRAMES:-12}
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-3072}
 export VIDEO_MAX_TOKEN_NUM=${VIDEO_MAX_TOKEN_NUM:-49}
-export ASCEND_LAUNCH_BLOCKING=1
 
 if [ -z "$USER_NAME" ]; then
     echo "Error: USER_NAME is not set"
     exit 1
 fi
 # --- model / data -----------------------------------------------------------
-# NPU-side paths (same checkpoint family the GPU debug script uses, just the
-# NPU-side /sfs_turbo mount — see lf_mllm_sft.sh).
 
 # model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-397B-A17B
 model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
 
-# swift MLLM SFT dataset id (the NPU debug MLLM dataset, same one lf_
-# _mllm_sft.sh targets). For an offline NPU box, override DATASET to a local
-# .jsonl path swift can load directly, e.g.:
-#   DATASET=/mnt/sfs_turbo/.../sampled_sft_data_0630_fixed.jsonl bash <this>
-#dataset=/mnt/aicompiler-a3/common/data/MedOneModel_debug_data/data_0630/sampled_sft_data_count_151372_0630_fixed.jsonl
 dataset=/mnt/sfs_turbo/torchturbo/datasets/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl
 #dataset=/mnt/sfs_turbo/data/data/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl
 
-dataset_num_proc=96            # swift --dataset_num_proc. multiprocess dataset.map is now safe:
-                                # TurboSwiftSft / TurboSftArguments are module-level classes, so
-                                # dill pickles them by reference (no by-value save_type -> no
-                                # "_abc._abc_data"). If the map STILL fails with that error, re-run
-                                # with TURBO_DIAG_PICKLE=1 (run_swift.py) to pinpoint the real
-                                # unpicklable leaf.
+dataset_num_proc=96
 dataloader_num_workers=8       # swift args: --dataloader_num_workers
 
 model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
@@ -165,4 +150,5 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --tt_freeze_multi_modal_projector true \
     --tt_ac_use_reentrant \
     --tt_enable_chunk_loss \
+    --tt_log_mfu \
     2>&1 | tee "$log_file"

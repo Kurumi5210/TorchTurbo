@@ -264,6 +264,13 @@ class DiffusionConfig:
             )
 
 
+@dataclass
+class MfuConfig:
+    """MFU/HFU reporting: ``enabled`` + ``card``."""
+
+    enabled: bool = False
+    card: str | None = None
+
 @dataclass(frozen=True)
 class FreezePolicy:
     """Engine config for freezing semantic model parameter groups."""
@@ -371,6 +378,9 @@ class EngineConfig:
 
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     """Block-diffusion training settings (only active for ``is_diffusion_model`` models)."""
+
+    mfu: MfuConfig = field(default_factory=MfuConfig)
+    """MFU/HFU reporting settings."""
 
     extra: dict[str, Any] = field(default_factory=dict)
     """Catch-all for user-defined settings."""
@@ -496,6 +506,9 @@ class EngineConfig:
         # Freeze policy
         freeze_policy = cls._parse_freeze_policy(d.get("freeze_policy", {}))
 
+        # MFU/HFU reporting
+        mfu_config = cls._parse_mfu_config(d.get("mfu", {}))
+
         # Extra
         known_keys = {
             "backend",
@@ -535,6 +548,7 @@ class EngineConfig:
             "enable_chunk_loss",
             "loss_chunk_size",
             "freeze_policy",
+            "mfu",
         }
         extra = {k: v for k, v in d.items() if k not in known_keys}
 
@@ -552,6 +566,7 @@ class EngineConfig:
             moe=moe_config,
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
+            mfu=mfu_config,
             extra=extra,
         )
 
@@ -602,6 +617,19 @@ class EngineConfig:
         if not isinstance(value, dict):
             raise TypeError("moe must be a dict or MoEConfig.")
         return MoEConfig(**value)
+
+    @staticmethod
+    def _parse_mfu_config(value: Any) -> MfuConfig:
+        if isinstance(value, MfuConfig):
+            return value
+        if value is None or value == {}:
+            return MfuConfig()
+        if not isinstance(value, dict):
+            raise TypeError("mfu must be a dict or MfuConfig.")
+        kwargs = dict(value)
+        if kwargs.get("enabled") is not None:
+            kwargs["enabled"] = string_to_bool(kwargs["enabled"])
+        return MfuConfig(**kwargs)
 
     @staticmethod
     def _parse_freeze_policy(value: Any) -> FreezePolicy:
@@ -783,6 +811,7 @@ def build_from_args(
         moe=_build_moe_config(fields),
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
+        mfu=_build_mfu_config(fields),
         diffusion=_build_diffusion_config(fields),
         extra={},
     )
@@ -916,6 +945,15 @@ def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:
         if enabled
     ]
     return FreezePolicy.from_list(groups)
+
+
+def _build_mfu_config(fields: Mapping[str, Any]) -> MfuConfig:
+    """MfuConfig from the merged config dict (CLI ``mfu.enabled``/``mfu.card``)."""
+    mfu_d = fields.get("mfu") or {}
+    return MfuConfig(
+        enabled=string_to_bool(mfu_d.get("enabled", False)),
+        card=mfu_d.get("card") or None,
+    )
 
 
 def _build_diffusion_config(fields: Mapping[str, Any]) -> DiffusionConfig:

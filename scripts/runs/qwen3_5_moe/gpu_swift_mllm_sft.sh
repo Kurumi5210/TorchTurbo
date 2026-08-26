@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.5-MoE (M)LLM SFT with torchturbo via ms-swift — turbo takeover model build + training.
 #
-# This script uses ms-swift's NATIVE HF/FSDP2 SFT path end to end (turbo takeover
-# runs through swift's own SwiftSft pipeline + TrainerFactory + ModelLoader).
-# It is the turbo takeover counterpart of the team's historical `megatron sft`
-# script — same training intent, but using the HF-path argument vocabulary
-# (see swift/trainers/arguments.py), NOT the megatron one. Key differences
-# from the megatron script are called out inline.
 
 set -o pipefail
 set -ex
@@ -44,12 +38,7 @@ fi
 #model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
 model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
 dataset=/mnt/medmm-s3/common/data/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl
-dataset_num_proc=96            # swift --dataset_num_proc. multiprocess dataset.map is now safe:
-                                # TurboSwiftSft / TurboSftArguments are module-level classes, so
-                                # dill pickles them by reference (no by-value save_type -> no
-                                # "_abc._abc_data"). If the map STILL fails with that error, re-run
-                                # with TURBO_DIAG_PICKLE=1 (run_swift.py) to pinpoint the real
-                                # unpicklable leaf.
+dataset_num_proc=96            # swift --dataset_num_proc.
 dataloader_num_workers=8       # swift args: --dataloader_num_workers
 
 model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
@@ -97,13 +86,6 @@ export WANDB_DISABLED=True
 export TRANSFORMERS_VERBOSITY=error
 
 PYTHON=${PYTHON:-python3}
-# Launch the turbo worker entry directly under torchrun (the same flags swift's
-# own cli_main re-exec passes). We bypass `swift sft` on purpose: run_swift.py
-# imports the msswift plugin BEFORE sft_main, swapping SwiftSft -> TurboSwiftSft
-# in time for TurboSftArguments to parse the `--tt_*` knobs. (`--external_plugins`
-# fires too late — during BaseArguments.__post_init__, after sft_main has already
-# started constructing plain SwiftSft — so --tt_* land in remaining_argv and are
-# rejected.)
 RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
 TORCHRUN_FLAGS=(--nproc_per_node "${NPROC_PER_NODE}"
                 --nnodes "${NNODES}"

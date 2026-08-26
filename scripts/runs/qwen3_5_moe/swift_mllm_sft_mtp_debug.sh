@@ -1,12 +1,5 @@
 #!/bin/sh
-# Qwen3.5-MoE (M)LLM SFT + MTP with torchturbo via ms-swift — debug script.
-#
-# Same as swift_mllm_sft_debug.sh but enables Multi-Token Prediction heads.
-# MTP needs raw input_ids to re-embed the shifted next token every layer, but
-# swift's pre_forward_hook fuses vision into inputs_embeds and pops input_ids.
-# The turbo-wrapped qwen3_5 template (src/torchturbo/models/qwen3_5/swift_template.py)
-# re-injects input_ids after the hook so turbo's MTP heads see it. Just use
-# --template qwen3_5 (no separate MTP template).
+# Qwen3.5-MoE (M)LLM SFT + MTP with torchturbo via ms-swift
 #
 
 set -o pipefail
@@ -44,17 +37,9 @@ if [ -z "$USER_NAME" ]; then
     exit 1
 fi
 # --- model / data -----------------------------------------------------------
-# NPU-side paths (same checkpoint family the GPU debug script uses, just the
-# NPU-side /sfs_turbo mount — see lf_mllm_sft.sh).
-
 # model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-397B-A17B
 model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
 
-# swift MLLM SFT dataset id (the NPU debug MLLM dataset, same one lf_
-# _mllm_sft.sh targets). For an offline NPU box, override DATASET to a local
-# .jsonl path swift can load directly, e.g.:
-#   DATASET=/mnt/sfs_turbo/.../sampled_sft_data_0630_fixed.jsonl bash <this>
-#dataset=/mnt/aicompiler-a3/common/data/MedOneModel_debug_data/data_0630/sampled_sft_data_count_151372_0630_fixed.jsonl
 dataset=/mnt/sfs_turbo/torchturbo/datasets/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl
 #dataset=/mnt/sfs_turbo/data/data/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl
 
@@ -109,9 +94,6 @@ export WANDB_DISABLED=True
 export TRANSFORMERS_VERBOSITY=error
 
 PYTHON=${PYTHON:-python3}
-# Launch the turbo worker entry directly under torchrun (bypassing `swift sft`:
-# run_swift.py imports the msswift plugin BEFORE sft_main, swapping SwiftSft ->
-# TurboSwiftSft in time for TurboSftArguments to parse the `--tt_*` knobs).
 RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
 
 "${PYTHON}" -m torch.distributed.run \
@@ -161,4 +143,5 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --tt_enable_mtp true \
     --tt_mtp_loss_scaling_factor 0.1 \
     --tt_enable_chunk_loss \
+    --tt_log_mfu \
     2>&1 | tee "$log_file"

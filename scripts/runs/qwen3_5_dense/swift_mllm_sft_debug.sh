@@ -1,7 +1,5 @@
 #!/bin/sh
-# Qwen3.5-MoE (M)LLM SFT with torchturbo via ms-swift — turbo接管 model build + training.
-# Ascend NPU counterpart of gpu_swift_mllm_sft_debug.sh.
-#
+# Qwen3.5-MoE (M)LLM SFT with torchturbo via ms-swift
 
 set -o pipefail
 set -ex
@@ -32,7 +30,6 @@ export VIDEO_MAX_PIXELS=${VIDEO_MAX_PIXELS:-50176}
 export FPS_MAX_FRAMES=${FPS_MAX_FRAMES:-12}
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-3072}
 export VIDEO_MAX_TOKEN_NUM=${VIDEO_MAX_TOKEN_NUM:-49}
-export ASCEND_LAUNCH_BLOCKING=1
 
 if [ -z "$USER_NAME" ]; then
     echo "Error: USER_NAME is not set"
@@ -44,20 +41,10 @@ fi
 
 model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-27B
 
-# swift MLLM SFT dataset id (the NPU debug MLLM dataset, same one lf_
-# _mllm_sft.sh targets). For an offline NPU box, override DATASET to a local
-# .jsonl path swift can load directly, e.g.:
-#   DATASET=/mnt/sfs_turbo/.../sampled_sft_data_0630_fixed.jsonl bash <this>
-#dataset=/mnt/aicompiler-a3/common/data/MedOneModel_debug_data/data_0630/sampled_sft_data_count_151372_0630_fixed.jsonl
 dataset=/mnt/sfs_turbo/torchturbo/datasets/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl
 #dataset=/mnt/sfs_turbo/data/data/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl
 
-dataset_num_proc=96            # swift --dataset_num_proc. multiprocess dataset.map is now safe:
-                                # TurboSwiftSft / TurboSftArguments are module-level classes, so
-                                # dill pickles them by reference (no by-value save_type -> no
-                                # "_abc._abc_data"). If the map STILL fails with that error, re-run
-                                # with TURBO_DIAG_PICKLE=1 (run_swift.py) to pinpoint the real
-                                # unpicklable leaf.
+dataset_num_proc=96
 dataloader_num_workers=8       # swift args: --dataloader_num_workers
 
 model_type=turbo_qwen3_5   # turbo-registered model_type (loader = TurboModelLoader)
@@ -108,13 +95,6 @@ export WANDB_DISABLED=True
 export TRANSFORMERS_VERBOSITY=error
 
 PYTHON=${PYTHON:-python3}
-# Launch the turbo worker entry directly under torchrun (the same flags swift's
-# own cli_main re-exec passes). We bypass `swift sft` on purpose: run_swift.py
-# imports the msswift plugin BEFORE sft_main, swapping SwiftSft -> TurboSwiftSft
-# in time for TurboSftArguments to parse the `--tt_*` knobs. (`--external_plugins`
-# fires too late — during BaseArguments.__post_init__, after sft_main has already
-# started constructing plain SwiftSft — so --tt_* land in remaining_argv and are
-# rejected.)
 RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
 
 "${PYTHON}" -m torch.distributed.run \
@@ -162,4 +142,5 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --tt_freeze_multi_modal_projector true \
     --tt_ac_use_reentrant \
     --tt_enable_chunk_loss \
+    --tt_log_mfu \
     2>&1 | tee "$log_file"

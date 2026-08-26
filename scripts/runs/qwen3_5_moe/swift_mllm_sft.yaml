@@ -16,3 +16,6 @@ engine_config:
 
   moe:
     aux_loss_coeff: 1e-6
+
+  mfu:
+    enabled: true

@@ -185,6 +185,7 @@ class TorchTurboEngine:
             self.config = config
 
         self.metric_tracker = MetricTracker()
+        self._mfu_estimator: Any = None
 
         # Select distributed backend before configuring process-wide state.
         backend_name = self.config.backend.value
@@ -884,6 +885,8 @@ class TorchTurboEngine:
         **kwargs,
     ):
         """Compute the scalar loss for a single micro-batch."""
+        if model.training:
+            self._record_micro(inputs)
         self._prepare_moe_runtime(
             model, inputs, gradient_accumulation_steps
         )
@@ -903,7 +906,34 @@ class TorchTurboEngine:
         self.metric_tracker.collect(model)
 
     def report_metrics(self, logs: dict, gather: Callable) -> None:
+        """Flush engine metrics into ``logs``"""
+        if self.config.mfu.enabled:
+            self.metric_tracker.record(self._get_mfu_estimator().report())
         self.metric_tracker.report(logs, gather)
+
+    # ------------------------------------------------------------------
+    # Online MFU / HFU estimation
+    # ------------------------------------------------------------------
+    def _get_mfu_estimator(self):
+        """Build the MFU estimator once by extracting what it needs from the engine/model."""
+        if self._mfu_estimator is not None:
+            return self._mfu_estimator
+
+        from .metrics import MFUEstimator
+        self._mfu_estimator = MFUEstimator(
+            flops_cls=self.model.get_flops_class(),
+            engine_config=self.config,
+            model_config=self.model.config,
+            parallel_context=self._get_parallel_context(),
+            runtime=self.device_runtime,
+        )
+
+        return self._mfu_estimator
+
+    def _record_micro(self, inputs: Any) -> None:
+        """Feed one micro-batch to the MFU estimator."""
+        if self.config.mfu.enabled:
+            self._get_mfu_estimator().record_micro(inputs)
 
     def compute_diffusion_loss(
         self,

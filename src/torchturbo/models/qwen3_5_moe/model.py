@@ -3,6 +3,7 @@ from typing_extensions import override
 
 import torch
 
+from torchturbo.engine.metrics.flops import BaseModelFlops
 from transformers import AutoModelForImageTextToText
 from transformers.cache_utils import Cache
 from transformers.processing_utils import Unpack
@@ -85,6 +86,12 @@ class TurboQwen3_5MoeForConditionalGeneration(
             and not name.startswith("model.visual.merger.")
         )
         return groups
+
+    def get_flops_class(self) -> type[BaseModelFlops]:
+        """Qwen3.5-MoE flops recipe (gated GQA + GatedDeltaNet + MoE FFN + vision)."""
+        from .mfu import Qwen3_5MoeFlops
+
+        return Qwen3_5MoeFlops
 
     def __init__(self, config: Qwen3_5MoeConfig) -> None:
         if hasattr(config, "vision_config"):

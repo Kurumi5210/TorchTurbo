@@ -14,6 +14,7 @@ from .weight_converter import BaseWeightConverter
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
+    from ..engine.metrics.flops import BaseModelFlops
     from .modules.moe.moe_layer import MoERuntimeInputs
 
 
@@ -141,6 +142,13 @@ class TurboModel:
 
     def get_weight_converter(self, parallel_context: dict[str, Any]):
         return BaseWeightConverter(self, parallel_context)
+
+    def get_flops_class(self) -> type[BaseModelFlops]:
+        """Return the model's forward-FLOP recipe class (a :class:`BaseModelFlops` subclass)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not provide an MFU flops recipe; "
+            "implement get_flops_class(self) to enable MFU/HFU logging."
+        )
 
     @staticmethod
     def _force_config_dtype_float32(config: Any) -> dict[str, Any]:

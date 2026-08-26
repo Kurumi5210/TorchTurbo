@@ -533,6 +533,25 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         args_name="output_dir",
         config_path="checkpoint.dcp_path",
     ),
+    TurboArgSpec(
+        name="log_mfu",
+        cli_name="--tt_log_mfu",
+        env_name="TORCH_TURBO_LOG_MFU",
+        config_path="mfu.enabled",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Turn MFU/HFU logging on (off by default)",
+    ),
+    TurboArgSpec(
+        name="card_name",
+        cli_name="--tt_card_name",
+        env_name="TORCH_TURBO_CARD_NAME",
+        config_path="mfu.card",
+        metavar="CARD",
+        help="Chip family for the device runtime's peak table. Unset (default) "
+        "uses the runtime's default card (NPU 910c / CUDA h20); "
+        "e.g. 910b / h100 / h200 / a100.",
+    ),
 )
 
 

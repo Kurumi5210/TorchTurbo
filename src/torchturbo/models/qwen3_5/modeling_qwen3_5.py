@@ -1965,8 +1965,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         ```
         """
 
+        # Exactly one embedding input may reach the backbone: the swift
+        # template passes vision-fused inputs_embeds alongside input_ids,
+        # and the model below rejects receiving both.
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=None if inputs_embeds is not None else input_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,

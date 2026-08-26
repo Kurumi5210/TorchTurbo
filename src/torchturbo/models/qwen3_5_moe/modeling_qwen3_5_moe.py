@@ -2397,8 +2397,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
         "A woman in a plaid shirt sits on a sandy beach at sunset, smiling as she gives a high-five to a yellow Labrador Retriever wearing a harness. The ocean waves roll in the background."
         ```"""
 
+        # Exactly one embedding input may reach the backbone: the swift
+        # template re-injects input_ids for MTP alongside vision-fused
+        # inputs_embeds, and the model below rejects receiving both. The MTP
+        # block after this call still reads the raw input_ids above.
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=None if inputs_embeds is not None else input_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,

@@ -191,11 +191,10 @@ class MTPConfig:
 
 @dataclass
 class LossChunkConfig:
-    """Chunked fused ``lm_head`` + cross-entropy configuration.
+    """Compute ``lm_head`` + cross-entropy in token chunks, avoiding the full
+    ``[tokens, vocab]`` logits tensor.
 
-    When enabled, the model returns its final hidden states without running the
-    ``lm_head``. The backend then computes linear + cross-entropy in flattened
-    token chunks, so it never materializes full ``[tokens, vocab]`` logits.
+    Off by default; ``chunk_size`` defaults to 1024.
     """
 
     enabled: bool = False

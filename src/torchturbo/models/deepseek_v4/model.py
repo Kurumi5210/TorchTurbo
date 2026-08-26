@@ -1,4 +1,5 @@
 import math
+from functools import wraps
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -68,6 +69,31 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
     def get_weight_converter(self, parallel_context, model_path):
         return DeepseekV4WeightConverter(self, parallel_context, model_path)
+
+    def get_lm_head(self):
+        return self.head
+
+    @wraps(DeepseekV4ForCausalLM.forward)
+    def forward(self, *args, **kwargs):
+        lm_head = self._modules["head"]
+        noop_lm_head = self.head
+        if noop_lm_head is lm_head:
+            return super().forward(*args, **kwargs)
+
+        def head_forward(hidden_states, hc_fn, hc_scale, hc_base, norm):
+            hidden_states = lm_head._hc_head(
+                hidden_states,
+                hc_fn,
+                hc_scale,
+                hc_base,
+            )
+            return noop_lm_head(norm(hidden_states).float())
+
+        object.__setattr__(self, "head", head_forward)
+        try:
+            return super().forward(*args, **kwargs)
+        finally:
+            object.__setattr__(self, "head", noop_lm_head)
 
     @staticmethod
     def _pre_init_patches(config):

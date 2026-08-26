@@ -4,16 +4,11 @@ import math
 import torch
 from torchturbo.engine.metrics.flops import BaseModelFlops
 from transformers import AutoModelForImageTextToText
-from transformers.cache_utils import Cache
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, can_return_tuple
 from typing_extensions import override
 
 from torchturbo.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from torchturbo.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5CausalLMOutputWithPast,
     Qwen3_5ForConditionalGeneration,
-    Qwen3_5ModelOutputWithPast,
 )
 from torchturbo.runtime import get_device_runtime
 
@@ -75,67 +70,6 @@ class TurboQwen3_5ForConditionalGeneration(
             config.vision_config._attn_implementation = "flash_attention_2"
         super().__init__(config)
         self._post_init_patches()
-
-    @can_return_tuple
-    @override
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        pixel_values_videos: torch.FloatTensor | None = None,
-        image_grid_thw: torch.LongTensor | None = None,
-        video_grid_thw: torch.LongTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        skip_lm_head: bool = False,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | Qwen3_5CausalLMOutputWithPast | Qwen3_5ModelOutputWithPast:
-        """Optionally return pre-head states for TorchTurbo chunked LM loss."""
-        if not skip_lm_head:
-            return super().forward(
-                input_ids=None if inputs_embeds is not None else input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                cache_position=cache_position,
-                logits_to_keep=logits_to_keep,
-                return_dict=True,
-                **kwargs,
-            )
-
-        outputs = self.model(
-            input_ids=None if inputs_embeds is not None else input_ids,
-            pixel_values=pixel_values,
-            pixel_values_videos=pixel_values_videos,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
-            **kwargs,
-        )
-        hidden_states = outputs[0]
-
-        return Qwen3_5ModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
-        )
 
     @classmethod
     def get_default_parallel_plan(cls, **kwargs):

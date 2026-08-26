@@ -25,6 +25,5 @@ pip install matplotlib
 # install packages related to npu triton
 pip install /sfs_turbo/zhisan/envs/triton_ascend-3.5.1.dev2026042622-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl --no-deps
 /sfs_turbo/zhisan/envs/ascendnpu-ir_1.1.0_linux-aarch64.run --install
-pip install /mnt/aicompiler-a3/common/envs/flash_linear_attention-0.4.2-py3-none-any.whl --no-deps
 
 rm -rf ~/.cache/huggingface/modules/transformers_modules/

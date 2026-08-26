@@ -1,14 +1,7 @@
-"""ms-swift template hook that keeps adapter kwargs Swift's hook would drop.
+"""ms-swift template hook that keeps raw token IDs for MTP.
 
-Shared by both Qwen3.5 dense and MoE: the fix is adapter-specific, not
-dense/MoE-specific. Swift's ``pre_forward_hook`` fuses vision into
-``inputs_embeds`` then restores only a fixed allowlist from the original inputs
-(ms-swift base.py), so adapter-injected kwargs vanish after multimodal encoding:
-
-* ``skip_lm_head`` — turbo chunked loss asks the model to skip lm_head and
-  return pre-head states.
-* ``input_ids`` — turbo MTP re-embeds the shifted next token from raw
-  ``input_ids`` every layer.
+Swift's ``pre_forward_hook`` fuses vision into ``inputs_embeds`` and drops the
+original ``input_ids``. Turbo MTP needs those IDs to embed the shifted token.
 """
 
 from __future__ import annotations
@@ -19,10 +12,7 @@ from ...logging import get_logger
 
 logger = get_logger(__name__)
 
-# Adapter kwargs Swift's pre_forward_hook drops; re-injected when present in the
-# original inputs. input_ids is re-added only once ``inputs_embeds`` is set
-# (vision fused), so it is harmless for non-MTP / pure-text runs.
-PRESERVE_KEYS = ("skip_lm_head", "input_ids")
+PRESERVE_KEYS = ("input_ids",)
 
 
 def _make_kwarg_preserving_template_cls():
@@ -48,8 +38,7 @@ def _make_kwarg_preserving_template_cls():
 
 
 def register() -> None:
-    """Wrap native ``qwen3_5`` so ``--template qwen3_5`` keeps ``skip_lm_head``
-    (chunked loss) and ``input_ids`` (MTP)."""
+    """Wrap native ``qwen3_5`` so ``--template qwen3_5`` keeps MTP inputs."""
     from swift.template.register import TEMPLATE_MAPPING, register_template
 
     native = TEMPLATE_MAPPING.get("qwen3_5")

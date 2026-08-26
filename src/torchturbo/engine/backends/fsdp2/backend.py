@@ -3,10 +3,10 @@
 import functools
 from dataclasses import dataclass
 from types import MethodType
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
-import torch.distributed as dist
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 try:
@@ -29,7 +29,6 @@ from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
-    ParallelPlan,
 )
 from torchturbo.runtime import DeviceRuntime
 from torchturbo.engine.utils import strip_peft_prefix
@@ -879,20 +878,55 @@ class FSDP2Backend(BaseBackend):
 
         return no_shard_params, no_shard_modules
 
+    def _forward_for_lm_loss(
+        self,
+        model: nn.Module,
+        inputs: dict[str, Any],
+        *,
+        use_chunked_loss: bool,
+    ) -> tuple[Any, list[torch.Tensor] | None]:
+        """Run LM forward, optionally replacing its output head with a no-op."""
+        if not use_chunked_loss:
+            return model(**inputs), None
+
+        forward_inputs = dict(inputs)
+        forward_inputs["return_dict"] = True
+        lm_head = model.get_lm_head()
+        if getattr(lm_head, "bias", None) is not None:
+            raise NotImplementedError(
+                "chunked linear CE does not support lm_head bias"
+            )
+        module_name = next(
+            name for name, module in model.named_modules() if module is lm_head
+        )
+        parent_name, _, name = module_name.rpartition(".")
+        parent = model.get_submodule(parent_name)
+
+        # Shadow the attribute without changing its FSDP module registration.
+        object.__setattr__(parent, name, nn.Identity())
+        try:
+            outputs = model(**forward_inputs)
+        finally:
+            object.__delattr__(parent, name)
+
+        hidden_dtype = lm_head.weight.dtype
+        hidden_states = [outputs.logits.to(hidden_dtype)]
+        mtp_hidden_states = getattr(outputs, "mtp_logits", None)
+        if mtp_hidden_states:
+            hidden_states.extend(
+                hidden_state.to(hidden_dtype)
+                for hidden_state in mtp_hidden_states
+            )
+        outputs["logits"] = None
+        if mtp_hidden_states is not None:
+            outputs["mtp_logits"] = None
+        return outputs, hidden_states
+
     def _prepare_chunk_loss_lm_head(
         self, model: nn.Module, reference: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the full LM-head weight, FSDP input, and fallback anchor."""
         lm_head = model.get_lm_head()
-        if not isinstance(lm_head, nn.Linear):
-            raise RuntimeError(
-                "chunked linear CE requires model.get_lm_head() to return "
-                f"nn.Linear, got {type(lm_head).__name__}"
-            )
-        if lm_head.bias is not None:
-            raise NotImplementedError(
-                "chunked linear CE does not support lm_head bias"
-            )
 
         if isinstance(lm_head, FSDPModule):
             if register_fsdp_forward_method is None:
@@ -901,9 +935,9 @@ class FSDP2Backend(BaseBackend):
                     "register_fsdp_forward_method"
                 )
 
-            # The chunked loss reads the full weight after this synthetic
-            # forward, so the standalone head must remain unsharded until
-            # FSDP's post-backward callback consumes its accumulated gradient.
+            # The model forward bypasses this unit. This synthetic forward
+            # all-gathers it only after the backbone and MTP forwards finish,
+            # then keeps the full weight resident until chunk loss backward.
             lm_head.set_reshard_after_forward(False, recurse=False)
             method_name = "_tt_prepare_chunk_loss_input"
             if not hasattr(lm_head, method_name):
@@ -917,11 +951,6 @@ class FSDP2Backend(BaseBackend):
                             "chunked LM loss requires the LM head to expose "
                             "a tensor weight"
                         )
-                    # Return the FSDP-wrapped input so chunk loss itself passes
-                    # through RegisterPostBackwardFunction. This makes the
-                    # standalone head reduce-scatter and reshard immediately
-                    # after chunk loss produces its weight gradient, instead
-                    # of waiting for the root final callback.
                     loss_anchor = reference.new_zeros(
                         (),
                         requires_grad=(
@@ -1387,14 +1416,17 @@ class FSDP2Backend(BaseBackend):
 
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
         mtp_loss_scale = self.config.mtp.loss_scaling_factor
-        forward_kwargs = {"skip_lm_head": True} if use_chunked_loss else {}
-        outputs = model(**inputs, **forward_kwargs)
+        outputs, chunk_hidden_states = self._forward_for_lm_loss(
+            model,
+            inputs,
+            use_chunked_loss=use_chunked_loss,
+        )
 
         total_loss, component_losses = self._compute_lm_loss_with_sp(
             model=model,
             outputs=outputs,
             labels=labels,
-            use_chunked_loss=use_chunked_loss,
+            chunk_hidden_states=chunk_hidden_states,
             sp_size=sp_size,
             sp_group=sp_group,
             sp_rank=sp_rank,
@@ -1512,7 +1544,7 @@ class FSDP2Backend(BaseBackend):
         model: nn.Module,
         outputs: Any,
         labels: torch.Tensor,
-        use_chunked_loss: bool,
+        chunk_hidden_states: list[torch.Tensor] | None,
         sp_size: int,
         sp_group: Any,
         sp_rank: int,
@@ -1524,22 +1556,8 @@ class FSDP2Backend(BaseBackend):
         Returns the scaled total plus ``1 + num_mtp`` detached per-stream
         losses, main path first.
         """
-        if use_chunked_loss:
-            if getattr(outputs, "logits", None) is not None:
-                raise RuntimeError(
-                    "chunked LM loss is enabled, but the model ignored "
-                    "skip_lm_head=True and still returned logits"
-                )
-            main_hidden_state = getattr(outputs, "last_hidden_state", None)
-            if main_hidden_state is None:
-                raise RuntimeError(
-                    "chunked LM loss requires `last_hidden_state` in model "
-                    f"outputs, but it was not found in {type(outputs).__name__}"
-                )
-            hidden_states = [main_hidden_state]
-            mtp_hidden_states = getattr(outputs, "mtp_hidden_states", None)
-            if self.config.mtp.enabled and mtp_hidden_states:
-                hidden_states.extend(mtp_hidden_states)
+        if chunk_hidden_states is not None:
+            hidden_states = chunk_hidden_states
 
             shifted_labels, normalizers = self._prepare_loss_labels(
                 hidden_states,
@@ -1621,6 +1639,11 @@ class FSDP2Backend(BaseBackend):
         SP factor (``gradient_accumulation_steps`` is already multiplied by ``sp_size``
         upstream).
         """
+        if self.config.loss_chunk.enabled:
+            raise NotImplementedError(
+                "chunked LM loss does not support diffusion training"
+            )
+
         inputs = dict(inputs)
         inputs["use_cache"] = False
         labels = inputs.pop("labels")  # [1, 2T], clean half = -100

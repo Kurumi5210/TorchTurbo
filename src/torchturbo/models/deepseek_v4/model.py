@@ -35,31 +35,6 @@ class DeepseekV4WeightConverter(BaseWeightConverter):
     def get_router_hash_name(self):
         return "router.tid2eid"
 
-    def get_special_param_names(self):
-        return [
-            "hc_head_base",
-            "hc_head_fn",
-            "hc_head_scale",
-            "hc_attn_base",
-            "hc_attn_fn",
-            "hc_attn_scale",
-            "hc_ffn_base",
-            "hc_ffn_fn",
-            "hc_ffn_scale",
-            "attn.attn_sink",
-            "compressor.ape",
-        ]
-
-    def get_default_hf_dtype(self, param_name):
-        if self.get_hf_gate_hash_name() in param_name:
-            return torch.int64
-        if self.get_hf_gate_bias_name() in param_name:
-            return torch.float32
-        for name in self.get_special_param_names():
-            if name in param_name:
-                return torch.float32
-        return self.dtype
-
     def is_persist_buffer(self, name):
         if self.get_router_bias_name() in name:
             return True
@@ -91,8 +66,8 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
         return get_parallel_plan(**kwargs)
 
-    def get_weight_converter(self, parallel_context):
-        return DeepseekV4WeightConverter(self, parallel_context)
+    def get_weight_converter(self, parallel_context, model_path):
+        return DeepseekV4WeightConverter(self, parallel_context, model_path)
 
     @staticmethod
     def _pre_init_patches(config):

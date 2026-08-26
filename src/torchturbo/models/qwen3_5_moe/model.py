@@ -26,27 +26,12 @@ from ..weight_converter import FusedExpertWeightConverter
 
 class Qwen3_5MoeWeightConverter(FusedExpertWeightConverter):
 
-    def __init__(self, model, parallel_context):
-        super().__init__(model, parallel_context)
+    def __init__(self, model, parallel_context, model_path):
+        super().__init__(model, parallel_context, model_path)
         config = self.config
         if hasattr(config, "text_config"):
             self.config = config.text_config
             self.model_type = self.config.model_type
-            self.dtype = self.get_save_dtype(self.config)
-
-    def get_hf_alog_name(self):
-        return "A_log"
-
-    def get_hf_linear_attn_norm_name(self):
-        return "linear_attn.norm"
-
-    @override
-    def get_default_hf_dtype(self, param_name):
-        if self.get_hf_alog_name() in param_name:
-            return torch.float32
-        if self.get_hf_linear_attn_norm_name() in param_name:
-            return torch.float32
-        return self.dtype
 
 
 @register_model(
@@ -836,8 +821,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
         attn_cls.forward = sp_forward
 
-    def get_weight_converter(self, parallel_context):
-        return Qwen3_5MoeWeightConverter(self, parallel_context)
+    def get_weight_converter(self, parallel_context, model_path):
+        return Qwen3_5MoeWeightConverter(self, parallel_context, model_path)
 
     def on_materialized(self):
         device = get_device_runtime().device

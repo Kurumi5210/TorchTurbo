@@ -33,8 +33,8 @@ class TurboLLaDA2MoeForCausalLM(TurboModel, LLaDA2MoeModelLM):
 
         return get_parallel_plan(**kwargs)
 
-    def get_weight_converter(self, parallel_context):
-        return LLaDA2WeightConverter(self, parallel_context)
+    def get_weight_converter(self, parallel_context, model_path):
+        return LLaDA2WeightConverter(self, parallel_context, model_path)
 
     @staticmethod
     def _pre_init_patches(config):

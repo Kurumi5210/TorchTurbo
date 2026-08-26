@@ -140,8 +140,8 @@ class TurboModel:
             ParameterGroup.LANGUAGE_MODEL: self.named_parameters(),
         }
 
-    def get_weight_converter(self, parallel_context: dict[str, Any]):
-        return BaseWeightConverter(self, parallel_context)
+    def get_weight_converter(self, parallel_context: dict[str, Any], model_path: str):
+        return BaseWeightConverter(self, parallel_context, model_path)
 
     def get_flops_class(self) -> type[BaseModelFlops]:
         """Return the model's forward-FLOP recipe class (a :class:`BaseModelFlops` subclass)."""

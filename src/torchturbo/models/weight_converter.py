@@ -1,11 +1,58 @@
+import json
+import struct
+from pathlib import Path
+
+from safetensors.torch import _TYPES
 import torch
 import torch.distributed as dist
 
 from torchturbo.models.modules.moe.moe_layer import BaseMoELayer
 
 
+class CheckpointInfo:
+    """Collect checkpoint tensor shapes and dtypes for weight conversion."""
+
+    def __init__(self, model_path):
+        """Initialize ``self.tensor_infos``: {HF tensor name: (shape, torch.dtype)}.
+
+        E.g. {"model.layers.0.self_attn.q_proj.weight": ((2048, 2048), torch.bfloat16)}.
+        """
+        self.tensor_infos = self._load_checkpoint_tensor_infos(model_path)
+
+    def get_tensor_infos(self):
+        return self.tensor_infos
+
+    def _load_checkpoint_tensor_infos(self, model_path):
+        """Read tensor metadata from safetensors checkpoints."""
+        model_path = Path(model_path)
+        if not model_path.is_dir():
+            raise FileNotFoundError(f"Model path not found: {model_path}")
+        index_path = model_path / "model.safetensors.index.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Index file not found: {index_path}")
+
+        with index_path.open() as index_file:
+            filenames = set(json.load(index_file)["weight_map"].values())
+
+        tensor_infos = {}
+        for filename in filenames:
+            with (model_path / filename).open("rb") as shard:
+                header_size = struct.unpack("<Q", shard.read(8))[0]
+                header = json.loads(shard.read(header_size))
+            tensor_infos.update({
+                name: (tensor_metadata["shape"], tensor_metadata["dtype"])
+                for name, tensor_metadata in header.items()
+                if name != "__metadata__"
+            })
+        tensor_infos = {
+            name: (tuple(shape), _TYPES[dtype])
+            for name, (shape, dtype) in tensor_infos.items()
+        }
+        return tensor_infos
+
+
 class BaseWeightConverter:
-    def __init__(self, model, parallel_context):
+    def __init__(self, model, parallel_context, model_path):
         config = model.config
         ep_info = parallel_context["ep"]
         self.rank = dist.get_rank()
@@ -16,28 +63,13 @@ class BaseWeightConverter:
         self.moe_config = self.get_moe_config(model)
         self.config = config
         self.model_type = config.model_type
-        self.dtype = self.get_save_dtype(config)
+        self.checkpoint_info = CheckpointInfo(model_path)
 
     def get_moe_config(self, model):
         for _, module in model.named_modules():
             if isinstance(module, BaseMoELayer):
                 return module.config
         return None
-
-    def get_save_dtype(self, config):
-        if hasattr(config, 'dtype'):
-            return config.dtype
-        dtype_str = "bfloat16"
-        if hasattr(config, "torch_dtype"):
-            dtype_str = config.torch_dtype
-        DTYPE_MAP = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        if dtype_str in DTYPE_MAP:
-            return DTYPE_MAP[dtype_str]
-        return torch.bfloat16
 
     def get_experts_name(self):
         return 'experts'
@@ -76,9 +108,9 @@ class BaseWeightConverter:
         return "gate.e_score_correction_bias"
 
     def get_default_hf_dtype(self, param_name):
-        if self.get_hf_gate_bias_name() in param_name:
-            return torch.float32
-        return self.dtype
+        if self.is_virtual_key(param_name):
+            param_name = self.get_physical_key(param_name)
+        return self.checkpoint_info.get_tensor_infos()[param_name][1]
 
     def _get_element_size(self, name):
         """Return element size in bytes for the checkpoint dtype of this param."""
@@ -197,7 +229,7 @@ class BaseWeightConverter:
         assert self.get_moe_router_name() in name, "must be"
         return name.replace(self.get_moe_router_name(), self.get_hf_gate_name())
 
-    def to_common_hf_name(self, name):
+    def to_hf_name(self, name):
         """Convert a non-expert internal param name to its HF checkpoint name.
 
         Only handles router and common params (NOT expert weights).
@@ -219,10 +251,10 @@ class BaseWeightConverter:
         expert_result = self.get_expert_save_entries(name, param_to_filename=param_to_filename)
         if expert_result is not None:
             return expert_result
-        element_size = self._get_element_size(name)
+        hf_name = self.to_hf_name(name)
+        element_size = self._get_element_size(hf_name)
         param_bytes = numel * element_size
         if self.is_router_param(name):
-            hf_name = self.convert_router_param_to_hf(name)
             return [hf_name], [], {hf_name: param_bytes}
         return [name], [], {name: param_bytes}
 
@@ -238,10 +270,10 @@ class BaseWeightConverter:
         expert_result = self.get_expert_load_entries(name, param_to_filename=param_to_filename)
         if expert_result is not None:
             return expert_result
-        element_size = self._get_element_size(name)
+        hf_name = self.to_hf_name(name)
+        element_size = self._get_element_size(hf_name)
         param_bytes = numel * element_size
         if self.is_router_param(name):
-            hf_name = self.convert_router_param_to_hf(name)
             return [hf_name], None, {hf_name: param_bytes}
         return [name], None, {name: param_bytes}
 
@@ -258,9 +290,9 @@ class BaseWeightConverter:
 
     def get_weight1_save_entries(self, name, param_to_filename=None):
         """Return (common_keys, expert_keys, size_map) for weight1 save allocation."""
-        element_size = self._get_element_size(name)
         ep_gates, ep_ups = self.convert_expert_weight1_to_hf(name, only_local_experts=True)
         gates, ups = self.convert_expert_weight1_to_hf(name)
+        element_size = self._get_element_size(gates[0])
         gate_size = self.get_gate_weight_bytes(element_size)
         up_size = self.get_up_weight_bytes(element_size)
         local_keys = list(ep_gates) + list(ep_ups)
@@ -270,9 +302,9 @@ class BaseWeightConverter:
 
     def get_weight2_save_entries(self, name, param_to_filename=None):
         """Return (common_keys, expert_keys, size_map) for weight2 save allocation."""
-        element_size = self._get_element_size(name)
         ep_downs = self.convert_expert_weight2_to_hf(name, only_local_experts=True)
         downs = self.convert_expert_weight2_to_hf(name)
+        element_size = self._get_element_size(downs[0])
         down_size = self.get_down_weight_bytes(element_size)
         local_keys = list(ep_downs)
         size_map = {d: down_size for d in downs}
@@ -296,10 +328,10 @@ class BaseWeightConverter:
         expert_group: (model_name, local_names, total_local_bytes) or None.
         size_map: dict mapping HF param name → byte size.
         """
-        element_size = self._get_element_size(name)
         ep_gates, ep_ups = self.convert_expert_weight1_to_hf(name, only_local_experts=True)
         local_names = list(ep_gates) + list(ep_ups)
         all_gates, all_ups = self.convert_expert_weight1_to_hf(name)
+        element_size = self._get_element_size(all_gates[0])
         gate_size = self.get_gate_weight_bytes(element_size)
         up_size = self.get_up_weight_bytes(element_size)
         size_map = {g: gate_size for g in all_gates}
@@ -314,10 +346,10 @@ class BaseWeightConverter:
         expert_group: (model_name, local_names, total_local_bytes) or None.
         size_map: dict mapping HF param name → byte size.
         """
-        element_size = self._get_element_size(name)
         ep_downs = self.convert_expert_weight2_to_hf(name, only_local_experts=True)
         local_names = list(ep_downs)
         all_downs = self.convert_expert_weight2_to_hf(name)
+        element_size = self._get_element_size(all_downs[0])
         down_size = self.get_down_weight_bytes(element_size)
         size_map = {d: down_size for d in all_downs}
         total_local_bytes = len(ep_downs) * down_size
@@ -429,8 +461,8 @@ class FusedExpertWeightConverter(BaseWeightConverter):
 
     VIRTUAL_KEY_DELIMITER = "__ep"
 
-    def __init__(self, model, parallel_context):
-        super().__init__(model, parallel_context)
+    def __init__(self, model, parallel_context, model_path):
+        super().__init__(model, parallel_context, model_path)
         # Model param names where the checkpoint uses per-expert format
         # (not fused). Filled by get_weight1/2_load_entries when the
         # fused key is absent from param_to_filename.
@@ -588,7 +620,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if param_to_filename is not None and fused_name not in param_to_filename:
             self._per_expert_fallback_names.add(name)
             return super().get_weight1_save_entries(name)
-        fused_size = self.get_fused_w1_bytes(self._get_element_size(name))
+        fused_size = self.get_fused_w1_bytes(self._get_element_size(fused_name))
         return [fused_name], [], {fused_name: fused_size}
 
     def get_weight2_save_entries(self, name, param_to_filename=None):
@@ -603,7 +635,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if param_to_filename is not None and fused_name not in param_to_filename:
             self._per_expert_fallback_names.add(name)
             return super().get_weight2_save_entries(name)
-        fused_size = self.get_fused_w2_bytes(self._get_element_size(name))
+        fused_size = self.get_fused_w2_bytes(self._get_element_size(fused_name))
         return [fused_name], [], {fused_name: fused_size}
 
     def get_weight1_load_entries(self, name, param_to_filename=None):
@@ -621,7 +653,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if param_to_filename is not None and fused_name not in param_to_filename:
             self._per_expert_fallback_names.add(name)
             return super().get_weight1_load_entries(name)
-        local_bytes = self.get_fused_w1_bytes(self._get_element_size(name)) // self.ep_size
+        local_bytes = self.get_fused_w1_bytes(self._get_element_size(fused_name)) // self.ep_size
         virtual_key = self._make_virtual_key(fused_name)
         # Include sizes for ALL EP ranks' virtual keys so that after EP all-gather,
         # param_size_map has entries for every virtual key and rank_shard_bytes
@@ -647,7 +679,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if param_to_filename is not None and fused_name not in param_to_filename:
             self._per_expert_fallback_names.add(name)
             return super().get_weight2_load_entries(name)
-        local_bytes = self.get_fused_w2_bytes(self._get_element_size(name)) // self.ep_size
+        local_bytes = self.get_fused_w2_bytes(self._get_element_size(fused_name)) // self.ep_size
         virtual_key = self._make_virtual_key(fused_name)
         size_map = {
             self._make_virtual_key_for_ep(fused_name, ep): local_bytes

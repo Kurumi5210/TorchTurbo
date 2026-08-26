@@ -25,6 +25,7 @@ from torchturbo.models.modules.attention.ulysses import (
 )
 from torchturbo.models.modules.comm import all_gather_tensor
 from torchturbo.models.modules.loss import chunk_loss, logits_loss
+from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
@@ -139,6 +140,7 @@ class FSDP2Backend(BaseBackend):
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
+        self.weight_converter: BaseWeightConverter = None
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
         """Create sequence parallel process group.
@@ -407,7 +409,10 @@ class FSDP2Backend(BaseBackend):
         if load_weights:
             from .weight_loader import DistParamLoader
 
-            weight_converter = model.get_weight_converter(parallel_context)
+            weight_converter = model.get_weight_converter(
+                parallel_context, model_name_or_path
+            )
+            self.weight_converter = weight_converter
             loader = DistParamLoader(
                 model=model,
                 path=model_name_or_path,
@@ -469,14 +474,13 @@ class FSDP2Backend(BaseBackend):
     ):
         from .weight_saver import DistParamSaver
 
-        weight_converter = model.get_weight_converter(parallel_context)
         saver = DistParamSaver(
             model=model,
             rank=self.rank,
             mesh=self._mesh,
             path=model_name_or_path,
             processing_class=None,
-            weight_converter=weight_converter,
+            weight_converter=self.weight_converter,
             device_runtime=self.device_runtime,
             is_cpu_offload=self.fsdp_config.cpu_offload,
         )

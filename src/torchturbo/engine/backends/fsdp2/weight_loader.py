@@ -52,6 +52,8 @@ class DistParamLoader:
         is_cpu_offload,
         weight_converter,
     ):
+        if weight_converter is None:
+            raise ValueError("weight_converter must not be None")
         self.model = model
         self.hf_config = model.config
         self.is_cpu_offload = is_cpu_offload
@@ -360,7 +362,7 @@ class DistParamLoader:
         """
         hf_key = self.param_converter.get_expert_broadcast_key(name)
         owner = self.param_to_rank[hf_key]
-        hf_dtype = self.param_converter.get_default_hf_dtype(name)
+        hf_dtype = self.param_converter.get_default_hf_dtype(hf_key)
 
         # Pre-allocate in checkpoint dtype
         tensor = torch.empty(param.shape, device=self.device, dtype=hf_dtype)
@@ -564,7 +566,7 @@ class DistParamLoader:
                 handle, full = self._async_broadcast_expert_weight(clean_name, param)
                 mesh = self.mesh['edp']
             else:
-                hf_name = self.param_converter.to_common_hf_name(clean_name)
+                hf_name = self.param_converter.to_hf_name(clean_name)
                 if hf_name not in self.param_to_filename:
                     logger.debug_rank0(
                         "[load] SKIP (not in checkpoint): %s (original: %s)",
@@ -578,7 +580,7 @@ class DistParamLoader:
                     )
                     continue
                 # Broadcast in checkpoint dtype; dtype conversion deferred to flush
-                hf_dtype = self.param_converter.get_default_hf_dtype(clean_name)
+                hf_dtype = self.param_converter.get_default_hf_dtype(hf_name)
                 handle, full = self._async_broadcast_tensor(hf_name, param.shape, hf_dtype, group=None)
                 mesh = self.world_mesh
 

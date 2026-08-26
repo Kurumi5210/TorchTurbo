@@ -22,24 +22,23 @@ class KimiK25WeightConverter(BaseWeightConverter):
     Kimi-K2.5 is a VLM whose real transformer dims live under
     ``config.text_config`` (DeepseekV3Config), not on the top-level
     ``KimiK25Config`` wrapper. BaseWeightConverter reads ``hidden_size`` /
-    ``moe_intermediate_size`` / ``model_type`` / dtype off ``self.config``,
+    ``moe_intermediate_size`` and ``model_type`` off ``self.config``,
     so we re-point it at ``text_config``.
 
     The language model is DeepSeek-V3 with per-expert checkpoint format
     (``language_model.model.layers.N.mlp.experts.{i}.gate_proj/up_proj/
     down_proj.weight``), so the BaseWeightConverter defaults for the
     expert (``gate_proj``/``up_proj``/``down_proj``) and router
-    (``router`` -> ``gate``, ``gate.e_score_correction_bias``) names
+    (``router`` -> ``gate``, ``gate.e_score_correction_bias``) conversions
     already match; no name overrides are needed.
     """
 
-    def __init__(self, model, parallel_context):
-        super().__init__(model, parallel_context)
+    def __init__(self, model, parallel_context, model_path):
+        super().__init__(model, parallel_context, model_path)
         config = self.config
         if hasattr(config, "text_config"):
             self.config = config.text_config
             self.model_type = self.config.model_type
-            self.dtype = self.get_save_dtype(self.config)
 
 
 @register_model("kimi_k25", config_cls=KimiK25Config, auto_class=AutoModelForCausalLM)
@@ -47,8 +46,8 @@ class TurboKimiK25ForConditionalGeneration(
     TurboVLMModel, KimiK25ForConditionalGeneration
 ):
 
-    def get_weight_converter(self, parallel_context):
-        return KimiK25WeightConverter(self, parallel_context)
+    def get_weight_converter(self, parallel_context, model_path):
+        return KimiK25WeightConverter(self, parallel_context, model_path)
 
     def get_norm(self):
         # Final text-model RMSNorm is nested at ``language_model.model.norm``;

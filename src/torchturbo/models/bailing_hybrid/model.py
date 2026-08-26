@@ -27,25 +27,9 @@ from .configuration_bailing_moe_v3 import BailingMoeV3Config
 from .modeling_bailing_moe_v3 import BailingMoeV3ForCausalLM
 
 class BailingV3WeightConverter(BaseWeightConverter):
-    def get_hf_kda_alog(self):
-        return "A_log"
-
-    def get_hf_kda_dt_bias(self):
-        return "dt_bias"
-
     @override
     def get_hf_gate_bias_name(self):
         return "gate.expert_bias"
-
-    @override
-    def get_default_hf_dtype(self, param_name):
-        if self.get_hf_gate_bias_name() in param_name:
-            return torch.float32
-        if self.get_hf_kda_alog() in param_name:
-            return torch.float32
-        if self.get_hf_kda_dt_bias() in param_name:
-            return torch.float32
-        return self.dtype
 
 
 @cache
@@ -66,8 +50,8 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
     _supports_flash_attn_2 = True
 
     @override
-    def get_weight_converter(self, parallel_context):
-        return BailingV3WeightConverter(self, parallel_context)
+    def get_weight_converter(self, parallel_context, model_path):
+        return BailingV3WeightConverter(self, parallel_context, model_path)
 
     def __init__(self, config: BailingMoeV3Config) -> None:
         self._pre_init_patches(config)

@@ -30,6 +30,8 @@ class ShardedParamManager:
         processing_class=None,
         is_cpu_offload: bool = False,
     ):
+        if weight_converter is None:
+            raise ValueError("weight_converter must not be None")
         self.move_to_cpu = True
         self.model = model
         self.device_runtime = device_runtime

@@ -31,10 +31,24 @@ logger = get_logger(__name__)
 
 
 def _gather(tensor: torch.Tensor) -> torch.Tensor:
-    """Gather a possibly-sharded DTensor into a full local tensor."""
-    if isinstance(tensor, DTensor):
+    """Gather a possibly-sharded DTensor, staging CPU-offloaded shards."""
+    if not isinstance(tensor, DTensor):
+        return tensor
+
+    compute_device = tensor.device_mesh.device_type
+    local = tensor.to_local()
+    if local.device.type == compute_device:
         return tensor.full_tensor()
-    return tensor
+
+    staged = DTensor.from_local(
+        local.to(compute_device),
+        tensor.device_mesh,
+        tensor.placements,
+        run_check=False,
+        shape=tensor.shape,
+        stride=tensor.stride(),
+    )
+    return staged.full_tensor()
 
 
 # ---------------------------------------------------------------------------

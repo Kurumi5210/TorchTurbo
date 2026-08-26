@@ -88,6 +88,13 @@ class TurboModelMixin:
             peft_config=peft_config,
         )
 
+    def _postprocess_model(self, model_dir, model):
+        from peft import PeftModel
+
+        if isinstance(model, PeftModel):
+            model = model.model
+        super()._postprocess_model(model_dir, model)
+
 
 class TurboModelLoader(TurboModelMixin, ModelLoader):
     """turbo loader for the text-only fallback (no native swift loader).

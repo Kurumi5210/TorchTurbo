@@ -615,6 +615,8 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         Falls back to BaseWeightConverter per-expert logic when the fused key
         is not in param_to_filename (e.g. MTP layers in Qwen3.5).
         """
+        if name in self._per_expert_fallback_names:
+            return super().get_weight1_save_entries(name)
         fused_name = self.convert_expert_weight1_to_hf(name)
         # Fallback: fused key not in checkpoint → per-expert format (e.g. MTP)
         if param_to_filename is not None and fused_name not in param_to_filename:
@@ -630,6 +632,8 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         Falls back to BaseWeightConverter per-expert logic when the fused key
         is not in param_to_filename (e.g. MTP layers in Qwen3.5).
         """
+        if name in self._per_expert_fallback_names:
+            return super().get_weight2_save_entries(name)
         fused_name = self.convert_expert_weight2_to_hf(name)
         # Fallback: fused key not in checkpoint → per-expert format (e.g. MTP)
         if param_to_filename is not None and fused_name not in param_to_filename:

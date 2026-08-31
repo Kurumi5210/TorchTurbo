@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # glm_moe_dsa SFT training with torchturbo
 # Usage:
-#   pip install -r scripts/runs/glm5_lf_v094_npu_requirements.txt --no-deps
 #   bash scripts/runs/glm5/lf_small_sft.sh
 
 set -o pipefail
 
 set -ex
 
-# source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /mnt/sfs_turbo/hw/dengshumin/CANN_2/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export HCCL_EVENT_TIMEOUT=14500
@@ -17,7 +15,6 @@ export ACL_DEVICE_SYNC_TIMEOUT=14400
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_ASYNC_ERROR_HANDLING=0
-source /mnt/sfs_turbo/hw/dengshumin/CANN_2/nnal/atb/set_env.sh || true
 
 export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
@@ -29,7 +26,7 @@ if [ -z "$USER_NAME" ]; then
     exit 1
 fi
 
-model_name_or_path=/mnt/sfs_turbo/xiyun.wc/ckpt/glm5/small_glm5/
+model_name_or_path=/sfs_turbo/pretrained_models/small_glm5
 output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/glm5/lf/
 
 seq_length=$((1024 * 4))
@@ -51,6 +48,7 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 
 export ASCEND_PROCESS_LOG_PATH=$output_dir/log
+export PATH=/usr/local/Ascend/aarch64-linux/bin:$PATH
 
 mkdir -p $output_dir
 if [ -d $output_dir ]; then
@@ -75,11 +73,20 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="$(dirname "$0")/../run_lf.py"
-DATASET_DIR="$(dirname "$0")/../../../dataset/npu"
+DATASET_DIR="${REPO_ROOT}/dataset/npu/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/opensource/LlamaFactory/src/:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/torchturbo/src:$PYTHONPATH
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size 2 \

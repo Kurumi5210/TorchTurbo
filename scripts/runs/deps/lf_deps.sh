@@ -1,15 +1,12 @@
 #!/bin/bash
-set -e
 
-# verified in image 'hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-0b9af7b5-20260824140737'
-
-
-pip config set global.index-url https://pypi.antfin-inc.com/simple/
+deps_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${deps_dir}/platform.sh"
 
 pip install transformers==4.57.3
-pip install safetensors==0.7.0
 
 # dependency of llama_factory
+pip install safetensors==0.7.0
 pip install deepspeed==0.16.0
 pip install tensorboard
 pip install psutil==7.2.2
@@ -18,11 +15,8 @@ pip install pyparsing
 pip install cycler
 pip install kiwisolver
 pip install peft==0.17.1
-pip install torchvision==0.25.0
 pip install torchaudio==2.10.0
 pip install datasets==4.0.0
 pip install accelerate==1.11.0
 pip install trl==0.24.0
 pip install matplotlib
-
-rm -rf ~/.cache/huggingface/modules/transformers_modules/

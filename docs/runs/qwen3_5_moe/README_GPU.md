@@ -47,7 +47,7 @@ RDMA = True
 # Debug vs production launch command
 REAL_CMD = (
     "cd /input/asystem/xiyun.wc/ && python qwen3_5.py && "
-    "cd /input/asystem/xiyun.wc/torchturbo && bash scripts/runs/gpu_deps/qwen3_5_moe_deps.sh && "
+    "cd /input/asystem/xiyun.wc/torchturbo && bash scripts/runs/qwen3_5_moe/install_lf_deps.sh && "
     "bash scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh"
 )
 
@@ -206,7 +206,7 @@ print(load_path) # 挂载路径点，可直接读取ckpt
 安装依赖
 ```bash
 cd /input/asystem/xiyun.wc/torchturbo
-bash scripts/runs/gpu_deps/qwen3_5_moe_deps.sh
+bash scripts/runs/qwen3_5_moe/install_lf_deps.sh
 ```
 
 运行训练
@@ -220,7 +220,7 @@ bash scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh
 安装依赖
 ```bash
 cd /input/asystem/xiyun.wc/torchturbo
-bash scripts/runs/gpu_deps/qwen3_5_moe_swift_deps.sh
+bash scripts/runs/qwen3_5_moe/install_swift_deps.sh
 ```
 
 运行训练

@@ -4,7 +4,7 @@
 #   mkdir -p /mnt/medmm-s3/common/data/debug_data
 #   ln -s /sfs_turbo/zhisan/datasets/mnt/medmm-s3/common/data/debug_data/images /mnt/medmm-s3/common/data/debug_data/images
 
-#   bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
+#   bash scripts/runs/qwen3_5_moe/install_lf_deps.sh
 #   bash scripts/runs/qwen3_5_moe/lf_mllm_sft_med.sh
 
 set -o pipefail

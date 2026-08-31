@@ -85,7 +85,7 @@ if __name__ == "__main__":
 ## 运行方式
 
 ```bash
-sh scripts/runs/npu_deps/deepseek_v4_deps.sh
+sh scripts/runs/deepseek_v4/install_lf_deps.sh
 sh scripts/runs/deepseek_v4/lf_sft.sh
 ```
 

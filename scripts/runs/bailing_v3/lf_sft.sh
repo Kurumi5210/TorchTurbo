@@ -74,6 +74,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="$(dirname "$0")/../run_lf.py"
 DATASET_DIR="${REPO_ROOT}/dataset/npu/"
 
+export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/flash-linear-attention/:$PYTHONPATH
 export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
 export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
 

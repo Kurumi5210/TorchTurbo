@@ -81,7 +81,7 @@ if __name__ == "__main__":
 
 ### SFT
 ```bash
-sh scripts/runs/npu_deps/kimi_k25_deps.sh
+sh scripts/runs/kimi_k25/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
 sh scripts/runs/kimi_k25/lf_sft.sh

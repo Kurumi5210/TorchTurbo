@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Qwen3.5-Dense MLLM CPT with torchturbo
 # Usage:
-#   bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
+#   bash scripts/runs/qwen3_5_dense/install_lf_deps.sh
 #   bash scripts/runs/qwen3_5_dense/lf_mllm_cpt.sh
 
 set -o pipefail

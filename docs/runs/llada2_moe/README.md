@@ -8,7 +8,7 @@ LLaDA2.1 是**离散块扩散（Block Diffusion, BD）**模型，不是自回归
 
 ```bash
 # 1. 装依赖（NPU）
-bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
+bash scripts/runs/llada2/install_lf_deps.sh
 
 # 2. 训练（单机 16 卡 / sp2 ep8 / 8K / gsm8k_bd）
 bash scripts/runs/llada2/lf_text_sft.sh

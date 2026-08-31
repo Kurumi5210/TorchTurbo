@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bailing V3 tiny SFT training with torchturbo
 # Usage:
-#   bash scripts/runs/npu_deps/bailing_v3_deps.sh
+#   bash scripts/runs/bailing_v3/install_lf_deps.sh
 #   bash scripts/runs/bailing_v3/lf_tiny_sft.sh
 set -o pipefail
 

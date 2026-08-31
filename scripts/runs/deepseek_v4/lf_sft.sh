@@ -25,7 +25,7 @@ if [ -z "$USER_NAME" ]; then
     exit 1
 fi
 
-model_name_or_path=/storage/xiyun.wc/ckpt/small_dsv4
+model_name_or_path=/sfs_turbo/pretrained_models/small_dsv4
 output_dir=/sfs_turbo/${USER_NAME}/sft/ckpt/deepseek_v4/lf/
 
 seq_length=$((1024 * 4))

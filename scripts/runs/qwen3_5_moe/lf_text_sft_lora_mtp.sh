@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Qwen3.5-MoE LoRA TEXT SFT with torchturbo
 # Usage:
-#   bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
-#   bash scripts/runs/lf_qwen3_5_moe_text_sft_lora_mtp.sh
+#   bash scripts/runs/qwen3_5_moe/install_lf_deps.sh
+#   bash scripts/runs/qwen3_5_moe/lf_text_sft_lora_mtp.sh
 
 set -o pipefail
 

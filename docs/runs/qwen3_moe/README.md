@@ -84,7 +84,7 @@ if __name__ == "__main__":
 ## 运行方式
 
 ```bash
-sh scripts/runs/npu_deps/qwen3_moe_deps.sh
+sh scripts/runs/qwen3_moe/install_lf_deps.sh
 sh scripts/runs/qwen3_moe/lf_sft.sh
 ```
 

@@ -7,8 +7,7 @@ set -o pipefail
 
 set -ex
 
-# source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /mnt/sfs_turbo/hw/dengshumin/CANN_2/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export HCCL_EVENT_TIMEOUT=14500
@@ -16,7 +15,6 @@ export ACL_DEVICE_SYNC_TIMEOUT=14400
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_ASYNC_ERROR_HANDLING=0
-source /mnt/sfs_turbo/hw/dengshumin/CANN_2/nnal/atb/set_env.sh || true
 
 export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
@@ -67,6 +65,7 @@ seq_length_k=$((seq_length / 1024))k
 output_dir=/sfs_turbo/zlj/ckpt/${model_basename}/lf/sft_lora_seq${seq_length_k}_sp${sp_size}ep${ep_size}_node${NNODES}/
 
 export ASCEND_PROCESS_LOG_PATH=$output_dir/log
+export PATH=/usr/local/Ascend/aarch64-linux/bin:$PATH
 
 export OOM_SNAPSHOT_ENABLE=1
 export OOM_SNAPSHOT_PATH=/sfs_turbo/shanyicheng.syc
@@ -95,19 +94,22 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
-RUN_LF="$(dirname "$0")/../run_lf.py"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="${SCRIPT_DIR}/../run_lf.py"
 DATASET_DIR="${REPO_ROOT}/dataset/npu/"
 TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
 #export ASCEND_LAUNCH_BLOCKING=1
 
-#export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
 export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
-#export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size $sp_size \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Qwen3.5-MoE TEXT SFT with torchturbo
 # Usage:
-#   bash scripts/runs/npu_deps/qwen3_5_moe_deps.sh
+#   bash scripts/runs/qwen3_5_moe/install_lf_deps.sh
 #   bash scripts/runs/qwen3_5_moe/lf_text_sft.sh
 
 set -o pipefail

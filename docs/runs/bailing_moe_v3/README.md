@@ -82,7 +82,7 @@ if __name__ == "__main__":
 
 ### PT
 ```bash
-sh scripts/runs/npu_deps/bailing_v3_deps.sh
+sh scripts/runs/bailing_v3/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
 sh scripts/runs/bailing_v3/lf_tiny_pt.sh
@@ -90,7 +90,7 @@ sh scripts/runs/bailing_v3/lf_tiny_pt.sh
 
 ### SFT
 ```bash
-sh scripts/runs/npu_deps/bailing_v3_deps.sh
+sh scripts/runs/bailing_v3/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
 sh scripts/runs/bailing_v3/lf_tiny_sft.sh
@@ -98,7 +98,7 @@ sh scripts/runs/bailing_v3/lf_tiny_sft.sh
 
 ### DPO
 ```bash
-sh scripts/runs/npu_deps/bailing_v3_deps.sh
+sh scripts/runs/bailing_v3/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
 sh scripts/runs/bailing_v3/lf_tiny_dpo.sh

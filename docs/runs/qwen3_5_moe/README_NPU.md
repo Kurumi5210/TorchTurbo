@@ -92,7 +92,7 @@ if __name__ == "__main__":
 
 安装依赖
 ```bash
-sh scripts/runs/npu_deps/qwen3_5_moe_swift_deps.sh
+sh scripts/runs/qwen3_5_moe/install_swift_deps.sh
 ```
 
 运行训练

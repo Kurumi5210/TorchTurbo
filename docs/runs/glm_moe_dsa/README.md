@@ -28,9 +28,9 @@ def torch_train():
     update_pypai()
     a3_sfs_old = DataStore(mount_point="/sfs_turbo", store_name="wl02-02-aidc-antfinix-sfs")
     a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
+    a3_aic_pcache = DataStore(store_name="ais-pcache-a3-common-aicompiler", mount_point="/mnt/aicompiler-a3/common")
     km_conf = KMConf(
-        # glm5
-        image="hcr.meta-wulan01.hw-wulan.local/atorch/atorch-dev-ascend_alios:deepseek-3.2-cann850-91c52d4d-20260121175052"
+        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-0b9af7b5-20260824140737"
     )
 
     labels={
@@ -46,28 +46,12 @@ def torch_train():
     node_gpu_num = 16
     node_num = 1
 
-    # glm5
-    command = ''
-    command += 'source /root/.bashrc && '
-    command += f'export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && '
-    command += "pip list && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && \
-        pip install pynvml --trusted-host repo.huaweicloud.com && \
-        cd /mnt/sfs_turbo/shanyicheng.syc/code/ && ./cann-ops-transformer-custom_linux-aarch64.run && \
-        cd /root && \
-        source /mnt/sfs_turbo/hw/dengshumin/CANN_2/ascend-toolkit/set_env.sh && \
-        source /mnt/sfs_turbo/hw/dengshumin/CANN_2/nnal/atb/set_env.sh && \
-        wget  https://gpu-wulanchabu-aistudiocode.oss-cn-wulanchabu.aliyuncs.com/040846/dlrover-0.6.0rc730-py3-none-any.whl && \
-        pip install dlrover-0.6.0rc730-py3-none-any.whl --trusted-host repo.huaweicloud.com && \
-        pip install grpcio --trusted-host repo.huaweicloud.com && \
-        cd /mnt/sfs_turbo/shanyicheng.syc/code/LLaMA-Factory && \
-        pip install -r requirements.txt && \
-        pip install deepspeed==0.16.0 && \
-        pip install transformers==4.57.3 && \
-        export ASCEND_PROCESS_LOG_PATH=/sfs_turbo/hw/liyanlong/log/plog/penglanqian/GLM5/ && \
-        pip list && "
+    command = ""
+    command += f"export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && "
+    command += f"pip list && source /usr/local/Ascend/ascend-toolkit/set_env.sh && echo 'cannVersion: ', $ASCEND_TOOLKIT_HOME && "
 
     command += ' sleep inf'
-    name = 'glm_moe_dsa_env'
+    name = 'glm5_moe_env'
 
     master= ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
     worker = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=node_num-1, shared_memory=20480, gpu_type="hpu910c", disk_m=192000)
@@ -85,7 +69,7 @@ def torch_train():
                            runtime="pytorch",
                            name=name,
                            tag="type=SFT,basemodel=ling25",
-                           data_stores = [a3_sfs_old, a3_sfs_new],
+                           data_stores = [a3_sfs_old, a3_sfs_new, a3_aic_pcache],
                            host_network=False,
                            labels=labels,
                            edl_job_args = edl_job_args,)

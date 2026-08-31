@@ -155,13 +155,13 @@ class CheckpointConfig:
         Path to a distributed checkpoint (DCP) for efficient sharded load.
     hf_model_path:
         HuggingFace model path (local or repo id) for weight loading.
-    save_format:
-        Format for saving: ``"dcp"`` (distributed) or ``"hf"`` (HuggingFace).
+    default_save_format:
+        Default weight checkpoint save format when not specified: 'hf' or 'dcp'.
     """
 
     dcp_path: str | None = None
     hf_model_path: str | None = None
-    save_format: str = "dcp"
+    default_save_format: str = "hf"
 
 
 @dataclass
@@ -489,7 +489,7 @@ class EngineConfig:
         ckpt_d = d.get("checkpoint", {})
         if not ckpt_d:
             ckpt_d = {
-                k: d[k] for k in ("dcp_path", "hf_model_path", "save_format") if k in d
+                k: d[k] for k in ("dcp_path", "hf_model_path", "default_save_format") if k in d
             }
         ckpt = CheckpointConfig(**ckpt_d)
 
@@ -537,7 +537,7 @@ class EngineConfig:
             "comm_overlap",
             "dcp_path",
             "hf_model_path",
-            "save_format",
+            "default_save_format",
             "mtp",
             "moe",
             "enable_mtp",
@@ -879,7 +879,7 @@ def _build_checkpoint_config(fields: Mapping[str, Any]) -> CheckpointConfig:
     return CheckpointConfig(
         hf_model_path=ckpt_d.get("hf_model_path"),
         dcp_path=ckpt_d.get("dcp_path") or None,
-        save_format=ckpt_d.get("save_format", "dcp"),
+        default_save_format=ckpt_d.get("default_save_format", "hf"),
     )
 
 

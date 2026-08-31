@@ -73,10 +73,10 @@ class ProfilingBackend(DummyBackend):
     def prepare_model(self, model, parallel_plan=None, peft_config=None):
         return model
 
-    def load_model(self, model, model_name_or_path, parallel_context):
+    def load_model(self, model, model_name_or_path):
         return model
 
-    def save_model(self, model, model_name_or_path, output_dir, parallel_context, **kw):
+    def save_model(self, model, model_name_or_path, output_dir, **kw):
         return None
 
     def get_dp_info(self) -> dict[str, int]:

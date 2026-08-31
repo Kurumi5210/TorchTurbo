@@ -41,7 +41,9 @@ from ...distributed import init_process_group_if_needed
 from ....logging import get_logger
 from ..base import BaseBackend
 from .config import FSDPConfig
+from .dcp import DcpCheckpoint
 from .prefetch import FSDPPrefetchManager
+from .weight_saver import has_hf_weights, hf_model_dir, hf_weights_dir_exists
 
 logger = get_logger(__name__)
 
@@ -402,27 +404,13 @@ class FSDP2Backend(BaseBackend):
         self,
         model: nn.Module,
         model_name_or_path: str,
-        parallel_context: dict[str, Any],
         load_weights: bool = True,
     ):
         if load_weights:
-            from .weight_loader import DistParamLoader
-
-            weight_converter = model.get_weight_converter(
-                parallel_context, model_name_or_path
+            self.weight_converter = model.get_weight_converter(
+                self.get_parallel_context(), model_name_or_path
             )
-            self.weight_converter = weight_converter
-            loader = DistParamLoader(
-                model=model,
-                path=model_name_or_path,
-                rank=self.rank,
-                mesh=self._mesh,
-                world_mesh=self._world_mesh,
-                device_runtime=self.device_runtime,
-                is_cpu_offload=self.fsdp_config.cpu_offload,
-                weight_converter=weight_converter,
-            )
-            loader.load_weights()
+            self._load_weights_from_hf(model=model, weights_dir=model_name_or_path)
         else:
             device = torch.device("cpu") if self.fsdp_config.cpu_offload else self.device
             model.to_empty(device=device)
@@ -468,11 +456,29 @@ class FSDP2Backend(BaseBackend):
         model: nn.Module,
         model_name_or_path: str,
         output_dir: str,
-        parallel_context: dict[str, Any],
+        format: str,
         **kwargs: Any,
     ):
+        parallel_context = self.get_parallel_context()
+        if format == "hf":
+            self._save_model_hf(model, model_name_or_path, output_dir)
+        elif format == "dcp":
+            dcp = DcpCheckpoint(self.rank, self.weight_converter)
+            dcp.save_model(model, output_dir, parallel_context)
+        else:
+            raise ValueError(
+                f"Unknown format {format}; expected 'hf' or 'dcp'."
+            )
+
+    def _save_model_hf(
+        self,
+        model: nn.Module,
+        model_name_or_path: str,
+        checkpoint_dir: str,
+    ) -> None:
         from .weight_saver import DistParamSaver
 
+        assert self.weight_converter is not None, "must have a weight converter"
         saver = DistParamSaver(
             model=model,
             rank=self.rank,
@@ -483,7 +489,93 @@ class FSDP2Backend(BaseBackend):
             device_runtime=self.device_runtime,
             is_cpu_offload=self.fsdp_config.cpu_offload,
         )
-        saver.save_model(output_dir)
+        saver.save_model(hf_model_dir(checkpoint_dir))
+
+    def load_from_checkpoint(
+        self,
+        model: nn.Module,
+        checkpoint_dir: str,
+        format: str,
+        **kwargs: Any,
+    ) -> None:
+        """Re-load model weights into an already-sharded model on resume.
+        """
+        if format == "hf":
+            if has_hf_weights(checkpoint_dir):
+                self._load_weights_from_hf(model, hf_model_dir(checkpoint_dir))
+            elif hf_weights_dir_exists(checkpoint_dir):
+                logger.warning_rank0(
+                    f"HF model checkpoint in {checkpoint_dir} is incomplete "
+                    f"(missing model.safetensors.index.json or all shards) — model weights start fresh"
+                )
+            else:
+                logger.warning_rank0(f"No HF model checkpoint found in {checkpoint_dir} — model weights start fresh")
+        elif format == "dcp":
+            dcp = DcpCheckpoint(self.rank, self.weight_converter)
+            if dcp.has_model_weights(checkpoint_dir):
+                dcp.load_model(model, checkpoint_dir, self.get_parallel_context())
+            elif dcp.model_weights_dir_exists(checkpoint_dir):
+                logger.warning_rank0(
+                    f"DCP model checkpoint in {checkpoint_dir} is incomplete (missing .metadata) — "
+                    f"model weights start fresh"
+                )
+            else:
+                logger.warning_rank0(f"No DCP model checkpoint found in {checkpoint_dir} — model weights start fresh")
+        else:
+            raise ValueError(
+                f"Unknown format {format}; expected 'hf' or 'dcp'."
+            )
+
+    def _load_weights_from_hf(
+        self,
+        model: nn.Module,
+        weights_dir: str,
+    ) -> None:
+        from .weight_loader import DistParamLoader
+
+        assert self.weight_converter is not None, "must have a weight converter"
+        loader = DistParamLoader(
+            model=model,
+            path=weights_dir,
+            rank=self.rank,
+            mesh=self._mesh,
+            world_mesh=self._world_mesh,
+            device_runtime=self.device_runtime,
+            is_cpu_offload=self.fsdp_config.cpu_offload,
+            weight_converter=self.weight_converter,
+        )
+        loader.load_weights()
+
+    def save_optimizer(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: nn.Module,
+        output_dir: str,
+        **kwargs: Any,
+    ) -> None:
+        dcp = DcpCheckpoint(self.rank, self.weight_converter)
+        dcp.save_optimizer(
+            optimizer, model, output_dir, self.get_parallel_context(), **kwargs
+        )
+
+    def load_optimizer(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: nn.Module,
+        checkpoint_dir: str,
+        **kwargs: Any,
+    ) -> None:
+        dcp = DcpCheckpoint(self.rank, self.weight_converter)
+        if dcp.has_optimizer(checkpoint_dir):
+            dcp.load_optimizer(
+                optimizer, model, checkpoint_dir, self.get_parallel_context(), **kwargs
+            )
+        elif dcp.optimizer_dir_exists(checkpoint_dir):
+            logger.warning_rank0(
+                f"Optimizer DCP in {checkpoint_dir} is incomplete (missing .metadata) — optimizer starts fresh"
+            )
+        else:
+            logger.warning_rank0(f"No optimizer checkpoint found in {checkpoint_dir} — optimizer starts fresh")
 
     def _build_fsdp_kwargs(
         self,
@@ -1155,6 +1247,14 @@ class FSDP2Backend(BaseBackend):
         else:
             return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
 
+    def get_parallel_context(self) -> dict[str, Any]:
+        """Assemble the parallel-context dict from this backend's own EP/SP/DP info."""
+        return {
+            "dp": self.get_dp_info(),
+            "sp": self.get_sp_info(),
+            "ep": self.get_ep_info(),
+        }
+
     def prepare_optimizer(
         self,
         model: nn.Module,
@@ -1191,13 +1291,12 @@ class FSDP2Backend(BaseBackend):
                 else:
                     ignored_params.append(param)
 
-            optimizer_params.extend(
-                [
-                    {"params": params, **group_options},
-                    {"params": moe_params, **group_options},
-                    {"params": ignored_params, **group_options},
-                ]
-            )
+            # Drop empty groups: set_optimizer_state_dict allows at most one empty group.
+            for shard_params in (params, moe_params, ignored_params):
+                if shard_params:
+                    optimizer_params.append(
+                        {"params": shard_params, **group_options}
+                    )
 
         return optimizer_cls(optimizer_params, **optimizer_kwargs)
 

@@ -34,6 +34,7 @@ from ..runtime import BaseProfiler, get_device_runtime
 
 logger = get_logger(__name__)
 
+SCHEDULER_NAME = "scheduler.pt"
 
 class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
     """DistributedSampler subclass that gives each SP group contiguous index blocks.
@@ -340,7 +341,6 @@ class TorchTurboEngine:
         self.backend.load_model(
             model,
             model_name_or_path=model_name_or_path,
-            parallel_context=parallel_context,
             load_weights=load_weights,
         )
 
@@ -464,24 +464,104 @@ class TorchTurboEngine:
 
         self._log_model_info(self.model)
 
-    def save_model(self, model: nn.Module, output_dir: str, **kwargs: Any) -> None:
+    def save_model(self, model: nn.Module, output_dir: str, format = None, **kwargs: Any) -> None:
+        if format is None:
+            format = self.config.checkpoint.default_save_format
         self.backend.save_model(
             model,
             self.model_name_or_path,
             output_dir,
-            parallel_context=self._get_parallel_context(),
-            **kwargs,
+            format=format,
         )
         logger.info_rank0(
             "Model saved in %s via %s backend", output_dir, self.config.backend.value
         )
 
+    def save_optimizer_and_scheduler(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+        output_dir: str,
+        **kwargs: Any,
+    ) -> None:
+        """Save optimizer (per-rank, via backend) and LR scheduler (rank-0).
+
+        ``optimizer`` / ``model`` / ``lr_scheduler`` are the training loop's
+        live objects, threaded down from the trainer.
+        """
+        self.backend.save_optimizer(
+            optimizer,
+            model,
+            output_dir,
+            **kwargs,
+        )
+        if lr_scheduler is not None:
+            self._save_scheduler(lr_scheduler.state_dict(), output_dir)
+
+    def load_optimizer_and_scheduler(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+        checkpoint_dir: str,
+        **kwargs: Any,
+    ) -> None:
+        """Load optimizer (per-rank, via backend) and LR scheduler if present.
+        """
+        self.backend.load_optimizer(
+            optimizer,
+            model,
+            checkpoint_dir,
+            **kwargs,
+        )
+
+        scheduler_state = self._load_scheduler(checkpoint_dir)
+        if scheduler_state is not None and lr_scheduler is not None:
+            lr_scheduler.load_state_dict(scheduler_state)
+        elif lr_scheduler is not None:
+            scheduler_file = os.path.join(checkpoint_dir, SCHEDULER_NAME)
+            if os.path.isfile(scheduler_file):
+                logger.warning_rank0(
+                    f"Scheduler checkpoint {scheduler_file} is empty (interrupted save) — lr scheduler starts fresh"
+                )
+            else:
+                logger.warning_rank0(
+                    f"No scheduler checkpoint found in {checkpoint_dir} — lr scheduler starts fresh"
+                )
+
+    def load_from_checkpoint(self, model: nn.Module, checkpoint_dir: str, **kwargs: Any) -> None:
+        format = self.config.checkpoint.default_save_format
+        self.backend.load_from_checkpoint(
+            model,
+            checkpoint_dir,
+            format=format,
+        )
+        logger.info_rank0(
+            "Model weights reloaded from %s via %s backend",
+            checkpoint_dir,
+            self.config.backend.value,
+        )
+
+    def _save_scheduler(self, scheduler_state: Any, output_dir: str) -> None:
+        """Rank-0 only — scheduler state is plain python, not sharded."""
+        if not scheduler_state:
+            return
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(scheduler_state, os.path.join(output_dir, SCHEDULER_NAME))
+
+    def _load_scheduler(self, checkpoint_dir: str) -> Any:
+        """Return the scheduler state dict, or None if no usable scheduler.pt exists.
+        """
+        scheduler_file = os.path.join(checkpoint_dir, SCHEDULER_NAME)
+        if not os.path.isfile(scheduler_file) or os.path.getsize(scheduler_file) == 0:
+            return None
+        return torch.load(scheduler_file, map_location="cpu", weights_only=True)
+
     def _get_parallel_context(self) -> dict[str, Any]:
-        return {
-            "dp": self.get_dp_info(),
-            "sp": self.get_sp_info(),
-            "ep": self.get_ep_info(),
-        }
+        return self.backend.get_parallel_context()
 
     # ------------------------------------------------------------------
     # Optimizer & LR scheduler

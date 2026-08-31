@@ -17,6 +17,37 @@ from torchturbo.logging import get_logger
 
 logger = get_logger(__name__)
 
+# HF checkpoint layout under a checkpoint root: weights live in the
+# ``huggingface`` sub-dir and are described by ``model.safetensors.index.json``.
+_HF_MODEL_SUBDIR = "huggingface"
+_HF_INDEX = "model.safetensors.index.json"
+_HF_SHARD_SUFFIX = ".safetensors"
+
+
+def hf_model_dir(checkpoint_dir) -> str:
+    """HF weights sub-directory under a checkpoint root."""
+    return os.path.join(checkpoint_dir, _HF_MODEL_SUBDIR)
+
+
+def _hf_shard_files(model_dir: str) -> list:
+    return [f for f in os.listdir(model_dir) if f.endswith(_HF_SHARD_SUFFIX)] if os.path.isdir(model_dir) else []
+
+
+def has_hf_weights(checkpoint_dir) -> bool:
+    """True iff ``checkpoint_dir`` holds a *complete* HF sharded-safetensors save.
+
+    Requires the sharding index (``model.safetensors.index.json``) AND at least
+    one ``*.safetensors`` shard in the ``huggingface/`` subdir. A dir with an
+    index but no shards is an interrupted save and must not be loaded.
+    """
+    model_dir = hf_model_dir(checkpoint_dir)
+    return os.path.isfile(os.path.join(model_dir, _HF_INDEX)) and len(_hf_shard_files(model_dir)) > 0
+
+
+def hf_weights_dir_exists(checkpoint_dir) -> bool:
+    """Shallow existence (subdir present at all), for ``missing vs incomplete`` messaging."""
+    return os.path.isdir(hf_model_dir(checkpoint_dir))
+
 
 class ShardedParamManager:
     def __init__(
@@ -189,7 +220,7 @@ class ShardedParamManager:
 
     def _load_index_json(self, path):
         """Load the model.safetensors.index.json file."""
-        index_path = Path(path) / "model.safetensors.index.json"
+        index_path = Path(path) / _HF_INDEX
         if not index_path.exists():
             raise FileNotFoundError(f"Index file not found: {index_path}")
         with open(index_path) as f:
@@ -204,7 +235,7 @@ class ShardedParamManager:
         for item in Path(src_path).iterdir():
             if item.is_file():
                 # Skip safetensors files and index json
-                if item.suffix == '.safetensors' or item.name == 'model.safetensors.index.json':
+                if item.suffix == '.safetensors' or item.name == _HF_INDEX:
                     continue
                 shutil.copy2(item, dst_path / item.name)
             elif item.is_dir():
@@ -376,7 +407,7 @@ class ShardedParamManager:
                 shard_dict[param] = state_dict[param]
                 weight_map[param] = file_name
             if shard_dict:
-                logger.debug_rank0(
+                logger.debug(
                     "[save][rank %d] Saving %s with %d params...",
                     self.rank, file_name, len(shard_dict),
                 )
@@ -384,7 +415,7 @@ class ShardedParamManager:
                 file_path = save_path / file_name
                 save_file(shard_dict, file_path.as_posix())
                 file_elapsed = time.perf_counter() - file_start
-                logger.debug_rank0(
+                logger.info(
                     "[save][rank %d] Saved %s in %.2fs",
                     self.rank, file_name, file_elapsed,
                 )
@@ -402,7 +433,7 @@ class ShardedParamManager:
                 "metadata": metadata,
                 "weight_map": final_weight_map
             }
-            with open(save_path / "model.safetensors.index.json", "w") as f:
+            with open(save_path / _HF_INDEX, "w") as f:
                 json.dump(index_content, f, indent=2)
 
             self._copy_non_safetensor_files(self.src_path, save_path)

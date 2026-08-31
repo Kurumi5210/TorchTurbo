@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from contextlib import nullcontext
 from typing import Any
 
@@ -125,6 +124,27 @@ class TorchTurboTrainerBase:
             raise RuntimeError("TorchTurbo trainer is missing its engine binding.")
         return engine
 
+    # Checkpoint resume hooks — route to the engine; fall back to HF when unbound.
+    def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
+        self.engine.save_optimizer_and_scheduler(
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            output_dir,
+        )
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        self.engine.load_from_checkpoint(self.model, resume_from_checkpoint)
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        if checkpoint:
+            self.engine.load_optimizer_and_scheduler(
+                self.model,
+                self.optimizer,
+                self.lr_scheduler,
+                checkpoint,
+            )
+
     def create_optimizer(self):
         if self.optimizer is not None:
             return self.optimizer
@@ -157,9 +177,12 @@ class TorchTurboTrainerBase:
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        save_path = str(Path(output_dir) / "huggingface")
-        logger.info_rank0("torchturbo: saving model via engine.save_model(%s)", save_path)
-        engine.save_model(self.model, save_path)
+        logger.info_rank0("torchturbo: saving model via engine.save_model(%s)", output_dir)
+        # LF's final save is an explicit save_model() (_internal_call=False);
+        # intermediates come through the HF checkpoint machinery (_internal_call=True).
+        # The engine picks the format from this; we forward it unchanged.
+        format = None if _internal_call else "hf"
+        engine.save_model(self.model, output_dir, format = format)
 
         if getattr(self.args, "push_to_hub", False) and not _internal_call:
             self.push_to_hub(commit_message="Model save")

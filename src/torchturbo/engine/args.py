@@ -155,6 +155,7 @@ class TorchTurboArgs:
     # builder can reconstruct an EngineConfig from a single TorchTurboArgs.
     model_path: str | None = None
     output_dir: str | None = None
+    default_save_format: str | None = None
 
     # Block-diffusion (BD) fields — threaded into EngineConfig.diffusion by
     # build_config_from_lf_args(); only active for is_diffusion_model models.
@@ -197,6 +198,9 @@ class TurboArgSpec:
 
     metavar: str | None = None
     """Argparse metavar for the CLI option; None means argparse default."""
+
+    choices: tuple[str, ...] | None = None
+    """Argparse ``choices`` for the CLI option; None means unrestricted."""
 
     help: str | None = None
     """Help/documentation text for the CLI option."""
@@ -552,6 +556,15 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         "uses the runtime's default card (NPU 910c / CUDA h20); "
         "e.g. 910b / h100 / h200 / a100.",
     ),
+    TurboArgSpec(
+        name="default_save_format",
+        config_path="checkpoint.default_save_format",
+        cli_name="--tt_default_save_format",
+        choices=("hf", "dcp"),
+        help=(
+            "Default weight checkpoint save format when not specified: 'hf' or 'dcp'."
+        ),
+    ),
 )
 
 
@@ -580,6 +593,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "metavar": spec.metavar,
             "help": spec.help,
         }
+        if spec.choices is not None:
+            kwargs["choices"] = spec.choices
         if spec.type is string_to_bool:
             kwargs["nargs"] = "?"
             kwargs["const"] = True

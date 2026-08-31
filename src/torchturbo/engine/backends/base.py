@@ -73,7 +73,6 @@ class BaseBackend(ABC):
         self,
         model: nn.Module,
         model_name_or_path: str,
-        parallel_context: dict[str, Any],
         load_weights: bool = True,
     ) -> nn.Module:
         """Load weights or materialize the model without checkpoint I/O."""
@@ -84,10 +83,47 @@ class BaseBackend(ABC):
         model: nn.Module,
         model_name_or_path: str,
         output_dir: str,
-        parallel_context: dict[str, Any],
+        format: str,
         **kwargs: Any,
     ) -> None:
         """Save weights."""
+
+    @abstractmethod
+    def load_from_checkpoint(
+        self,
+        model: nn.Module,
+        checkpoint_dir: str,
+        format: str,
+        **kwargs: Any,
+    ) -> None:
+        """Re-load weights into an already-sharded model on resume (backend override).
+
+        The loader is chosen by ``save_format`` and must match the format the
+        checkpoint was written in.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support load_from_checkpoint.")
+
+    @abstractmethod
+    def save_optimizer(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: nn.Module,
+        output_dir: str,
+        **kwargs: Any,
+    ) -> None:
+        """Save optimizer state for resume (backend override)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support save_optimizer.")
+
+    @abstractmethod
+    def load_optimizer(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: nn.Module,
+        checkpoint_dir: str,
+        **kwargs: Any,
+    ) -> None:
+        """Load optimizer state written by :meth:`save_optimizer` (backend override)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support load_optimizer.")
 
     @abstractmethod
     def prepare_optimizer(
@@ -117,6 +153,13 @@ class BaseBackend(ABC):
     @abstractmethod
     def get_sp_info(self) -> dict[str, Any]:
         """Compute sequence-parallel rank, size and group.
+
+        Override in subclass for distributed backends.
+        """
+
+    @abstractmethod
+    def get_parallel_context(self) -> dict[str, Any]:
+        """Return parallel-context dict of EP/SP/DP info.
 
         Override in subclass for distributed backends.
         """

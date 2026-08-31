@@ -52,6 +52,9 @@ engine_config:
     forward_prefetch_depth: 1
     backward_prefetch_depth: 1
 
+  checkpoint:
+    default_save_format: "hf"
+
   activation_checkpointing:
     enabled: true
     use_reentrant: false

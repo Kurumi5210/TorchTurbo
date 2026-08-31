@@ -133,6 +133,45 @@ class TurboTrainerMixin:
     callbacks, the train loop, and grad accumulation.
     """
 
+    # Checkpoint resume hooks — route to the engine.
+    def _is_final_save(self, _internal_call: bool) -> bool:
+        """Training-complete save: explicit call, or the last-step checkpoint.
+
+        swift's final save also goes through ``save_checkpoint`` (so
+        ``_internal_call=True`` like intermediates); disambiguate via
+        ``global_step >= max_steps``.
+        """
+        if not _internal_call:
+            return True
+        state = getattr(self, "state", None)
+        if state is None:
+            return False
+        max_steps = getattr(state, "max_steps", 0) or 0
+        global_step = getattr(state, "global_step", 0) or 0
+        return bool(max_steps) and global_step >= max_steps
+
+    def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
+        engine = engine_registry.get_engine()
+        engine.save_optimizer_and_scheduler(
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            output_dir,
+        )
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        engine = engine_registry.get_engine()
+        engine.load_from_checkpoint(self.model, resume_from_checkpoint)
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        engine = engine_registry.get_engine()
+        engine.load_optimizer_and_scheduler(
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            checkpoint,
+        )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         engine = engine_registry.get_engine_or_none()
@@ -322,11 +361,13 @@ class TurboTrainerMixin:
         return None
 
     def save_model(self, output_dir=None, _internal_call=False):
-        engine = engine_registry.get_engine_or_none()
+        engine = engine_registry.get_engine()
         output_dir = output_dir if output_dir is not None else self.args.output_dir
-        if engine is not None:
-            os.makedirs(output_dir, exist_ok=True)
-            engine.save_model(self.model, output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        # Map the real-final save to _internal_call=False so the engine forces HF
+        # (swift's last-step save also goes through the HF checkpoint machinery).
+        format = "hf" if self._is_final_save(_internal_call) else None
+        engine.save_model(self.model, output_dir, format = format)
         # Let swift persist training_args.bin / args.json / tokenizer;
         # _save_model is a no-op above, so weights aren't double-written.
         super().save_model(output_dir, _internal_call=_internal_call)

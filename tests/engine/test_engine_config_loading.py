@@ -431,7 +431,7 @@ checkpoint:
 
     assert cfg.checkpoint.hf_model_path == "/file/model"
     assert cfg.checkpoint.dcp_path == "/file/out"
-    assert cfg.checkpoint.save_format == "dcp"
+    assert cfg.checkpoint.default_save_format == "hf"
 
 
 def test_tt_mtp_values_kept_when_file_only_touches_enabled(tmp_path):

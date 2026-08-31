@@ -95,7 +95,7 @@ def test_load_model_materializes_model_when_cpu_offload(monkeypatch):
         (m, backend.device)
     )
 
-    backend.load_model(model, "unused", {}, load_weights=False)
+    backend.load_model(model, "unused", load_weights=False)
 
     assert to_empty_calls == [torch.device("cpu")]
     assert helper_calls == [(model, torch.device("cuda"))]

@@ -13,6 +13,7 @@ dependencies = [
     "torch>=2.4.0",
     "omegaconf>=2.3.0",
     "PyYAML>=6.0",
+    "safetensors>=0.4.3",
 ]
 
 [project.optional-dependencies]

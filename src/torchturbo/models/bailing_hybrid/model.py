@@ -47,7 +47,6 @@ def _get_cu_seqlens(attention_mask):
 class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
     config_class = BailingMoeV3Config
     base_model_prefix = "model"
-    _supports_flash_attn_2 = True
 
     @override
     def get_weight_converter(self, parallel_context, model_path):

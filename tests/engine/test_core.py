@@ -203,6 +203,8 @@ class TestEngineSetup:
         assert logs == {"test_metric": 2.0}
 
     def test_compute_loss_sets_moe_runtime_inputs(self):
+        calls = []
+
         class RuntimeMoELayer(BaseMoELayer):
             def __init__(self):
                 nn.Module.__init__(self)
@@ -217,10 +219,17 @@ class TestEngineSetup:
                 self.moe = RuntimeMoELayer()
 
             def get_moe_runtime_inputs(self, inputs, parallel_context):
+                calls.append("moe_runtime")
                 return MoERuntimeInputs(padding_mask=inputs["padding_mask"])
 
         class RuntimeBackend:
+            def prepare_inputs(self, model, inputs):
+                calls.append("prepare_inputs")
+                return {**inputs, "padding_mask": prepared_padding_mask}
+
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                calls.append("compute_loss")
+                assert inputs["padding_mask"] is prepared_padding_mask
                 return torch.tensor(0.0)
 
             def get_dp_info(self):
@@ -232,15 +241,25 @@ class TestEngineSetup:
             def get_ep_info(self):
                 return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
 
+            def get_parallel_context(self):
+                return {
+                    "dp": self.get_dp_info(),
+                    "ep": self.get_ep_info(),
+                    "sp": self.get_sp_info(),
+                }
+
         engine = object.__new__(TorchTurboEngine)
         engine.backend = RuntimeBackend()
         engine.metric_tracker = engine_core.MetricTracker()
+        engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
         model = RuntimeModel()
         padding_mask = torch.tensor([[False, True]])
+        prepared_padding_mask = torch.tensor([[False, True, True]])
 
         engine.compute_loss(model, {"padding_mask": padding_mask})
 
-        assert model.moe._runtime_inputs.padding_mask is padding_mask
+        assert model.moe._runtime_inputs.padding_mask is prepared_padding_mask
+        assert calls == ["prepare_inputs", "moe_runtime", "compute_loss"]
 
     @pytest.mark.parametrize(
         ("training", "gradient_accumulation_steps", "expected_scale"),
@@ -254,6 +273,9 @@ class TestEngineSetup:
         expected_scale,
     ):
         class RuntimeBackend:
+            def prepare_inputs(self, model, inputs):
+                return inputs
+
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 return torch.tensor(0.0)
 
@@ -302,6 +324,9 @@ class TestEngineSetup:
 
     def test_compute_loss_skips_moe_setup_for_dense(self, monkeypatch):
         class RuntimeBackend:
+            def prepare_inputs(self, model, inputs):
+                return inputs
+
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 return torch.tensor(0.0)
 

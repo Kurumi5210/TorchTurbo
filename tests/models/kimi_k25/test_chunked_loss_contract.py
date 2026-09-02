@@ -2,14 +2,9 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.utils import import_utils
-
-if not hasattr(import_utils, "is_torch_fx_available"):
-    pytest.skip("Kimi K2.5 requires Transformers 4.57.x", allow_module_level=True)
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.models.kimi_k25.model import TurboKimiK25ForConditionalGeneration

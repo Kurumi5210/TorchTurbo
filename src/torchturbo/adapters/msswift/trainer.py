@@ -310,8 +310,7 @@ class TurboTrainerMixin:
         # inputs_bridging.py.
         from .inputs_bridging import bridge_swift_inputs
 
-        engine = engine_registry.get_engine_or_none()
-        return bridge_swift_inputs(inputs, engine)
+        return bridge_swift_inputs(inputs)
 
     def _report_engine_metrics(self, logs) -> None:
         engine = engine_registry.get_engine_or_none()

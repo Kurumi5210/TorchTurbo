@@ -289,6 +289,20 @@ ALL_LAYERNORM_LAYERS.append(BailingMoeV3RMSNorm)
 
 
 class BailingMoeV3RotaryEmbedding(nn.Module):
+    @staticmethod
+    def compute_default_rope_parameters(config, device=None, **kwargs):
+        dim = int(config.head_dim * config.partial_rotary_factor)
+        inv_freq = 1.0 / (
+            config.rope_theta
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device, dtype=torch.float32
+                )
+                / dim
+            )
+        )
+        return inv_freq, 1.0
+
     def __init__(self, config: BailingMoeV3Config, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
@@ -302,8 +316,9 @@ class BailingMoeV3RotaryEmbedding(nn.Module):
         self.config = deepcopy(config)
         self.config.head_dim = config.qk_rope_head_dim
         self.config.partial_rotary_factor = 1.0
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
+        self.rope_init_fn = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
@@ -689,7 +704,8 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
         )
 
         self.scaling = self.qk_head_dim ** (-0.5)
-        if self.config.rope_scaling is not None:
+        # Apply YaRN scaling only when the configuration provides its factor.
+        if self.config.rope_scaling is not None and "factor" in self.config.rope_scaling:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
             scaling_factor = self.config.rope_scaling["factor"]
             if mscale_all_dim:
@@ -1203,7 +1219,7 @@ class BailingMoeV3PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["BailingMoeV3DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
 

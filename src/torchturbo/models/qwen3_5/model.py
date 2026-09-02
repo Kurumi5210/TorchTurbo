@@ -379,7 +379,7 @@ class TurboQwen3_5ForConditionalGeneration(
         rotary_emb = lm.rotary_emb
         rope_init_fn = rotary_emb.compute_default_rope_parameters
         if rotary_emb.rope_type != "default":
-            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rotary_emb.rope_type]
         inv_freq, rotary_emb.attention_scaling = rope_init_fn(rotary_emb.config, device)
         rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
         rotary_emb.register_buffer(

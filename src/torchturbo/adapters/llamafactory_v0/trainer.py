@@ -373,7 +373,12 @@ class TorchTurboTrainerBase:
         return result
 
     def _report_engine_metrics(self, logs) -> None:
-        self._engine().report_metrics(logs, self._nested_gather)
+        from transformers.trainer import nested_gather
+
+        def gather_fn(tensors):
+            return nested_gather(tensors, self.args.parallel_mode)
+
+        self._engine().report_metrics(logs, gather_fn)
 
     def log(self, logs, *args, **kwargs):
         self._report_engine_metrics(logs)

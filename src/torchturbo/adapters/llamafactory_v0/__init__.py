@@ -29,11 +29,11 @@ from ...registry import BaseAdapter, register_adapter
 from .compat import is_llamafactory_v0
 from .patches import (
     AcceleratorPatch,
-    CollatorPatch,
     CreateRefModelPatch,
     DictFieldPatch,
     LoadModelPatch,
     LogCallbackPatch,
+    PackedFA2CollatorPatch,
     PretrainProcessorPatch,
     RegisterAutoclassPatch,
     RunExpPatch,
@@ -96,7 +96,7 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         self._register_lf_templates()
 
         # Register patches — inner patches applied by RunExpPatch
-        self.add_patch(CollatorPatch())
+        self.add_patch(PackedFA2CollatorPatch())
         self.add_patch(LoadModelPatch(adapter=self))
         self.add_patch(CreateRefModelPatch(adapter=self))
         self.add_patch(AcceleratorPatch())
@@ -129,9 +129,8 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         self._active = False
         logger.info_rank0("LlamaFactory v0 adapter deactivated.")
 
-    @staticmethod
-    def _register_lf_templates() -> None:
-        """Auto-register LF templates/plugins for all torchturbo models.
+    def _register_lf_templates(self) -> None:
+        """Auto-register LF templates/plugins and patches for all models.
 
         Scans model directories for ``lf_template.py`` modules with a
         ``register()`` function.  Each model that wants LF integration
@@ -144,6 +143,9 @@ class LlamaFactoryV0Adapter(BaseAdapter):
             module_path = f"torchturbo.models.{model_name}.lf_template"
             try:
                 mod = importlib.import_module(module_path)
+                if hasattr(mod, "get_patches"):
+                    for patch in mod.get_patches():
+                        self.add_patch(patch)
                 if hasattr(mod, "register"):
                     mod.register()
                     logger.debug("Registered LF template for model %r", model_name)

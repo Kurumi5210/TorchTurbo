@@ -17,7 +17,7 @@ paths run on correct, fixed-length inputs:
 3. **pad the batch to a FIXED length** — turbo's packing path wants a constant
    shape (Triton / flash-attn shape-cache; no unpad roundtrip), while swift
    padding-free packing emits variable lengths. Every sequence-length field is
-   padded to ``packing_length`` (rounded up to a multiple of ``sp_size``).
+   padded to ``packing_length``. Backend-specific SP alignment happens later.
    ``attention_mask=0`` and ``labels=-100`` mark the padding tail.
 
 4. **[4, bsz, seq] position_ids** — turbo qwen3.5 expects ``row 0 = text
@@ -29,7 +29,7 @@ paths run on correct, fixed-length inputs:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -132,28 +132,20 @@ def bake_loss_scale_into_labels(inputs: dict) -> dict:
     return inputs
 
 
-def resolve_fixed_packing_length(engine: Any) -> Optional[int]:
+def resolve_fixed_packing_length() -> Optional[int]:
     """Fixed sequence length to pad every batch to, for turbo's packing path.
 
     The target is the configured ``packing_length`` (falling back to
     ``max_length``) — stashed in :mod:`engine_registry` by ``TurboSwiftSft``
     from its FULL args, because swift hands the trainer a stripped args view
-    that lacks ``packing_length``/``max_length``. Rounded UP to a multiple of
-    ``sp_size`` so turbo's ``ulysses_pad`` also stays a no-op
-    (``pad_size == 0``). ``None`` when no length is configured.
+    that lacks ``packing_length``/``max_length``. ``None`` when no length is
+    configured. FSDP2 owns any additional Ulysses alignment.
     """
     from . import engine_registry
     length = engine_registry.get_packing_length()
     if not length:
         return None
-    try:
-        sp_size = engine.get_sp_info().get("sp_size", 1) or 1
-    except Exception:
-        sp_size = 1
-    length = int(length)
-    if sp_size <= 1:
-        return length
-    return ((length + sp_size - 1) // sp_size) * sp_size
+    return int(length)
 
 
 def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
@@ -237,7 +229,7 @@ def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
 
     return inputs
 
-def bridge_swift_inputs(inputs: dict, engine: Any) -> dict:
+def bridge_swift_inputs(inputs: dict) -> dict:
     """Full swift → turbo input bridge for one batch (called from _prepare_inputs).
 
     Order matters: rebuild the packed attention mask, fold loss_scale, then pad
@@ -245,7 +237,7 @@ def bridge_swift_inputs(inputs: dict, engine: Any) -> dict:
     """
     inputs = bridge_packed_inputs(inputs)
     inputs = bake_loss_scale_into_labels(inputs)
-    target = resolve_fixed_packing_length(engine)
+    target = resolve_fixed_packing_length()
     if target is not None:
         inputs = pad_batch_to_fixed_length(inputs, target)
     return inputs

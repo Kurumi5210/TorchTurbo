@@ -1309,6 +1309,7 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
     config_class = DeepseekV4Config
     base_model_prefix = ""  # Deepseek HF weights don't have 'model.' prefix
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
     _no_split_modules = ["DeepseekV4DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
 

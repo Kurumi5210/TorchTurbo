@@ -237,7 +237,7 @@ def test_bridge_swift_inputs_end_to_end_with_packing_length():
             "labels": _t([[10, 0, 12, 13, 14]]),
             "loss_scale": _t([[1.0, 0.0, 1.0, 1.0, 1.0]]),  # idx 1 zeroed -> label -100
         }
-        out = bridge_swift_inputs(inputs, engine=None)
+        out = bridge_swift_inputs(inputs)
         assert out["input_ids"].shape[-1] == 8           # padded to packing_length
         # loss_scale folded: the zero-weight token's label is -100 (then padded).
         assert out["labels"].tolist()[0][0:5] == [10, -100, 12, 13, 14]

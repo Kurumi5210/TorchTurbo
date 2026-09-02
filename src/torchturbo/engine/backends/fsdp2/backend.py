@@ -21,7 +21,6 @@ from torchturbo.models.base import SequenceParallelInputMode
 from torchturbo.models.modules.attention.ulysses import (
     slice_input_tensor,
     ulysses_pad,
-    ulysses_pad_and_slice_inputs,
 )
 from torchturbo.models.modules.comm import all_gather_tensor
 from torchturbo.models.modules.loss import chunk_loss, logits_loss
@@ -1473,6 +1472,98 @@ class FSDP2Backend(BaseBackend):
 
         return total_norm
 
+    def prepare_inputs(self, model, inputs):
+        """Pad inputs for Ulysses sequence parallelism."""
+        if not isinstance(inputs, dict):
+            return inputs
+
+        sp_size = self.get_sp_info()["sp_size"]
+        input_ids = inputs.get("input_ids")
+        if sp_size <= 1 or not torch.is_tensor(input_ids) or input_ids.dim() != 2:
+            return inputs
+
+        seq_len = input_ids.size(-1)
+        pad_size = (-seq_len) % sp_size
+        if pad_size == 0:
+            return inputs
+
+        inputs = dict(inputs)
+        position_ids = inputs.get("position_ids")
+        labels = inputs.get("labels")
+        pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0
+        (
+            inputs["input_ids"],
+            inputs["position_ids"],
+            inputs["labels"],
+            _,
+        ) = ulysses_pad(
+            input_ids,
+            position_ids_rmpad=position_ids,
+            labels=labels,
+            sp_size=sp_size,
+            pad_value=pad_token_id,
+        )
+
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+            if attention_mask.size(-1) != seq_len:
+                raise ValueError(
+                    "attention_mask must be aligned with input_ids before "
+                    "FSDP2 Ulysses padding"
+                )
+            inputs["attention_mask"] = nn.functional.pad(
+                attention_mask, (0, pad_size), value=0
+            )
+
+        for key in ("token_type_ids", "mm_token_type_ids"):
+            tensor = inputs.get(key)
+            if torch.is_tensor(tensor) and tensor.size(-1) == seq_len:
+                inputs[key] = nn.functional.pad(tensor, (0, pad_size), value=0)
+
+        text_position_ids = inputs.get("text_position_ids")
+        if (
+            torch.is_tensor(text_position_ids)
+            and text_position_ids.size(-1) == seq_len
+        ):
+            pad_positions = torch.arange(
+                pad_size,
+                device=text_position_ids.device,
+                dtype=text_position_ids.dtype,
+            ).reshape((1,) * (text_position_ids.dim() - 1) + (pad_size,))
+            inputs["text_position_ids"] = torch.cat(
+                (
+                    text_position_ids,
+                    pad_positions.expand(*text_position_ids.shape[:-1], pad_size),
+                ),
+                dim=-1,
+            )
+
+        padded_seq_len = seq_len + pad_size
+        # Update packed sequence metadata after padding.
+        packed_metadata = (
+            ("cu_seqlens", None),
+            ("cu_seq_lens_q", "max_length_q"),
+            ("cu_seq_lens_k", "max_length_k"),
+        )
+        for key, max_length_key in packed_metadata:
+            cu_seqlens = inputs.get(key)
+            if (
+                torch.is_tensor(cu_seqlens)
+                and cu_seqlens.dim() == 1
+                and cu_seqlens.numel() > 1
+            ):
+                cu_seqlens = cu_seqlens.clone()
+                cu_seqlens[-1] = padded_seq_len
+                inputs[key] = cu_seqlens
+                if max_length_key is not None and max_length_key in inputs:
+                    inputs[max_length_key] = inputs[max_length_key] + pad_size
+
+        return inputs
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if inputs.get("position_ids", None) is None:
             inputs["position_ids"] = torch.arange(
@@ -1494,24 +1585,21 @@ class FSDP2Backend(BaseBackend):
         # num_items_in_batch = num_items_in_batch // sp_size
 
         input_mode = model.get_sequence_parallel_input_mode()
-        if input_mode == SequenceParallelInputMode.POST_EMBEDDING:
-            # vlm model's inputs will be sliced after embedding
-            inputs["input_ids"], inputs["position_ids"], _, pad_size = ulysses_pad(
+        if input_mode != SequenceParallelInputMode.POST_EMBEDDING:
+            inputs["input_ids"] = slice_input_tensor(
                 inputs["input_ids"],
-                position_ids_rmpad=inputs["position_ids"],
-                sp_size=sp_size,
+                dim=1,
+                group=sp_group,
+                rank=sp_rank,
+                padding=False,
             )
-        else:
-            inputs["input_ids"], inputs["position_ids"], _, pad_size = (
-                ulysses_pad_and_slice_inputs(
-                    inputs["input_ids"],
-                    position_ids_rmpad=inputs["position_ids"],
-                    sp_size=sp_size,
-                    sp_group=sp_group,
-                    sp_rank=sp_rank,
-                )
+            inputs["position_ids"] = slice_input_tensor(
+                inputs["position_ids"],
+                dim=-1,
+                group=sp_group,
+                rank=sp_rank,
+                padding=False,
             )
-        assert pad_size == 0, "must be"
 
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
         mtp_loss_scale = self.config.mtp.loss_scaling_factor

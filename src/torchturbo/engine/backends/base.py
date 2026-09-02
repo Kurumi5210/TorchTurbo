@@ -164,6 +164,10 @@ class BaseBackend(ABC):
         Override in subclass for distributed backends.
         """
 
+    def prepare_inputs(self, model: nn.Module, inputs: Any) -> Any:
+        """Apply backend-specific input layout requirements before a step."""
+        return inputs
+
     @abstractmethod
     def compute_loss(
         self, model: nn.Module, inputs: Any, return_outputs: bool = False, **kwargs

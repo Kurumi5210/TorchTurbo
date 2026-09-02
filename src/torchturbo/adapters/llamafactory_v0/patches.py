@@ -17,8 +17,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # Version range for LlamaFactory v0
-_LF_V0 = ">=0.5,<1.0"
-
+_LF_V0 = "==0.9.5"
 
 # ---------------------------------------------------------------------------
 # DictFieldPatch — fix dict-typed CLI args in HfArgumentParser
@@ -116,7 +115,6 @@ class RunExpPatch(BasePatch):
         self._original = None
         self._module = None
         self._launcher_module = None
-        self._train_module = None
 
     def patch(self, engine: TorchTurboEngine | None = None) -> None:
         try:
@@ -248,158 +246,53 @@ class RunExpPatch(BasePatch):
         except ImportError as e:
             raise ImportError("Failed to patch llamafactory.launcher")
 
-        # src/train.py does `from llamafactory.train.tuner import run_exp`
-        try:
-            import train as train_module
-
-            if hasattr(train_module, "run_exp"):
-                self._train_module = train_module
-                train_module.run_exp = _patched_run_exp
-                logger.debug_rank0("Patched train.run_exp")
-        except ImportError as e:
-            raise ImportError("Failed to patch train")
-
     def revert(self) -> None:
         if self._module and self._original:
             self._module.run_exp = self._original
         if self._launcher_module and self._original:
             self._launcher_module.run_exp = self._original
             self._launcher_module = None
-        if self._train_module and self._original:
-            self._train_module.run_exp = self._original
-            self._train_module = None
         self._original = None
 
 
 # ---------------------------------------------------------------------------
-# CollatorPatch — skip fake image injection
+# PackedFA2CollatorPatch — preserve the padded integer mask
 # ---------------------------------------------------------------------------
 
 
-class CollatorPatch(BasePatch):
-    """Patch collator for VLM models that need special handling in torchturbo.
+class PackedFA2CollatorPatch(BasePatch):
+    """Keep LF's padded integer mask for neat-packed FA2 batches."""
 
-    - Text-only batch: skip fake image/audio injection.
-    - block_diag_attn (neat_packing): skip get_rope_func, backend handles position_ids.
-    - No block_diag_attn: let get_rope_func run, then prepend text_position_ids → [4, bsz, seq].
-    """
-
-    name = "collator"
+    name = "packed_fa2_collator"
     supported_versions = _LF_V0
-
-    _PATCHED_MODEL_TYPES = ("qwen3_5_moe", "qwen3_5")
 
     def __init__(self) -> None:
         self._original_call = None
         self._cls = None
 
-    def patch(self, engine: "TorchTurboEngine | None" = None) -> None:
-        try:
-            from llamafactory.data.collator import MultiModalDataCollatorForSeq2Seq
-        except ImportError:
-            return
+    def patch(self, engine: TorchTurboEngine | None = None) -> None:
+        from llamafactory.data.collator import SFTDataCollatorWith4DAttentionMask
 
-        self._cls = MultiModalDataCollatorForSeq2Seq
-        self._original_call = MultiModalDataCollatorForSeq2Seq.__call__
-        patched_types = self._PATCHED_MODEL_TYPES
+        self._cls = SFTDataCollatorWith4DAttentionMask
+        self._original_call = SFTDataCollatorWith4DAttentionMask.__call__
         original_call = self._original_call
 
-        def _patched_call(collator_self, features):
-            import torch
-
-            model_type = getattr(getattr(collator_self, "model", None), "config", None)
-            model_type = getattr(model_type, "model_type", None)
-            if model_type not in patched_types:
+        def _call_with_padded_packed_mask(collator_self, features):
+            if not (
+                collator_self.neat_packing
+                and collator_self.attn_implementation == "flash_attention_2"
+            ):
                 return original_call(collator_self, features)
 
-            plugin = collator_self.template.mm_plugin
-            block_diag = getattr(collator_self, "block_diag_attn", False)
-            has_mm = any(feature.get("images") or feature.get("videos") or feature.get("audios") for feature in features)
+            original_neat_packing = collator_self.neat_packing
+            collator_self.neat_packing = False
+            try:
+                return original_call(collator_self, features)
+            finally:
+                collator_self.neat_packing = original_neat_packing
 
-            # Cache MLLM dataset detection to avoid per-batch isinstance scans.
-            # A dataset is MLLM if any feature has a list-typed images/videos/audios
-            # column (even empty [] from packing). TEXT datasets set these to None.
-            is_mllm = getattr(collator_self, "_torchturbo_is_mllm", None)
-            if is_mllm is None:
-                is_mllm = any(
-                    isinstance(feature.get("images"), list) or
-                    isinstance(feature.get("videos"), list) or
-                    isinstance(feature.get("audios"), list)
-                    for feature in features
-                )
-                collator_self._torchturbo_is_mllm = is_mllm
-
-            saved_img = saved_aud = saved_rope = None
-            if not has_mm and not is_mllm:
-                saved_img, saved_aud = plugin.image_token, plugin.audio_token
-                plugin.image_token = None
-                plugin.audio_token = None
-            if block_diag:
-                saved_rope = collator_self.get_rope_func
-                collator_self.get_rope_func = None
-
-            result = original_call(collator_self, features)
-
-            if saved_img is not None:
-                plugin.image_token, plugin.audio_token = saved_img, saved_aud
-            if saved_rope is not None:
-                collator_self.get_rope_func = saved_rope
-
-            if not block_diag and "position_ids" in result:
-                pos = result["position_ids"]
-                if pos.ndim == 3 and pos.shape[0] == 3:
-                    text_pos = torch.arange(pos.shape[-1], device=pos.device, dtype=pos.dtype)
-                    text_pos = text_pos.reshape(1, 1, -1).expand(1, pos.shape[1], -1)
-                    result["position_ids"] = torch.cat([text_pos, pos], dim=0)
-
-            # Neat packing + multimodal: get_rope_func was disabled above to stop
-            # LF from computing 3D mrope positions — LF binarizes the attention_mask
-            # to (>=1).float() before calling get_rope_func (see LF collator), which
-            # discards the integer packing labels and merges the packed sequences.
-            # We recompute here with the *integer* packing mask (still in
-            # result["attention_mask"], since LF's binarization is only a transient
-            # kwarg) so the packing-aware get_rope_index (installed by
-            # qwen3_5_moe/model.py) can read block boundaries and reset positions
-            # per packed sub-sequence. Row 0 (text positions) reuses LF's per-block
-            # reset position_ids; rows 1-3 are the 3D mrope positions. Produces the
-            # [4, bsz, seq] layout the model expects.
-            #
-            # Read the rope func live from the model each time rather than reusing
-            # `saved_rope`: the latter is a reference captured by LF at collator-
-            # init time, before our wrapper may have been installed, and a stale
-            # reference would skip the packing-aware path. The model's current
-            # get_rope_index is always the wrapped one.
-            model_obj = getattr(collator_self, "model", None)
-            rope_func = getattr(model_obj, "get_rope_index", None) or getattr(
-                getattr(model_obj, "model", None), "get_rope_index", None
-            )
-            if (
-                block_diag
-                and has_mm
-                and "position_ids" in result
-                and "input_ids" in result
-                and rope_func is not None
-                and (result.get("image_grid_thw") is not None or result.get("video_grid_thw") is not None)
-            ):
-                mrope_pos, _ = rope_func(
-                    input_ids=result["input_ids"],
-                    image_grid_thw=result.get("image_grid_thw"),
-                    video_grid_thw=result.get("video_grid_thw"),
-                    attention_mask=result["attention_mask"],  # integer packing mask, NOT binarized
-                    # mm_token_type_ids is auto-filled by the wrapper in
-                    # qwen3_5_moe/model.py from image/video token ids.
-                )
-                text_pos = result["position_ids"]
-                if text_pos.ndim == 2:
-                    text_pos = text_pos.long().unsqueeze(0)  # [1, bsz, seq] per-block reset
-                    result["position_ids"] = torch.cat(
-                        [text_pos, mrope_pos.to(text_pos.dtype)], dim=0
-                    )  # [4, bsz, seq]
-
-            return result
-
-        MultiModalDataCollatorForSeq2Seq.__call__ = _patched_call
-        logger.info_rank0("CollatorPatch applied for %s", patched_types)
+        SFTDataCollatorWith4DAttentionMask.__call__ = _call_with_padded_packed_mask
+        logger.info_rank0("PackedFA2CollatorPatch applied")
 
     def revert(self) -> None:
         if self._cls and self._original_call:

@@ -956,6 +956,7 @@ class TorchTurboEngine:
         **kwargs,
     ):
         """Compute the scalar loss for a single micro-batch."""
+        inputs = self.backend.prepare_inputs(model, inputs)
         if model.training:
             self._record_micro(inputs)
         self._prepare_moe_runtime(

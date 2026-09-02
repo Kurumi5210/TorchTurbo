@@ -708,7 +708,7 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
     config_class = None
     model_type = "moonvit3d"
     _no_split_modules = ["PackingTransformer"]
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
 
     def __init__(self, config, *inputs, **kwargs):
@@ -841,7 +841,7 @@ class KimiK25PreTrainedModel(PreTrainedModel):
         "PatchMergerMLP",
     ]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = False
     supports_gradient_checkpointing = True
 
@@ -947,8 +947,8 @@ class KimiK25ForConditionalGeneration(KimiK25PreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.language_model.get_decoder()
 
-    def tie_weights(self):
-        return self.language_model.tie_weights()
+    def tie_weights(self, *args, **kwargs):
+        return self.language_model.tie_weights(*args, **kwargs)
 
     def resize_token_embeddings(
         self, new_num_tokens: int | None = None, pad_to_multiple_of=None

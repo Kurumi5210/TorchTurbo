@@ -562,6 +562,7 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModel):
     config_class = GlmMoeDsaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
     _no_split_modules = ["GlmMoeDsaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
 

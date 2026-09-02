@@ -56,7 +56,12 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from transformers.utils.import_utils import is_torch_fx_available
+# Used only to register the FX leaf nodes below.
+try:
+    from transformers.utils.import_utils import is_torch_fx_available
+except ImportError:
+    def is_torch_fx_available() -> bool:
+        return hasattr(torch, "fx")
 
 # import sys
 # sys.path.insert(0, "/sfs_turbo/hw/shiyang/model/Moonlight-16B-A3B-Instruct")
@@ -66,6 +71,12 @@ import torch.distributed as dist
 import numpy as np
 
 from torchturbo.logging import get_logger
+from torchturbo.utils.flash_attn_utils import (
+    get_unpad_data,
+    index_first_axis,
+    pad_input,
+    unpad_input,
+)
 
 logger = get_logger(__name__)
 
@@ -76,12 +87,6 @@ if is_flash_attn_2_available():
 
 if is_torch_npu_available():
     logger.info_rank0("Using npu_fusion_attention")
-    from torchturbo.utils.flash_attn_utils import (
-        index_first_axis,
-        pad_input,
-        unpad_input,
-        get_unpad_data,
-    )
     from transformers.integrations.npu_flash_attention import (
         npu_flash_attn_varlen_func as flash_attn_varlen_func,
         npu_flash_attn_func as flash_attn_func,
@@ -94,7 +99,6 @@ if is_torch_fx_available():
         import torch.fx
 
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
-
 
 _CONFIG_FOR_DOC = "DeepseekV3Config"
 
@@ -1412,7 +1416,7 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["DeepseekV3DecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_cache_class = True
 
     def _init_weights(self, module):

@@ -584,13 +584,14 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if name in self._per_expert_fallback_names:
             return super().get_local_ep_w1_hf_state_dict(name, tensor)
         assert self.moe_config is not None, "must be"
+        hf_name = self.convert_expert_weight1_to_hf(name)
+        tensor = tensor.to(self.get_default_hf_dtype(hf_name))
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
         w1 = tensor.reshape(num_local_experts, self.config.hidden_size, -1)
         w1 = w1.permute(0, 2, 1).contiguous()  # [num_local, 2I, H]
         # All-gather directly into output tensor, avoiding intermediate list + cat
         full_w1 = w1.new_zeros(self.moe_config.num_moe_experts, *w1.shape[1:])
         dist.all_gather_into_tensor(full_w1, w1, group=self.ep_group)
-        hf_name = self.convert_expert_weight1_to_hf(name)
         return {hf_name: full_w1}
 
     def get_local_ep_w2_hf_state_dict(self, name, tensor):
@@ -599,13 +600,14 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if name in self._per_expert_fallback_names:
             return super().get_local_ep_w2_hf_state_dict(name, tensor)
         assert self.moe_config is not None, "must be"
+        hf_name = self.convert_expert_weight2_to_hf(name)
+        tensor = tensor.to(self.get_default_hf_dtype(hf_name))
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
         w2 = tensor.reshape(num_local_experts, self.config.moe_intermediate_size, self.config.hidden_size)
         w2 = w2.permute(0, 2, 1).contiguous()  # [num_local, H, I]
         # All-gather directly into output tensor, avoiding intermediate list + cat
         full_w2 = w2.new_zeros(self.moe_config.num_moe_experts, *w2.shape[1:])
         dist.all_gather_into_tensor(full_w2, w2, group=self.ep_group)
-        hf_name = self.convert_expert_weight2_to_hf(name)
         return {hf_name: full_w2}
 
     def get_weight1_save_entries(self, name, param_to_filename=None):

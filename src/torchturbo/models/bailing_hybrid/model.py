@@ -98,53 +98,7 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
             weight = weight[tuple(slices)]
             return weight
 
-        def apply_causal_conv1d_fn(conv1d, tensor):
-            # self.conv1d.weight: [D, 1, W] (nn.Conv1d format), squeeze to [D, W] for _causal_conv1d_prefill
-            conv1d_weight = get_parameter_local_cp(conv1d.weight, dim=0).squeeze(1)
-            conv1d_bias = get_parameter_local_cp(conv1d.bias, dim=0) if conv1d.bias else None
-            tensor_conv, _ = conv1d._causal_conv1d_prefill(
-                x=tensor,
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                initial_state=None,
-                output_final_state=False
-            )
-            return tensor_conv
-
-        def naive_causal_conv1d_wrapper(conv1d, tensor, cu_seqlens):
-            if cu_seqlens is not None:
-                # Variable-length: loop over sequences (naive functions don't support cu_seqlens)
-                N = cu_seqlens.shape[0] - 1
-                outputs = []
-                for i in range(N):
-                    s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
-                    o = apply_causal_conv1d_fn(conv1d, tensor[:, s:e])
-                    outputs.append(o)
-                o = torch.cat(outputs, dim=1)
-                # Pad output back to original sequence length (padding positions excluded by cu_seqlens)
-                seq_len = tensor.shape[1]
-                if o.shape[1] < seq_len:
-                    o = torch.cat([o, o.new_zeros(o.shape[0], seq_len - o.shape[1], *o.shape[2:])], dim=1)
-                return o
-            else:
-                return apply_causal_conv1d_fn(conv1d, tensor)
-
-        from fla.modules.convolution import causal_conv1d
-        def triton_conv1d_wrapper(conv1d, tensor, cu_seqlens):
-            conv1d_weight = get_parameter_local_cp(conv1d.weight, dim=0).squeeze(1)
-            conv1d_bias = get_parameter_local_cp(conv1d.bias, dim=0) if conv1d.bias else None
-            result, _ = causal_conv1d(
-                x=tensor,
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                residual=None,
-                initial_state=None,
-                output_final_state=False,
-                activation=conv1d.activation,
-                backend='triton',
-                cu_seqlens=cu_seqlens,
-            )
-            return result
+        from torchturbo.ops import ops
 
         from fla.modules.fused_norm_gate import rms_norm_gated
         def _patched_o_norm_forward(
@@ -192,11 +146,36 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
                 k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size)
                 v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size)
 
-            # TODO: replace with fused ops, performance of triton version is very low
-            conv1d_fn = naive_causal_conv1d_wrapper # triton_conv1d_wrapper
-            q = conv1d_fn(self.q_conv1d, q, cu_seqlens)
-            k = conv1d_fn(self.k_conv1d, k, cu_seqlens)
-            v = conv1d_fn(self.v_conv1d, v, cu_seqlens)
+            # ops dispatcher picks the AscendC provider (priority 100) on NPU
+            # and falls back to fla's triton conv otherwise — same integration
+            # as the Qwen3.5 path.
+            q, _ = ops.causal_conv1d(
+                x=q,
+                weight=get_parameter_local_cp(self.q_conv1d.weight, dim=0).squeeze(1),  # d,1,w -> d,w
+                bias=get_parameter_local_cp(self.q_conv1d.bias, dim=0) if self.q_conv1d.bias else None,
+                activation=self.q_conv1d.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+            )
+            k, _ = ops.causal_conv1d(
+                x=k,
+                weight=get_parameter_local_cp(self.k_conv1d.weight, dim=0).squeeze(1),
+                bias=get_parameter_local_cp(self.k_conv1d.bias, dim=0) if self.k_conv1d.bias else None,
+                activation=self.k_conv1d.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+            )
+            v, _ = ops.causal_conv1d(
+                x=v,
+                weight=get_parameter_local_cp(self.v_conv1d.weight, dim=0).squeeze(1),
+                bias=get_parameter_local_cp(self.v_conv1d.bias, dim=0) if self.v_conv1d.bias else None,
+                activation=self.v_conv1d.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+            )
 
             # Compute g, beta from padded hidden_states (always [B, T/sp, H] format)
             if self.no_kda_lora:

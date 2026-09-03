@@ -52,6 +52,12 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
     def get_weight_converter(self, parallel_context, model_path):
         return BailingV3WeightConverter(self, parallel_context, model_path)
 
+    def get_flops_class(self):
+        """Bailing v3 flops recipe (hybrid MLA+KDA attention, dense+MoE FFN, MTP)."""
+        from .mfu import BailingMoeV3Flops
+
+        return BailingMoeV3Flops
+
     def __init__(self, config: BailingMoeV3Config) -> None:
         self._pre_init_patches(config)
         super().__init__(config)

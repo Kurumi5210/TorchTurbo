@@ -26,7 +26,7 @@ if [ -z "$USER_NAME" ]; then
 fi
 
 #model_name_or_path=/sfs_turbo/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324/
-model_name_or_path=/mnt/aicompiler-a3/common/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324/
+model_name_or_path=/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242/
 output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/ling_v3/lf_lora/
 
 seq_length=$((1024 * 4))
@@ -50,12 +50,10 @@ lora_dropout=0.0
 #   loftq  - LoftQ initialization
 pissa_init=false
 
-export PATH=/usr/local/Ascend/tools/bishengir/bin:$PATH
 
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
 export PYTHONPATH=/opt/MindSpeed:$PYTHONPATH
-export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 export TRANSFORMERS_VERBOSITY=error
 
 export NNODES=${NNODES:-1}
@@ -90,12 +88,20 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT} \
     --node_rank $NODE_RANK
 "
-RUN_LF="$(dirname "$0")/../run_lf.py"
-DATASET_DIR="$(dirname "$0")/../../../dataset/npu/"
 
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/opensource/LlamaFactory/src/:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/torchturbo/src:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/xiyun.wc/flash-linear-attention/:$PYTHONPATH
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+RUN_LF="${SCRIPT_DIR}/../run_lf.py"
+DATASET_DIR="${REPO_ROOT}/dataset/npu/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
+
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size 2 \

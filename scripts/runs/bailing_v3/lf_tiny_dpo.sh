@@ -27,7 +27,7 @@ if [ -z "$USER_NAME" ]; then
 fi
 
 #model_name_or_path=/sfs_turbo/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324/
-model_name_or_path=/mnt/aicompiler-a3/common/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324/
+model_name_or_path=/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242/
 output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/ling_v3/lf/
 
 seq_length=$((1024 * 64))
@@ -35,12 +35,9 @@ dataset=orca_rlhf
 packing_mode=False
 finetuning_type=full
 
-export PATH=/usr/local/Ascend/tools/bishengir/bin:$PATH
-
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
 export PYTHONPATH=/opt/MindSpeed:$PYTHONPATH
-export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
 export TRANSFORMERS_VERBOSITY=error
 
 export NNODES=${NNODES:-1}
@@ -87,8 +84,6 @@ if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
     exit 1
 fi
 
-export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
-export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/flash-linear-attention/:$PYTHONPATH
 export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \

@@ -1,4 +1,14 @@
 engine_config:
   parallel_plan:
-    sp_size: 2
+    sp_size: 4
     ep_size: 8
+
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: true
+
+  moe:
+    aux_loss_coeff: 1e-6
+
+  loss_chunk:
+    enabled: true

@@ -73,6 +73,9 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 replace_module=_replace_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),
+            "model.layers.*": FSDPPlanSpec(
+                activation_checkpoint=True,
+            ),
         },
         sp_size=1,
         ep_size=1,

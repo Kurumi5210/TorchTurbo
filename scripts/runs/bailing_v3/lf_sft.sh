@@ -23,7 +23,7 @@ export MULTI_STREAM_MEMORY_REUSE=2 # 多流
 
 #model_name_or_path=/sfs_turbo/pretrained_models/bailing_v3/ling-v3-flash-2-layer
 model_name_or_path=/mnt/aicompiler-a3/common/pretrained_models/bailing_v3/ling-v3-flash-2-layer
-output_dir=/sfs_turbo/zlj/output
+output_dir=/mnt/sfs_turbo/${USER_NAME}/ckpt/ling_v3/lf/
 
 seq_length=$((1024 * 4))
 dataset=science
@@ -43,7 +43,6 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
 
 export ASCEND_PROCESS_LOG_PATH=$output_dir/log
-export PATH=/usr/local/Ascend/aarch64-linux/bin:$PATH
 
 mkdir -p $output_dir
 if [ -d $output_dir ]; then
@@ -73,10 +72,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="$(dirname "$0")/../run_lf.py"
 DATASET_DIR="${REPO_ROOT}/dataset/npu/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
-export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/flash-linear-attention/:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zlj/workspace/LLaMA-Factory/src:$PYTHONPATH
-export PYTHONPATH=/sfs_turbo/zlj/workspace/torchturbo/src:$PYTHONPATH
+if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
+    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
+    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
+    exit 1
+fi
+
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
+
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_config "${SCRIPT_DIR}/lf_sft.yaml" \

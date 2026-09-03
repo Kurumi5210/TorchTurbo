@@ -33,7 +33,7 @@ class AscendCCausalConv1d(OpImpl):
 
             from torchturbo.logging import get_logger
 
-            get_logger(__name__).warning(
+            get_logger(__name__).warning_rank0(
                 "ascendc_causal_conv1d unavailable (will fall back to fla "
                 "under auto): %r\n%s",
                 exc,

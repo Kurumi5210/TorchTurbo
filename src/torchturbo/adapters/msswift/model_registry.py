@@ -58,7 +58,7 @@ def register_turbo_models_to_swift() -> None:
                           if native_meta else ModelGroup([Model()])],
             loader=loader_cls,
             template=getattr(native_meta, "template", None),
-            architectures=getattr(native_meta, "architectures", []) if native_meta else [],
+            architectures=[],
             is_multimodal=isinstance(model_cls, type) and issubclass(model_cls, TurboVLMModel),
             requires=getattr(native_meta, "requires", []) if native_meta else [],
             tags=list(getattr(native_meta, "tags", [])) if native_meta else [],

@@ -64,6 +64,27 @@ class BaseWeightConverter:
         self.config = config
         self.model_type = config.model_type
         self.checkpoint_info = CheckpointInfo(model_path)
+        # Transformers 5.x populates this fully-expanded {target: source}
+        # mapping in PreTrainedModel.post_init(). Keep that authoritative
+        # snapshot instead of re-expanding names after Turbo/FSDP rewrites.
+        self.tied_weight_keys = dict(model.all_tied_weights_keys)
+
+    def get_omitted_tied_source(self, model_name, hf_name):
+        """Return the present checkpoint source for an omitted tied target.
+
+        Only a target explicitly declared by Transformers may be absent, and
+        its source must actually exist in the checkpoint. Any other missing
+        tensor continues through the normal path and raises a hard error.
+        """
+        source_name = self.tied_weight_keys.get(model_name)
+        if source_name is None:
+            return None
+
+        tensor_infos = self.checkpoint_info.get_tensor_infos()
+        hf_source_name = self.to_hf_name(source_name)
+        if hf_name not in tensor_infos and hf_source_name in tensor_infos:
+            return hf_source_name
+        return None
 
     def get_moe_config(self, model):
         for _, module in model.named_modules():
@@ -271,6 +292,9 @@ class BaseWeightConverter:
         if expert_result is not None:
             return expert_result
         hf_name = self.to_hf_name(name)
+        if self.get_omitted_tied_source(name, hf_name) is not None:
+            return [], None, {}
+
         element_size = self._get_element_size(hf_name)
         param_bytes = numel * element_size
         if self.is_router_param(name):

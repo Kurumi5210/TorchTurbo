@@ -118,7 +118,7 @@ if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
     exit 1
 fi
 
-export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_sp_size $sp_size \

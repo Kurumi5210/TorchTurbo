@@ -108,7 +108,6 @@ fi
 
 #export ASCEND_LAUNCH_BLOCKING=1
 
-export PYTHONPATH=/mnt/sfs_turbo/torchturbo/stable/LLaMA-Factory/src/:$PYTHONPATH
 export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \

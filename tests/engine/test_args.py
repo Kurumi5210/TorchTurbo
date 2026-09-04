@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 
@@ -133,24 +135,26 @@ def test_parse_torchturbo_args_gradient_checkpointing():
     assert args.gradient_checkpointing is True
 
 
-def test_parse_torchturbo_args_cpu_offload():
+def test_parse_torchturbo_args_cpu_offload_overrides_enabled_flag():
+    """``--tt_cpu_offload`` is a boolean override, not a JSON policy."""
     from torchturbo.engine.args import parse_torchturbo_args
 
     args, remaining = parse_torchturbo_args([])
-    assert args.cpu_offload is False
+    assert args.cpu_offload.enabled is None
+    assert args.cpu_offload_enabled is None
     assert remaining == []
 
     args, remaining = parse_torchturbo_args(
         ["--tt_cpu_offload", "false", "--foo", "bar"]
     )
-    assert args.cpu_offload is False
+    assert args.cpu_offload.enabled is None
+    assert args.cpu_offload_enabled is False
+    assert args.config_overrides["tt_cpu_offload"] is False
     assert remaining == ["--foo", "bar"]
 
-    args, _ = parse_torchturbo_args(["--tt_cpu_offload=true"])
-    assert args.cpu_offload is True
-
-    args, _ = parse_torchturbo_args(["--tt_cpu_offload"])
-    assert args.cpu_offload is True
+    args, remaining = parse_torchturbo_args(["--tt_cpu_offload"])
+    assert args.cpu_offload_enabled is True
+    assert remaining == []
 
 
 def test_parse_torchturbo_args_freeze_flags():

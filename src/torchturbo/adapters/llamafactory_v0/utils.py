@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...engine import EngineConfig
+from ...engine import CPUOffloadConfig, CPUOffloadMode, EngineConfig
 from ...engine.args import TorchTurboArgs, get_arg_specs, string_to_bool
 from ...engine.config import MixedPrecisionPolicy
 from ...logging import get_logger
@@ -100,10 +100,10 @@ def _build_config_from_args(
                 mixed_precision_hint = MixedPrecisionPolicy.FP8
         tt.mixed_precision = mixed_precision_hint.value
 
-    # --- FSDP CPU offload: reconcile LF fsdp options with --tt_cpu_offload ---
+    # --- FSDP CPU offload: reconcile LF fsdp options with the file/adapter config ---
     # Single source of truth, shared with the early process-group init in the
     # adapter patch so the two never diverge. resolve_cpu_offload raises on an
-    # explicit --tt_cpu_offload=false that contradicts an LF-requested offload.
+    # explicit non-full mode that contradicts an LF-requested offload.
     fsdp_options = (
         getattr(training_args, "fsdp", []) if training_args is not None else []
     )
@@ -265,11 +265,11 @@ def fsdp_options_from_raw_args(raw_args: Any) -> Any:
 
 def resolve_cpu_offload(
     fsdp_options: Any,
-    torchturbo_args: TorchTurboArgs | None = None,
+    torchturbo_args: TorchTurboArgs,
     *,
     strict: bool = True,
-) -> bool:
-    """Resolve CPU offload from LF ``fsdp`` options plus ``--tt_cpu_offload``.
+) -> CPUOffloadConfig:
+    """Resolve CPU offload from LF ``fsdp`` options plus the file/adapter config.
 
     Single source of truth shared by ``_build_config_from_args`` (which feeds
     ``cpu_offload`` into the shared ``build_from_args``) and by early
@@ -278,9 +278,9 @@ def resolve_cpu_offload(
     (``training_args.fsdp``) or the raw string from
     :func:`fsdp_options_from_raw_args`.
 
-    With ``strict=True`` (config path) an explicit ``--tt_cpu_offload=false`` that
-    would disable an adapter-requested offload raises. Early PG init uses
-    ``strict=False`` — it only needs the boolean and must not move where that
+    With ``strict=True`` (config path) an explicit structured config that disables
+    parameter offload while LF requests it raises. Early PG init uses
+    ``strict=False`` -- it only needs the policy and must not move where that
     validation surfaces.
     """
     if isinstance(fsdp_options, str):
@@ -295,20 +295,22 @@ def resolve_cpu_offload(
     else:
         fsdp_tokens = []
 
-    cpu_offload = "offload" in fsdp_tokens
-
-    torchturbo_cpu_offload = _explicit_torchturbo_bool_arg(
-        "cpu_offload",
-        torchturbo_args,
-        config_path="backend_config.cpu_offload",
-    )
-    if torchturbo_cpu_offload is not None:
-        if strict and cpu_offload and not torchturbo_cpu_offload:
-            raise ValueError(
-                "TorchTurbo --tt_cpu_offload must not disable the adapter "
-                "FSDP offload setting: adapter=True, torchturbo=False."
-            )
-        cpu_offload = torchturbo_cpu_offload
+    adapter_offload = "offload" in fsdp_tokens
+    if strict and adapter_offload and torchturbo_args.cpu_offload_enabled is False:
+        raise ValueError(
+            "TorchTurbo cpu_offload must use mode='full' when the adapter "
+            "enables FSDP parameter offload"
+        )
+    cpu_offload = torchturbo_args.cpu_offload
+    if cpu_offload.enabled is None:
+        cpu_offload = CPUOffloadConfig(enabled=adapter_offload)
+    if strict and adapter_offload and (
+        not cpu_offload.enabled or cpu_offload.mode is not CPUOffloadMode.FULL
+    ):
+        raise ValueError(
+            "TorchTurbo cpu_offload must use mode='full' when the adapter "
+            "enables FSDP parameter offload"
+        )
     return cpu_offload
 
 

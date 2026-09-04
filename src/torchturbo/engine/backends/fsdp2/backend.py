@@ -39,7 +39,8 @@ from ...config import EngineConfig
 from ...distributed import init_process_group_if_needed
 from ....logging import get_logger
 from ..base import BaseBackend
-from .config import FSDPConfig
+from .config import CPUOffloadMode, FSDPConfig
+from .optimizers.adamw_swap import AdamWSwap
 from .dcp import DcpCheckpoint
 from .prefetch import FSDPPrefetchManager
 from .weight_saver import has_hf_weights, hf_model_dir, hf_weights_dir_exists
@@ -112,7 +113,8 @@ class FSDP2Backend(BaseBackend):
         super().__init__(config, device_runtime)
         self.fsdp_config: FSDPConfig = config.backend_config
 
-        if self.fsdp_config.cpu_offload:
+        offload = self.fsdp_config.cpu_offload
+        if offload.enabled and offload.mode is CPUOffloadMode.FULL:
             init_process_group_if_needed(enable_cpu_backend=True)
 
         fsdp_config = self.fsdp_config
@@ -411,9 +413,11 @@ class FSDP2Backend(BaseBackend):
             )
             self._load_weights_from_hf(model=model, weights_dir=model_name_or_path)
         else:
-            device = torch.device("cpu") if self.fsdp_config.cpu_offload else self.device
+            offload = self.fsdp_config.cpu_offload
+            full_offload = offload.enabled and offload.mode is CPUOffloadMode.FULL
+            device = torch.device("cpu") if full_offload else self.device
             model.to_empty(device=device)
-            if self.fsdp_config.cpu_offload:
+            if full_offload:
                 self._keep_non_offloaded_on_device(model)
 
         # Register gradient all-reduce hooks for no_shard params after the
@@ -486,7 +490,10 @@ class FSDP2Backend(BaseBackend):
             processing_class=None,
             weight_converter=self.weight_converter,
             device_runtime=self.device_runtime,
-            is_cpu_offload=self.fsdp_config.cpu_offload,
+            is_cpu_offload=(
+                self.fsdp_config.cpu_offload.enabled
+                and self.fsdp_config.cpu_offload.mode is CPUOffloadMode.FULL
+            ),
         )
         saver.save_model(hf_model_dir(checkpoint_dir))
 
@@ -540,7 +547,10 @@ class FSDP2Backend(BaseBackend):
             mesh=self._mesh,
             world_mesh=self._world_mesh,
             device_runtime=self.device_runtime,
-            is_cpu_offload=self.fsdp_config.cpu_offload,
+            is_cpu_offload=(
+                self.fsdp_config.cpu_offload.enabled
+                and self.fsdp_config.cpu_offload.mode is CPUOffloadMode.FULL
+            ),
             weight_converter=self.weight_converter,
         )
         loader.load_weights()
@@ -606,12 +616,11 @@ class FSDP2Backend(BaseBackend):
         if ignored_params:
             fsdp_kwargs["ignored_params"] = ignored_params
 
-        if self.fsdp_config.cpu_offload:
+        offload = self.fsdp_config.cpu_offload
+        if offload.enabled and offload.mode is CPUOffloadMode.FULL:
             from torch.distributed.fsdp import CPUOffloadPolicy
 
-            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(
-                pin_memory=self.fsdp_config.pin_memory
-            )
+            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
 
         return fsdp_kwargs
 
@@ -1297,7 +1306,25 @@ class FSDP2Backend(BaseBackend):
                         {"params": shard_params, **group_options}
                     )
 
-        return optimizer_cls(optimizer_params, **optimizer_kwargs)
+        offload = self.fsdp_config.cpu_offload
+        if offload.enabled and offload.mode is CPUOffloadMode.OPTIMIZER:
+            if optimizer_cls is not torch.optim.AdamW:
+                raise ValueError(
+                    "swap-optimizer mode currently only supports AdamW; "
+                    f"got {optimizer_cls.__module__}.{optimizer_cls.__name__}"
+                )
+            optimizer_cls = AdamWSwap
+            optimizer_kwargs.pop("fused", None)
+            optimizer_kwargs.update(
+                device_runtime=self.device_runtime,
+                optimizer_memory_fraction=offload.optimizer_memory_fraction,
+            )
+
+        optimizer = optimizer_cls(
+            optimizer_params,
+            **optimizer_kwargs,
+        )
+        return optimizer
 
     @torch.no_grad()
     def _clip_grad_norm_cpu_offload(
@@ -1398,6 +1425,7 @@ class FSDP2Backend(BaseBackend):
 
     @torch.no_grad()
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
+        offload = self.fsdp_config.cpu_offload
         params = []
         grads = []
         moe_params = []
@@ -1422,10 +1450,8 @@ class FSDP2Backend(BaseBackend):
                     ignored_params.append(param)
                     ignored_grads.append(param.grad)
 
-        # FSDP2 CPU offload: grads are sharded DTensors on CPU and the
-        # DTensor-collective fast path has no cpu backend on the (cuda) mesh —
-        # use the gloo-based local-reduce path instead.
-        if self.fsdp_config.cpu_offload:
+
+        if offload.enabled and offload.mode is CPUOffloadMode.FULL:
             return self._clip_grad_norm_cpu_offload(
                 moe_params, params, ignored_params, max_norm, norm_type
             )

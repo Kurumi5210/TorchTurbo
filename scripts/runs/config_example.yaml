@@ -46,11 +46,18 @@ engine_config:
 
   backend_config:
     reshard_after_forward: true
-    cpu_offload: false
     prefetch_strategy: auto
     prefetch_direction: forward_backward
     forward_prefetch_depth: 1
     backward_prefetch_depth: 1
+    # CPU offload config
+    cpu_offload:
+      # if "enabled" is "false", CPU offload is disabled
+      enabled: true
+      # "mode: optimizer" for swap-optimzier, or "full" for full-offload
+      mode: optimizer
+      # "optimizer_memory_fraction" controls workspace size on swap-optimzier mode
+      optimizer_memory_fraction: 0.8
 
   checkpoint:
     default_save_format: "hf"

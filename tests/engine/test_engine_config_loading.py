@@ -95,15 +95,15 @@ def test_parse_overrides_only_explicit_flags():
 
 
 def test_parse_explicit_false_is_an_override():
-    tt, _ = parse_torchturbo_args(["--tt_cpu_offload", "false"])
+    tt, _ = parse_torchturbo_args(["--tt_gradient_checkpointing", "false"])
 
-    assert tt.config_overrides == {"tt_cpu_offload": False}
+    assert tt.config_overrides == {"tt_gradient_checkpointing": False}
 
 
 def test_parse_bool_flag_without_value_is_true_override():
-    tt, _ = parse_torchturbo_args(["--tt_cpu_offload"])
+    tt, _ = parse_torchturbo_args(["--tt_gradient_checkpointing"])
 
-    assert tt.config_overrides == {"tt_cpu_offload": True}
+    assert tt.config_overrides == {"tt_gradient_checkpointing": True}
 
 
 def test_parse_runtime_flags_excluded_from_overrides():
@@ -379,7 +379,8 @@ def test_partial_nested_overrides_keep_unset_base_values(tmp_path):
         _engine_config(
             """\
 backend_config:
-  cpu_offload: true
+  cpu_offload:
+    enabled: true
 diffusion:
   cap_lambda: 2.0
 checkpoint:
@@ -398,7 +399,8 @@ mtp:
         )
     )
 
-    assert cfg.backend_config.cpu_offload is True
+    assert cfg.backend_config.cpu_offload.enabled is True
+    assert cfg.backend_config.cpu_offload.mode.value == "full"
     assert cfg.backend_config.prefetch_strategy.value == "auto"
     assert cfg.diffusion.cap_lambda == 2.0
     assert cfg.diffusion.bd_mask_low == 0.3
@@ -406,6 +408,85 @@ mtp:
     assert cfg.checkpoint.hf_model_path == "/tt/model"
     assert cfg.mtp.enabled is True
     assert cfg.mtp.loss_scaling_factor == 0.1
+
+
+def test_yaml_cpu_offload_nested_optimizer_path(tmp_path):
+    """A nested cpu_offload struct is read hierarchically from the YAML file.
+
+    Covers the optimizer mode with a custom device-memory budget.
+    """
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        """\
+engine_config:
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: optimizer
+      optimizer_memory_fraction: 0.5
+""",
+    )
+
+    cfg = build_from_args(
+        TorchTurboArgs(model_path="/tt/model", output_dir="/tt/out", config_path=path)
+    )
+
+    offload = cfg.backend_config.cpu_offload
+    assert offload.enabled is True
+    assert offload.mode.value == "optimizer"
+    assert offload.optimizer_memory_fraction == 0.5
+    assert offload.mode.value == "optimizer"
+
+
+def test_yaml_cpu_offload_rejects_legacy_enable_key(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("backend_config:\n  cpu_offload:\n    enable: true\n"),
+    )
+
+    with pytest.raises(
+        ValueError, match="Unknown key: backend_config.cpu_offload.enable"
+    ):
+        _build_from_argv(["--tt_config", path])
+
+
+def test_yaml_cpu_offload_rejects_removed_swap_options(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            "backend_config:\n  cpu_offload:\n    enabled: true\n"
+            "    swap_optimizer: {enabled: true}\n"
+        ),
+    )
+
+    with pytest.raises(
+        ValueError, match="Unknown key: backend_config.cpu_offload.swap_optimizer"
+    ):
+        _build_from_argv(["--tt_config", path])
+
+
+@pytest.mark.parametrize("cli_value", ["true", "false"])
+def test_cli_cpu_offload_overrides_file_enabled(tmp_path, cli_value):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            "backend_config:\n  cpu_offload:\n    enabled: false\n"
+            "    mode: optimizer\n    optimizer_memory_fraction: 0.5\n"
+        ),
+    )
+
+    cfg = _build_from_argv(
+        ["--tt_config", path, "--tt_cpu_offload", cli_value]
+    )
+
+    assert cfg.backend_config.cpu_offload.enabled is (cli_value == "true")
+    assert cfg.backend_config.cpu_offload.mode.value == (
+        "optimizer" if cli_value == "true" else "full"
+    )
 
 
 def test_file_checkpoint_overrides_adapter_seeded_paths(tmp_path):
@@ -797,12 +878,13 @@ def test_legacy_fsdp_key_in_file_is_applied(tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        _engine_config("fsdp:\n  cpu_offload: true\n"),
+        _engine_config("fsdp:\n  cpu_offload:\n    enabled: true\n"),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
 
-    assert cfg.backend_config.cpu_offload is True
+    assert cfg.backend_config.cpu_offload.enabled is True
+    assert cfg.backend_config.cpu_offload.mode.value == "full"
 
 
 def test_unknown_plan_spec_field_raises(tmp_path):

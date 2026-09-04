@@ -68,7 +68,7 @@ def test_fsdp_cpu_offload_defaults_to_disabled():
 
     cfg = EngineConfig.from_dict({"backend": "fsdp2"})
 
-    assert cfg.backend_config.cpu_offload is False
+    assert cfg.backend_config.cpu_offload.enabled is False
 
 
 def test_engine_config_to_dict_excludes_runtime_state():
@@ -88,14 +88,81 @@ def test_engine_config_from_dict_parses_moe_config():
     assert cfg.moe.aux_loss_coeff == 0.01
 
 
-def test_engine_config_env_enables_cpu_offload(monkeypatch):
+def test_engine_config_parses_structured_cpu_offload():
     from torchturbo.engine.config import EngineConfig
 
-    monkeypatch.setenv("TORCH_TURBO_CPU_OFFLOAD", "1")
+    structured = EngineConfig.from_dict(
+        {
+            "backend": "fsdp2",
+            "backend_config": {
+                "cpu_offload": {
+                    "enabled": True,
+                    "mode": "optimizer",
+                    "optimizer_memory_fraction": 0,
+                }
+            },
+        }
+    )
+    assert structured.backend_config.cpu_offload.enabled is True
+    assert structured.backend_config.cpu_offload.mode.value == "optimizer"
+    assert (
+        structured.backend_config.cpu_offload.optimizer_memory_fraction == 0
+    )
 
-    cfg = EngineConfig.from_dict({"backend": "fsdp2"})
 
-    assert cfg.backend_config.cpu_offload is True
+def test_cpu_offload_workspace_only_applies_to_optimizer_mode():
+    from torchturbo.engine import CPUOffloadConfig
+
+    workspace_config = CPUOffloadConfig(
+        enabled=True,
+        mode="optimizer",
+        optimizer_memory_fraction=0.5,
+    )
+    assert workspace_config.enabled is True
+    assert workspace_config.mode.value == "optimizer"
+    assert workspace_config.optimizer_memory_fraction > 0
+
+    no_device_staging = CPUOffloadConfig(
+        enabled=True,
+        mode="optimizer", optimizer_memory_fraction=0
+    )
+    assert no_device_staging.optimizer_memory_fraction == 0
+    assert CPUOffloadConfig(enabled=True).mode.value == "full"
+
+
+@pytest.mark.parametrize("fraction", [-0.1, 1.1])
+def test_cpu_offload_config_rejects_invalid_memory_fraction(fraction):
+    from torchturbo.engine import CPUOffloadConfig
+
+    with pytest.raises(ValueError, match="optimizer_memory_fraction must be in"):
+        CPUOffloadConfig(
+            enabled=True, mode="optimizer", optimizer_memory_fraction=fraction
+        )
+
+
+def test_cpu_offload_config_rejects_invalid_mode():
+    from torchturbo.engine import CPUOffloadConfig
+
+    with pytest.raises(ValueError):
+        CPUOffloadConfig(enabled=True, mode="invalid")
+
+
+def test_disabled_cpu_offload_ignores_mode_and_memory_fraction():
+    from torchturbo.engine import CPUOffloadConfig
+
+    config = CPUOffloadConfig(
+        enabled=False, mode="invalid", optimizer_memory_fraction=-1
+    )
+
+    assert config.enabled is False
+    assert config.mode.value == "full"
+    assert config.optimizer_memory_fraction == 0.8
+
+
+def test_cpu_offload_config_defaults_to_unspecified():
+    from torchturbo.engine import CPUOffloadConfig
+
+    assert CPUOffloadConfig().enabled is None
 
 
 def test_engine_config_from_dict_parses_freeze_policy():

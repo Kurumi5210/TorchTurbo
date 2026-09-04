@@ -27,7 +27,12 @@ from .args import (
     string_to_bool,
 )
 from .backend_registry import get_available_backends, get_backend, register_backend
-from .backends.fsdp2 import FSDP2Backend, FSDPConfig
+from .backends.fsdp2 import (
+    CPUOffloadConfig,
+    CPUOffloadMode,
+    FSDP2Backend,
+    FSDPConfig,
+)
 from .backends.base import BaseBackend
 from .config import (
     ActivationCheckpointingConfig,
@@ -62,6 +67,8 @@ __all__ = [
     "ActivationCheckpointingConfig",
     "CheckpointConfig",
     "CommConfig",
+    "CPUOffloadConfig",
+    "CPUOffloadMode",
     "DistributedBackend",
     "EngineConfig",
     "FreezePolicy",

@@ -12,7 +12,8 @@ engine_config:
     use_reentrant: true
 
   backend_config:
-    cpu_offload: true
+    cpu_offload:
+      enabled: true
 
   moe:
     aux_loss_coeff: 1e-6

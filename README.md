@@ -200,7 +200,6 @@ bash scripts/runs/bailing_v3/lf_sft.sh
 - `NNODES` / `NPUS_PER_NODE` / `MASTER_ADDR` / `MASTER_PORT`
 - `TORCH_TURBO_SP_SIZE` / `TORCH_TURBO_EP_SIZE`
 - `TORCH_TURBO_GRADIENT_CHECKPOINTING` / `--tt_gradient_checkpointing`
-- `TORCH_TURBO_CPU_OFFLOAD` / `--tt_cpu_offload`
 
 ### 运行文档
 
@@ -235,7 +234,6 @@ docs/runs/
 | `TORCH_TURBO_GRADIENT_CHECKPOINTING=true` | activation checkpointing |
 | `TORCH_TURBO_SP_SIZE=2` | Sequence Parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Expert Parallel size |
-| `TORCH_TURBO_CPU_OFFLOAD=1` | 对所有 FSDP-wrapped units 启用 CPU offload（默认关闭） |
 | `TORCH_TURBO_RESHARD_AFTER_FWD=0` | forward 后是否 reshard |
 | `TORCH_TURBO_PREFETCH_STRATEGY=auto` | FSDP prefetch 拓扑：`native` / `auto`（默认）/ `expert_lookahead` / `expert_with_layer` |
 | `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | prefetch 作用的 pass：`forward` / `forward_backward`（默认）|

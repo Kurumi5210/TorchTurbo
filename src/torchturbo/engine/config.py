@@ -831,6 +831,14 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
         for spec in get_arg_specs()
         if spec.config_path is not None
     }
+    # Allow CPU offload options to pass the config file validation
+    allowed.update(
+        {
+            "backend_config.cpu_offload.enabled",
+            "backend_config.cpu_offload.mode",
+            "backend_config.cpu_offload.optimizer_memory_fraction",
+        }
+    )
 
     for key, value in data.items():
         parts = (*parents, key)
@@ -854,9 +862,14 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
 
 def _build_fsdp_config(fields: Mapping[str, Any]) -> Any:
     """FSDPConfig from the merged config dict."""
-    from torchturbo.engine.backends.fsdp2.config import FSDPConfig, ShardingStrategy
+    from torchturbo.engine.backends.fsdp2.config import (
+        FSDPConfig,
+        ShardingStrategy,
+    )
 
     fsdp_d = fields.get("backend_config") or {}
+    # FSDPConfig.__post_init__ accepts None, dict, DictConfig, and
+    # CPUOffloadConfig, and normalizes None to the disabled default.
     return FSDPConfig(
         sharding_strategy=fsdp_d.get(
             "sharding_strategy", ShardingStrategy.FULL_SHARD
@@ -864,8 +877,7 @@ def _build_fsdp_config(fields: Mapping[str, Any]) -> Any:
         reshard_after_forward=string_to_bool(
             fsdp_d.get("reshard_after_forward", True)
         ),
-        cpu_offload=string_to_bool(fsdp_d.get("cpu_offload", False)),
-        pin_memory=string_to_bool(fsdp_d.get("pin_memory", True)),
+        cpu_offload=fsdp_d.get("cpu_offload"),
         prefetch_strategy=fsdp_d.get("prefetch_strategy", "auto"),
         prefetch_direction=fsdp_d.get("prefetch_direction", "forward_backward"),
         forward_prefetch_depth=fsdp_d.get("forward_prefetch_depth", 1),

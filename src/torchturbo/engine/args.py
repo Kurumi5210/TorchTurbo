@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..logging import LogLevel, get_logger
+from .backends.fsdp2.config import CPUOffloadConfig
 
 logger = get_logger(__name__)
 
@@ -94,8 +95,12 @@ class TorchTurboArgs:
         Whether TorchTurbo should enable engine-owned activation
         checkpointing. Defaults to ``True``.
     cpu_offload:
-        Whether CPU offload is applied to FSDP-wrapped units. Defaults to
-        ``False``.
+        Structured CPU offload policy (``CPUOffloadConfig``).
+        File configuration uses ``enabled``, ``mode`` and
+        ``optimizer_memory_fraction``.
+    cpu_offload_enabled:
+        Explicit ``--tt_cpu_offload`` boolean override for the file's
+        ``cpu_offload.enabled`` value. ``None`` means no CLI override.
     enable_mtp:
         Whether to build Multi-Token-Prediction (MTP) layers.  ``True``
         opts in: build MTP heads, load their weights, run forward, compute
@@ -134,7 +139,8 @@ class TorchTurboArgs:
     ep_size: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
-    cpu_offload: bool = False
+    cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
+    cpu_offload_enabled: bool | None = None
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
     moe_aux_loss_coeff: float = 0.0
@@ -302,13 +308,21 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
     TurboArgSpec(
         name="cpu_offload",
         args_name="cpu_offload",
-        cli_name="--tt_cpu_offload",
-        env_name="TORCH_TURBO_CPU_OFFLOAD",
+        cli_name=None,
+        env_name=None,
         config_path="backend_config.cpu_offload",
+        help="Structured CPU offload policy (see CPUOffloadConfig). Adapters "
+        "may seed this value before the YAML/JSON config is loaded.",
+    ),
+    TurboArgSpec(
+        name="cpu_offload_enabled",
+        args_name="cpu_offload_enabled",
+        cli_name="--tt_cpu_offload",
+        config_path="backend_config.cpu_offload.enabled",
         type=string_to_bool,
         metavar="BOOL",
-        help="Enable or disable FSDP CPU offload for wrapped units. "
-        "Replaces TORCH_TURBO_CPU_OFFLOAD.",
+        help="Override backend_config.cpu_offload.enabled. Accepts "
+        "--tt_cpu_offload, --tt_cpu_offload true, or --tt_cpu_offload false.",
     ),
     TurboArgSpec(
         name="prefetch_strategy",
@@ -663,6 +677,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.op_policy,
             args.sp_size,
             args.ep_size,
+            args.cpu_offload_enabled,
             args.enable_mtp,
             args.mtp_loss_scaling_factor,
             args.moe_aux_loss_coeff,

@@ -125,8 +125,7 @@ def test_build_config_maps_lf_fsdp_without_offload_to_disabled_cpu_offload():
         training_args=training_args, torchturbo_args=TorchTurboArgs()
     )
 
-    assert cfg.backend_config.cpu_offload is False
-    assert cfg.backend_config.pin_memory is True
+    assert cfg.backend_config.cpu_offload.enabled is False
 
 
 def test_build_config_maps_lf_fsdp_offload_to_enabled_cpu_offload():
@@ -141,80 +140,65 @@ def test_build_config_maps_lf_fsdp_offload_to_enabled_cpu_offload():
         training_args=training_args, torchturbo_args=TorchTurboArgs()
     )
 
-    assert cfg.backend_config.cpu_offload is True
-    assert cfg.backend_config.pin_memory is True
+    assert cfg.backend_config.cpu_offload.enabled is True
+    assert cfg.backend_config.cpu_offload.mode.value == "full"
 
 
-def test_build_config_cpu_offload_torchturbo_cli_cannot_disable_lf_offload(
-    monkeypatch,
-):
+def test_build_config_cpu_offload_cannot_disable_lf_offload():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
 
     training_args = types.SimpleNamespace(
         fsdp=["full_shard", "offload"], fsdp_config={}, gradient_checkpointing=True
     )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["run_lf.py", "--tt_cpu_offload=false"],
-    )
-
-    with pytest.raises(ValueError, match="tt_cpu_offload must not disable"):
+    with pytest.raises(ValueError, match="must use mode='full'"):
         build_config_from_lf_args(
             training_args=training_args,
-            torchturbo_args=TorchTurboArgs(cpu_offload=False),
+            torchturbo_args=TorchTurboArgs(
+                cpu_offload=CPUOffloadConfig(enabled=False)
+            ),
         )
 
 
-def test_build_config_cpu_offload_env_cannot_disable_lf_offload(monkeypatch):
-    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+def test_resolve_cpu_offload_non_strict_preserves_non_full_mode():
+    from torchturbo.adapters.llamafactory_v0.utils import resolve_cpu_offload
     from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
 
-    monkeypatch.setenv("TORCH_TURBO_CPU_OFFLOAD", "false")
-    training_args = types.SimpleNamespace(
-        fsdp=["full_shard", "offload"], fsdp_config={}, gradient_checkpointing=True
+    policy = resolve_cpu_offload(
+        ["full_shard", "offload"],
+        TorchTurboArgs(
+            cpu_offload=CPUOffloadConfig(
+                enabled=True,
+                mode="optimizer",
+            )
+        ),
+        strict=False,
     )
 
-    with pytest.raises(ValueError, match="tt_cpu_offload must not disable"):
-        build_config_from_lf_args(
-            training_args=training_args,
-            torchturbo_args=TorchTurboArgs(),
-        )
+    assert policy.enabled is True
+    assert policy.mode.value == "optimizer"
 
 
-def test_build_config_cpu_offload_env_overrides_lf(monkeypatch):
+def test_build_config_cpu_offload_overrides_lf():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
 
-    monkeypatch.setenv("TORCH_TURBO_CPU_OFFLOAD", "true")
     training_args = types.SimpleNamespace(
         fsdp=["full_shard"], fsdp_config={}, gradient_checkpointing=True
     )
 
     cfg, _ = build_config_from_lf_args(
         training_args=training_args,
-        torchturbo_args=TorchTurboArgs(),
+        torchturbo_args=TorchTurboArgs(
+            cpu_offload=CPUOffloadConfig(enabled=True)
+        ),
     )
 
-    assert cfg.backend_config.cpu_offload is True
-
-
-def test_build_config_cpu_offload_cli_overrides_lf(monkeypatch):
-    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
-    from torchturbo.engine.args import TorchTurboArgs
-
-    monkeypatch.setattr(sys, "argv", ["run_lf.py", "--tt_cpu_offload"])
-    training_args = types.SimpleNamespace(
-        fsdp=["full_shard"], fsdp_config={}, gradient_checkpointing=True
-    )
-
-    cfg, _ = build_config_from_lf_args(
-        training_args=training_args,
-        torchturbo_args=TorchTurboArgs(cpu_offload=True),
-    )
-
-    assert cfg.backend_config.cpu_offload is True
+    assert cfg.backend_config.cpu_offload.enabled is True
+    assert cfg.backend_config.cpu_offload.mode.value == "full"
 
 
 def test_engine_activation_checkpointing_defaults_to_enabled():

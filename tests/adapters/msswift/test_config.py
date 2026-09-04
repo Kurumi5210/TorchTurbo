@@ -45,6 +45,9 @@ from torchturbo.adapters.msswift.utils import (  # noqa: E402
     build_lora_config_from_swift_args,
 )
 from torchturbo.engine.args import TorchTurboArgs  # noqa: E402
+from torchturbo.engine.backends.fsdp2.config import (  # noqa: E402
+    CPUOffloadConfig,
+)
 from torchturbo.engine.config import (  # noqa: E402
     DistributedBackend,
     FreezePolicy,
@@ -176,12 +179,19 @@ def test_activation_checkpointing_owned_by_engine():
 
 
 def test_cpu_offload_to_fsdp_config():
-    _set_tt(cpu_offload=True)
+    _set_tt(cpu_offload=CPUOffloadConfig(enabled=True))
     cfg = build_config_from_swift_args(_base_args())
-    assert cfg.backend_config.cpu_offload is True
-    _set_tt(cpu_offload=False)
+    assert cfg.backend_config.cpu_offload.enabled is True
+    assert cfg.backend_config.cpu_offload.mode.value == "full"
+    _set_tt(
+        cpu_offload=CPUOffloadConfig(
+            enabled=True,
+            mode="optimizer",
+        )
+    )
     cfg = build_config_from_swift_args(_base_args())
-    assert cfg.backend_config.cpu_offload is False
+    assert cfg.backend_config.cpu_offload.enabled is True
+    assert cfg.backend_config.cpu_offload.mode.value == "optimizer"
 
 
 def test_checkpoint_paths():

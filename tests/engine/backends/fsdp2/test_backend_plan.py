@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 
 
@@ -57,6 +58,37 @@ def make_backend(*, mtp_enabled=False):
     return backend
 
 
+def fsdp_config(*, full_offload=False):
+    cpu_offload = types.SimpleNamespace(
+        enabled=full_offload, mode=CPUOffloadMode.FULL
+    )
+    return types.SimpleNamespace(cpu_offload=cpu_offload)
+
+
+def test_cpu_offload_grad_norm_counts_replicated_grad_once(monkeypatch):
+    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._device_runtime = types.SimpleNamespace(
+        device=torch.device("cpu"), synchronize=lambda: None
+    )
+    sharded_param = types.SimpleNamespace(
+        grad=types.SimpleNamespace(_local_tensor=torch.tensor([3.0]))
+    )
+    replicated_param = nn.Parameter(torch.zeros(1))
+    replicated_param.grad = torch.tensor([4.0])
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, **kwargs: tensor.mul_(4),
+    )
+
+    total_norm = backend._clip_grad_norm_cpu_offload(
+        [], [sharded_param], [replicated_param], max_norm=1000.0, norm_type=2.0
+    )
+
+    torch.testing.assert_close(total_norm, torch.sqrt(torch.tensor(52.0)))
+
+
 class CheckpointBlock(TaggedModule):
     def __init__(self, tag: str) -> None:
         super().__init__(tag)
@@ -84,7 +116,7 @@ def test_standalone_world_shard_skips_default_descendant_wrapping(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -121,7 +153,7 @@ def test_no_shard_matches_parameter_names(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -163,7 +195,7 @@ def test_no_shard_module_skips_descendant_wrapping(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -200,7 +232,7 @@ def test_default_policy_wraps_module_list_children(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -231,7 +263,7 @@ def test_global_cpu_offload_applies_to_all_fsdp_units(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=True, pin_memory=True)
+    backend.fsdp_config = fsdp_config(full_offload=True)
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -259,7 +291,7 @@ def test_carves_tail_unit_with_reshard_false_and_root(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -299,7 +331,7 @@ def test_tail_unit_uses_input_embedding_when_tied(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -377,7 +409,7 @@ def test_tail_unit_does_not_guess_lm_head_attr(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -427,7 +459,11 @@ def test_vlm_nested_norm_via_get_norm_joins_tail_unit(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = types.SimpleNamespace(
+        cpu_offload=types.SimpleNamespace(
+            enabled=False, mode=CPUOffloadMode.FULL
+        )
+    )
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -469,7 +505,12 @@ def test_mtp_keeps_vlm_norm_separate_from_reused_lm_head(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = types.SimpleNamespace(
+        cpu_offload=types.SimpleNamespace(
+            enabled=False, mode=CPUOffloadMode.FULL
+        ),
+        pin_memory=True,
+    )
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -507,7 +548,7 @@ def test_tail_unit_skips_modules_inside_explicit_parent(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 
@@ -544,7 +585,7 @@ def test_explicit_output_embedding_merges_with_tail_norm(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
 

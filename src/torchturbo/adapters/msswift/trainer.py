@@ -29,6 +29,7 @@ import os
 from functools import partial
 from typing import Any
 
+from ...engine import CPUOffloadMode
 from ...logging import get_logger
 from . import engine_registry
 
@@ -180,9 +181,9 @@ class TurboTrainerMixin:
         apply_ulysses_sp_patch(engine)
         install_clip_override(self, engine)
         install_accelerator_overrides(self)
-        # Force ``model.device`` to the compute device via a class-level attribute
-        # under offload; non-offload keeps HF's default.
-        if engine.config.backend_config.cpu_offload:
+
+        offload = engine.config.backend_config.cpu_offload
+        if offload.enabled and offload.mode is CPUOffloadMode.FULL:
             import torch
             from ...runtime import get_device_name
 

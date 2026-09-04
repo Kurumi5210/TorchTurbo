@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 import torchturbo.engine.backends.fsdp2.weight_loader as weight_loader_mod
 from torchturbo.engine.backends.fsdp2.weight_loader import DistParamLoader
 from torchturbo.runtime import TurboDevice
@@ -73,7 +74,12 @@ def test_load_weights_cpu_offload_assigns_and_restores_buffers(monkeypatch):
 
 def test_load_model_materializes_model_when_cpu_offload(monkeypatch):
     backend = FSDP2Backend.__new__(FSDP2Backend)
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=True)
+    backend.fsdp_config = types.SimpleNamespace(
+        cpu_offload=types.SimpleNamespace(
+            enabled=True,
+            mode=CPUOffloadMode.FULL,
+        )
+    )
     backend._device_runtime = types.SimpleNamespace(
         device=torch.device("cuda"),
         turbo_device=TurboDevice.CUDA,

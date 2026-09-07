@@ -91,6 +91,11 @@ class TorchTurboArgs:
         Sequence parallelism group size.
     ep_size:
         Expert parallelism group size.
+    gbs:
+        Global batch size in micro-batch units. When set, the engine derives
+        ``gradient_accumulation_steps = gbs * sp_size / world_size`` (overriding
+        the framework's own), letting the SP dimension control the effective
+        global batch size.
     gradient_checkpointing:
         Whether TorchTurbo should enable engine-owned activation
         checkpointing. Defaults to ``True``.
@@ -137,6 +142,7 @@ class TorchTurboArgs:
     use_deterministic_algorithms: bool = False
     sp_size: int | None = None
     ep_size: int | None = None
+    gbs: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
     cpu_offload: CPUOffloadConfig = field(default_factory=CPUOffloadConfig)
@@ -279,6 +285,20 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         type=int,
         metavar="SIZE",
         help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
+    ),
+    TurboArgSpec(
+        name="gbs",
+        args_name="gbs",
+        cli_name="--tt_gbs",
+        env_name="TORCH_TURBO_GBS",
+        config_path="gbs",
+        type=int,
+        metavar="GBS",
+        help="Global batch size in micro-batch units. When set, "
+        "gradient_accumulation_steps is derived as tt_gbs * sp_size / "
+        "world_size (overriding the framework's own ga/gbs), so the SP "
+        "dimension controls the effective global batch size. "
+        "Replaces TORCH_TURBO_GBS.",
     ),
     TurboArgSpec(
         name="gradient_checkpointing",

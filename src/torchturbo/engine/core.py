@@ -102,13 +102,13 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
 
         logger.info_rank0(
             "SPDistributedSampler: world=%d, rank=%d, sp_size=%d, "
-            "dp_size=%d, dp_rank=%d, iterations=%d",
+            "dp_size=%d, dp_rank=%d, num_samples=%d",
             self.num_replicas,
             self.rank,
             self.sp_size,
             self.dp_size,
             self.dp_rank,
-            self.num_iterations,
+            self.num_samples,
         )
 
     def __iter__(self) -> Iterator[int]:
@@ -913,6 +913,47 @@ class TorchTurboEngine:
     def get_sp_info(self) -> dict[str, Any]:
         """Get sequence-parallel rank, size and group."""
         return self.backend.get_sp_info()
+
+    def resolve_gradient_accumulation_steps(self, framework_ga: int) -> int:
+        """Return the ``gradient_accumulation_steps`` the HF/swift loop should use.
+
+        Two modes:
+        - ``tt_gbs`` set (``--tt_gbs``): derive ``ga = tt_gbs * sp_size /
+          world_size``.
+        - ``tt_gbs`` unset: fall back to ``framework_ga * sp_size``
+        """
+        sp_size = int(self.get_sp_info().get("sp_size", 1))
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        gbs = self.config.gbs
+        if gbs is not None:
+            if framework_ga > 1:
+                raise ValueError(
+                    f"Cannot set both tt_gbs ({gbs}) and "
+                    f"gradient_accumulation_steps ({framework_ga}) at the same "
+                    f"time; pick one — tt_gbs will derive ga from gbs*sp/world."
+                )
+            if gbs <= 0:
+                raise ValueError(
+                    f"tt_gbs must be a positive integer, got {gbs}."
+                )
+            if (gbs * sp_size) % world_size != 0:
+                raise ValueError(
+                    f"tt_gbs({gbs}) * sp_size({sp_size}) must be divisible by "
+                    f"world_size({world_size}); got remainder "
+                    f"{(gbs * sp_size) % world_size}."
+                )
+            ga = (gbs * sp_size) // world_size
+            logger.info_rank0(
+                "gbs=%d, sp=%d: gradient_accumulation_steps = %d*%d/%d = %d "
+                "(overriding framework ga=%d)",
+                gbs, sp_size, gbs, sp_size, world_size, ga, framework_ga,
+            )
+            return ga
+        logger.info_rank0(
+            "sp=%d: gradient_accumulation_steps %d -> %d (step compensated)",
+            sp_size, framework_ga, framework_ga * sp_size,
+        )
+        return framework_ga * sp_size
 
     def get_ep_info(self) -> dict[str, Any]:
         """Get expert-parallel rank, size and group."""

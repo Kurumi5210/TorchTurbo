@@ -198,15 +198,11 @@ class TorchTurboTrainerBase:
 
         engine = self._engine()
         args = self.args
-        sp_size = engine.get_sp_info()["sp_size"]
 
-        orig = args.gradient_accumulation_steps
-        args.gradient_accumulation_steps = orig * sp_size
-        logger.info_rank0(
-            "SP=%d: gradient_accumulation_steps %d -> %d",
-            sp_size,
-            orig,
-            args.gradient_accumulation_steps,
+        args.gradient_accumulation_steps = (
+            engine.resolve_gradient_accumulation_steps(
+                args.gradient_accumulation_steps
+            )
         )
 
         finetuning_args = getattr(self, "finetuning_args", None)
@@ -279,12 +275,10 @@ class TorchTurboTrainerBase:
             tags=bd_tags,
         )
 
-        # ga *= sp_size must run — compute_diffusion_loss does /ga expecting the SP factor.
-        orig_ga = args.gradient_accumulation_steps
-        args.gradient_accumulation_steps = orig_ga * sp_size
-        logger.info_rank0(
-            "BD SP=%d: gradient_accumulation_steps %d -> %d",
-            sp_size, orig_ga, args.gradient_accumulation_steps,
+        args.gradient_accumulation_steps = (
+            engine.resolve_gradient_accumulation_steps(
+                args.gradient_accumulation_steps
+            )
         )
 
         return engine.create_dataloader(

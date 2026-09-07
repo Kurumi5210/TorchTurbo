@@ -381,6 +381,11 @@ class EngineConfig:
     mfu: MfuConfig = field(default_factory=MfuConfig)
     """MFU/HFU reporting settings."""
 
+    gbs: int | None = None
+    """Global batch size in micro-batch units (``--tt_gbs``). When set, the
+    engine derives ``gradient_accumulation_steps = gbs * sp_size / world_size``
+    """
+
     extra: dict[str, Any] = field(default_factory=dict)
     """Catch-all for user-defined settings."""
 
@@ -548,6 +553,7 @@ class EngineConfig:
             "loss_chunk_size",
             "freeze_policy",
             "mfu",
+            "gbs",
         }
         extra = {k: v for k, v in d.items() if k not in known_keys}
 
@@ -566,6 +572,7 @@ class EngineConfig:
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
             mfu=mfu_config,
+            gbs=d.get("gbs"),
             extra=extra,
         )
 
@@ -812,6 +819,7 @@ def build_from_args(
         freeze_policy=_build_freeze_policy(fields),
         mfu=_build_mfu_config(fields),
         diffusion=_build_diffusion_config(fields),
+        gbs=fields.get("gbs"),
         extra={},
     )
 

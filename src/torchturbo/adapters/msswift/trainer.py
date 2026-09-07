@@ -377,16 +377,11 @@ class TurboTrainerMixin:
         if engine is None or self.train_dataset is None:
             return super().get_train_dataloader(skip_batches=skip_batches)
 
-        sp_size = engine.get_sp_info().get("sp_size", 1)
-
-        # scale gradient_accumulation_steps by sp_size
-        args = self.args
-        orig = args.gradient_accumulation_steps
-        args.gradient_accumulation_steps = orig * sp_size
-        logger.info_rank0(
-            "SP=%d: gradient_accumulation_steps %d -> %d (step count "
-            "compensated)",
-            sp_size, orig, args.gradient_accumulation_steps,
+        # Derive gradient_accumulation_steps
+        self.args.gradient_accumulation_steps = (
+            engine.resolve_gradient_accumulation_steps(
+                self.args.gradient_accumulation_steps
+            )
         )
         return engine.create_dataloader(
             self.train_dataset,

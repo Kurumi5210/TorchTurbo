@@ -922,3 +922,58 @@ parallel_plan:
 
     with pytest.raises(ValueError, match="typo_flag"):
         _build_from_argv(["--tt_config", path])
+
+
+# ---------------------------------------------------------------------------
+# Global batch size (--tt_gbs -> gbs)
+# ---------------------------------------------------------------------------
+
+
+def test_gbs_defaults_to_none():
+    cfg = build_from_args(TorchTurboArgs())
+
+    assert cfg.gbs is None
+
+
+def test_gbs_from_turboargs():
+    cfg = build_from_args(TorchTurboArgs(gbs=32))
+
+    assert cfg.gbs == 32
+
+
+def test_gbs_from_cli_flag(tmp_path):
+    path = _write(tmp_path, "cfg.yaml", _engine_config(""))
+    cfg = _build_from_argv(["--tt_config", path, "--tt_gbs", "32"])
+
+    assert cfg.gbs == 32
+
+
+def test_gbs_from_config_file(tmp_path):
+    path = _write(tmp_path, "cfg.yaml", _engine_config("gbs: 32\n"))
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.gbs == 32
+
+
+def test_gbs_cli_overrides_file(tmp_path):
+    path = _write(tmp_path, "cfg.yaml", _engine_config("gbs: 8\n"))
+    cfg = _build_from_argv(["--tt_config", path, "--tt_gbs", "32"])
+
+    assert cfg.gbs == 32
+
+
+def test_gbs_env_var_overrides(monkeypatch):
+    monkeypatch.setenv("TORCH_TURBO_GBS", "16")
+    cfg = build_from_args(TorchTurboArgs())
+
+    assert cfg.gbs == 16
+
+
+def test_gbs_negative_raises():
+    with pytest.raises(ValueError):
+        build_from_args(TorchTurboArgs(gbs=-1))
+
+
+def test_gbs_zero_raises():
+    with pytest.raises(ValueError):
+        build_from_args(TorchTurboArgs(gbs=0))

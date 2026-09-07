@@ -528,3 +528,90 @@ class TestEngineSetup:
         engine.model = engine.backend.shard_model(TinyModel())
         
         assert "model" in repr(engine).lower()
+
+
+# ---------------------------------------------------------------------------
+# resolve_gradient_accumulation_steps (--tt_gbs vs legacy SP compensation)
+# ---------------------------------------------------------------------------
+
+
+def _make_engine_for_ga(sp_size, world_size, gbs=None):
+    """Build a bare TorchTurboEngine with mocked sp/dp info + config.gbs.
+
+    Patches the engine module's ``dist`` reference so
+    ``is_initialized`` is True and ``get_world_size`` reports ``world_size``.
+    Returns ``(engine, restore)`` — call ``restore()`` in the test's ``finally``.
+    """
+    engine = object.__new__(TorchTurboEngine)
+    engine.get_sp_info = lambda: {"sp_size": sp_size}
+    engine.config = SimpleNamespace(
+        gbs=gbs,
+        mfu=SimpleNamespace(enabled=False),
+    )
+    cd = engine_core.dist
+    orig_init, orig_world = cd.is_initialized, cd.get_world_size
+    cd.is_initialized = lambda: True
+    cd.get_world_size = lambda group=None: world_size
+
+    def restore():
+        cd.is_initialized = orig_init
+        cd.get_world_size = orig_world
+
+    return engine, restore
+
+
+def test_resolve_ga_tt_gbs_derives_from_formula():
+    # world=64, gbs=32, sp=4 -> ga = 32*4/64 = 2
+    engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=32)
+    try:
+        assert engine.resolve_gradient_accumulation_steps(4) == 2
+    finally:
+        restore()
+
+
+def test_resolve_ga_tt_gbs_matches_legacy_when_divisible():
+    # When gbs == framework_ga * world (i.e. gbs/world is integer),
+    # the tt_gbs formula and the legacy framework_ga*sp give the same answer.
+    # world=8, sp=2; framework_ga=1 -> legacy ga=2; gbs such that gbs*sp/world=2 -> gbs=8
+    engine, restore = _make_engine_for_ga(sp_size=2, world_size=8, gbs=8)
+    try:
+        assert engine.resolve_gradient_accumulation_steps(1) == 2
+    finally:
+        restore()
+
+
+def test_resolve_ga_legacy_when_gbs_unset():
+    engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=None)
+    try:
+        # legacy: framework_ga * sp_size
+        assert engine.resolve_gradient_accumulation_steps(3) == 12
+    finally:
+        restore()
+
+
+def test_resolve_ga_legacy_sp1_noop():
+    engine, restore = _make_engine_for_ga(sp_size=1, world_size=8, gbs=None)
+    try:
+        assert engine.resolve_gradient_accumulation_steps(5) == 5
+    finally:
+        restore()
+
+
+def test_resolve_ga_tt_gbs_indivisible_raises():
+    # 31*4 = 124, 124 % 64 != 0
+    engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=31)
+    try:
+        with pytest.raises(ValueError, match="divisible"):
+            engine.resolve_gradient_accumulation_steps(1)
+    finally:
+        restore()
+
+
+def test_resolve_ga_tt_gbs_minimum_one():
+    # world=64, gbs=1, sp=4 -> 1*4/64 = 0 remainder 4 -> raises (indivisible),
+    # so use gbs=16, sp=4, world=64 -> 16*4/64 = 1
+    engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=16)
+    try:
+        assert engine.resolve_gradient_accumulation_steps(8) == 1
+    finally:
+        restore()

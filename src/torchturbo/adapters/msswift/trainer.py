@@ -8,8 +8,8 @@ is mixed ahead of swift's trainer base for any stage:
 * ``create_optimizer`` — build via the engine (FSDP2-aware); ``create_scheduler``
   keeps HF's default around the engine optimizer.
 * ``compute_loss``  — ``engine.compute_loss`` (with SP loss re-scale).
-* ``_prepare_inputs`` — bridge swift-packed inputs to turbo's forward contract
-  (see :mod:`torchturbo.adapters.msswift.inputs_bridging`).
+* ``_prepare_inputs`` — bridge swift-packed inputs (see
+  :mod:`torchturbo.adapters.msswift.inputs_bridging`).
 * ``save_model`` — engine writes DCP weights; swift still records metadata.
 * ``get_train_dataloader`` — engine SP-aware sampler for all ``sp_size``.
 
@@ -305,10 +305,6 @@ class TurboTrainerMixin:
         from transformers.trainer import Trainer as HfTrainer
 
         inputs = HfTrainer._prepare_inputs(self, inputs)
-        # Bridge swift-packed inputs into turbo's forward contract:
-        # integer-attention-mask rebuild, loss_scale fold, fixed-length pad
-        # (text + mrope rows + cu_seq_lens + [4,b,s] position_ids). See
-        # inputs_bridging.py.
         from .inputs_bridging import bridge_swift_inputs
 
         return bridge_swift_inputs(inputs)

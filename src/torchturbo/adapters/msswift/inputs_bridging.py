@@ -3,7 +3,7 @@
 swift's padding-free packing + qwen3.5 mrope lay out a batch differently from
 what turbo's model forward consumes. This module rewrites a swift batch dict
 (from the trainer's ``_prepare_inputs``) so turbo's full-attn / GDN / mrope
-paths run on correct, fixed-length inputs:
+paths run on correct inputs:
 
 1. **integer attention_mask from reset position_ids** — swift encodes packed
    sub-sequence boundaries as ``position_ids`` resets to 0; turbo models key
@@ -14,17 +14,11 @@ paths run on correct, fixed-length inputs:
    read ``loss_scale``; binary weights (e.g. ``--loss_scale ignore_empty_think``)
    are baked into ``labels`` as ``-100``.
 
-3. **pad the batch to a FIXED length** — turbo's packing path wants a constant
-   shape (Triton / flash-attn shape-cache; no unpad roundtrip), while swift
-   padding-free packing emits variable lengths. Every sequence-length field is
-   padded to ``packing_length``. Backend-specific SP alignment happens later.
-   ``attention_mask=0`` and ``labels=-100`` mark the padding tail.
-
-4. **[4, bsz, seq] position_ids** — turbo qwen3.5 expects ``row 0 = text
-   positions`` (per-block reset) + ``rows 1-3 = 3D mrope``. swift collator stores
-   them split (``position_ids=[3,b,s]`` mrope + ``text_position_ids=[1,b,s]``
-   text). Once both are padded to the same length, prepend the text row.
-
+3. **model-specific input layout** — Swift's split position rows are left intact
+   here. Model-specific layout normalization runs in the swift template's
+   pre_forward_hook, not in this bridge.
+   before its forward pass. Batches keep Swift's native variable length; backend
+   ``prepare_inputs`` owns any SP alignment padding.
 """
 
 from __future__ import annotations
@@ -32,7 +26,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from ...logging import get_logger
 
@@ -132,112 +125,7 @@ def bake_loss_scale_into_labels(inputs: dict) -> dict:
     return inputs
 
 
-def resolve_fixed_packing_length() -> Optional[int]:
-    """Fixed sequence length to pad every batch to, for turbo's packing path.
-
-    The target is the configured ``packing_length`` (falling back to
-    ``max_length``) — stashed in :mod:`engine_registry` by ``TurboSwiftSft``
-    from its FULL args, because swift hands the trainer a stripped args view
-    that lacks ``packing_length``/``max_length``. ``None`` when no length is
-    configured. FSDP2 owns any additional Ulysses alignment.
-    """
-    from . import engine_registry
-    length = engine_registry.get_packing_length()
-    if not length:
-        return None
-    return int(length)
-
-
-def pad_batch_to_fixed_length(inputs: dict, target_length: int) -> dict:
-    """Pad the batch to a fixed length with zero-valued mask padding.
-
-    Every sequence-length field is padded so they agree at ``target_length``:
-    ``input_ids`` (0), ``attention_mask`` (0),
-    ``position_ids`` (each row continues from its OWN last position — rows
-    differ, text ends higher than mrope), ``text_position_ids`` (continue its
-    last text position), ``labels`` (-100, loss-ignored). Packed-seq params
-    (``cu_seq_lens_q/k``, ``max_length_q/k``) are re-derived from the padded
-    ``text_position_ids`` so ``cu_seq_lens_q[-1] == target_length``.
-
-    No-op when the batch is already at (or beyond) ``target_length``.
-    """
-    if not target_length or target_length <= 0:
-        return inputs
-    input_ids = inputs.get("input_ids")
-    if input_ids is None:
-        return inputs
-    seq = int(input_ids.size(-1))
-    pad = target_length - seq
-    if pad <= 0:
-        return inputs
-    inputs["input_ids"] = F.pad(input_ids, (0, pad), value=0)
-
-    am = inputs.get("attention_mask")
-    if am is None:
-        am = torch.ones_like(input_ids)
-    inputs["attention_mask"] = F.pad(am, (0, pad), value=0)
-
-    # position_ids (mrope rows): each row continues from its OWN last position;
-    # rows differ (text ends higher than mrope rows) so must not share one tail.
-    pos = inputs.get("position_ids")
-    if pos is not None:
-        starts = pos[..., -1].unsqueeze(-1) + 1  # (R, B, 1)
-        offsets = torch.arange(pad, device=pos.device, dtype=pos.dtype).reshape((1,) * (pos.dim() - 1) + (pad,))
-        pad_pos = (starts + offsets).to(pos.dtype)
-        inputs["position_ids"] = torch.cat((pos, pad_pos), dim=-1)
-
-    # text_position_ids: continue the text row's last position (drives
-    # cu_seq_lens_q; MUST match the padded length).
-    tpos = inputs.get("text_position_ids")
-    if tpos is not None:
-        last_t = int(tpos[..., -1].max().item())
-        tpad = torch.arange(last_t + 1, last_t + 1 + pad, device=tpos.device, dtype=tpos.dtype)
-        tpad = tpad.reshape((1,) * (tpos.dim() - 1) + (pad,)).expand(tpos.shape[:-1] + (pad,))
-        inputs["text_position_ids"] = torch.cat((tpos, tpad), dim=-1)
-
-    labels = inputs.get("labels")
-    if labels is not None:
-        inputs["labels"] = F.pad(labels, (0, pad), value=_IGNORE_INDEX)
-
-    ls = inputs.get("loss_scale")
-    if ls is not None and torch.is_tensor(ls):
-        inputs["loss_scale"] = F.pad(ls.float(), (0, pad), value=0.0)
-
-    # Re-derive full-attention metadata from the padded text row so its final
-    # boundary still covers the fixed physical length.
-    tpos2 = inputs.get("text_position_ids")
-    if tpos2 is not None:
-        try:
-            from swift.utils import get_packed_seq_params as _gpc
-            row = tpos2[0] if tpos2.dim() == 3 else tpos2
-            inputs.update(_gpc(row.reshape(1, -1) if row.dim() == 1 else row))
-        except Exception:
-            logger.debug_rank0("pad: recompute cu_seq_lens failed", exc_info=True)
-
-    # Position_ids row 0 = text: prepend the (now-padded) text row so the model
-    # sees [4, bsz, seq]. mrope rows stay 1-3.
-    tpos3 = inputs.get("text_position_ids")
-    pos3 = inputs.get("position_ids")
-    if (
-        pos3 is not None and tpos3 is not None
-        and pos3.dim() == 3 and pos3.shape[0] == 3
-        and pos3.shape[-1] == tpos3.shape[-1]
-    ):
-        inputs["position_ids"] = torch.cat(
-            [tpos3.to(pos3.device).reshape(1, *pos3.shape[1:]), pos3], dim=0
-        )
-
-    return inputs
-
 def bridge_swift_inputs(inputs: dict) -> dict:
-    """Full swift → turbo input bridge for one batch (called from _prepare_inputs).
-
-    Order matters: rebuild the packed attention mask, fold loss_scale, then pad
-    all sequence fields.
-    """
+    """Rebuild the packed attention mask, then fold loss_scale (per batch)."""
     inputs = bridge_packed_inputs(inputs)
-    inputs = bake_loss_scale_into_labels(inputs)
-    target = resolve_fixed_packing_length()
-    if target is not None:
-        inputs = pad_batch_to_fixed_length(inputs, target)
-    return inputs
+    return bake_loss_scale_into_labels(inputs)

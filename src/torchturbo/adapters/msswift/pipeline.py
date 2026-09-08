@@ -72,14 +72,6 @@ class TurboEnginePipelineMixin:
         if getattr(self.args, "tuner_type", "full") == "lora":
             engine.peft_config = build_lora_config_from_swift_args(self.args)
         engine_registry.set_engine(engine, stage=getattr(self.args, "rlhf_type", None) or "sft")
-        # Stash the fixed packing length from the pipeline's FULL args: swift
-        # hands the trainer a stripped args view without packing_length /
-        # max_length, so the trainer can't read it from self.args. The trainer
-        # pads each batch to this length so turbo's constant-shape packing path
-        # runs unchanged (Triton/FA shape cache; no unpad roundtrip).
-        engine_registry.set_packing_length(
-            getattr(self.args, "packing_length", None) or getattr(self.args, "max_length", None)
-        )
         logger.info_rank0(
             "TurboSwiftSft: engine ready (backend=%s, mp=%s)",
             config.backend.value, config.mixed_precision.value,

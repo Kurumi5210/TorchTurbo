@@ -67,14 +67,14 @@ flowchart TD
     CLI --> Main["sft_main()<br/>(闭包引用已替换的 SwiftSft)"]
     Main --> Pipe["TurboSwiftSft.__init__"]
     Pipe --> Args["SwiftPipeline.__init__: 解析 swift-native args<br/>(--tt_* 已由 launcher 剥离进 TorchTurboArgs)"]
-    Pipe --> Eng["_build_turbo_engine:<br/>build_from_args → TorchTurboEngine<br/>LoRA peft_config → engine_registry.set_engine/set_packing_length<br/>VLM _post_encode 旁路"]
+    Pipe --> Eng["_build_turbo_engine:<br/>build_from_args → TorchTurboEngine<br/>LoRA peft_config → engine_registry.set_engine<br/>VLM _post_encode 旁路"]
     Pipe --> Prep["_prepare_model_tokenizer →<br/>swift ModelMeta.loader.load() →<br/>TurboModelLoader.get_model → engine.prepare_model<br/>(meta + FSDP2 shard + load + LoRA/AC)"]
     Pipe --> Tmpl["_prepare_template / _prepare_flash_ckpt<br/>(swift 原生)"]
     Main --> TF["TrainerFactory.get_trainer_cls(args)<br/>→ TurboSeq2SeqTrainer(TurboTrainerMixin, Seq2SeqTrainer)"]
     TF --> Loop["swift/HF Trainer.train() 主循环<br/>(dataloader / grad accum / log / ckpt 触发)"]
     Loop --> CO["create_optimizer: engine.prepare_optimizer"]
-    Loop --> CL["compute_loss: engine.backend.compute_loss (+SP 回补)"]
-    Loop --> PI["_prepare_inputs: bridge_swift_inputs<br/>(整数mask重建 / loss_scale折叠 / 定长pad / [4,b,s] position_ids)"]
+    Loop --> CL["compute_loss: engine.compute_loss<br/>(backend.prepare_inputs: SP 对齐; +SP 回补)"]
+    Loop --> PI["_prepare_inputs: bridge_swift_inputs<br/>(整数mask重建 / loss_scale折叠)"]
     Loop --> WM["_wrap_model: 返回已 sharded 模型<br/>install_accelerator_overrides / install_clip_override"]
     Loop --> DL["get_train_dataloader: SP>1 时 engine.create_dataloader"]
     Loop --> SV["save_model: engine.save_model(DCP)<br/>_save_model = no-op"]
@@ -90,7 +90,7 @@ flowchart TD
 src/torchturbo/adapters/msswift/
 ├── __init__.py          # MSSwiftAdapter(@register_adapter("msswift", priority=20)): detect/activate
 ├── compat.py            # is_swift_installed / get_swift_version / is_swift_supported(钉 v4.1 布局)
-├── engine_registry.py   # 进程级引擎槽位 + packing_length 槽位(pipeline 存 / loader+trainer 取)
+├── engine_registry.py   # 进程级引擎与训练阶段槽位(pipeline 存 / loader+trainer 取)
 ├── stages.py            # SwiftStageSpec + TURBO_SWIFT_STAGES 注册表; SFT_STAGE 注册
 ├── args.py              # TurboSwiftArgsMixin(__post_init__ 关掉 engine 接管的 swift 开关) + TurboSftArguments
 ├── utils.py             # build_config_from_swift_args / build_lora_config_from_swift_args / 不支持项校验(纯函数,不 import swift)
@@ -114,13 +114,13 @@ tests/adapters/msswift/{test_config,test_inputs_bridging,test_registry}.py
 | --- | --- | --- |
 | `ModelLoader.get_model`（`AutoModel.from_pretrained`） | `TurboModelMixin.get_model` → `engine.prepare_model(model_dir, init_kwargs={'config': config}, peft_config=...)` | `loader.py` |
 | 模型工厂取 engine | 进程级 `engine_registry`（pipeline 存、loader/trainer 取） | `engine_registry.py` |
-| 固定 packing 长度 | `engine_registry.set_packing_length`（pipeline 从 FULL args 存，trainer 读） | `engine_registry.py` / `pipeline.py` |
+| SP 输入长度对齐 | FSDP2 `prepare_inputs` 按 `sp_size` 补齐，并同步序列字段与 packed metadata | `engine/backends/fsdp2/backend.py` |
 | `TrainerFactory.TRAINER_MAPPING[<task/rlhf_type>]` | `register_turbo_trainers_to_swift` 按 `stages` 写入 turbo trainer dotted-path | `model_registry.py` / `stages.py` |
 | 阶段 pipeline 全局（`SwiftSft` / 未来 `SwiftRLHF`） | `plugin.py` 按 `stages` 遍历 `setattr` 替换为 turbo pipeline | `plugin.py` / `stages.py` |
 | `Trainer.create_optimizer` | `engine.prepare_optimizer(get_optimizer_cls_and_kwargs())`（兼容 2/3-tuple） | `trainer.py:TurboTrainerMixin` |
 | `Trainer.create_scheduler` | 跳过 swift `OptimizerCallback`，走 HF 默认 + engine optimizer | `trainer.py:TurboTrainerMixin` |
-| `Trainer.compute_loss` | `engine.backend.compute_loss(model, inputs, return_outputs=True)`（SP 时按 sp_size 回补） | `trainer.py:TurboTrainerMixin` |
-| `Trainer._prepare_inputs` | `bridge_swift_inputs`：整数 mask 重建 / loss_scale 折叠 / 定长 pad / `[4,b,s]` position_ids | `trainer.py:TurboTrainerMixin` / `inputs_bridging.py` |
+| `Trainer.compute_loss` | `engine.compute_loss(model, inputs, return_outputs=True)`（backend 先对齐 SP 输入；trainer 再按 sp_size 回补 loss） | `trainer.py:TurboTrainerMixin` |
+| `Trainer._prepare_inputs` | `bridge_swift_inputs`：整数 mask 重建 / loss_scale 折叠；保留 swift 原始序列长度（模型布局后处理在 swift 模板 `pre_forward_hook` 内） | `trainer.py:TurboTrainerMixin` / `inputs_bridging.py` |
 | `Trainer.save_model`/`_save_model` | `engine.save_model`（DCP）写权重；swift 仅留 metadata（`_save_model` 置 no-op 防止重存 DTensor） | `trainer.py:TurboTrainerMixin` |
 | `Trainer.get_train_dataloader` | sp_size>1 时 `engine.create_dataloader`（SP-aware sampler + grad_accum 补偿） | `trainer.py:TurboTrainerMixin` |
 | `Trainer._wrap_model` | 返回已 sharded 的原模型，挡住 accelerate 重新 wrap | `trainer.py:TurboTrainerMixin` |
@@ -155,29 +155,28 @@ swift --dataset X --model_type turbo_qwen3_5_moe --template qwen3_5
  │            padding_free: (1, N) + position_ids 归零边界（无 attention_mask）
  │            packing:      (1, N) + position_ids 归零边界（离线 binpack）
  │
- ├─ bridge:   TurboTrainerMixin._prepare_inputs → bridge_swift_inputs(inputs, engine)（见 §6.1）
+ ├─ bridge:   TurboTrainerMixin._prepare_inputs → bridge_swift_inputs(inputs)（见 §6.1）
  │
- └─ turbo:    engine.backend.compute_loss → model(**inputs)
+ └─ turbo:    engine.compute_loss → backend.prepare_inputs → backend.compute_loss → model(**inputs)
              TurboQwen3_5MoeForConditionalGeneration.forward 消费：
-               input_ids, attention_mask, position_ids(3D mrope / [4,b,s] 合并 text 行),
+               input_ids, attention_mask, position_ids(3D mrope / [4,b,s] 由模型合并 text 行),
                pixel_values[/videos], image_grid_thw[/video_grid_thw], mm_token_type_ids,
                output_router_logits；labels 被 backend 取走算 CE。
 ```
 
-### 6.1 `inputs_bridging.py`：packing 边界编码与定长对齐
+### 6.1 `inputs_bridging.py`：packing 边界编码与 mrope 对齐
 
-swift 的 padding-free packing + qwen3.5 mrope 产出的 batch 与 turbo 模型 forward 契约不一致，桥接层按顺序做四件事：
+swift 的 padding-free packing + qwen3.5 mrope 产出的 batch 与 turbo 模型 forward 契约不一致，输入适配流程按顺序做三件事：
 
 1. **整数 `attention_mask` 重建**（`position_ids_reset_to_packed_mask`）：swift 把 packed 子序列边界编码为 `position_ids` 归零（每个子序列 `0,1,2...`）；turbo 模型按整数 `attention_mask`（每段 `1,2,3...`，padding=0）走块对角 varlen（`_get_cu_seqlens`）。从 `position_ids`（`(B,N)` 或 mrope `(3,B,N)/(4,B,N)`，取 row0 文本行）重建整数 mask。
    - **判界用 `==0`，非 `<=`**：mrope 给视觉 token 分配长串相同 position（如 `[0,1,2,3,4,4,4,...]`），`<=` 会把每个 plateau 当成新段，凭空造出上万个 phantom segment。
    - 单段（无归零）→ 返回 `None`，调用方直通，`plain padding` 字节不变。
 2. **`loss_scale` 二值折叠进 labels**（`bake_loss_scale_into_labels`）：turbo 的 shift CE 不读 `loss_scale`；`--loss_scale ignore_empty_think` 等二值加权（零权重）被折叠进 `labels`（`<=0` 处置 `-100`）后移除 `loss_scale`。`(0,1)` 之间的非二值权重丢弃并告警（覆盖团队 `ignore_empty_think` 二值语义）。
-3. **定长 pad**（`pad_batch_to_fixed_length`）：turbo 的 packing 路径要求常量 shape（Triton / flash-attn shape-cache，无 unpad roundtrip），而 swift padding-free packing 产变长。每个 seq 维字段 pad 到 `packing_length`（向上取整到 `sp_size` 倍，使 `ulysses_pad` 也是 no-op）：
-   - `input_ids` → 0；`labels` → `-100`（loss-ignored）；`attention_mask` → 末段 segment id（**不新增段**，`cu_seqlens` 不增 toy segment）；`position_ids` 各 mrope 行从自己末位置续；`text_position_ids` 续文本行（驱动 `cu_seq_lens_q`，须与 pad 后长度一致）。
-   - 已达/超过 target → no-op。
-4. **`[4, bsz, seq]` position_ids**：turbo qwen3.5 期望 `row0 = 文本 position`（按段归零）+ `rows1-3 = 3D mrope`。swift collator 把文本与 mrope 分开存（`position_ids=[3,b,s]` mrope + `text_position_ids=[1,b,s]`）。两者 pad 到同长后，prepend 文本行合并成 `[4,b,s]`。
+3. **模型相关的 position_ids 后处理**：qwen3.5 的 mrope 行合并（swift 分存的 `[3,b,s]` + `text_position_ids` → turbo 的 `[4,b,s]`）在 `qwen3_5/swift_template.py` 的模板 `pre_forward_hook` 内完成（与 MTP kwargs 保留同一 hook）。
 
-桥接顺序（`bridge_swift_inputs`）：重建整数 mask → 折叠 loss_scale → 定长 pad（含 `[4,b,s]` 合并）。
+bridge 保持 swift 产出的原始序列长度。SP>1 且长度不能被 `sp_size` 整除时，FSDP2 backend 的 `prepare_inputs` 在 `compute_loss` 前完成最小对齐，并同步 `attention_mask`、`labels`、position ids、token type ids 与 packed metadata。
+
+桥接顺序（`bridge_swift_inputs`）：重建整数 mask → 折叠 loss_scale。
 
 ### 6.2 数据流适配点逐项核对
 
@@ -186,7 +185,7 @@ swift 的 padding-free packing + qwen3.5 mrope 产出的 batch 与 turbo 模型 
 | `input_ids` | ✅ | ✅ | 否 |
 | `labels` | ✅ | ✅（backend `pop` 算 CE，不进 forward） | 否 |
 | `attention_mask` | padding:2D 0/1；packing/pf:不传 | 整数(>1)→`_get_cu_seqlens`→varlen 块对角 | **是（§6.1-1）**：packing/pf 时从 position_ids 重建整数 mask |
-| `position_ids` | text arange；mrope 3D `[3,B,N]` | ✅（mrope get_rope_index） | 否，但需实测 mrope 与 packing-aware 分支协同 |
+| `position_ids` | text arange；mrope 3D `[3,B,N]`，文本行另存于 `text_position_ids` | ✅（mrope get_rope_index） | **模型后处理（§6.1-3）**：prepend 文本行形成 `[4,B,N]` |
 | `pixel_values`/`image_grid_thw` | ✅（Qwen3_5Template mm_plugin） | ✅ | 否 |
 | `pixel_values_videos`/`video_grid_thw` | ✅ | ✅ | 否（实测确认 swift 命名一致） |
 | `mm_token_type_ids` | ❌（swift 不产） | ✅（image/video 区分） | **turbo 自补**：`_wrapped_get_rope_index` 内按 `input_ids==image_token_id/video_token_id` 自动建 |
@@ -278,7 +277,7 @@ turbo 接管走 swift 的 HF 路径，参数用 HF 字段（`swift/trainers/argu
 | MLLM swift `_post_encode` 预编码（`model.visual` 不存在）与 turbo 自编码重复 | `_build_turbo_engine` 把 `template._post_encode` 置 passthrough |
 | packing 下 attention 边界编码两框架不通（swift position_ids 归零 vs turbo 整数 mask） | `inputs_bridging.position_ids_reset_to_packed_mask` 重建整数 mask（§6.1-1） |
 | `loss_scale` 被 turbo 丢弃（`ignore_empty_think` 等加权失效） | `bake_loss_scale_into_labels` 把二值零权重折叠进 labels `-100`（§6.1-2） |
-| turbo packing 路径要求常量 shape，swift padding-free 产变长 | `pad_batch_to_fixed_length` 定长 pad，padding 折进尾段（§6.1-3） |
+| SP 下 swift 变长 batch 无法均匀切分 | FSDP2 `prepare_inputs` 只补齐到 `sp_size` 倍数，并同步 mask 与 packed metadata |
 | `cosine_with_min_lr` 在当前 transformers 是否接受 | 透传 HF；不支持则退 `cosine`（GPU 实测） |
 | mrope + packing 协同（turbo `get_rope_index` packing-aware 分支） | GPU 实测核对 |
 | 多模态视频键命名一致（`pixel_values_videos`/`video_grid_thw`） | GPU 实测对齐，不一致则在 bridge 做键名映射 |
@@ -291,7 +290,9 @@ turbo 接管走 swift 的 HF 路径，参数用 HF 字段（`swift/trainers/argu
 ## 10. 测试
 
 - `test_config.py`：`build_config_from_swift_args`/`build_lora_config_from_swift_args` 纯函数（字段映射、freeze/MTP/cpu_offload、LoRA target、不支持项 raise）。不需 swift。
-- `test_inputs_bridging.py`：输入桥接纯函数（依赖 torch，不需 swift）。覆盖 `position_ids` 归零→整数 mask（多段/单段/mrope 三维/padding/直通）、`loss_scale` 二值折叠进 labels、`pad_batch_to_fixed_length` 定长 pad（labels=-100 / 各 seq 字段对齐）、`bridge_swift_inputs` 端到端（packing_length 驱动）。
+- `test_inputs_bridging.py`：输入桥接纯函数（依赖 torch，不需 swift）。覆盖 `position_ids` 归零→整数 mask（多段/单段/mrope 三维/padding/直通）、`loss_scale` 二值折叠进 labels，以及 `bridge_swift_inputs` 保留原始序列长度的端到端契约。
+- `tests/models/qwen3_5_moe/test_chunked_loss_contract.py`：覆盖 Qwen3.5-MoE 模型后处理把 Swift 的文本 position 行合并到 `[4,B,S]`。
+- `test_input_preparation.py`：覆盖 FSDP2 backend 的 SP 最小 padding，包括序列字段、padding mask 与 packed metadata 同步。
 - `test_registry.py`：需 swift（`importorskip`）。检测/激活、`MODEL_MAPPING` 含 `turbo_*` 且 loader 为 mixin-ahead-of-native、`TrainerFactory['causal_lm']` 指向 turbo trainer、`TurboTrainerMixin` 提供接管方法、`stages` 注册表（SFT spec + `iter_stages` 驱动 plugin swap）、`TurboSftArguments` 结构（`TurboSwiftArgsMixin` 在 MRO 且 `__post_init__` force-off；`--tt_*` 不在 swift 字段而在 `TorchTurboArgs`）、plugin 交换 `SwiftSft` 的动作。
 
 均对标「不跑 e2e」的单元/结构级；e2e 见 §9 风险表（GPU 实测）。

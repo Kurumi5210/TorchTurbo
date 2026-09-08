@@ -17,10 +17,8 @@ from torchturbo.adapters.msswift.inputs_bridging import (  # noqa: E402
     bake_loss_scale_into_labels,
     bridge_packed_inputs,
     bridge_swift_inputs,
-    pad_batch_to_fixed_length,
     position_ids_reset_to_packed_mask,
 )
-from torchturbo.adapters.msswift import engine_registry  # noqa: E402
 
 
 def _t(values):
@@ -193,58 +191,23 @@ def test_loss_scale_non_binary_warns_but_still_masks_zeros(caplog):
 
 
 # --------------------------------------------------------------------------- #
-# pad_batch_to_fixed_length + bridge_swift_inputs (end-to-end packing bridge)
+# bridge_swift_inputs (end-to-end packing bridge)
 # --------------------------------------------------------------------------- #
 
 
-def test_pad_batch_pads_all_seq_fields_to_target_and_labels_ignored():
-    # A 2-segment packed batch (boundaries at reset-0 in position_ids).
+def test_bridge_swift_inputs_end_to_end():
+    # keep Swift's split position rows and native (unpadded) length.
     inputs = {
         "input_ids": _t([[1, 2, 3, 4, 5]]),
+        "position_ids": _t([[[0, 1, 0, 1, 2]], [[9, 9, 9, 9, 9]], [[7, 7, 7, 7, 7]]]),  # (3,1,5)
+        "text_position_ids": _t([[0, 1, 0, 1, 2]]),
         "attention_mask": _t([[1, 1, 1, 1, 1]]),
-        "position_ids": _t([[[0, 1, 0, 1, 2], [9, 9, 9, 9, 9], [7, 7, 7, 7, 7]]]),  # (3,1,5) mrope
-        "labels": _t([[10, 11, 12, 13, 14]]),
+        "labels": _t([[10, 0, 12, 13, 14]]),
+        "loss_scale": _t([[1.0, 0.0, 1.0, 1.0, 1.0]]),  # idx 1 zeroed -> label -100
     }
-    out = pad_batch_to_fixed_length(inputs, target_length=8)
-    # Every sequence-length field agrees at 8.
-    assert out["input_ids"].shape[-1] == 8
-    assert out["labels"].shape[-1] == 8
-    assert out["attention_mask"].shape[-1] == 8
-    assert out["position_ids"].shape[-1] == 8
-    assert out["attention_mask"].tolist() == [
-        [1, 1, 1, 1, 1, 0, 0, 0]
-    ]
-    # Padded labels are loss-ignored; original labels preserved.
-    assert out["labels"].tolist()[0][:5] == [10, 11, 12, 13, 14]
-    assert out["labels"].tolist()[0][5:] == [-100, -100, -100]
-
-
-def test_pad_batch_noop_when_already_at_target():
-    inputs = {"input_ids": _t([[1, 2, 3]]), "labels": _t([[10, 11, 12]])}
-    out = pad_batch_to_fixed_length(inputs, target_length=3)
-    assert out is inputs  # no padding needed -> returned unchanged
-
-
-def test_bridge_swift_inputs_end_to_end_with_packing_length():
-    # Full bridge on a packed batch: rebuild the packed mask, fold loss_scale,
-    # and pad to the stashed packing length.
-    try:
-        engine_registry.set_packing_length(8)
-        inputs = {
-            "input_ids": _t([[1, 2, 3, 4, 5]]),
-            "position_ids": _t([[0, 1, 0, 1, 2]]),  # 2 segments -> triggers mask rebuild
-            "attention_mask": _t([[1, 1, 1, 1, 1]]),
-            "labels": _t([[10, 0, 12, 13, 14]]),
-            "loss_scale": _t([[1.0, 0.0, 1.0, 1.0, 1.0]]),  # idx 1 zeroed -> label -100
-        }
-        out = bridge_swift_inputs(inputs)
-        assert out["input_ids"].shape[-1] == 8           # padded to packing_length
-        # loss_scale folded: the zero-weight token's label is -100 (then padded).
-        assert out["labels"].tolist()[0][0:5] == [10, -100, 12, 13, 14]
-        assert "loss_scale" not in out                    # removed after folding
-        assert out["position_ids"].shape[-1] == 8
-        assert out["attention_mask"].tolist() == [
-            [1, 1, 2, 2, 2, 0, 0, 0]
-        ]
-    finally:
-        engine_registry.clear()
+    out = bridge_swift_inputs(inputs)
+    assert out["input_ids"].shape[-1] == 5             # native length, no padding
+    assert out["labels"].tolist() == [[10, -100, 12, 13, 14]]
+    assert "loss_scale" not in out                     # removed after folding
+    assert out["attention_mask"].tolist() == [[1, 1, 2, 2, 2]]  # packed mask rebuilt
+    assert out["position_ids"].shape == (3, 1, 5)      # mRoPE rows stay split

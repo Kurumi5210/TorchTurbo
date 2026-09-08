@@ -45,6 +45,27 @@ def test_qwen_moe_uses_standard_forward_with_noop_lm_head():
     )
 
 
+def test_qwen_moe_postprocess_merges_swift_position_rows():
+    from torchturbo.models.qwen3_5.swift_template import _post_process_inputs
+
+    inputs = {
+        "position_ids": torch.tensor(
+            [[[0, 1, 0, 1, 2]], [[9, 9, 9, 9, 9]], [[7, 7, 7, 7, 7]]]
+        ),
+        "text_position_ids": torch.tensor([[0, 1, 0, 1, 2]]),
+    }
+
+    result = _post_process_inputs(inputs)
+
+    assert result["position_ids"].shape == (4, 1, 5)
+    assert result["position_ids"][0].tolist() == [[0, 1, 0, 1, 2]]
+    assert result["position_ids"][1:].tolist() == [
+        [[0, 1, 0, 1, 2]],
+        [[9, 9, 9, 9, 9]],
+        [[7, 7, 7, 7, 7]],
+    ]
+
+
 def test_qwen_moe_standard_forward_returns_main_and_mtp_hidden_states():
     model = object.__new__(TurboQwen3_5MoeForConditionalGeneration)
     nn.Module.__init__(model)

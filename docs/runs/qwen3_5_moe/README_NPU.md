@@ -1,101 +1,138 @@
-# Qwen35 MoE NPU
+# Qwen3.5-MoE NPU
 
-## AIStudio 环境
+## Docker Environment
 
-```python
-import os
-from pypai.job import PythonJobBuilder
-from pypai.conf import ExecConf
-from pypai.conf import KMConf
-from pypai.conf import GpuType
-from pypai.conf import AlertConf
-from aistudio_common.openapi.models import DataStore
+TODO
 
-def update_pypai():
-    # install dependencies
-    import subprocess
-    try:
-        subprocess.run(["pip", "install", "--upgrade", "aii-pypai"], check=True)
-        print("pip executes succeeded!")
-    except subprocess.CalledProcessError as e:
-        print(f"pip executes failed with code {e.returncode}")
+## Preparing the Model
 
-def torch_train():
-    update_pypai()
-    a3_sfs = DataStore(mount_point="/sfs_turbo", store_name="wl02-02-aidc-antfinix-sfs")
-    mnt_sfs = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
-    # a3_pcache = DataStore(store_name="ais-pcache-a3-common-antfinix2", mount_point="/mnt/antfinix2-a3/common")
-    a3_aic_pcache = DataStore(store_name="ais-pcache-a3-common-aicompiler", mount_point="/mnt/aicompiler-a3/common")
-    # ais-pcache-a3-common-antfinix2 	/mnt/antfinix2-a3/common
-    km_conf = KMConf(
-        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-0b9af7b5-20260824140737"
-    )
+Download a Qwen3.5 model from Hugging Face to your local machine (taking 35B-A3B as an example; 122B-A10B and 397B-A17B are the same):
 
-    labels={
-        "\"sigma.ali/rack-group-num\"": "1",  # 同超节点约束，确保任务在同一超节点内
-        "\"kubemaker.alipay.com/enable-pytorch-coscheduling\"": "true"  # 确保 PyTorchJob Pod 同时创建，避免超节点调度失败
-    }
-    # edl_job_args = "--critical_worker_index=0:2 --relaunch_always"
-
-    node_gpu_num = 16
-    node_num = 1
-    
-    custom_cmd="sleep infinity"
-    command = ''
-    command += 'source /usr/local/Ascend/nnal/atb/set_env.sh && source /root/.bashrc && '
-    command += f'export NPUS_PER_NODE={node_gpu_num} && export NNODES={node_num} && '
-    command += f"pip install peft==0.15.0 && pip install trl && pip install pynvml && \
-        pip install grpcio --trusted-host repo.huaweicloud.com && \
-        pip list && sleep 1 && \
-        cd /mnt/sfs_turbo/haishan.fhs/torchturbo/ && \
-        {custom_cmd}"
-
-    master = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=1, shared_memory=1000000, gpu_type="hpu910c", disk_m=192000)
-    worker = ExecConf(cpu=256, memory=2000000, gpu_num=node_gpu_num, num=node_num - 1, shared_memory=1000000, gpu_type="hpu910c", disk_m=192000)
-    job = PythonJobBuilder(source_root=None,
-                           main_file="", #命令模式必填空，详情参考：https://yuque.antfin-inc.com/aii/aistudio/gpu-job#y3tRY
-                           km_conf=km_conf,
-                           command=command,
-                           platform="kubemaker",
-                        #    k8s_app_name="deepseekmedameds1",
-                           k8s_app_name="hpuopt",
-                           k8s_priority="high",  
-                           distribution_strategy="AllreduceStrategy",
-                           master=master,
-                           worker=worker,
-                        #    runtime="elasticdl",
-                           runtime='pytorch',
-                           name="swift_torchturbo_qwen35b_630jsonl_sp2_ep4",
-                           tag="type=sft,basemodel=qwen3.5_35b",
-                           data_stores = [a3_sfs, mnt_sfs, a3_aic_pcache],
-                           host_network=False,
-                           labels=labels,
-                        #    edl_job_args = edl_job_args,
-                           enable_pcache_fuse=True,
-                        #    annotations=annotations,
-                        #    alert=alert_conf,
-                          )
-
-    job.run(enable_wait=False)
-
-if __name__ == "__main__":
-    torch_train()
+```bash
+pip install -U huggingface_hub
+hf download Qwen/Qwen3.5-35B-A3B --local-dir /path/to/models/Qwen3.5-35B-A3B
+# hf download Qwen/Qwen3.5-122B-A10B --local-dir /path/to/models/Qwen3.5-122B-A10B
+# hf download Qwen/Qwen3.5-397B-A17B --local-dir /path/to/models/Qwen3.5-397B-A17B
 ```
 
-## 运行方式
+If network access is restricted, use an HF mirror: `export HF_ENDPOINT=https://hf-mirror.com`.
 
-### llamafactory运行命令
+The downloaded model directory will be mounted into the container in the "Starting the Container" section, with the in-container path `/models/<model_name>`.
 
-// TODO
+## Preparing the Dataset
 
-### swift运行命令
+It is recommended to download the dataset to your local machine first, then configure a local `file_name` for the entry in `dataset/dataset_info.json` as described below. (If the server has internet access, you can also keep the default `hf_hub_url` of the entry, and the dataset will be downloaded automatically during training.)
 
-安装依赖
+### Text dataset (gsm8k as an example)
+
+Download (GSM8K uses the `main` subset):
+
 ```bash
-sh scripts/runs/qwen3_5_moe/install_swift_deps.sh
+hf download openai/gsm8k --repo-type dataset --include "main/*" --local-dir /path/to/datasets/gsm8k
 ```
 
-运行训练
+Edit `dataset/dataset_info.json` and point the `gsm8k` entry to the local file:
+
+```json
+"gsm8k": {
+  "file_name": "/datasets/gsm8k/main/train-00000-of-00001.parquet",
+  "columns": { "prompt": "question", "response": "answer" }
+}
+```
+
+`file_name` is the in-container path of the data file; keep the column mapping `question`→`prompt` and `answer`→`response`.
+
+### Multimodal dataset (llava_1k_zh as an example)
+
+Download:
+
 ```bash
-sh scripts/runs/qwen3_5_moe/swift_mllm_sft.sh
+hf download BUAADreamer/llava-en-zh-2k --repo-type dataset --local-dir /path/to/datasets/llava-en-zh-2k
+```
+
+Edit `dataset/dataset_info.json` and point the `llava_1k_zh` entry to the local file as well:
+
+```json
+"llava_1k_zh": {
+  "file_name": "/datasets/llava-en-zh-2k/zh/train-00000-of-00001.parquet",
+  "formatting": "sharegpt",
+  "columns": { "messages": "messages", "images": "images" },
+  "tags": {
+    "role_tag": "role",
+    "content_tag": "content",
+    "user_tag": "user",
+    "assistant_tag": "assistant"
+  }
+}
+```
+
+## Starting the Container
+
+Mount the models, datasets, and this repository into a Docker container with NPU/GPU devices attached (the container name `env-torchturbo` is just an example):
+
+```bash
+docker run -it \
+    --name env-torchturbo \
+    --device /dev/davinci0 --device /dev/davinci1 \
+    --device /dev/davinci2 --device /dev/davinci3 \
+    --device /dev/davinci4 --device /dev/davinci5 \
+    --device /dev/davinci6 --device /dev/davinci7 \
+    --device /dev/davinci8 --device /dev/davinci9 \
+    --device /dev/davinci10 --device /dev/davinci11 \
+    --device /dev/davinci12 --device /dev/davinci13 \
+    --device /dev/davinci14 --device /dev/davinci15 \
+    --device /dev/davinci_manager \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /path/to/models:/models \
+    -v /path/to/torchturbo:/torchturbo \
+    -v /path/to/datasets:/datasets \
+    <image> bash
+```
+
+The example above attaches 16 NPUs (`/dev/davinci0`–`/dev/davinci15`), matching the default `NPUS_PER_NODE=16` of the training scripts; adjust the devices according to the actual number of cards on your machine. The in-container model path is `/models/<model_name>` (e.g. `/models/Qwen3.5-35B-A3B`).
+
+## Running Training
+
+### Text SFT with LLaMA-Factory
+
+```bash
+# Install dependencies
+bash scripts/runs/qwen3_5_moe/install_lf_deps.sh
+# Run training (with the default configuration)
+bash scripts/runs/qwen3_5_moe/lf_text_sft.sh
+```
+
+### Multimodal SFT with ms-swift
+
+```bash
+# Install dependencies
+bash scripts/runs/qwen3_5_moe/install_swift_deps.sh
+# Run training (with the default configuration)
+bash scripts/runs/qwen3_5_moe/swift_mllm_sft.sh
+```
+
+### Basic Variables
+
+Both training scripts share the same set of basic variables:
+
+| Variable | Example | Description |
+|---|---|---|
+| `MODEL` | `/models/Qwen3.5-35B-A3B` | Model path, corresponding to the container mount path in "Preparing the Model" |
+| `OUTPUT_DIR` | `/tmp/tblf-sft/...` | Output directory where checkpoints and logs are stored |
+| `SEQ_LEN` | `4096` | Training sequence length, adjusted according to memory and data length |
+| `FINETUNING_TYPE` | `full` | Finetuning type; only supports `full` and `lora` |
+| `DATASET` | `gsm8k` | Dataset for training. |
+| `TT_CONFIG` | `${SCRIPT_DIR}/lf_text_sft.yaml` | torchturbo engine config file, containing `engine_config.parallel_plan` (sp_size/ep_size), etc. |
+
+Override the variables as needed when launching:
+
+```bash
+# LLaMA-Factory
+DATASET=gsm8k MODEL=/models/Qwen3.5-35B-A3B OUTPUT_DIR=/torchturbo/output \
+    bash scripts/runs/qwen3_5_moe/lf_text_sft.sh
+
+# ms-swift
+DATASET=/datasets/llava-en-zh-2k/zh/train-00000-of-00001.parquet \
+    MODEL=/models/Qwen3.5-397B-A17B OUTPUT_DIR=/torchturbo/output \
+    bash scripts/runs/qwen3_5_moe/swift_mllm_sft.sh
 ```

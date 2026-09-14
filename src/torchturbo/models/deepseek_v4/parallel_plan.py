@@ -91,6 +91,7 @@ def get_parallel_plan() -> FSDPParallelPlan:
 
     return FSDPParallelPlan(
         plan={
+            "layers.*": FSDPPlanSpec(activation_checkpoint=True),
             "layers.*.ffn.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),

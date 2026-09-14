@@ -178,6 +178,16 @@ class TurboTrainerMixin:
         engine = engine_registry.get_engine_or_none()
         if engine is None:
             return
+
+        # Resolve GA here (not in get_train_dataloader) so the HF/swift
+        # "Running training" summary shows the SP-compensated value instead
+        # of the raw script value.
+        self.args.gradient_accumulation_steps = (
+            engine.resolve_gradient_accumulation_steps(
+                self.args.gradient_accumulation_steps
+            )
+        )
+
         apply_ulysses_sp_patch(engine)
         install_clip_override(self, engine)
         install_accelerator_overrides(self)
@@ -373,12 +383,7 @@ class TurboTrainerMixin:
         if engine is None or self.train_dataset is None:
             return super().get_train_dataloader(skip_batches=skip_batches)
 
-        # Derive gradient_accumulation_steps
-        self.args.gradient_accumulation_steps = (
-            engine.resolve_gradient_accumulation_steps(
-                self.args.gradient_accumulation_steps
-            )
-        )
+        # GA was already resolved in __init__; just build the dataloader.
         return engine.create_dataloader(
             self.train_dataset,
             batch_size=self._train_batch_size,

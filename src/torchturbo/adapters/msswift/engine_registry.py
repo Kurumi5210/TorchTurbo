@@ -12,7 +12,7 @@ from typing import Optional
 
 
 _engine = None
-_stage: Optional[str] = None  # 'sft' | 'dpo' | ...
+_stage: Optional[str] = None  # 'sft' | 'pt' | 'dpo' | ... (pipeline class turbo_stage)
 
 
 def set_engine(engine, stage: Optional[str] = None) -> None:
@@ -26,8 +26,8 @@ def set_engine(engine, stage: Optional[str] = None) -> None:
 def get_engine():
     if _engine is None:
         raise RuntimeError(
-            "No active turbo engine — TurboSwiftSft must build one before "
-            "swift loads the model."
+            "No active turbo engine -- a turbo pipeline (TurboSwiftSft / "
+            "TurboSwiftPretrain) must build one before swift loads the model."
         )
     return _engine
 

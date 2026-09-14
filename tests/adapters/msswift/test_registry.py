@@ -92,26 +92,20 @@ def test_trainer_registry_is_stage_driven():
     from torchturbo.adapters.msswift.stages import SFT_STAGE, iter_stages
 
     # The SFT stage contributes the causal_lm trainer to TrainerFactory.
-    assert SFT_STAGE.turbo_trainers["causal_lm"].endswith("TurboSeq2SeqTrainer")
-    stages = iter_stages()
-    assert any(s.name == "sft" for s in stages)
-    assert any(
-        "causal_lm" in s.turbo_trainers for s in stages
-    )
+    assert any(s.name == "sft" for s in iter_stages())
 
 
-def test_stage_registry_drives_plugin_swap():
-    """The plugin swaps each registered stage's pipeline module global.
-
-    Register a fake stage against an importable module and confirm the plugin
-    module's swap loop reassigns the attribute, then clean up so other tests
-    see only the real SFT stage.
-    """
+def test_stage_registry_drives_plugin_swap(monkeypatch):
+    """The swap loop resolves each registered stage's pipeline class by name
+    via stage_wiring; snapshot/restore the real globals it touches."""
+    import importlib
+    import sys
     import types
 
     from torchturbo.adapters.msswift import stages as stages_mod
 
-    # A throwaway swift-free module + attr to swap.
+    # A throwaway swift-free module + attr to swap; stage_wiring is stubbed so
+    # the fake stage name resolves (the real one only knows sft/pt).
     fake_mod = types.ModuleType("turbo_test_stage_mod")
     fake_mod.SwiftSft = object  # sentinel original
 
@@ -119,36 +113,41 @@ def test_stage_registry_drives_plugin_swap():
         name="__test_stage__",
         pipeline_module="turbo_test_stage_mod",
         pipeline_attr="SwiftSft",
-        turbo_pipeline_factory=lambda: str,  # sentinel turbo pipeline
-        turbo_trainers={},
     )
     stages_mod.TURBO_SWIFT_STAGES.append(fake_spec)
-    import sys
-
     sys.modules["turbo_test_stage_mod"] = fake_mod
+    monkeypatch.setattr(stages_mod, "stage_wiring", lambda stage: (str, None))
+
+    # Snapshot the real stages' pipeline globals the loop is about to swap.
+    originals = {}
+    for spec in stages_mod.iter_stages():
+        if spec is fake_spec:
+            continue
+        mod = importlib.import_module(spec.pipeline_module)
+        originals[(spec.pipeline_module, spec.pipeline_attr)] = getattr(
+            mod, spec.pipeline_attr
+        )
     try:
         # Re-run the plugin's swap logic in isolation.
-        import importlib
-
         for spec in stages_mod.iter_stages():
             mod = importlib.import_module(spec.pipeline_module)
-            setattr(mod, spec.pipeline_attr, spec.turbo_pipeline_factory())
+            setattr(mod, spec.pipeline_attr, stages_mod.stage_wiring(spec.name)[0])
         assert fake_mod.SwiftSft is str  # swapped to the sentinel turbo pipeline
     finally:
         stages_mod.TURBO_SWIFT_STAGES.remove(fake_spec)
         del sys.modules["turbo_test_stage_mod"]
+        for (module_name, attr), original in originals.items():
+            mod = importlib.import_module(module_name)
+            setattr(mod, attr, original)
 
 
 def test_turbo_sft_arguments_structure():
     from swift.arguments import SftArguments
 
-    from torchturbo.adapters.msswift.args import (
-        TurboSwiftArgsMixin,
-        get_turbo_sft_arguments_class,
-    )
+    from torchturbo.adapters.msswift.args import TurboSwiftArgsMixin, TurboSftArguments
     from torchturbo.engine.args import TorchTurboArgs
 
-    cls = get_turbo_sft_arguments_class()
+    cls = TurboSftArguments
     assert issubclass(cls, SftArguments)
 
     # The force-off of engine-owned swift settings lives on TurboSwiftArgsMixin,
@@ -184,12 +183,6 @@ def test_turbo_sft_arguments_structure():
         )
 
 
-def test_turbo_sft_arguments_class_is_cached():
-    from torchturbo.adapters.msswift.args import get_turbo_sft_arguments_class
-
-    assert get_turbo_sft_arguments_class() is get_turbo_sft_arguments_class()
-
-
 def test_native_plugin_swaps_swift_sft():
     """The `--external_plugins` entry must swap swift's SwiftSft -> TurboSwiftSft.
 
@@ -200,9 +193,8 @@ def test_native_plugin_swaps_swift_sft():
     import swift.pipelines.train.sft as swift_sft_mod
 
     from torchturbo.adapters.msswift import MSSwiftAdapter
-    from torchturbo.adapters.msswift.pipeline import get_turbo_swift_sft
+    from torchturbo.adapters.msswift.pipeline import TurboSwiftSft
 
-    TurboSwiftSft = get_turbo_swift_sft()
     original = swift_sft_mod.SwiftSft
 
     # Activate (registers models/trainers) then swap the pipeline class exactly
@@ -216,3 +208,93 @@ def test_native_plugin_swaps_swift_sft():
         assert callable(swift_sft_mod.sft_main)
     finally:
         swift_sft_mod.SwiftSft = original
+
+
+def test_pt_pipeline_structure():
+    """The PT stage class: mixin ahead of SwiftPretrain, turbo args class,
+    shared __init__ from the mixin (same takeover sequence as SFT), and a
+    ``turbo_stage`` label for the engine registry."""
+    from swift.arguments import PretrainArguments
+    from swift.pipelines.train.pretrain import SwiftPretrain
+    from swift.pipelines.train.sft import SwiftSft
+
+    from torchturbo.adapters.msswift.args import (
+        TurboPretrainArguments,
+        TurboSwiftArgsMixin,
+    )
+    from torchturbo.adapters.msswift.pipeline import (
+        TurboEnginePipelineMixin,
+        TurboSwiftPretrain,
+        TurboSwiftSft,
+    )
+
+    # SwiftPretrain is a thin SwiftSft subclass -- the turbo takeover mirrors it.
+    assert issubclass(SwiftPretrain, SwiftSft)
+    assert issubclass(TurboSwiftPretrain, SwiftPretrain)
+    mro = TurboSwiftPretrain.__mro__
+    assert mro.index(TurboEnginePipelineMixin) < mro.index(SwiftPretrain)
+    assert TurboSwiftPretrain.args_class is TurboPretrainArguments
+    assert TurboSwiftPretrain.turbo_stage == "pt"
+
+    # Both stages share the mixin __init__.
+    assert TurboSwiftSft.__init__ is TurboEnginePipelineMixin.__init__
+    assert TurboSwiftPretrain.__init__ is TurboEnginePipelineMixin.__init__
+
+    # Args: force-off mixin must run ahead of PretrainArguments.__post_init__.
+    assert issubclass(TurboPretrainArguments, PretrainArguments)
+    amro = TurboPretrainArguments.__mro__
+    assert amro.index(TurboSwiftArgsMixin) < amro.index(PretrainArguments)
+    assert TurboPretrainArguments.__post_init__ is TurboSwiftArgsMixin.__post_init__
+
+
+
+def test_native_plugin_swaps_swift_pretrain():
+    """PT needs its own swap: SwiftPretrain binds SwiftSft at class-definition
+    time, so the SFT swap never reaches it."""
+    import importlib
+
+    import swift.pipelines.train.pretrain as swift_pt_mod
+
+    from torchturbo.adapters.msswift import MSSwiftAdapter
+    from torchturbo.adapters.msswift.pipeline import TurboSwiftPretrain
+    from torchturbo.adapters.msswift.stages import iter_stages, stage_wiring
+
+    MSSwiftAdapter().activate()
+    # Replay the plugin's swap loop; snapshot/restore the touched globals.
+    originals = {}
+    for spec in iter_stages():
+        mod = importlib.import_module(spec.pipeline_module)
+        originals[(spec.pipeline_module, spec.pipeline_attr)] = getattr(
+            mod, spec.pipeline_attr
+        )
+        setattr(mod, spec.pipeline_attr, stage_wiring(spec.name)[0])
+    try:
+        assert swift_pt_mod.SwiftPretrain is TurboSwiftPretrain
+        assert callable(swift_pt_mod.pretrain_main)
+    finally:
+        for (module_name, attr), original in originals.items():
+            mod = importlib.import_module(module_name)
+            setattr(mod, attr, original)
+
+
+def test_pt_stage_reuses_causal_lm_trainer():
+    """PT resolves through TRAINER_MAPPING['causal_lm']: TrainerFactory keys
+    by ``rlhf_type`` when present else ``task_type``, and PretrainArguments has
+    no ``rlhf_type``. NB: ``task_type``'s class default is None in 4.4.2
+    (resolved per-instance) -- assert the mechanism, not the class default.
+    """
+    from swift.arguments import PretrainArguments
+    from swift.trainers import TrainerFactory
+
+    from torchturbo.adapters.msswift import MSSwiftAdapter
+
+    # Activate explicitly -- the mapping entry is only turbo's after activation.
+    adapter = MSSwiftAdapter()
+    adapter.activate()
+    try:
+        assert getattr(PretrainArguments, "rlhf_type", None) is None
+        assert TrainerFactory.TRAINER_MAPPING["causal_lm"].endswith(
+            "TurboSeq2SeqTrainer"
+        )
+    finally:
+        adapter.deactivate()

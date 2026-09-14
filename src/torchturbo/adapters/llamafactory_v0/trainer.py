@@ -87,7 +87,7 @@ class TorchTurboTrainerBase:
             model=self.model,
             pad_to_multiple_of=8,
             label_pad_token_id=IGNORE_INDEX,
-            tokenizer=self.tokenizer,
+            tokenizer=self.processing_class,
             processor=self._mm_processor,
         )
         logger.info_rank0("Upgraded PT collator to MultiModalDataCollatorForSeq2Seq")

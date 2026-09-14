@@ -21,7 +21,6 @@ import importlib
 from ...logging import get_logger
 from ...models.base import TurboVLMModel
 from ...models.registry import get_all_models
-from .stages import iter_stages
 
 logger = get_logger(__name__)
 
@@ -81,17 +80,13 @@ def register_turbo_models_to_swift() -> None:
 
 
 def register_turbo_trainers_to_swift() -> None:
-    """Register every registered stage's turbo trainers into swift.
-
-    Driven by :func:`stages.iter_stages` — each spec contributes the
-    ``TRAINER_MAPPING`` entries for the task/rlhf types it covers (SFT:
-    ``causal_lm``; a future RLHF stage: ``dpo``/``kto``/...).
-    """
+    """Register the turbo trainers into swift (keyed by task/rlhf type)."""
     from swift.trainers import TrainerFactory
 
+    from .stages import TURBO_TRAINERS
+
     registered = []
-    for spec in iter_stages():
-        for task_type, dotted in spec.turbo_trainers.items():
-            TrainerFactory.TRAINER_MAPPING[task_type] = dotted
-            registered.append(f"{spec.name}:{task_type}")
+    for task_type, dotted in TURBO_TRAINERS.items():
+        TrainerFactory.TRAINER_MAPPING[task_type] = dotted
+        registered.append(task_type)
     logger.info_rank0("Registered turbo trainers into TrainerFactory: %s", registered)

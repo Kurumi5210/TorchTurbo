@@ -239,7 +239,7 @@ def test_lora_config_explicit_targets():
     lora = build_lora_config_from_swift_args(
         _base_args(tuner_type="lora", target_modules="q_proj,k_proj")
     )
-    assert lora.target_modules == ["q_proj", "k_proj"]
+    assert lora.target_modules == {"k_proj", "q_proj"}
 
 
 def test_lora_config_dora_rslora_flags():

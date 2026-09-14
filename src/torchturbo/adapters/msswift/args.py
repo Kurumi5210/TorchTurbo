@@ -34,11 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from swift.arguments import SftArguments
-
-from ...logging import get_logger
-
-logger = get_logger(__name__)
+from swift.arguments import PretrainArguments, SftArguments
 
 
 class TurboSwiftArgsMixin:
@@ -77,10 +73,14 @@ class TurboSftArguments(TurboSwiftArgsMixin, SftArguments):  # type: ignore[misc
     ``@dataclass`` gives the subclass its own ``__dataclass_fields__`` (a copy
     of the inherited ones); the generated ``__init__`` still calls
     ``self.__post_init__`` because ``hasattr(cls, '__post_init__')`` sees the
-    mixin's. So the mixin's force-off runs before ``super().__post_init__``.
+    mixin's. So the mixin's force-off runs before ``super().__post_init__()``.
     """
 
 
-def get_turbo_sft_arguments_class():
-    """Return the module-level ``TurboSftArguments`` (kept for API compat)."""
-    return TurboSftArguments
+@dataclass
+class TurboPretrainArguments(TurboSwiftArgsMixin, PretrainArguments):  # type: ignore[misc]
+    """Swift ``PretrainArguments`` for the turbo PT stage. The mixin must run
+    ahead of its ``__post_init__`` so accelerate/deepspeed stay off (the engine
+    owns them); with the native class they would compete with the engine.
+    """
+

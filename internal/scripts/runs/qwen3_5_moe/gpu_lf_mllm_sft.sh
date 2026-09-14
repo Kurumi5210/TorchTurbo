@@ -1,101 +1,77 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Qwen3.5-MoE TEXT SFT with torchturbo
-# Usage:
 #   bash scripts/runs/qwen3_5_moe/install_lf_deps.sh
 #   bash scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh
+#
+# Usage:
+#   bash internal/scripts/runs/qwen3_5_moe/install_lf_deps.sh
+#   bash internal/scripts/runs/qwen3_5_moe/gpu_lf_mllm_sft.sh
 
 set -o pipefail
+set -eux
 
-set -ex
+[ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
 
-export PYTORCH_ALLOC_CONF=expandable_segments:True
-export NCCL_DEBUG=WARN
+# model name or path
+MODEL=${MODEL:-/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys}
+# sequence length
+SEQ_LEN=${SEQ_LEN:-32768}
+# output directory
+OUTPUT_DIR=${OUTPUT_DIR:-/mnt/sfs_turbo/${USER_NAME}/ckpt/$(basename "${MODEL}")/lf/mllm_sft_seq$((${SEQ_LEN}/1024))k_node${NNODES:-1}}
+# tuner type: 'full' | 'lora'
+FINETUNING_TYPE=${FINETUNING_TYPE:-full}
+# training dataset (LF dataset id resolved via --dataset_dir, or a local path)
+DATASET=${DATASET:-med_debug}
+# turbo engine flags (sp/ep, freeze, mtp, ...) live in the sibling yaml.
+TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/gpu_lf_mllm_sft.yaml"}
 
-
-export VIDEO_PLACEHOLDER="<qwen3_5_video_placeholder>"
-export AUDIO_PLACEHOLDER="<qwen3_5_audio_placeholder>"
-#export IMAGE_PLACEHOLDER="<qwen3_5_image_placeholder>"
-
-
-if [ -z "$USER_NAME" ]; then
-    echo "Error: USER_NAME is not set"
-    exit 1
-fi
-
-model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys/
-#model_name_or_path=/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys
-
-seq_length=$((1024 * 32))
-sp_size=4
-ep_size=8
-dataset=med_debug
 packing_mode=packing_sep
-finetuning_type=full
 
 if [ ! -d /mnt/medmm-s3/common/data/debug_data ]; then
     mkdir -p /mnt/medmm-s3/common/data
     ln -s /input/torchturbo/stable/dataset/med /mnt/medmm-s3/common/data/debug_data
 fi
 
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=WARN
+export VIDEO_PLACEHOLDER="<qwen3_5_video_placeholder>"
+export AUDIO_PLACEHOLDER="<qwen3_5_audio_placeholder>"
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
 export TRANSFORMERS_VERBOSITY=error
-
 export NNODES=${WORLD_SIZE:-1}
 export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 export NODE_RANK=${RANK:-0}
 export WORLD_SIZE=$(($GPUS_PER_NODE * $NNODES))
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-23556}
+export ASCEND_PROCESS_LOG_PATH=$OUTPUT_DIR/log
 
-
-seq_length_k=$((seq_length / 1024))k
-model_basename=$(basename "$model_name_or_path")
-output_dir=/input/asystem/${USER_NAME}/ckpt/${model_basename}/lf/text_sft_seq${seq_length_k}_sp${sp_size}ep${ep_size}_node${NNODES}/
-
-mkdir -p $output_dir
-if [ -d $output_dir ]; then
-  echo 'Exist: ', $output_dir
-else
-  echo 'Not exist: ', $output_dir
-fi
-
-log_file=$output_dir/log-$NODE_RANK.txt
-echo $output_dir
-if [ "$NODE_RANK" -eq 0 ]; then
-    cp -f "$0" "$output_dir/"
-fi
-cur_time=$(date "+%Y%m%d-%H%M%S")
-echo $cur_time >> $log_file
-echo $output_dir >> $log_file
-
-DISTRIBUTED_ARGS="
-    --nproc_per_node $GPUS_PER_NODE \
-    --nnodes $NNODES \
-    --master_addr=${MASTER_ADDR} \
-    --master_port=${MASTER_PORT} \
-    --node_rank $NODE_RANK
-"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
-DATASET_DIR="${REPO_ROOT}/internal/dataset/gpu/"
-TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
+DATASET_DIR="${REPO_ROOT}/internal/dataset/npu/"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}}"
+[ -d "${TORCHTURBO_SRC_DIR}/torchturbo" ] || { echo "bad TORCHTURBO_SRC_DIR: ${TORCHTURBO_SRC_DIR}" >&2; exit 1; }
+export PYTHONPATH="${TORCHTURBO_SRC_DIR}:/opt/MindSpeed${PYTHONPATH:+:${PYTHONPATH}}"
 
-if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
-    echo "Error: TORCHTURBO_SRC_DIR does not point to torchturbo src: ${TORCHTURBO_SRC_DIR}" >&2
-    echo "Set TORCHTURBO_SRC_DIR=/path/to/torchturbo/src or run this script from the torchturbo repo." >&2
-    exit 1
+DISTRIBUTED_ARGS="
+    --nproc_per_node ${NPROC_PER_NODE:-${GPUS_PER_NODE:-8}} \
+    --nnodes ${NNODES:-1} \
+    --node_rank ${NODE_RANK:-0} \
+    --master_addr=${MASTER_ADDR:-127.0.0.1} \
+    --master_port=${MASTER_PORT:-23556}
+"
+
+mkdir -p $OUTPUT_DIR
+LOG_FILE=$OUTPUT_DIR/log-$NODE_RANK.txt
+if [ "${NODE_RANK:-0}" -eq 0 ]; then
+    cp -f "$0" $OUTPUT_DIR/
 fi
-
-export PYTHONPATH="${TORCHTURBO_SRC_DIR}:$PYTHONPATH"
+{ date "+%Y%m%d-%H%M%S"; echo "$OUTPUT_DIR"; } >> $LOG_FILE
 
 torchrun $DISTRIBUTED_ARGS $RUN_LF \
-    --tt_sp_size $sp_size \
-    --tt_ep_size $ep_size \
-    --tt_freeze_vision_tower \
-    --tt_freeze_multi_modal_projector \
-    --tt_ac_use_reentrant true \
+    --tt_config ${TT_CONFIG} \
     --num_train_epochs 1 \
     --report_to tensorboard \
     --logging_dir /home/admin/logs/tfevent \
@@ -103,16 +79,16 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --dataset_dir ${DATASET_DIR} \
     --trust_remote_code \
     --stage sft \
-    --model_name_or_path $model_name_or_path \
+    --model_name_or_path ${MODEL} \
     --do_train \
     --flash_attn fa2 \
-    --dataset $dataset \
+    --dataset ${DATASET} \
     --preprocessing_num_workers 64 \
-    --cutoff_len ${seq_length} \
+    --cutoff_len ${SEQ_LEN} \
     --neat_packing \
     --template qwen3_5 \
-    --finetuning_type ${finetuning_type} \
-    --output_dir $output_dir \
+    --finetuning_type ${FINETUNING_TYPE} \
+    --output_dir ${OUTPUT_DIR} \
     --overwrite_output_dir \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
@@ -132,4 +108,4 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --bf16 \
     --include_num_input_tokens_seen \
     --torch_empty_cache_steps 10 \
-    --ddp_timeout 1800000000 2>&1 | tee $log_file
+    --ddp_timeout 1800000000 2>&1 | tee ${LOG_FILE}

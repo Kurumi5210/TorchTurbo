@@ -18,6 +18,8 @@ SEQ_LEN=${SEQ_LEN:-4096}
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 # training dataset (must be registered in ${DATASET_DIR}/dataset_info.json)
 DATASET=${DATASET:-gsm8k}
+# turbo engine flags (sp/ep, freeze, cpu offload) live in the sibling yaml.
+TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/lf_text_sft.yaml"}
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
@@ -56,7 +58,6 @@ LOG_FILE=${LOG_FILE_PREFIX:-$OUTPUT_DIR/rank$NODE_RANK}-$CUR_TIME.log
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
-TT_CONFIG=${TT_CONFIG:-"${SCRIPT_DIR}/lf_text_sft.yaml"}
 DATASET_DIR="${REPO_ROOT}/dataset"
 export PYTHONPATH=$REPO_ROOT/src:$PYTHONPATH
 

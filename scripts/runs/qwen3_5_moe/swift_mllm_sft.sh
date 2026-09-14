@@ -18,8 +18,8 @@ SEQ_LEN=${SEQ_LEN:-32768}
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 # training dataset (ms-swift dataset id "repo#subset", or path to a local jsonl/parquet)
 DATASET=${DATASET:-BUAADreamer/llava-en-zh-2k#zh}
-# python interpreter (defaults to python3)
-PYTHON=${PYTHON:-python3}
+# turbo engine flags (sp/ep, freeze, cpu offload) live in the sibling yaml.
+TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/swift_mllm_sft.yaml"}
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
@@ -58,10 +58,11 @@ export ASCEND_PROCESS_LOG_PATH=$OUTPUT_DIR/ascend_log
 
 CUR_TIME=$(date "+%Y%m%d-%H%M%S")
 LOG_FILE=${LOG_FILE_PREFIX:-$OUTPUT_DIR/rank$NODE_RANK}-$CUR_TIME.log
+# python interpreter (defaults to python3)
+PYTHON=${PYTHON:-python3}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
-TT_CONFIG=${TT_CONFIG:-"${SCRIPT_DIR}/swift_mllm_sft.yaml"}
 export PYTHONPATH=$REPO_ROOT/src:$PYTHONPATH
 
 DISTRIBUTED_ARGS="

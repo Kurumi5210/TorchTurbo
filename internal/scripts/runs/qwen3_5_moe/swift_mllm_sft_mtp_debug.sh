@@ -1,59 +1,53 @@
-#!/bin/sh
+#!/bin/bash
 # Qwen3.5-MoE (M)LLM SFT + MTP with torchturbo via ms-swift
+# --- Ascend env (mirrors lf_mllm_sft.sh; replaces the GPU
 #
+# Usage:
+#   bash internal/scripts/runs/qwen3_5_moe/install_swift_deps.sh
+#   bash internal/scripts/runs/qwen3_5_moe/swift_mllm_sft_mtp_debug.sh
 
 set -o pipefail
-set -ex
+set -eux
 
-# --- Ascend env (mirrors lf_mllm_sft.sh; replaces the GPU
-#     PYTORCH_CUDA_ALLOC_CONF / NCCL_DEBUG block) ----------------------------
+[ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
+
+# model name or path
+MODEL=${MODEL:-/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B}
+# output directory
+OUTPUT_DIR=${OUTPUT_DIR:-/sfs_turbo/${USER_NAME}/ckpt/qwen35_35B/swift_mllm_sft_mtp_debug_node${NNODES:-1}}
+# sequence length
+SEQ_LEN=${SEQ_LEN:-32768}
+# tuner type: 'full' | 'lora'
+FINETUNING_TYPE=${FINETUNING_TYPE:-full}
+# training dataset (LF dataset id resolved via --dataset_dir, or a local path)
+DATASET=${DATASET:-/mnt/sfs_turbo/torchturbo/datasets/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl}
+# turbo engine flags (sp/ep, freeze, mtp, ...) live in the sibling yaml.
+TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/swift_mllm_sft_mtp_debug.yaml"}
+
+dataset_num_proc=96            # swift --dataset_num_proc
+dataloader_num_workers=8       # swift args: --dataloader_num_workers
+model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
+template=qwen3_5               # turbo-wrapped: re-injects input_ids after the hook for MTP
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export HCCL_EVENT_TIMEOUT=14500
 export ACL_DEVICE_SYNC_TIMEOUT=14400
-# AI_CPU is default for A3; AIV does not support multi-comm-domain parallelism
 export HCCL_OP_EXPANSION_MODE="AI_CPU"
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_ASYNC_ERROR_HANDLING=0
-
 export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
 export MULTI_STREAM_MEMORY_REUSE=1 # 多流
 export TENSORBOARD_LOGGING_DIR=/home/admin/logs/tfevent
-# MLLM data-processing caps (read by swift's mm_plugin, not backend-specific).
-# Defaults here mirror the GPU debug script; override via the environment for
-# one-off adjustments.
 export MAX_PIXELS=${MAX_PIXELS:-3145728}
 export VIDEO_MAX_PIXELS=${VIDEO_MAX_PIXELS:-50176}
 export FPS_MAX_FRAMES=${FPS_MAX_FRAMES:-12}
 export IMAGE_MAX_TOKEN_NUM=${IMAGE_MAX_TOKEN_NUM:-3072}
 export VIDEO_MAX_TOKEN_NUM=${VIDEO_MAX_TOKEN_NUM:-49}
-
-if [ -z "$USER_NAME" ]; then
-    echo "Error: USER_NAME is not set"
-    exit 1
-fi
-# --- model / data -----------------------------------------------------------
-# model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-397B-A17B
-model_name_or_path=/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B
-
-dataset=/mnt/sfs_turbo/torchturbo/datasets/debug_data/data_0630/sampled_sft_data_count_151372_0630.jsonl
-#dataset=/mnt/sfs_turbo/data/data/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl
-
-dataset_num_proc=96            # swift --dataset_num_proc
-dataloader_num_workers=8       # swift args: --dataloader_num_workers
-
-model_type=turbo_qwen3_5_moe   # turbo-registered model_type (loader = TurboModelLoader)
-template=qwen3_5               # turbo-wrapped: re-injects input_ids after the hook for MTP
-
-seq_length=$((1024 * 32))
-tuner_type=full                # swift args: 'full' | 'lora' (megatron uses --finetune)
-
-# --- distributed-launch env (fed to torchrun below; swift's BaseArguments
-#     also reads NPROC_PER_NODE / RANK / WORLD_SIZE for its own dist setup) ---
 export NNODES=${NNODES:-1}
 export NODE_RANK=${RANK:-0}
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
@@ -61,40 +55,33 @@ export MASTER_PORT=${MASTER_PORT:-23556}
 export NPUS_PER_NODE=${NPUS_PER_NODE:-16}
 export NPROC_PER_NODE=${NPROC_PER_NODE:-${NPUS_PER_NODE}}
 export WORLD_SIZE=$((${NPUS_PER_NODE} * ${NNODES}))
-
-# turbo-owned parallelism (engine/backend FSDP2 plan). NOTE: turbo owns
-# sequence + expert parallelism, so swift's `--sequence_parallel` is left off.
-# Qwen3.5-35B-A3B: linear_num_value_heads=32, max SP=32.
-sp_size=2
-ep_size=8
-
-output_dir=/sfs_turbo/${USER_NAME}/ckpt/qwen35_35B/swift_sft_mtp_sp${sp_size}ep${ep_size}_node${NNODES}
-mkdir -p "$output_dir"
-log_file=$output_dir/log-$NODE_RANK.txt
-export ASCEND_PROCESS_LOG_PATH=${output_dir}/ascend_log
-if [ "$NODE_RANK" -eq 0 ]; then
-    cp -f "$0" "$output_dir/"
-fi
-{ date "+%Y%m%d-%H%M%S"; echo "$output_dir"; } >> "$log_file"
-
-# --- paths: make torchturbo + ms-swift importable ---------------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
-PLUGIN="${TORCHTURBO_SRC_DIR}/torchturbo/adapters/msswift/plugin.py"
-# ms-swift repo root (the dir containing the `swift/` package); leave empty if
-# ms-swift is `pip install -e`'d.
-SWIFT_SRC_DIR=${SWIFT_SRC_DIR}
-
-[ -d "${TORCHTURBO_SRC_DIR}/torchturbo" ] || { echo "bad TORCHTURBO_SRC_DIR: ${TORCHTURBO_SRC_DIR}" >&2; exit 1; }
-[ -f "${PLUGIN}" ] || { echo "plugin not found: ${PLUGIN}" >&2; exit 1; }
-
-export PYTHONPATH="${TORCHTURBO_SRC_DIR}${SWIFT_SRC_DIR:+:${SWIFT_SRC_DIR}}:${PYTHONPATH}"
 export WANDB_DISABLED=True
 export TRANSFORMERS_VERBOSITY=error
+export ASCEND_PROCESS_LOG_PATH=$OUTPUT_DIR/ascend_log
 
+# python interpreter (defaults to python3)
 PYTHON=${PYTHON:-python3}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
+# ms-swift repo root (the dir containing the `swift` package); empty if pip-installed.
+SWIFT_SRC_DIR=${SWIFT_SRC_DIR:-}
+export PYTHONPATH="${REPO_ROOT}/src${SWIFT_SRC_DIR:+:${SWIFT_SRC_DIR}}${PYTHONPATH:+:${PYTHONPATH}}"
+
+DISTRIBUTED_ARGS="
+    --nproc_per_node ${NPROC_PER_NODE:-${NPUS_PER_NODE:-16}} \
+    --nnodes ${NNODES:-1} \
+    --node_rank ${NODE_RANK:-0} \
+    --master_addr=${MASTER_ADDR:-127.0.0.1} \
+    --master_port=${MASTER_PORT:-23556}
+"
+
+mkdir -p $OUTPUT_DIR
+LOG_FILE=$OUTPUT_DIR/log-$NODE_RANK.txt
+if [ "${NODE_RANK:-0}" -eq 0 ]; then
+    cp -f "$0" $OUTPUT_DIR/
+fi
+{ date "+%Y%m%d-%H%M%S"; echo "$OUTPUT_DIR"; } >> $LOG_FILE
 
 "${PYTHON}" -m torch.distributed.run \
     --nproc_per_node "${NPROC_PER_NODE}" \
@@ -104,18 +91,19 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --master_port "${MASTER_PORT}" \
     "${RUN_SWIFT}" \
     --model_type "${model_type}" \
-    --model "${model_name_or_path}" \
+    --model "${MODEL}" \
     --template "${template}" \
     --add_non_thinking_prefix true \
     --loss_scale ignore_empty_think \
-    --dataset "${dataset}" \
+    --dataset "${DATASET}" \
     --load_from_cache_file true \
-    --max_length "${seq_length}" \
+    --max_length "${SEQ_LEN}" \
     --packing true \
-    --packing_length "${seq_length}" \
+    --packing_length "${SEQ_LEN}" \
     --attn_impl flash_attn \
     --dataset_num_proc "${dataset_num_proc}" \
-    --tuner_type "${tuner_type}" \
+    --tuner_type "${FINETUNING_TYPE}" \
+    --tt_config ${TT_CONFIG} \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
@@ -132,16 +120,6 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
     --bf16 true \
     --dataloader_num_workers "${dataloader_num_workers}" \
     --report_to tensorboard \
-    --output_dir "${output_dir}" \
+    --output_dir "${OUTPUT_DIR}" \
     --ddp_timeout 1800000000 \
-    --tt_sp_size "${sp_size}" \
-    --tt_ep_size "${ep_size}" \
-    --tt_moe_aux_loss_coeff 1e-6 \
-    --tt_freeze_vision_tower true \
-    --tt_freeze_multi_modal_projector true \
-    --tt_ac_use_reentrant \
-    --tt_enable_mtp true \
-    --tt_mtp_loss_scaling_factor 0.1 \
-    --tt_enable_chunk_loss \
-    --tt_log_mfu \
-    2>&1 | tee "$log_file"
+    2>&1 | tee "${LOG_FILE}"

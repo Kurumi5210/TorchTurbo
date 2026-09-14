@@ -1,0 +1,8 @@
+engine_config:
+  parallel_plan:
+    sp_size: 2
+    ep_size: 8
+  diffusion:
+    bd_mask_low: 0.3
+    bd_mask_high: 0.8
+    bd_block_size: 32

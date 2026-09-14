@@ -1,0 +1,6 @@
+engine_config:
+  parallel_plan:
+    sp_size: 2
+    ep_size: 1
+  freeze_policy:
+    vision_tower: true

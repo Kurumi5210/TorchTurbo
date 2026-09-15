@@ -1,0 +1,47 @@
+version: "2.0"
+
+stages:
+  - 基础软件镜像构建
+  - 镜像扫描
+  - 同步镜像
+
+
+jobs:
+  torchturbo镜像构建:
+    stage: 基础软件镜像构建
+    id: build
+    component: docker-image-build-aarch64
+    inputs:
+      imageName: reg.docker.alibaba-inc.com/hcs-base/torchturbo # 构建产物镜像名称(不含tag), 如: reg.docker.alibaba-inc.com/antcodebuild/test-image-build
+      imageTag: ${{pipeline.currentTimestamp}}_aarch64 # 构建产物镜像 tag
+      dockerfile: ./Dockerfile_aarch64_910c # dockerfile 路径，不传默认为 ./Dockerfile (即: ${ACB_BUILD_DIR}/code-repo/Dockerfile)
+      forceCompression: false # 对所有镜像层强制应用压缩类型compression(包括已经存在的层)
+      skipWhenImageExists: false # true | false, 如果镜像已存在，是否跳过镜像构建，默认 false
+      errWhenImageExists: true # true | false, 如果镜像已存在，是否直接失败，默认 true
+      nydusSwitch: true # 是否一并构建 nydus 加速镜像，true | false，默认为 true。详细信息：https://yuque.antfin-inc.com/tuna/nydus/pmlc56l8svt95ilh#i7Q1f
+      cacheStrategy: always # 镜像构建是否使用缓存，默认 always
+      timeoutInSec: 86400 # 构建任务执行超时时间，单位(秒)
+
+
+  镜像扫描:
+    stage: 镜像扫描
+    id: image-scan
+    component: image-scan
+    inputs:
+      appName: hcr-aci-image-sync
+      image: ${{jobs.build.outputs.image}}
+      tenant: AIDC
+      timeoutMinute: 30
+
+  A3乌兰同步镜像:
+    id: a3-image-sync-ats-core-wulan
+    stage: 同步镜像
+    component: image-sync-from-alipay-to-ats
+    inputs:
+      sourceImage: ${{jobs.build.outputs.image}}
+      targetImage: hcr.meta-wulan01.hw-wulan.local/antsys/torchturbo:${{pipeline.currentTimestamp}}_aarch64
+      appName: hcr-aci-image-sync
+      tenant: AIDC
+      imageType: oci
+      checkImageAndStc: false
+      retry: 3

@@ -13,6 +13,7 @@ __pycache__
 build/
 dist/
 *.whl
+!image/pkg/*.whl
 
 # pip temporary dirs
 pip-build-tracker-*/

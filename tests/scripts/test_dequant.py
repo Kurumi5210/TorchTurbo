@@ -9,12 +9,15 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-SCRIPT_DIR = Path(__file__).resolve().parents[2] / "scripts" / "dequant"
+SCRIPT_DIR = (
+    Path(__file__).resolve().parents[2] / "internal" / "scripts" / "dequant"
+)
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import converter  # noqa: E402
 import dequantize  # noqa: E402
 import deepseekv4  # noqa: E402
+import deepseekv4_1  # noqa: E402
 import kimik26  # noqa: E402
 
 
@@ -150,6 +153,115 @@ def test_dequantize_deepseek_fp8():
     )
 
 
+def test_deepseek_v41_preserves_indexer_names_and_official_scale_suffix():
+    weight_map = {
+        "model.layers.2.self_attn.indexer.attn_k.weight": "weights.safetensors",
+        "model.layers.2.self_attn.indexer.attn_k.weight_scale_inv": (
+            "weights.safetensors"
+        ),
+        "model.layers.2.self_attn.indexer.k_norm.weight": "norm.safetensors",
+        "model.layers.2.self_attn.indexer.k_norm.weight_scale_inv": (
+            "norm.safetensors"
+        ),
+    }
+
+    sources = deepseekv4_1.DeepSeekV41Format().resolve_sources(weight_map)
+
+    assert set(sources) == {
+        "model.layers.2.self_attn.indexer.attn_k.weight",
+        "model.layers.2.self_attn.indexer.k_norm.weight",
+    }
+    for logical_key in (
+        "model.layers.2.self_attn.indexer.attn_k.weight",
+        "model.layers.2.self_attn.indexer.k_norm.weight",
+    ):
+        assert sources[logical_key].logical_key == logical_key
+        assert sources[logical_key].quantized
+        assert sources[logical_key].physical_keys == (
+            logical_key,
+            logical_key.removesuffix(".weight") + ".weight_scale_inv",
+        )
+
+
+def test_deepseek_v41_dequantizes_packed_fp4_with_ue8m0_scale():
+    packed = torch.tensor([[0x21]], dtype=torch.uint8)
+    scale = torch.tensor([[128]], dtype=torch.uint8)
+
+    result = deepseekv4_1.DeepSeekV41Format.dequantize_weight(packed, scale)
+
+    assert result.dtype is torch.bfloat16
+    assert result.shape == (1, 2)
+    assert result.is_contiguous()
+    torch.testing.assert_close(
+        result.float(), torch.tensor([[1.0, 2.0]]), rtol=0, atol=0
+    )
+
+
+def test_deepseek_v41_dequantizes_fp8_block_and_partial_blocks():
+    weight = torch.ones((33, 33), dtype=torch.float8_e4m3fn)
+    scale = torch.tensor(
+        [
+            [127, 128],
+            [126, 125],
+        ],
+        dtype=torch.uint8,
+    )
+
+    result = deepseekv4_1.DeepSeekV41Format.dequantize_weight(weight, scale)
+
+    assert result.dtype is torch.bfloat16
+    assert result.shape == (33, 33)
+    torch.testing.assert_close(
+        result.float()[0, 0], torch.tensor(1.0), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        result.float()[0, -1], torch.tensor(2.0), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        result.float()[-1, 0], torch.tensor(0.5), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        result.float()[-1, -1], torch.tensor(0.25), rtol=0, atol=0
+    )
+
+
+
+def test_deepseek_v41_dequantizes_fp8_128_blocks():
+    weight = torch.ones((128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[128]], dtype=torch.uint8)
+
+    result = deepseekv4_1.DeepSeekV41Format.dequantize_weight(weight, scale)
+
+    assert result.shape == (128, 128)
+    torch.testing.assert_close(
+        result.float(), torch.full((128, 128), 2.0), rtol=0, atol=0
+    )
+
+
+def test_deepseek_v41_dequantizes_row_wise_fp8_scales():
+    weight = torch.ones((3, 64), dtype=torch.float8_e4m3fn)
+    scale = torch.tensor(
+        [
+            [127, 128],
+            [126, 127],
+            [125, 126],
+        ],
+        dtype=torch.uint8,
+    )
+
+    result = deepseekv4_1.DeepSeekV41Format.dequantize_weight(weight, scale)
+
+    expected = torch.tensor(
+        [
+            [1.0, 2.0],
+            [0.5, 1.0],
+            [0.25, 0.5],
+        ]
+    ).repeat_interleave(32, dim=1)
+    assert result.shape == (3, 64)
+    torch.testing.assert_close(result.float(), expected, rtol=0, atol=0)
+
+
 def test_dequantize_kimi_int4_with_group_scales():
     unpacked = torch.tensor(
         [[1, 2, 3, 4], [-1, -2, -3, -4]], dtype=torch.int8
@@ -228,6 +340,88 @@ def test_deepseek_offline_conversion_handles_cross_shard_scale(tmp_path):
     assert "quantization_config" not in config
     assert config["torch_dtype"] == "bfloat16"
     assert (output_dir / "tokenizer.model").read_bytes() == b"tokenizer"
+
+
+def test_deepseek_v41_offline_conversion_preserves_names_and_compress_ratios(
+    tmp_path,
+):
+    model_dir = tmp_path / "deepseek-v41"
+    output_dir = tmp_path / "deepseek-v41-bf16"
+    model_dir.mkdir()
+
+    dense_key = "model.layers.3.self_attn.wq_b.weight"
+    expert_key = "model.layers.4.mlp.experts.0.w1.weight"
+    indexer_key = "model.layers.2.self_attn.indexer.attn_k.weight"
+    norm_key = "model.layers.2.self_attn.indexer.k_norm.weight"
+    tensors = {
+        dense_key: torch.ones((1, 64), dtype=torch.float8_e4m3fn),
+        dense_key.removesuffix(".weight") + ".weight_scale_inv": torch.tensor(
+            [[127, 128]], dtype=torch.uint8
+        ),
+        expert_key: torch.tensor([[0x21, 0x43]], dtype=torch.uint8),
+        expert_key.removesuffix(".weight") + ".weight_scale_inv": torch.tensor(
+            [[127]], dtype=torch.uint8
+        ),
+        indexer_key: torch.ones((1, 64), dtype=torch.float8_e4m3fn),
+        indexer_key.removesuffix(".weight") + ".weight_scale_inv": torch.tensor(
+            [[126, 127]], dtype=torch.uint8
+        ),
+        norm_key: torch.tensor([[3.0]], dtype=torch.bfloat16),
+    }
+    save_file(tensors, model_dir / "model.safetensors")
+    _write_index(model_dir, {key: "model.safetensors" for key in tensors})
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "compress_ratios": [0, 1, 2],
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "weight_block_size": [32, 32],
+                    "scale_fmt": "ue8m0",
+                    "expert_dtype": "fp4",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = converter.Converter(
+        deepseekv4_1.DeepSeekV41Format()
+    ).convert(model_dir, output_dir)
+
+    index = _read_index(output_dir)
+    expected_output_keys = {dense_key, expert_key, indexer_key, norm_key}
+    assert set(index["weight_map"]) == expected_output_keys
+    assert summary.converted_tensors == 3
+    assert summary.copied_tensors == 1
+    assert summary.total_size == 266
+
+    for key in expected_output_keys:
+        assert _read_tensor(output_dir, index, key).dtype is torch.bfloat16
+
+    torch.testing.assert_close(
+        _read_tensor(output_dir, index, dense_key).float(),
+        torch.tensor([[1.0, 2.0]]).repeat_interleave(32, dim=1),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        _read_tensor(output_dir, index, expert_key).float(),
+        torch.tensor([[0.5, 1.0, 1.5, 2.0]]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        _read_tensor(output_dir, index, indexer_key).float(),
+        torch.tensor([[0.5, 1.0]]).repeat_interleave(32, dim=1),
+        rtol=0,
+        atol=0,
+    )
+
+    config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    assert config["compress_ratios"] == [0, 1, 2]
+    assert "quantization_config" not in config
+    assert config["torch_dtype"] == "bfloat16"
 
 
 def test_kimi_offline_conversion_handles_components_in_different_shards(

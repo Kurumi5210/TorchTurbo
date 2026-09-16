@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from torchturbo.models.modules.attention.ulysses import (
-    all_gather_sp,
+    all_gather_sp_with_grad_reduce,
     ulysses_pad,
     ulysses_pad_and_slice_inputs,
 )
@@ -31,7 +31,7 @@ def sp_gather_and_unpad(
     """Gather a tensor across the SP group and remove sequence padding."""
 
     sp_size = dist.get_world_size(group=sp_group)
-    x = all_gather_sp(x, gather_dim, sp_group, sp_size, grad_scaler)
+    x = all_gather_sp_with_grad_reduce(x, gather_dim, sp_group, sp_size)
     if padding_size > 0:
         slc = [slice(None)] * x.dim()
         slc[unpad_dim] = slice(0, -padding_size)

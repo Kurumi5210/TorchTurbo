@@ -18,7 +18,7 @@ from torchturbo.utils.flash_attn_utils import (
     get_seqlens_in_batch,
 )
 from torchturbo.models.modules.attention.ulysses import (
-    all_gather_sp,
+    all_gather_sp_with_grad_reduce,
 )
 
 
@@ -984,7 +984,7 @@ def _npu_compute_sparse_indices(
     # Phase 1.5: All-gather full key sequence (if SP enabled)
     if sp_enabled:
         # All-gather key_index: [B, N/sp, 1, D] -> [B, N, 1, D]
-        key_index = all_gather_sp(key_index, dim=1, sp_group=sp_group, sp_size=sp_size)
+        key_index = all_gather_sp_with_grad_reduce(key_index, dim=1, sp_group=sp_group, sp_size=sp_size)
 
     # Phase 2: Get topk indices using npu_lightning_indexer
     topk_indices, _ = indexer_forward_with_scores(
@@ -1024,7 +1024,7 @@ def npu_fused_dsa_attn_forward(
     5. Uses fused_sparse_lightning_indexer_kl_loss for training loss
     6. Supports Ulysses sequence parallelism (SP)
 
-    Ulysses SP for MLA (all-to-all communication is done via all_gather_sp, not all-to-all):
+    Ulysses SP for MLA (all-gather via all_gather_sp_with_grad_reduce, not all-to-all):
     - KV (head=1): all-gather sequence before attention -> [B, seq/sp, 1, D] -> [B, seq, 1, D]
     - Q (H heads): no communication before attention (heads are parallel)
 
@@ -1096,11 +1096,11 @@ def npu_fused_dsa_attn_forward(
     if sp_enabled:
         # KV: all-gather sequence to get full context for attention
         # k_lat: [B, seq/sp, 1, kv_lora] -> [B, seq, 1, kv_lora]
-        k_lat = all_gather_sp(k_lat, dim=1, sp_group=sp_group, sp_size=sp_size)
+        k_lat = all_gather_sp_with_grad_reduce(k_lat, dim=1, sp_group=sp_group, sp_size=sp_size)
         # v_lat: [B, seq/sp, 1, kv_lora] -> [B, seq, 1, kv_lora]
-        v_lat = all_gather_sp(v_lat, dim=1, sp_group=sp_group, sp_size=sp_size)
+        v_lat = all_gather_sp_with_grad_reduce(v_lat, dim=1, sp_group=sp_group, sp_size=sp_size)
         # k_pe: [B, seq/sp, 1, qk_rope] -> [B, seq, 1, qk_rope]
-        k_pe = all_gather_sp(k_pe, dim=1, sp_group=sp_group, sp_size=sp_size)
+        k_pe = all_gather_sp_with_grad_reduce(k_pe, dim=1, sp_group=sp_group, sp_size=sp_size)
 
     # =====================================================================
     # 6. Core attention - sparse attention with npu_sparse_flash_attention (TND layout)

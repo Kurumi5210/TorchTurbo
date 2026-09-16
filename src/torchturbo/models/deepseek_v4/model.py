@@ -4,7 +4,7 @@ from functools import wraps
 import torch
 from transformers import AutoModelForCausalLM
 
-from torchturbo.models.modules.attention.ulysses import all_gather_sp
+from torchturbo.models.modules.attention.ulysses import all_gather_sp_with_grad_reduce
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..base import TurboModel
@@ -208,8 +208,12 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             score = self.wgate(x)
 
             seqlen = local_seqlen
-            kv = all_gather_sp(kv, dim=1, sp_group=sp_group, sp_size=sp_size)
-            score = all_gather_sp(score, dim=1, sp_group=sp_group, sp_size=sp_size)
+            kv = all_gather_sp_with_grad_reduce(
+                kv, dim=1, sp_group=sp_group, sp_size=sp_size
+            )
+            score = all_gather_sp_with_grad_reduce(
+                score, dim=1, sp_group=sp_group, sp_size=sp_size
+            )
             seqlen = seqlen * sp_size
             assert seqlen == kv.size(1), "must be"
             freqs_cis = freqs_cis[:seqlen]
@@ -348,7 +352,9 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
             kv_rope = dsv4.apply_rotary_emb(kv_rope, local_freq_cis)
             kv = torch.cat([kv_nope, kv_rope], dim=-1)
-            kv = all_gather_sp(kv, dim=1, sp_group=sp_group, sp_size=sp_size)
+            kv = all_gather_sp_with_grad_reduce(
+                kv, dim=1, sp_group=sp_group, sp_size=sp_size
+            )
 
             offset = kv.size(1)
 

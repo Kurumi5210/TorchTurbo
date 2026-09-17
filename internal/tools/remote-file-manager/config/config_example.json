@@ -1,0 +1,11 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "users": [
+    "your_employee_id"
+  ],
+  "images": [
+    "hcr.meta-wulan01.hw-wulan.local/antsys/vllm:release_0.18.0_0415_202604171255_aarch64"
+  ],
+  "auto_mount_nas": true
+}

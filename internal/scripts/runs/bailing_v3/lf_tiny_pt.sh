@@ -11,6 +11,8 @@ set -eux
 [ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
 
 # model name or path
+#MODEL=${MODEL:-/sfs_turbo/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324}
+#MODEL=${MODEL:-/sfs_turbo/zhisan/models/ling_tiny_v3_0000324}
 MODEL=${MODEL:-/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242}
 # sequence length
 SEQ_LEN=${SEQ_LEN:-8192}

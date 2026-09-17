@@ -12,6 +12,7 @@ set -eux
 [ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
 
 # model name or path
+#MODEL=${MODEL:-/pcache-mnt/ro/checkpoint/54229/345412/264967436/1/rootmodelQwen3.5-35B-A3B-Base-hgf-asys}
 MODEL=${MODEL:-/pcache-mnt/ro/checkpoint/54229/345412/265265966/1/rootmodelQwen3.5-397B-A17B-BASE-hgf-asys}
 # sequence length
 SEQ_LEN=${SEQ_LEN:-32768}

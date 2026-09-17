@@ -13,6 +13,7 @@ set -eux
 [ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
 
 # model name or path
+#MODEL=${MODEL:-/sfs_turbo/pretrained_models/Qwen3.5-35B-A3B}
 MODEL=${MODEL:-/mnt/aicompiler-a3/common/pretrained_models/Qwen3.5-35B-A3B}
 # sequence length
 SEQ_LEN=${SEQ_LEN:-4096}

@@ -13,7 +13,8 @@ set -eux
 [ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
 
 # model name or path
-MODEL=${MODEL:-None}
+#MODEL=${MODEL:-/sfs_turbo/pretrained_models/bailing_v3/sft_ring_tiny_v3_formal_0402_rc52_baseline_100w_safegate_0403_iter_0000324}
+MODEL=${MODEL:-/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242}
 # sequence length
 SEQ_LEN=${SEQ_LEN:-4096}
 # output directory
@@ -21,16 +22,11 @@ OUTPUT_DIR=${OUTPUT_DIR:-/mnt/sfs_turbo/${USER_NAME}/ckpt/$(basename "${MODEL}")
 # tuner type: 'full' | 'lora'
 FINETUNING_TYPE=${FINETUNING_TYPE:-full}
 # training dataset (LF dataset id resolved via --dataset_dir, or a local path)
-DATASET=${DATASET:-None}
+DATASET=${DATASET:-science}
 # turbo engine flags (sp/ep, freeze, mtp, ...) live in the sibling yaml.
 TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/lf_tiny_sft.yaml"}
 
 packing_mode=packing_sep
-
-if [ "${NODE_RANK:-0}" -eq 0 ]; then
-    cp -f "$0" $OUTPUT_DIR/
-fi
-
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export HCCL_CONNECT_TIMEOUT=7200
@@ -59,7 +55,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 RUN_LF="${REPO_ROOT}/scripts/runs/run_lf.py"
 DATASET_DIR="${REPO_ROOT}/internal/dataset/npu/"
-TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}}"
+TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 [ -d "${TORCHTURBO_SRC_DIR}/torchturbo" ] || { echo "bad TORCHTURBO_SRC_DIR: ${TORCHTURBO_SRC_DIR}" >&2; exit 1; }
 export PYTHONPATH="${TORCHTURBO_SRC_DIR}:/opt/MindSpeed${PYTHONPATH:+:${PYTHONPATH}}"
 

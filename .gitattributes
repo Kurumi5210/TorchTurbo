@@ -1,1 +1,1 @@
-image/pkg/*.whl filter=lfs diff=lfs merge=lfs -text
+docker/npu/pkg/*.whl filter=lfs diff=lfs merge=lfs -text

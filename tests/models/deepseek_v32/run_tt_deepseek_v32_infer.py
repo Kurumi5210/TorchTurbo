@@ -169,14 +169,12 @@ def run(rank, args):
 def main(args):
     mp.spawn(run, args=(args,), nprocs=args.world_size, join=True)
 
-# command:
-#   export PYTHONPATH=/sfs_turbo/xiyun/sft/MindSpeed/:$PYTHONPATH
-#   python tests/npu/test_deepseek_v32.py
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, default="/mnt/sfs_turbo/pretrained_models/DeepSeek-V3.2-Speciale-BF16/")
+    parser.add_argument("--path", type=str, default="/path/to/DeepSeek-V3.2")
     args = parser.parse_args()
     args = argparse.Namespace(
         torch_turbo_enabled=True,

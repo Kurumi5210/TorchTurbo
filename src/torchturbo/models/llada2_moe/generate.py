@@ -23,7 +23,7 @@ share mask construction.
 Usage::
 
     python [path/to/your/torchturbo]/src/torchturbo/models/llada2_moe/generate.py \\
-        --model /sfs_turbo/pretrained_models/LLaDA2.1-mini-ais/
+        --model /path/to/LLaDA2.1-mini/
 
 The model class is loaded from this directory (the torchturbo source tree), not
 from the trust-remote-code copy shipped in the weights dir — see
@@ -163,7 +163,7 @@ def _apply_attn_implementation(config, impl: str) -> None:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LLaDA2 block-diffusion inference")
     parser.add_argument(
-        "--model", default="/mnt/sfs_turbo/models/LLaDA2.1-mini",
+        "--model", default="/path/to/LLaDA2.1-mini",
         help="HuggingFace weights directory",
     )
     parser.add_argument("--prompt", default=_DEFAULT_PROMPT)

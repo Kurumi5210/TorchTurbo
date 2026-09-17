@@ -1,9 +1,5 @@
 # Qwen3.5-MoE NPU
 
-## Docker Environment
-
-TODO
-
 ## Preparing the Model
 
 Download a Qwen3.5 model from Hugging Face to your local machine (taking 35B-A3B as an example; 122B-A10B and 397B-A17B are the same):

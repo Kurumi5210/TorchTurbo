@@ -205,7 +205,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--path", type=str, default="/mnt/sfs_turbo/pretrained_models/DeepSeek-V3.2-Speciale-BF16/")
+    parser.add_argument("--path", type=str, default="/path/to/DeepSeek-V3.2")
     args = parser.parse_args()
 
     main(args.path)

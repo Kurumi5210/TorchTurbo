@@ -1,33 +1,35 @@
 # TorchTurbo
 
-**Model-first distributed training for post-training workloads.**
+A supernode-native post-training engine for rapidly adapting and training large language and vision models.
 
-`TorchTurbo` 是一个以模型为中心的分布式训练加速框架，基于FSDP2训练引擎的3D并行方案，使能GPU/NPU高性能算子，提升训练显存/计算效率。它提供Engine和Adapter，可以灵活接入现有的后训练框架（例如：LLaMA-Factory/Asystem）。由模型声明 ParallelPlan，并交给 Engine / Backend
-执行分布式训练。
+## Overview
 
-## 架构
+Post-training large models presents several challenges. Model architectures continue to evolve and introduce innovations such as mixture-of-experts (MoE), multimodality, and sparse attention. Post-training workflows, including reinforcement learning (RL), supervised fine-tuning (SFT), continual pre-training (CPT), and direct preference optimization (DPO), must flexibly adapt to these changing architectures while combining N-dimensional parallelism for high-performance training. Rapid model iteration therefore calls for a simple, general-purpose, high-performance distributed training engine that keeps the focus on model and training logic.
 
-torchturbo 的核心约定是 **model-first**：
+At the same time, AI infrastructure is entering the SuperNode era. The powerful communication capabilities of SuperNodes provide better support for training ultra-large MoE models. Against this backdrop, we introduce TorchTurbo, a distributed training engine centered on model and training logic. TorchTurbo improves model adaptation and training efficiency through deeply optimized fused operators and SuperNode affinity, taking full advantage of low inter-node communication overhead within a SuperNode.
+
+Built on PyTorch FSDP2 and Hugging Face Transformers, TorchTurbo combines **fully sharded data parallelism (FSDP), expert parallelism (EP), and Ulysses sequence parallelism (SP)** to provide flexible and efficient parallel training strategies for multimodal models. Its architecture is shown below:
 
 ```text
                          ┌─────────────────────────────────────┐
                          │              Model                  │
-                         │         (First-Class Citizen)       │
+                         │   (Native HuggingFace Extension)    │
                          │                                     │
-                         │   - 定义自身结构 (Architecture)      │
-                         │   - 声明并行策略 (ParallelPlan)      │
-                         │   - 指定计算需求 (Precision, AC)    │
+                         │   - Defines its architecture        │
+                         │   - Declares its ParallelPlan       │
+                         │   - Specifies compute requirements  │
+                         │     (Precision, AC)                 │
                          └──────────────┬──────────────────────┘
                                         │
                    ┌────────────────────┼────────────────────┐
                    │                    │                    │
                    ▼                    ▼                    ▼
              ┌──────────┐        ┌──────────┐        ┌─────────────┐
-             │  Backend │        │ Adapter  │        │ ParallelPlan│
-             │ (执行层) │        │ (适配层) │        │  (策略层)   │
-             │          │        │          │        │             │
+             │ Backend  │        │ Adapter  │        │ParallelPlan │
+             │Execution │        │Adaptation│        │  Strategy   │
+             │  Layer   │        │  Layer   │        │             │
              │ - FSDP2  │        │ - LF v0  │        │ - SP/EP/DP  │
-             │          │        │          │        │ - Offload   │
+             │          │        │ - swift  │        │ - Offload   │
              └──────────┘        └──────────┘        └─────────────┘
                    │                    │                    │
                    └────────────────────┼────────────────────┘
@@ -35,289 +37,273 @@ torchturbo 的核心约定是 **model-first**：
                                         ▼
                          ┌─────────────────────────────────────┐
                          │            Engine                   │
-                         │           (编排层)                  │
+                         │       (Orchestration Layer)         │
                          │                                     │
                          │  prepare_model → prepare_optimizer  │
-                         │              → fit                  │
+                         │              → forward_backward     │
                          └─────────────────────────────────────┘
 ```
 
-核心原则：
+Core principles:
 
-- 模型自描述：模型通过 `get_parallel_plan()` 声明自己如何被分布式执行。
-- Backend 执行意图：Backend 负责执行模型声明的策略，不干预模型逻辑。
-- Adapter 连接框架：Adapter hook 到现有训练框架，不改变模型行为。
-- Engine 编排流程：Engine 协调各组件完成训练生命周期。
-
-Device Runtime 抽象、算子注册与分发的设计和扩展方式见
-[`docs/design/runtime_and_ops.md`](docs/design/runtime_and_ops.md)。
+1. **Model-faithful:** Use clean upstream Hugging Face model implementations, replacing modules only where necessary for high performance, such as MoE, attention, and fused operations. This approach simplifies maintenance and extension.
+2. **Simple parallel-training transformations:** Build straightforward training-parallel strategies by adding EP and SP on top of FSDP2 to achieve high training throughput.
+3. **Pluggable into mainstream training frameworks:** Keep the training engine focused on model and training logic.
+4. **SuperNode-native:** Optimize the training engine for SuperNode architectures.
 
 ### Model
 
-每个模型目录负责三件事：
+Each model directory is responsible for three tasks:
 
-- 注册模型类型
-- 定义模型特有 patch
-- 提供 `get_parallel_plan()`
+- Registering the model type
+- Implementing the `TurboModel` or `TurboVLMModel` contract and model-specific hooks
+- Providing the model's default strategy through `get_default_parallel_plan()`
 
-典型结构：
+Typical structure:
 
 ```text
 src/torchturbo/models/<model_name>/
 ├── __init__.py
 ├── model.py
 ├── parallel_plan.py
-├── lf_template.py
-├── configuration_*.py
-└── modeling_*.py
+├── configuration_*.py       # Optional local Transformers configuration
+├── modeling_*.py            # Optional local Transformers implementation
+├── lf_template.py            # Optional LlamaFactory integration
+├── swift_template.py         # Optional ms-swift integration
+└── npu.py                    # Optional device-specific patches
 ```
 
-如果模型已经在 `transformers` 中原生支持，可以直接复用上游配置和模型；
-如果没有，则在模型目录中维护对应的 `configuration_*.py` 和
-`modeling_*.py`。
+When a model needs local copies of upstream Transformers code, its directory maintains the corresponding `configuration_*.py` and `modeling_*.py` files.
 
 ### ParallelPlan
 
-模型通过 `FSDPParallelPlan` 声明分布式执行策略：
+A model declares its distributed execution strategy through `FSDPParallelPlan`:
 
 ```python
 from torch.distributed._tensor import Shard
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlacementSpec, FSDPPlanSpec
 
 
-def get_parallel_plan(sp_size: int = 2, ep_size: int = 8) -> FSDPParallelPlan:
+def get_parallel_plan() -> FSDPParallelPlan:
     return FSDPParallelPlan(
         plan={
             "model.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
         },
-        sp_size=sp_size,
-        ep_size=ep_size,
+        sp_size=1,
+        ep_size=1,
     )
 ```
 
-`EngineConfig` 会先读取模型默认 plan，再用环境变量或显式配置覆盖
-`sp_size`、`ep_size` 等运行时参数。
+The wrapper class returns this plan from `get_default_parallel_plan()`. The engine then merges `EngineConfig.parallel_plan` into it, including runtime `sp_size` and `ep_size` values supplied through environment variables, a configuration file, or CLI arguments.
 
 ### Backend
 
-当前 backend：
+Currently available backend:
 
-- `fsdp2`: 基于 PyTorch FSDP2 / DTensor 的权重加载、分片、保存和优化器准备
+- `fsdp2`: Provides weight loading, sharding, saving, and optimizer preparation based on PyTorch FSDP2 and DTensor
 
-后续 backend 应通过 `engine/backend_registry.py` 注册。
+Future backends should be registered through `src/torchturbo/engine/backend_registry.py`.
 
 ### Adapter
 
-当前主要 adapter：
+Currently registered adapters:
 
-- `llamafactory_v0`: hook LlamaFactory 的模型加载、训练和保存流程
+- `llamafactory_v0`: Hooks into LlamaFactory's model loading, training, and saving workflows
+- `msswift`: Integrates with ms-swift as a plugin
 
-模型如需注册 LlamaFactory template，可在模型目录提供 `lf_template.py`。
-Adapter 激活时会扫描已注册模型并自动调用对应 `register()`。
+The `src/torchturbo/adapters/rl/` package provides reusable packed-sequence and SP helpers for reinforcement learning frameworks; it is a utilities package rather than a registered adapter.
 
-## 安装
+To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.
 
-```bash
-pip install -e .
-```
+## Quick Start
 
-或者直接使用 PYTHONPATH
+### Build Docker
 
 ```bash
-export PYTHONPATH=<your_path>/torchturbo/src:$PYTHONPATH
+cd docker/npu/
+
+docker build \
+--platform linux/arm64 \
+-f Dockerfile_aarch64 \
+-t torchturbo:aarch64 \
 ```
 
-运行 LlamaFactory 相关入口前，还需要在环境中准备：
+Platform dependency scripts are available in `scripts/runs/deps/`, while model-specific installers are located under `scripts/runs/<model>/`.
 
-- PyTorch / torch-npu
-- Ascend CANN 运行环境
-- LLaMA-Factory 及其 requirements
-- 模型所需的额外依赖
+### Usage
 
-## 使用入口
+When training is launched through an entry point provided by TorchTurbo, the training framework is invoked as a dependency.
 
-torchturbo 有两种使用入口。
+The LlamaFactory entry point, `scripts/runs/run_lf.py`, explicitly activates `llamafactory_v0` and then calls LlamaFactory's `run_exp()`.    
+The ms-swift entry point, `scripts/runs/run_swift.py`, parses TorchTurbo arguments and activates the `msswift` plugin before dispatching the selected stage.
 
-### 原训练框架（LlamaFactory 为例）作为入口
+See the [`Qwen3.5 MoE training guide`](docs/runs/qwen3_5_moe/README_NPU.md).
 
-如果训练仍然从 LlamaFactory 启动，torchturbo 作为被集成的加速库使用。
-在 LlamaFactory 训练进程中导入 `torchturbo` 即可激活 adapter：
+### Configuration
 
-```python
-import torchturbo
+TorchTurbo-specific configuration can be provided in three ways. The precedence order, from lowest to highest, is:
+
+```text
+Adapter defaults < TORCH_TURBO_* environment variables < --tt_config YAML file < explicit --tt_* CLI arguments
 ```
 
-这种方式下，LlamaFactory 仍然负责启动训练，torchturbo 负责 hook 模型加载、
-并行策略、权重加载和保存流程。
+The `--tt_*` arguments are defined in [`src/torchturbo/engine/args.py`](src/torchturbo/engine/args.py).
 
-### torchturbo 作为入口
-
-如果训练从 torchturbo 提供的入口启动，LlamaFactory 会作为依赖库被调用。
-`scripts/runs/run_lf.py` 会导入 torchturbo，然后调用 LlamaFactory 的
-`run_exp()`：
+See [`scripts/runs/config_example.yaml`](scripts/runs/config_example.yaml) for an example YAML configuration:
 
 ```bash
 torchrun --nproc_per_node=8 scripts/runs/run_lf.py \
-  --stage sft \
-  --model_name_or_path /path/to/model \
-  --dataset your_dataset \
-  --template qwen3 \
-  --output_dir ./output/my_run
+  --tt_config scripts/runs/config_example.yaml \
+  <LLaMA-Factory arguments>
 ```
 
-### 运行脚本
+The `--tt_*` arguments are removed before the remaining arguments are forwarded to the training framework, so they do not interfere with the original framework's argument parser.
 
-常用训练脚本按模型分目录放在 `scripts/runs/`（`run_lf.py` / `run_swift.py` 为共享入口）：
+### Run Scripts
+
+Common training scripts are organized by model under `scripts/runs/`. The `run_lf.py` and `run_swift.py` files are shared entry points:
 
 ```text
 scripts/runs/
-├── run_lf.py
-├── run_swift.py
-├── qwen3_moe/
-│   └── lf_sft.sh
-├── glm5/
-│   └── lf_moe_dsa_sft.sh
-└── bailing_v3/
-    └── lf_sft.sh
+├── run_lf.py                 # LlamaFactory entry point
+├── run_swift.py              # ms-swift entry point
+├── config_example.yaml       # Example --tt_config file
+├── deps/                     # Base dependencies
+│   ├── gpu.sh                # GPU dependencies
+│   ├── npu.sh                # NPU dependencies
+│   ├── lf_deps.sh            # LlamaFactory dependencies
+│   └── swift_deps.sh         # ms-swift dependencies
+└── qwen3_5_moe/
+    ├── install_lf_deps.sh    # Model runtime dependency installer
+    ├── install_swift_deps.sh # ms-swift dependency installer
+    ├── lf_text_sft.sh        # LlamaFactory SFT training script
+    └── swift_mllm_sft.sh     # ms-swift multimodal SFT script
 ```
 
-示例：
+Example:
 
 ```bash
-bash scripts/runs/qwen3_moe/lf_sft.sh
-bash scripts/runs/glm5/lf_moe_dsa_sft.sh
-bash scripts/runs/bailing_v3/lf_sft.sh
+bash scripts/runs/qwen3_5_moe/lf_text_sft.sh
 ```
 
-这些脚本是当前 Ascend/NPU 环境下的启动模板。运行前通常需要检查：
+Before running a script, you will typically need to check:
 
 - `model_name_or_path`
 - `output_dir`
-- LLaMA-Factory `PYTHONPATH`
-- torchturbo `PYTHONPATH`
+- TorchTurbo's `PYTHONPATH`
 - `NNODES` / `NPUS_PER_NODE` / `MASTER_ADDR` / `MASTER_PORT`
-- `TORCH_TURBO_SP_SIZE` / `TORCH_TURBO_EP_SIZE`
+- `TORCH_TURBO_SP_SIZE` / `TORCH_TURBO_EP_SIZE` (or `--tt_sp_size` / `--tt_ep_size`)
 - `TORCH_TURBO_GRADIENT_CHECKPOINTING` / `--tt_gradient_checkpointing`
+- `--tt_cpu_offload` or `backend_config.cpu_offload` in the `--tt_config` file
 
-### 运行文档
+### Supported Models
 
-每个模型的环境说明、脚本使用和对比图放在 `docs/runs/`：
+Built-in models are discovered from `src/torchturbo/models/`. Public environment setup and run instructions are currently available under `docs/runs/`:
 
 ```text
 docs/runs/
-├── qwen3_moe/
-├── glm_moe_dsa/
-├── bailing_moe_v3/
-└── deepseek_v4/
+└── qwen3_5_moe/
 ```
 
-## 支持模型
-
-| 模型 | 注册名 | 类型 | 运行文档 |
+| Model | Registered Name | Type | Run Guide |
 | --- | --- | --- | --- |
-| Qwen3 MoE | `qwen3_moe` | MoE | `docs/runs/qwen3_moe/README.md` |
-| GLM MoE DSA | `glm_moe_dsa` | MoE / DSA | `docs/runs/glm_moe_dsa/README.md` |
-| Bailing MoE V3 | `bailing_hybrid` | MoE / MLA / KDA | `docs/runs/bailing_moe_v3/README.md` |
-| DeepSeekV4 | `deepseek_v4` | MoE / DSA / HC | `docs/runs/deepseek_v4/README.md` |
-| Kimi K25 | `kimi_k25` | VLM / MoE | TODO |
+| Qwen3.5 MoE | `qwen3_5_moe` | VLM / MoE | [`docs/runs/qwen3_5_moe/README_NPU.md`](docs/runs/qwen3_5_moe/README_NPU.md) |
 
-## 环境变量
+## Environment Variables
 
-| 环境变量 | 说明 |
+| Environment Variable | Description |
 | --- | --- |
-| `TORCH_TURBO_DISABLE=1` | 禁用 torchturbo 自动激活 |
-| `TORCH_TURBO_BACKEND=fsdp2` | 选择分布式 backend |
-| `TORCH_TURBO_MIXED_PRECISION=bf16` | 混合精度策略 |
-| `TORCH_TURBO_OP_POLICY=auto` | 算子分发策略：`auto` / `native` / `custom` |
-| `TORCH_TURBO_GRADIENT_CHECKPOINTING=true` | activation checkpointing |
-| `TORCH_TURBO_SP_SIZE=2` | Sequence Parallel size |
-| `TORCH_TURBO_EP_SIZE=8` | Expert Parallel size |
-| `TORCH_TURBO_RESHARD_AFTER_FWD=0` | forward 后是否 reshard |
-| `TORCH_TURBO_PREFETCH_STRATEGY=auto` | FSDP prefetch 拓扑：`native` / `auto`（默认）/ `expert_lookahead` / `expert_with_layer` |
-| `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | prefetch 作用的 pass：`forward` / `forward_backward`（默认）|
-| `TORCH_TURBO_FORWARD_PREFETCH_DEPTH=1` | forward 每个 source 预取多少层（默认 1）|
-| `TORCH_TURBO_BACKWARD_PREFETCH_DEPTH=1` | backward 每个 source 预取多少层（默认 1，仅 forward_backward 生效）|
-| `TORCH_TURBO_DEBUG=1` | 开启 torchturbo 调试信息，未完全实现 |
+| `TORCH_TURBO_DISABLE=1` | Disable detection-based activation through `activate()` without an explicit adapter name |
+| `TORCH_TURBO_BACKEND=fsdp2` | Select the distributed backend |
+| `TORCH_TURBO_MIXED_PRECISION=bf16` | Set the mixed-precision policy |
+| `TORCH_TURBO_OP_POLICY=auto` | Set the operator dispatch policy: `auto`, `native`, or `custom` |
+| `TORCH_TURBO_GRADIENT_CHECKPOINTING=true` | Enable activation checkpointing |
+| `TORCH_TURBO_AC_USE_REENTRANT=true` | Use reentrant activation checkpointing to reduce cross-step memory peaks for MoE and linear attention |
+| `TORCH_TURBO_USE_DETERMINISTIC_ALGORITHMS=true` | Require the selected device runtime to use deterministic algorithms |
+| `TORCH_TURBO_SP_SIZE=2` | Set the sequence-parallel size |
+| `TORCH_TURBO_EP_SIZE=8` | Set the expert-parallel size |
+| `TORCH_TURBO_GBS=64` | Set the global batch size in micro-batch units; the engine derives gradient accumulation from GBS, SP size, and world size |
+| `TORCH_TURBO_RESHARD_AFTER_FWD=0` | Control whether parameters are resharded after the forward pass |
+| `TORCH_TURBO_PREFETCH_STRATEGY=auto` | Set the FSDP prefetch topology: `native`, `auto` (default), `expert_lookahead`, or `expert_with_layer` |
+| `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | Set the passes in which prefetching is applied: `forward` or `forward_backward` (default) |
+| `TORCH_TURBO_FORWARD_PREFETCH_DEPTH=1` | Set the number of layers prefetched for each source during the forward pass (default: 1) |
+| `TORCH_TURBO_BACKWARD_PREFETCH_DEPTH=1` | Set the number of layers prefetched for each source during the backward pass (default: 1; applies only to `forward_backward`) |
+| `TORCH_TURBO_DEBUG=1` | Enable additional rank-0 debug output in the MoE layer |
 
-## 添加新模型
+## Command-Line Arguments
 
-1. 在 `src/torchturbo/models/` 下创建模型目录。
-2. 在 `model.py` 中用 `@register_model()` 注册 Turbo 模型类。
-3. 在 `parallel_plan.py` 中定义默认并行策略。
-4. 如有需要，添加 `configuration_*.py` 和 `modeling_*.py`。
-5. 如需 LlamaFactory template，添加 `lf_template.py`。
-6. 添加 `scripts/runs/<model>/` 启动脚本和 `docs/runs/<model>/` 运行文档。
+Most environment variables have corresponding higher-priority `--tt_*` CLI arguments. All arguments are defined in [`src/torchturbo/engine/args.py`](src/torchturbo/engine/args.py) and grouped below by category:
 
-最小包装类：
+| Category | Arguments |
+| --- | --- |
+| Basic configuration | `--tt_config` / `--tt_backend` / `--tt_mixed_precision` / `--tt_op_policy` / `--tt_use_deterministic_algorithms` |
+| Parallelism | `--tt_sp_size` / `--tt_ep_size` |
+| Batch size | `--tt_gbs` |
+| Memory | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
+| Prefetching | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |
+| MTP / MoE loss | `--tt_enable_mtp` / `--tt_mtp_loss_scaling_factor` / `--tt_mtp_log_loss` / `--tt_moe_aux_loss_coeff` / `--tt_moe_z_loss_coeff` / `--tt_enable_chunk_loss` / `--tt_loss_chunk_size` |
+| VLM freezing | `--tt_freeze_vision_tower` / `--tt_freeze_multi_modal_projector` / `--tt_freeze_language_model` |
+| Diffusion models (LLaDA2) | `--tt_cap_lambda` / `--tt_bd_mask_low` / `--tt_bd_mask_high` / `--tt_bd_block_size` |
+| Checkpointing | `--tt_default_save_format` |
+| Profiling, metrics, and logging | `--tt_profiling` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+
+## Adding a New Model
+
+1. Create a model directory under `src/torchturbo/models/`.
+2. In `model.py`, inherit from `TurboModel` for language models or `TurboVLMModel` for multimodal models, and register the class with `@register_model()`.
+3. Define the default parallel strategy in `parallel_plan.py` and return it from the class method `get_default_parallel_plan()`.
+4. Add `configuration_*.py` and `modeling_*.py` if needed.
+5. Add `lf_template.py` or `swift_template.py` when the corresponding framework requires model-specific registration.
+6. Override hooks such as `on_parallelized()` or `on_materialized()` only when the model needs setup at those lifecycle points.
+7. Add launch scripts under `scripts/runs/<model>/` and a run guide under `docs/runs/<model>/`.
+
+Minimal wrapper class:
 
 ```python
 from transformers import AutoModelForCausalLM
 
-from torchturbo.models.registry import register_model
+from torchturbo.parallel import FSDPParallelPlan
+
+from .configuration_my_model import MyConfig
+from .modeling_my_model import MyModelForCausalLM
+from ..base import TurboModel
+from ..registry import register_model
 
 
 @register_model("my_model", config_cls=MyConfig, auto_class=AutoModelForCausalLM)
-class TurboMyModelForCausalLM(MyModelForCausalLM):
+class TurboMyModelForCausalLM(TurboModel, MyModelForCausalLM):
     config_class = MyConfig
 
     @classmethod
-    def get_parallel_plan(cls, **kwargs):
+    def get_default_parallel_plan(cls) -> FSDPParallelPlan:
         from .parallel_plan import get_parallel_plan
 
-        return get_parallel_plan(**kwargs)
+        return get_parallel_plan()
 
-    def post_weight_load(self):
-        """Initialize runtime buffers after weights are loaded."""
+    def on_materialized(self) -> None:
+        """Initialize runtime buffers after parameters are materialized."""
 ```
 
-## 项目结构
+`on_materialized()` is optional; omit it when the model has no runtime buffers to rebuild. It runs after checkpoint loading or device materialization. Use `on_parallelized()` instead for setup that must happen immediately after module replacement and sharding.
 
-```text
-torchturbo/
-├── docs/
-│   ├── design/                # 架构设计和扩展指南
-│   └── runs/                  # 模型运行文档和图片
-├── scripts/
-│   ├── runs/                  # 当前训练入口脚本
-│   └── diagnostics/           # 对比和诊断脚本
-└── src/torchturbo/
-    ├── adapters/
-    │   └── llamafactory_v0/   # LlamaFactory adapter
-    ├── engine/
-    │   ├── core.py            # TorchTurboEngine
-    │   ├── config.py          # EngineConfig
-    │   └── backends/
-    │       └── fsdp2/         # FSDP2 backend
-    ├── models/
-    │   ├── registry.py        # 模型注册表
-    │   ├── qwen3_moe/
-    │   ├── glm_moe_dsa/
-    │   ├── bailing_hybrid/
-    │   ├── kimi_k25/
-    │   └── modules/
-    │       ├── attention/     # Ulysses SP helpers
-    │       ├── comm/          # 通信原语
-    │       └── moe/           # MoE 组件
-    ├── ops/                   # 算子注册、provider 与分发
-    ├── parallel/              # ParallelPlan 定义
-    ├── registry/              # Adapter / Patch 注册机制
-    ├── runtime/               # Device Runtime 抽象与设备选择
-    └── utils/
+## Citation
+
+If you find this project useful, please consider citing it as follows:
+
+```bibtex
+@misc{torchturbo2026,
+  title        = {TorchTurbo: A supernode-native post-training engine for rapidly adapting and training large language and vision models.},
+  author       = {Tai An and Haishan Feng and Xuejin He and Yicheng Shan and Wei Tang and Chao Wang and Yifei Yang and Liangji Zhuang},
+  year         = {2026},
+  url          = {},
+  license      = {Apache-2.0}
+}
 ```
 
-## 模块整理约定
+This project benefits from Megatron-LM. We thank its authors for their contributions.
 
-当前模型路径仍以模型目录内的 patch 和 parallel plan 为主。随着模型数量增加，
-通用层、attention backend、MoE 替换逻辑应逐步收敛到一致的 factory 或
-registry 形式，避免每个模型重复维护类似 patch。
-
-## 诊断脚本
-
-旧的对比和诊断入口放在 `scripts/diagnostics/`。它们主要用于 baseline 与
-torchturbo 输出对齐检查，不作为常规训练入口。
-
-## 许可证
+## License
 
 Apache-2.0

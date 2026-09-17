@@ -63,8 +63,6 @@ except ImportError:
     def is_torch_fx_available() -> bool:
         return hasattr(torch, "fx")
 
-# import sys
-# sys.path.insert(0, "/sfs_turbo/hw/shiyang/model/Moonlight-16B-A3B-Instruct")
 from .configuration_deepseek import DeepseekV3Config
 
 import torch.distributed as dist

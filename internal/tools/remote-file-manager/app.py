@@ -48,6 +48,9 @@ ITASK_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024
 ITASK_BINARY_MAX_BYTES = 128 * 1024 * 1024
 ITASK_ZIP_MAX_MEMBERS = 16
 ITASK_DOWNLOAD_TIMEOUT = 120.0
+# itask prints this when no user is persisted in ~/.itask/config.json yet;
+# commands that need a user fail this way until the first successful --user run.
+ITASK_FIRST_RUN_MESSAGE = "首次使用请通过 --user"
 OSSUTIL_VERSION = "v1.7.19"
 OSSUTIL_EXPECTED_VERSION_LINE = "ossutil version: %s" % OSSUTIL_VERSION
 OSSUTIL_MANAGED_BIN = os.path.join(ITASK_INSTALL_DIR, "ossutil")
@@ -152,6 +155,8 @@ async def sanitized_validation_error(_: Request, exc: RequestValidationError):
 
 tunnels: Dict[str, asyncio.subprocess.Process] = {}
 tunnel_ports: Dict[str, int] = {}
+exec_probe_states: Dict[str, Dict[str, Any]] = {}
+exec_probe_tasks: Dict[str, asyncio.Task] = {}
 local_mount_processes: Dict[str, Dict[str, asyncio.subprocess.Process]] = {}
 local_mount_paths: Dict[str, Dict[str, str]] = {}
 local_mount_created: Dict[str, Dict[str, bool]] = {}
@@ -2773,6 +2778,10 @@ async def itask_readiness_item() -> Dict[str, Any]:
         return {**base, "ready": True, "usable": True, "state": "ready", "code": "ready", "installable": False, "detail": "已安装且服务可用"}
     except HTTPException as exc:
         message = str(exc.detail).replace("\n", " ")[:240]
+        if ITASK_FIRST_RUN_MESSAGE in message:
+            # The binary works; this machine just has no persisted itask
+            # user yet, which the first create --user run will write.
+            return {**base, "ready": True, "usable": True, "state": "ready", "code": "needs_user_init", "installable": False, "detail": "已安装，创建首个任务后可查询列表"}
         return {**base, "ready": False, "state": "unavailable", "code": "list_failed", "installable": False, "detail": "已安装，但 itask list 失败：%s" % message}
 
 
@@ -2816,7 +2825,10 @@ async def install_itask(request: Request):
         try:
             candidate_path = await asyncio.to_thread(prepare_itask_candidate, current["artifact"])
             try:
-                await run([candidate_path, "list"], 15)
+                # Smoke-test execution only: "list" would also require a
+                # persisted itask user and network access, both of which a
+                # fresh machine does not have yet.
+                await run([candidate_path, "version"], 15)
             except HTTPException as exc:
                 raise HTTPException(502, "下载的 itask 验证失败：%s" % str(exc.detail).replace("\n", " ")[:240])
             try:
@@ -3134,12 +3146,69 @@ async def cancel_oss_task(task_id: str):
 
 
 
+EXEC_PROBE_TIMEOUT = 12.0
+EXEC_PROBE_MIN_INTERVAL = 15.0
+
+
+def pod_is_running(pod: Dict[str, Any]) -> bool:
+    status = str(pod.get("pod_status") or pod.get("status") or "").strip().lower()
+    return status in {"running", "ready"}
+
+
+async def probe_pod_exec(name: str) -> None:
+    try:
+        await run([require_itask_bin(), "exec", name, "--tty=false", "--", "true"], EXEC_PROBE_TIMEOUT)
+        exec_probe_states[name] = {"connectable": True, "checked_at": time.monotonic()}
+    except HTTPException:
+        exec_probe_states[name] = {"connectable": False, "checked_at": time.monotonic()}
+    finally:
+        exec_probe_tasks.pop(name, None)
+
+
+def attach_exec_probe_state(pod: Dict[str, Any]) -> None:
+    """Report whether exec into the pod works, scheduling a probe if unknown.
+
+    A fresh container's exec channel hangs for many minutes while its init
+    script runs (overlay setup, background model pull), which breaks sshd
+    injection and every other exec-based operation. The pods panel polls
+    this endpoint, so each poll schedules a bounded single-flight probe per
+    running pod; the UI disables connect/mount until a probe succeeds.
+    """
+    name = str(pod.get("name") or "")
+    if not pod_is_running(pod):
+        # A stopped pod re-initializes on restart, so the state must be
+        # earned again once it is back.
+        exec_probe_states.pop(name, None)
+        task = exec_probe_tasks.pop(name, None)
+        if task:
+            task.cancel()
+        pod["connectable"] = False
+        return
+    state = exec_probe_states.get(name)
+    if not state or not state["connectable"]:
+        stale = state is None or time.monotonic() - state["checked_at"] >= EXEC_PROBE_MIN_INTERVAL
+        if stale and name not in exec_probe_tasks:
+            exec_probe_tasks[name] = asyncio.create_task(probe_pod_exec(name))
+    pod["connectable"] = bool(state and state["connectable"])
+
+
+def mark_pod_connectable(name: str) -> None:
+    exec_probe_states[name] = {"connectable": True, "checked_at": time.monotonic()}
+
+
 @app.get("/api/pods")
 async def pods():
     try:
-        return await list_itask_pods()
+        listing = await list_itask_pods()
     except HTTPException as exc:
+        if ITASK_FIRST_RUN_MESSAGE in str(exc.detail):
+            # No itask user on this machine yet; an empty list is the accurate
+            # state, so don't surface itask's first-run error in the pods panel.
+            return {"output": "", "pods": []}
         return JSONResponse({"output": "", "pods": [], "warning": exc.detail})
+    for pod in listing["pods"]:
+        attach_exec_probe_state(pod)
+    return listing
 
 
 @app.get("/api/pods/{name}/details")
@@ -3247,6 +3316,10 @@ async def delete_pod(name: str):
         with contextlib.suppress(asyncio.CancelledError):
             await task
     mount_states.pop(name, None)
+    exec_probe_states.pop(name, None)
+    probe_task = exec_probe_tasks.pop(name, None)
+    if probe_task:
+        probe_task.cancel()
     result = await run([require_itask_bin(), "delete", name, "--force"], 300)
     return {"name": name, "output": result["output"]}
 
@@ -3260,6 +3333,7 @@ async def tunnel(name: str):
         if process.returncode is None:
             port = tunnel_ports[name]
             if await check_tunnel_ssh(name, port):
+                mark_pod_connectable(name)
                 return {"name": name, "port": port, "running": True}
             if preserved_port is None:
                 preserved_port = port if active_local_mount_port(name) else None
@@ -3273,6 +3347,7 @@ async def tunnel(name: str):
         stderr = (await process.stderr.read()).decode(errors="replace").strip() if process.returncode is not None else ""
         await stop_tunnel(name)
         raise HTTPException(502, stderr or "隧道建立失败，请稍后重试")
+    mark_pod_connectable(name)
     return {"name": name, "port": port, "running": True}
 
 
@@ -3649,6 +3724,9 @@ async def terminal(websocket: WebSocket, name: str):
             except (asyncio.CancelledError, RuntimeError):
                 pass
         output_task = asyncio.create_task(output())
+        # Restore remote PTY echo before forwarding user input to avoid a blank terminal.
+        process.stdin.write(b"stty echo\n")
+        await process.stdin.drain()
         while True:
             process.stdin.write((await websocket.receive_text()).encode()); await process.stdin.drain()
     except Exception as e:
@@ -3679,6 +3757,7 @@ async def cancel_background_tasks(tasks: Dict[str, asyncio.Task]) -> None:
 async def shutdown():
     await cancel_background_tasks(oss_tasks)
     await cancel_background_tasks(mount_tasks)
+    await cancel_background_tasks(exec_probe_tasks)
     for name in list(local_mount_paths):
         for remote_path in list(local_mount_paths.get(name, {})):
             with contextlib.suppress(HTTPException):

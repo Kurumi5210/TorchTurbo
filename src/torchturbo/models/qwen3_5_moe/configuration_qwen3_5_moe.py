@@ -234,6 +234,14 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+    @property
+    def num_nextn_predict_layers(self):
+        return self.mtp_num_hidden_layers
+
+    @num_nextn_predict_layers.setter
+    def num_nextn_predict_layers(self, value):
+        self.mtp_num_hidden_layers = value
+
 
 class Qwen3_5MoeVisionConfig(PretrainedConfig):
     model_type = "qwen3_5_moe"

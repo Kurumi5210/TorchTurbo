@@ -417,53 +417,50 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
     @classmethod
     def patch_mtp_for_sp(cls, mtp_cls, sp_group, sp_size, sp_rank):
-        """Slice MTP inputs under SP (VLM path keeps input_ids full-length).
-        The MTP forward calls ``_roll_left_one(cur_input_ids)`` on
-        ``input_ids``, then ``embed_tokens(cur_input_ids)`` to produce
-        the "next-token" embedding.  If ``input_ids`` were sliced to
-        ``[B, T/sp]`` first, the rolled-in token at the slice boundary
-        would be ``pad_token_id`` instead of the real next token.
+        """Keep MTP next-token inputs correct under sequence parallelism.
+
+        The VLM path provides global IDs, while the text path provides SP-local
+        IDs. The text path gathers local IDs before MTP builds next-token
+        embeddings so SP-boundary tokens use the next rank's first ID.
         """
         from ..modules.attention.ulysses import slice_input_tensor
 
         original_forward = mtp_cls.forward
 
         def _mtp_sp_forward(self_mtp, input_ids, hidden_states, embed_tokens, **kwargs):
-            # slice position metadata for SP
             position_embeddings = kwargs.pop("position_embeddings", None)
             attention_mask = kwargs.pop("attention_mask", None)
             position_ids = kwargs.pop("position_ids", None)
             pad_token_id = int(kwargs.pop("pad_token_id", 0))
 
-            if position_ids is not None:
-                position_ids = slice_input_tensor(
-                    position_ids,
-                    dim=-1,
-                    group=sp_group,
-                    rank=sp_rank,
-                    padding=False,
+            # The backbone is already SP-local. Reconstruct only IDs so MTP
+            # rolling sees the next token across an SP boundary.
+            local_seq_len = hidden_states.size(1)
+            if input_ids.size(1) == local_seq_len:
+                input_ids_list = [torch.empty_like(input_ids) for _ in range(sp_size)]
+                torch.distributed.all_gather(input_ids_list, input_ids, group=sp_group)
+                input_ids = torch.cat(input_ids_list, dim=1)
+
+            def localize(tensor, dim):
+                if tensor is None or tensor.size(dim) == local_seq_len:
+                    return tensor
+                return slice_input_tensor(
+                    tensor, dim=dim, group=sp_group, rank=sp_rank, padding=False
                 )
+
+            position_ids = localize(position_ids, -1)
             if position_embeddings is not None:
                 cos, sin = position_embeddings
-                position_embeddings = (
-                    slice_input_tensor(cos, dim=1, group=sp_group, rank=sp_rank, padding=False),
-                    slice_input_tensor(sin, dim=1, group=sp_group, rank=sp_rank, padding=False),
-                )
+                position_embeddings = (localize(cos, 1), localize(sin, 1))
 
-            # wrap embed_tokens so fc([embeds || hidden]) stays in shape
-            def _sp_embed_tokens(ids):
-                # ids is full-length [B, T]; embed produces [B, T, H]
-                # slice back to [B, T/sp, H] to match hidden_states
-                return slice_input_tensor(
-                    embed_tokens(ids),
-                    dim=1,
-                    group=sp_group,
-                    rank=sp_rank,
-                    padding=False,
-                )
+            def sp_embed_tokens(ids):
+                return localize(embed_tokens(ids), 1)
 
             return original_forward(
-                self_mtp, input_ids, hidden_states, _sp_embed_tokens,
+                self_mtp,
+                input_ids,
+                hidden_states,
+                sp_embed_tokens,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 position_ids=position_ids,

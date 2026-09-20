@@ -71,7 +71,7 @@ def main() -> None:
     import torchturbo
     from torchturbo.engine.args import parse_torchturbo_args
 
-    _, argv = parse_torchturbo_args(argv)
+    tt_args, argv = parse_torchturbo_args(argv)
 
     # tokenized_path is required — it is the output dir of this tool.
     argv, tokenized_path = pop_value(argv, "--tokenized_path")
@@ -82,9 +82,15 @@ def main() -> None:
         )
     tokenized_path = os.path.abspath(os.path.expanduser(tokenized_path))
 
-    # Explicitly activate the LF adapter BEFORE importing llamafactory modules:
-    # registers torchturbo model templates (lf_template.register per model).
+    # Activate the LF adapter (registers turbo model templates).
     torchturbo.activate("llamafactory_v0")
+
+    # No engine here: build a standalone PluginManager and consume --tt_plugin into the now-active LF adapter.
+    if tt_args.plugins:
+        from torchturbo.adapters.llamafactory_v0.plugins import install_plugins
+        from torchturbo.engine.plugins import PluginManager
+
+        install_plugins(PluginManager(list(tt_args.plugins)))
 
     if os.path.exists(tokenized_path) and os.listdir(tokenized_path):
         if not overwrite:

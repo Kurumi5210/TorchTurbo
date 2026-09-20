@@ -26,8 +26,9 @@ closure): swift's multiprocess dataset pipelines (``dataset.map`` with
 reference*.
 
 This module imports ``swift.arguments`` (heavy) at top level. It is imported
-lazily — only from the msswift plugin / ``pipeline`` on the turbo-swift code
-path — so it never fires on a plain ``import torchturbo``.
+lazily — only from the msswift ``pipeline`` on the turbo-swift code path
+(activated via ``torchturbo.activate("msswift")``) — so it never fires on a
+plain ``import torchturbo``.
 """
 
 from __future__ import annotations

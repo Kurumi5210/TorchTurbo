@@ -7,3 +7,4 @@ source "${deps_dir}/platform.sh"
 
 # Internal-only dependencies, e.g.:
 # pip install /path/to/internal/only.whl
+pip install mdatasets==0.5.70 -i https://pypi.antfin-inc.com/simple

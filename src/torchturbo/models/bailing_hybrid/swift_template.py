@@ -1,9 +1,4 @@
 """ms-swift chat template for Bailing V3.
-
-Mirrors the Ling v3 jinja: ``<role>SYSTEM/HUMAN/ASSISTANT/OBSERVATION</role>``
-closed by ``<|role_end|>``, hybrid thinking, a ``detailed thinking on/off``
-system directive, and ``<function=...><parameter=...>`` tool calls with
-```` ```result ... ``` ```` fenced observations.
 """
 
 from __future__ import annotations
@@ -28,178 +23,125 @@ OBSERVATION_OPEN = '<role>OBSERVATION</role>'
 DETAILED_THINKING_ON = 'detailed thinking on'
 DETAILED_THINKING_OFF = 'detailed thinking off'
 
-# Fenced block used for tool/observation results.
-RESULT_FENCE = '```result'
-
-# Tool-call XML building blocks (kept split so the source stays unambiguous).
-FN_OPEN = '<function='
-FN_CLOSE = '</function>'
-PARAM_OPEN = '<parameter='
-PARAM_CLOSE = '</parameter>'
-
-# The system-side tools preamble the Ling v3 jinja emits when tools are present.
-LING_V3_TOOLS_PREAMBLE = (
-    '# Tools\n\n'
-    'You may call one or more functions to assist with the user query.\n\n'
-    'You are provided with function signatures within <tools></tools> XML tags:\n<tools>'
-)
-LING_V3_TOOLS_SUFFIX = (
-    '\n</tools>\n\n'
-    'If none of the functions can be used, point it out. '
-    'If the given question lacks the parameters required by the function, also point it out.\n'
-    'If you need to use a function, for each function call, output the function name and arguments '
-    'within the following XML format:\n'
-    '<function=func_name>\n<parameter=arg_key>\narg_value\n</parameter>\n...\n</function>\n'
-)
-
 
 def _make_ling_v3_agent_template_cls():
-    """Ling v3 agent template on swift's model-agnostic ``BaseAgentTemplate``."""
+    """Ling v3 agent template taking from swift v4.5.3"""
     import json
     import re
     from typing import List, Optional, Tuple, Union
 
-    from swift.agent_template.base import BaseAgentTemplate
     from swift.infer_engine import Function
     from swift.template import Prompt
+    from swift.agent_template.base import BaseAgentTemplate
+
+    _FORMAT_EXAMPLE = ('<tool_call>{function-name}\n'
+                    '<arg_key>{arg-key-1}</arg_key>\n'
+                    '<arg_value>{arg-value-1}</arg_value>\n'
+                    '<arg_key>{arg-key-2}</arg_key>\n'
+                    '<arg_value>{arg-value-2}</arg_value>\n'
+                    '...\n'
+                    '</tool_call>\n')
 
     class LingV3AgentTemplate(BaseAgentTemplate):
+        """Agent template for Ling-3.0 models (Bailing V3 format).
+
+        Tool calling uses tool_call/arg_key/arg_value XML tags,
+        matching the model's chat_template.jinja.
+        """
 
         @staticmethod
-        def _parse_function_block(block: str) -> Optional[Function]:
-            """Parse a single ``<function=...>...</function>`` block."""
-            block = block.strip()
-            if not block.startswith(FN_OPEN) or not block.endswith(FN_CLOSE):
+        def _find_function_call(single_content: str) -> Optional[Function]:
+            single_content = single_content.strip()
+            func_name_match = re.match(r'^([^\n<]+)', single_content)
+            if not func_name_match:
                 return None
-            name_match = re.search(r'<function=([^>]+)>', block)
-            if not name_match:
+            func_name = func_name_match.group(1).strip()
+            keys = re.findall(r'<arg_key>(.*?)</arg_key>', single_content, re.DOTALL)
+            values = re.findall(r'<arg_value>(.*?)</arg_value>', single_content, re.DOTALL)
+            if len(keys) != len(values):
                 return None
-            func_name = name_match.group(1).strip()
-            parameters = {}
-            for param_name, param_value in re.findall(
-                    r'<parameter=([^>]+)>\s*(.*?)\s*</parameter>', block, re.DOTALL):
-                parameters[param_name.strip()] = param_value.strip()
-            return Function(name=func_name, arguments=json.dumps(parameters, ensure_ascii=False))
+            args = {k.strip(): v.strip() for k, v in zip(keys, values)}
+            return Function(name=func_name, arguments=json.dumps(args, ensure_ascii=False))
 
         def get_toolcall(self, response: str) -> List[Function]:
-            """Reverse of ``_format_tool_calls`` -- parse bare ``<function=...>`` blocks
-            out of generated text into :class:`Function` objects (used at inference).
-            Falls back to the ReAct parser when no block is found.
-            """
+            toolcall_list = re.findall(r'<tool_call>(.*?)</tool_call>', response, re.DOTALL)
             functions = []
-            for match in re.finditer(r'<function=.*?</function>', response, re.DOTALL):
-                fn = self._parse_function_block(match.group(0))
-                if fn is not None:
-                    functions.append(fn)
-            if not functions:
-                # Fall back to the ReAct-style parser for compatibility.
-                functions = super().get_toolcall(response)
+            for toolcall in toolcall_list:
+                function = self._find_function_call(toolcall)
+                if function:
+                    functions.append(function)
+            if len(functions) == 0:
+                # compat react_en
+                return super().get_toolcall(response)
             return functions
 
-        def _format_tools(self, tools: List[Union[str, dict]], system: Optional[str] = None,
-                          user_message=None) -> str:
-            """Render the tools preamble the jinja emits under ``{%- if tools %}``:
-
-                # Tools
-                You may call one or more functions ...
-                <tools>
-                {tool|tojson}
-                ...
-                </tools>
-                If you need to use a function ...
-
-            The ``detailed thinking`` directive is NOT added here -- it lives in
-            :meth:`LingV3Template._get_system` so it lands *after* the tools block (per
-            the jinja ordering). ``system`` (if given) is prepended as ``system\n``.
-            """
-            tool_lines = []
+        def _format_tools(self, tools: List[Union[str, dict]], system: Optional[str] = None, user_message=None) -> str:
+            tool_descs = [
+                '# Tools\n\n'
+                'You may call one or more functions to assist with the user query.\n\n'
+                'You are provided with function signatures within '
+                '<tools></tools> XML tags:\n<tools>'
+            ]
             for tool in tools:
-                if isinstance(tool, dict) and tool.get('type') == 'function':
-                    wrapped = tool
-                else:
-                    wrapped = self.wrap_tool(tool)
-                tool_lines.append(json.dumps(wrapped, ensure_ascii=False))
-            tools_block = LING_V3_TOOLS_PREAMBLE + '\n' + '\n'.join(tool_lines) + LING_V3_TOOLS_SUFFIX
-            if system:
-                return system.rstrip('\n') + '\n' + tools_block
-            return tools_block
+                tool = self.wrap_tool(tool)
+                tool_descs.append(json.dumps(tool, ensure_ascii=False))
+            tool_descs.append('</tools>\n\n'
+                            'If none of the functions can be used, point it out. '
+                            'If the given question lacks the parameters required by the function, '
+                            'also point it out.\n'
+                            'If you need to use a function, for each function call, '
+                            'output the function name and arguments within the following '
+                            'XML format:\n' + _FORMAT_EXAMPLE)
+            tool_section = '\n'.join(tool_descs)
+            if system is not None and system.strip():
+                return system.strip() + '\n' + tool_section
+            return tool_section
 
         def _format_tool_calls(self, tool_call_messages) -> str:
-            """Render each tool call as bare XML (the jinja assistant-branch
-            tool-call emit, no outer wrapper):
-
-                <function={name}>
-                <parameter={k}>
-                {v}
-                </parameter>
-                ...
-                </function>
-
-            Multiple calls are separated by a single ``\\n``."""
+            # Jinja: \n before each tool_call when (loop.first and content) or not loop.first.
+            # Since _format_tool_calls returns ONLY tool calls (content is separate),
+            # the first call gets no prefix, subsequent calls get \n.
             parts = []
-            for idx, message in enumerate(tool_call_messages):
+            for message in tool_call_messages:
                 tool_call = self._parse_tool_call(message['content'])
-                parts.append(FN_OPEN + tool_call['name'] + '>\n')
-                args = tool_call.get('arguments') or {}
-                for arg_name, arg_value in args.items():
-                    # jinja: ``v is string ? v : v | tojson``
-                    if not isinstance(arg_value, str):
-                        arg_value = json.dumps(arg_value, ensure_ascii=False)
-                    parts.append(PARAM_OPEN + arg_name + '>\n' + arg_value + '\n' + PARAM_CLOSE + '\n')
-                parts.append(FN_CLOSE + '\n')
-                if idx != len(tool_call_messages) - 1:
-                    parts.append('\n')
-            return ''.join(parts)
+                tc = '<tool_call>' + tool_call['name']
+                for arg_key, arg_value in tool_call['arguments'].items():
+                    tc += '<arg_key>' + arg_key + '</arg_key>'
+                    tc += '\n<arg_value>'
+                    if isinstance(arg_value, str):
+                        tc += arg_value
+                    else:
+                        tc += json.dumps(arg_value, ensure_ascii=False)
+                    tc += '</arg_value>'
+                tc += '\n</tool_call>'
+                parts.append(tc)
+            return '\n'.join(parts)
 
         def _format_tool_responses(
             self,
             assistant_content: str,
             tool_messages,
         ) -> Tuple[str, 'Prompt']:
-            """Render the jinja tool branch as the ``tool`` message payload:
-
-                <role>OBSERVATION</role>
-                ```result
-                {content}
-                ```
-                ...
-                <|role_end|>
-
-            ``<role>OBSERVATION</role>`` is NOT a swift template slot -- a
-            ``role=='tool'`` message's content is concatenated verbatim, so the wrapper
-            is emitted here (cf. ``HermesAgentTemplate``). Preceding assistant content
-            is returned unchanged.
-            """
-            res = [OBSERVATION_OPEN]
+            with_action = (self.keyword.action in assistant_content and self.keyword.action_input in assistant_content)
+            if with_action:
+                return super()._format_tool_responses(assistant_content, tool_messages)
+            # Close assistant turn, open OBSERVATION, then re-open ASSISTANT.
+            # chat_sep is NOT added when next query is tool, so we must include <|role_end|>.
+            res = ['<|role_end|><role>OBSERVATION</role>']
             for tool_message in tool_messages:
-                res.append('\n' + RESULT_FENCE + '\n' + tool_message['content'] + '\n```')
-            res.append(ROLE_END)
-            return assistant_content, [''.join(res)]
+                tool_content = tool_message['content']
+                res.append('\n<tool_response>\n' + tool_content + '\n</tool_response>')
+            res.append('<|role_end|><role>ASSISTANT</role>\n')
+            return assistant_content, res
 
-        def _add_tool_call_prefix(self, tool_content: str, pre_message=None) -> str:
-            """Insert one ``\n`` before a tool call when the preceding assistant turn
-            has non-empty content, mirroring the jinja tool-call loop:
-
-                {%- if (loop.first and content) or (not loop.first) %}
-                {{ '\n' }}
-                {%- endif %}
-
-            where ``content`` is the assistant text after the think block.
-            """
-            if not pre_message or pre_message.get('role') != 'assistant':
-                return tool_content
-            content = pre_message.get('content', '')
-            if not isinstance(content, str):
-                return tool_content
-            if THINK_END in content:
-                effective = content.split(THINK_END)[-1]
-            elif THINK_START in content:
-                effective = content.split(THINK_START)[-1]
-            else:
-                effective = content
-            if effective.strip():
-                return '\n' + tool_content
-            return tool_content
+        def _format_standalone_tool_responses(self, tool_messages) -> 'Prompt':
+            # Standalone tool messages follow a user message and are folded into the query.
+            # Close HUMAN, open OBSERVATION; template prompt will re-open ASSISTANT.
+            res = ['<|role_end|><role>OBSERVATION</role>']
+            for tool_message in tool_messages:
+                tool_content = tool_message['content']
+                res.append('\n<tool_response>\n' + tool_content + '\n</tool_response>')
+            return res
 
     return LingV3AgentTemplate
 
@@ -207,9 +149,13 @@ def _make_ling_v3_agent_template_cls():
 def _make_ling_v3_template_cls():
     """Ling v3 ``Template`` subclass (``detailed thinking`` system directive)."""
     from swift.template import Template
+    from swift.utils import get_env_args
 
     class LingV3Template(Template):
         """Ling v3 chat template with hybrid thinking + detailed-thinking directive."""
+        def init_env_args(self):
+            super().init_env_args()
+            self.enable_thinking = get_env_args('enable_thinking', bool, True)
 
         def _get_system(self, inputs):
             """Inject the ``detailed thinking {on|off}`` directive into the system
@@ -246,6 +192,31 @@ def _make_ling_v3_template_cls():
 
     return LingV3Template
 
+def _make_ling_v3_template_meta(template_type: str, template_cls) -> 'TemplateMeta':
+    """Build the shared ``TemplateMeta`` for the ling v3 template family.
+
+    ``template_cls`` selects the behavior: ``LingV3Template`` injects the
+    ``detailed thinking`` system directive; the plain swift ``Template`` leaves
+    the system untouched.
+    """
+    from swift.template.template_meta import TemplateMeta
+
+    return TemplateMeta(
+        template_type=template_type,
+        prefix=[],
+        system_prefix=[SYS_OPEN + '{{SYSTEM}}' + ROLE_END],
+        prompt=[HUMAN_OPEN + '{{QUERY}}' + ROLE_END + ASSISTANT_OPEN + '\n'],
+        chat_sep=[ROLE_END],
+        suffix=[ROLE_END],
+        template_cls=template_cls,
+        default_system=None,
+        is_thinking=True,
+        thinking_prefix=THINK_START,
+        non_thinking_prefix=THINK_START + THINK_END,
+        history_thinking_prefix=THINK_START + THINK_END,
+        agent_template='ling_v3',
+    )
+
 
 def _register_ling_v3_agent_template() -> None:
     from swift.agent_template import agent_template_map
@@ -256,33 +227,25 @@ def _register_ling_v3_agent_template() -> None:
 
 
 def register() -> None:
-    """Register the ``ling_v3`` template + agent template and point
-    ``turbo_bailing_hybrid`` at it."""
+    """Register the ``ling_v3`` / ``ling_v3_simple`` templates + agent template
+    and point ``turbo_bailing_hybrid`` at ``ling_v3``."""
     from swift.model.model_meta import MODEL_MAPPING
+    from swift.template import Template
     from swift.template.register import TEMPLATE_MAPPING, register_template
-    from swift.template.template_meta import TemplateMeta
 
     _register_ling_v3_agent_template()
 
     if 'ling_v3' not in TEMPLATE_MAPPING:
-        ling_v3_template_cls = _make_ling_v3_template_cls()
-        meta = TemplateMeta(
-            template_type='ling_v3',
-            prefix=[],
-            system_prefix=[SYS_OPEN + '\n{{SYSTEM}}' + ROLE_END + '\n\n'],
-            prompt=[HUMAN_OPEN + '\n{{QUERY}}' + ROLE_END + '\n\n' + ASSISTANT_OPEN + '\n'],
-            chat_sep=[ROLE_END + '\n\n'],
-            suffix=[ROLE_END + '\n\n'],
-            template_cls=ling_v3_template_cls,
-            default_system=None,
-            is_thinking=True,
-            thinking_prefix=THINK_START,
-            non_thinking_prefix=THINK_START + THINK_END,
-            history_thinking_prefix=THINK_START + THINK_END,
-            agent_template='ling_v3',
-        )
+        meta = _make_ling_v3_template_meta('ling_v3', _make_ling_v3_template_cls())
         register_template(meta, exist_ok=True)
         logger.debug_rank0("Registered ms-swift template 'ling_v3'")
+
+    # ``ling_v3_simple``: plain swift ``Template``, no ``detailed thinking``
+    # system directive. System is taken verbatim (or ``default_system``).
+    if 'ling_v3_simple' not in TEMPLATE_MAPPING:
+        meta = _make_ling_v3_template_meta('ling_v3_simple', Template)
+        register_template(meta, exist_ok=True)
+        logger.debug_rank0("Registered ms-swift template 'ling_v3_simple'")
 
     # ``turbo_bailing_hybrid`` would otherwise inherit the V2.5 template: the
     # turbo name ``bailing_hybrid`` collides with swift's native V2.5

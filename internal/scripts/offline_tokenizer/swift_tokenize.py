@@ -6,10 +6,10 @@ Thin, correctness-preserving wrapper around swift's native
 (``swift/pipelines/export/cached_dataset.py``; verified identical in ms-swift 4.4.2
 — the production-pinned version). It differs from the stock CLI in exactly two ways:
 
-1. Imports ``torchturbo.adapters.msswift.plugin`` FIRST, so ``turbo_<name>``
-   model types and torchturbo swift templates are registered before args are
-   parsed. (The plugin swaps the ``SwiftSft`` module global, but swift's
-   ``ExportCachedDataset`` binds the original class via
+1. Activates the msswift adapter (``torchturbo.activate("msswift")``) FIRST, so
+   ``turbo_<name>`` model types and torchturbo swift templates are registered
+   before args are parsed. (Activation swaps the ``SwiftSft`` module global,
+   but swift's ``ExportCachedDataset`` binds the original class via
    ``from ..train import SwiftSft`` at import time, so the export pipeline is
    unaffected.)
 2. Forces ``--to_cached_dataset true`` and sanity-checks the result.
@@ -87,11 +87,9 @@ def _patch_export_no_weights() -> None:
 def main() -> None:
     argv = sys.argv[1:]
 
-    # Accept (and strip) --tt_* so the exact training command can be reused;
-    # tokenization never builds the engine.
     from torchturbo.engine.args import parse_torchturbo_args
 
-    _, argv = parse_torchturbo_args(argv)
+    tt_args, argv = parse_torchturbo_args(argv)
 
     if "--output_dir" not in argv and not any(a.startswith("--output_dir=") for a in argv):
         raise SystemExit("swift_tokenize.py requires --output_dir <dir> (artifact root).")
@@ -101,7 +99,16 @@ def main() -> None:
         argv += ["--to_cached_dataset", "true"]
 
     # Register turbo models/templates before swift parses args.
-    import torchturbo.adapters.msswift.plugin  # noqa: F401
+    import torchturbo
+
+    torchturbo.activate("msswift")
+
+    # No engine here: build a standalone PluginManager and consume --tt_plugin into the now-active msswift adapter.
+    if tt_args.plugins:
+        from torchturbo.adapters.msswift.plugins import install_plugins
+        from torchturbo.engine.plugins import PluginManager
+
+        install_plugins(PluginManager(list(tt_args.plugins)))
 
     _patch_export_no_weights()
 

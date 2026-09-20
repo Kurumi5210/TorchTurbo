@@ -10,8 +10,8 @@
 | :--- | :--- | :--- |
 | **产物内容** | **全量 Token 级张量**（`input_ids`、`labels` 等） | **原始文本/多模态字段 + 预计算 `lengths`** |
 | **编码时机** | 离线一次性完成，训练时原样返回 | 训练取数据时懒加载（Lazy Encode） |
-| **`cutoff_len`** | ⚠️ **必须在离线定死**（训练传了会被忽略） | ⚠️ **以训练脚本为准**（离线仅做统计估算） |
-| **`packing`** | ⚠️ **在离线执行**（加 `--neat_packing` 拼满序列） | ⚠️ **在训练执行**（离线严禁传 `--packing`） |
+| **`cutoff_len`** | 必须在离线定死（训练传了会被忽略） | 以训练脚本为准（离线仅做统计估算） |
+| **`packing`** | 在离线执行（加 `--neat_packing` 拼满序列） | 在训练执行（离线严禁传 `--packing`） |
 | **多模态支持** | 离线需校验媒体占位符环境变量 | 完整保留媒体字段，Lazy 实时读图，完全支持 |
 
 ---
@@ -20,30 +20,49 @@
 
 ### 1. LLaMA-Factory 路径
 
-- **离线处理**：改好参数直接运行脚本
+- **离线处理**：
   ```bash
-  bash scripts/offline_tokenizer/lf_tokenize_run.sh
+  bash internal/scripts/offline_tokenizer/lf_tokenize_run.sh
   ```
-  *(注：脚本已配置 `--preprocessing_num_workers 32` 多进程及媒体占位符环境变量)*
+  脚本已配 `--preprocessing_num_workers` 与媒体占位符环境变量。
 - **训练加载**：训练脚本中把 `--dataset` 替换为 `--tokenized_path /path/to/science_lf`。
 
 ### 2. ms-swift 路径
 
-- **离线处理**：改好参数直接运行脚本
+- **离线处理**：
   ```bash
-  bash scripts/offline_tokenizer/swift_tokenize_run.sh
+  bash internal/scripts/offline_tokenizer/swift_tokenize_run.sh
   ```
-  *(注：脚本已配置 `--dataset_num_proc 32` 加速，离线切勿传 `--packing`)*
-- **训练加载**：训练脚本中**删掉 `--dataset`**，替换为 `--cached_dataset /path/to/science_swift/train`（训练命令照常带 `--packing`）。
+  脚本已配 `--dataset_num_proc`，离线切勿传 `--packing`。
+- **训练加载**：训练脚本中**删掉 `--dataset`**，替换为 `--cached_dataset /path/to/science_swift/train`（训练命令照常带 `--packing true --packing_length N`）。
 
-### 3. 精度抽样验证（可选）
+### 3. mdata 数据集离线 tokenize
+
+`swift_tokenize.py` / `lf_tokenize.py` 接受 `--tt_plugin`（加载 turbo 的 mdata 插件）。mdata 插件自动读取其同目录的 `datasets.json`；要指向别的配置文件用 `--tt_plugin path:config` 绑定。`--dataset <name>` 指定 `datasets.json` 里的数据集名。
+
+现成脚本（按模型分）：
+
+```bash
+# Swift mdata （Qwen3.5-MoE）
+bash internal/scripts/offline_tokenizer/swift_tokenize_run_mdata_qwen35.sh
+# Swift mdata （Bailing v3 / ling_v3）
+bash internal/scripts/offline_tokenizer/swift_tokenize_run_mdata_ling3.sh
+# LlamaFactory mdata
+bash internal/scripts/offline_tokenizer/lf_tokenize_run_mdata.sh
+```
+
+训练侧加载与上面对应（Swift 用 `--cached_dataset`，LF 用 `--tokenized_path`），不再传离线用的 `--tt_plugin`。
+
+注意：离线阶段的 `--tt_plugin`（实时 mount mdata）与训练阶段的 `--cached_dataset` / `--tokenized_path`（加载缓存）互斥——缓存一旦生成，训练直接吃缓存即可。
+
+### 4. 精度抽样验证（可选）
 
 ```bash
 # LF 验证
-python scripts/offline_tokenizer/verify_tokenized.py lf train_sft.yaml --tokenized_path /path/to/science_lf --num_samples 500
+python internal/scripts/offline_tokenizer/verify_tokenized.py lf train_sft.yaml --tokenized_path /path/to/science_lf --num_samples 500
 
 # Swift 验证
-python scripts/offline_tokenizer/verify_tokenized.py swift --model_type turbo_qwen3_5_moe --model /path/to/model --template qwen3_5 --max_length 4096 --cached_dataset /path/to/science_swift/train --num_samples 500
+python internal/scripts/offline_tokenizer/verify_tokenized.py swift --model_type turbo_qwen3_5_moe --model /path/to/model --template qwen3_5 --max_length 4096 --cached_dataset /path/to/science_swift/train --num_samples 500
 ```
 
 ---

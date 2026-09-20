@@ -11,9 +11,9 @@ This avoids the wrong adapter activating in a dev image that has both
 LlamaFactory and ms-swift installed — availability-based detection can't tell
 which one a process is about to run, because torchturbo is imported *before*
 the framework is loaded. Each launcher opts in unambiguously:
-``scripts/runs/run_lf.py`` calls ``activate("llamafactory_v0")``; the swift path
-imports ``torchturbo.adapters.msswift.plugin``, which activates the msswift
-adapter.
+``scripts/runs/run_lf.py`` calls ``activate("llamafactory_v0")``; the swift
+launchers (``run_swift.py`` / the offline tokenizers) call
+``activate("msswift")``.
 
 Extra engine config via env vars::
 
@@ -137,8 +137,7 @@ def activate(name: str | None = None) -> BaseAdapter | None:
     * ``name`` given (the supported path): activate that adapter. Raises
       ``ValueError`` if no adapter is registered under *name*. This is what
       launchers use — ``run_lf.py`` calls ``activate("llamafactory_v0")``; the
-      swift path imports ``msswift.plugin`` which calls
-      ``activate("msswift")``.
+      swift launchers call ``activate("msswift")``.
     * ``name`` ``None`` (convenience, not the recommended path): activate only
       when detection is unambiguous — exactly one adapter reports its framework
       present. In a multi-framework install this refuses to guess and returns

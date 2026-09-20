@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""turbo launch entry for native swift stages: ``run_swift.py [sft|pt] ...``.
-The leading positional mirrors swift's subcommand (omitted = sft). The
-plugin is imported BEFORE the stage's ``main()`` (``--external_plugins``
-fires too late), then the stage's native main() dispatches.
-"""
+"""turbo launch entry for native swift stages: ``run_swift.py [sft|pt] ...`` — activates the msswift adapter before the stage's ``main()`` (swift's ``--external_plugins`` fires too late), then dispatches."""
 from __future__ import annotations
 
 import sys
@@ -28,12 +24,14 @@ if __name__ == '__main__':
 
     tt_args, swift_argv = parse_torchturbo_args(argv)
     set_torchturbo_args(tt_args)
+
     sys.argv = [sys.argv[0]] + swift_argv
 
     main = stage_wiring(stage)[1]
 
-    # Import = activation + pipeline-global swap; must run before the main
-    # reads its pipeline global (external_plugins fires too late; see docstring).
-    import torchturbo.adapters.msswift.plugin  # noqa: F401  (import = activation)
+    # Activate msswift (registers models/trainers, swaps pipeline globals) before main() resolves its pipeline global.
+    import torchturbo
+
+    torchturbo.activate("msswift")
 
     main()

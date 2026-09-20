@@ -17,7 +17,7 @@ SEQ_LEN=${SEQ_LEN:-32768}
 # output directory
 OUTPUT_DIR=${OUTPUT_DIR:-/sfs_turbo/${USER_NAME}/ckpt/$(basename "${MODEL}")/swift/swift_tiny_sft_node${NNODES:-1}}
 # tuner type: 'full' | 'lora'
-FINETUNING_TYPE=${FINETUNING_TYPE:-full                # swift args: 'full' | 'lora' (megatron uses --finetune)}
+FINETUNING_TYPE=${FINETUNING_TYPE:-full} # swift args: 'full' | 'lora' (megatron uses --finetune)
 # training dataset (LF dataset id resolved via --dataset_dir, or a local path)
 DATASET=${DATASET:-/mnt/sfs_turbo/torchturbo/datasets/am_think/science.jsonl}
 # turbo engine flags (sp/ep, freeze, mtp, ...) live in the sibling yaml.
@@ -27,6 +27,9 @@ dataset_num_proc=96
 dataloader_num_workers=8          # swift args: --dataloader_num_workers
 model_type=turbo_bailing_hybrid   # turbo-registered model_type (loader = TurboModelLoader)
 template=ling_v3
+
+# python interpreter (defaults to python3)
+PYTHON=${PYTHON:-python3}
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export HCCL_CONNECT_TIMEOUT=7200
@@ -60,6 +63,8 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
 SWIFT_SRC_DIR=${SWIFT_SRC_DIR:-}
 export PYTHONPATH="${REPO_ROOT}/src${SWIFT_SRC_DIR:+:${SWIFT_SRC_DIR}}${PYTHONPATH:+:${PYTHONPATH}}"
 
+export HF_DATASETS_CACHE=/mnt/sfs_turbo/${USER_NAME}/datasets/cache/swift/science
+
 DISTRIBUTED_ARGS="
     --nproc_per_node ${NPROC_PER_NODE:-${NPUS_PER_NODE:-16}} \
     --nnodes ${NNODES:-1} \
@@ -84,6 +89,7 @@ fi
     "${RUN_SWIFT}" \
     --model_type "${model_type}" \
     --model "${MODEL}" \
+    --check_model false \
     --template "${template}" \
     --add_non_thinking_prefix true \
     --loss_scale ignore_empty_think \

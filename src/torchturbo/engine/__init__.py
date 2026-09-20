@@ -52,6 +52,15 @@ from .config import (
 from .core import TorchTurboEngine
 from .distributed import init_process_group_if_needed
 from .metrics import MetricTracker
+from .plugins import (
+    DatasetPlugin,
+    PackingPlugin,
+    Plugin,
+    PluginConsumer,
+    PluginKind,
+    PluginManager,
+    register_plugin,
+)
 
 
 __all__ = [
@@ -89,4 +98,12 @@ __all__ = [
     "register_backend",
     # Distributed
     "init_process_group_if_needed",
+    # Plugins
+    "DatasetPlugin",
+    "PackingPlugin",
+    "Plugin",
+    "PluginConsumer",
+    "PluginKind",
+    "PluginManager",
+    "register_plugin",
 ]

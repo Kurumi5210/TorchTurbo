@@ -185,6 +185,10 @@ class TorchTurboEngine:
         else:
             self.config = config
 
+
+        from .plugins import PluginManager
+
+        self.plugin_manager = PluginManager(list(self.config.plugin_paths))
         self.metric_tracker = MetricTracker()
         self._mfu_estimator: Any = None
 

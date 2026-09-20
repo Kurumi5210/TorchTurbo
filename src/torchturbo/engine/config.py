@@ -386,6 +386,9 @@ class EngineConfig:
     engine derives ``gradient_accumulation_steps = gbs * sp_size / world_size``
     """
 
+    plugin_paths: list[str] = field(default_factory=list)
+    """``--tt_plugin`` paths."""
+
     extra: dict[str, Any] = field(default_factory=dict)
     """Catch-all for user-defined settings."""
 
@@ -820,6 +823,7 @@ def build_from_args(
         mfu=_build_mfu_config(fields),
         diffusion=_build_diffusion_config(fields),
         gbs=fields.get("gbs"),
+        plugin_paths=list(tt.plugins or []),
         extra={},
     )
 

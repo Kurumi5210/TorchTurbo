@@ -142,7 +142,9 @@ def _check_swift_contract(cached: str, args) -> bool:
 
 
 def verify_swift(argv: list[str]) -> int:
-    import torchturbo.adapters.msswift.plugin  # noqa: F401  (register turbo models/templates)
+    import torchturbo
+
+    torchturbo.activate("msswift")  # registers turbo models/templates
 
     argv, cached = pop_value(argv, "--cached_dataset")
     argv, num_samples = pop_value(argv, "--num_samples")

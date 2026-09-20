@@ -54,6 +54,10 @@ class TurboEnginePipelineMixin:
 
         config = build_config_from_swift_args(self.args)
         engine = TorchTurboEngine(config)
+
+        from .plugins import install_plugins
+
+        install_plugins(engine.plugin_manager)
         if getattr(self.args, "tuner_type", "full") == "lora":
             engine.peft_config = build_lora_config_from_swift_args(self.args)
         engine_registry.set_engine(engine, stage=type(self).turbo_stage)

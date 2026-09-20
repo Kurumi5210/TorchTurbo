@@ -185,6 +185,9 @@ class TorchTurboArgs:
     config_path: str | None = None
     config_overrides: dict[str, Any] = field(default_factory=dict)
 
+    # ``--tt_plugin`` paths
+    plugins: list[str] = field(default_factory=list)
+
 
 @dataclass
 class TurboArgSpec:
@@ -213,6 +216,10 @@ class TurboArgSpec:
 
     choices: tuple[str, ...] | None = None
     """Argparse ``choices`` for the CLI option; None means unrestricted."""
+
+    action: str | None = None
+    """Argparse action for the CLI option (e.g. ``"append"`` for list flags);
+    None means the default store action."""
 
     help: str | None = None
     """Help/documentation text for the CLI option."""
@@ -599,6 +606,17 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
             "Default weight checkpoint save format when not specified: 'hf' or 'dcp'."
         ),
     ),
+    # turbo's plugin mechanism loads these modules; each registers a Plugin for a framework
+    # (or framework-agnostic), and the framework adapter dispatches it on activation.
+    TurboArgSpec(
+        name="plugins",
+        args_name="plugins",
+        cli_name="--tt_plugin",
+        metavar="PATH",
+        action="append",
+        help="Plugin .py to load (repeatable); optionally bind a per-plugin "
+        "config as 'plugin:config' (passed to the Plugin's __init__).",
+    ),
 )
 
 
@@ -629,6 +647,11 @@ def _build_parser() -> argparse.ArgumentParser:
         }
         if spec.choices is not None:
             kwargs["choices"] = spec.choices
+        if spec.action is not None:
+            kwargs["action"] = spec.action
+            # "append" stores a list; don't pass type/metavar semantics that
+            # conflict with a store-true/append action.
+            kwargs.pop("type", None)
         if spec.type is string_to_bool:
             kwargs["nargs"] = "?"
             kwargs["const"] = True

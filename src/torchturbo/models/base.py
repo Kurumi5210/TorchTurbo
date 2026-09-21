@@ -94,7 +94,10 @@ class TurboModel:
 
         return FSDPParallelPlan()
 
-    def patch_ulysses_fa(self, sp_info: dict[str, Any]) -> None:
+    def patch_ulysses_fa(
+        self,
+        sp_info: dict[str, Any],
+    ) -> None:
         from torchturbo.models.modules.attention.ulysses import patch_flash_attention_forward_for_sp
         patch_flash_attention_forward_for_sp(sp_info)
 

@@ -34,6 +34,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from torchturbo.ops.packed_params import ValidatedOffsets
+
 from fla_npu.ops.ascendc import (
     npu_causal_conv1d as ascendc_causal_conv1d,
     npu_causal_conv1d_bwd as ascendc_causal_conv1d_bwd,
@@ -53,9 +55,20 @@ def _require_npu_tensor(name: str, tensor: torch.Tensor) -> None:
 
 def _as_int_list(
     value: Optional[list[int] | tuple[int, ...] | torch.Tensor],
+    *,
+    validated_offsets: Optional[ValidatedOffsets] = None,
 ) -> Optional[list[int]]:
     if value is None:
         return None
+    if validated_offsets is not None:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("validated_offsets requires tensor cu_seqlens")
+        if value.numel() != len(validated_offsets):
+            raise ValueError(
+                "cu_seqlens and validated_offsets must have the same length, "
+                f"got {value.numel()} and {len(validated_offsets)}"
+            )
+        return validated_offsets
     if isinstance(value, torch.Tensor):
         if value.ndim != 1:
             raise ValueError(
@@ -106,6 +119,7 @@ def _validate_forward_inputs(
     activation: Optional[str],
     cu_seqlens: Optional[torch.Tensor],
     output_final_state: bool,
+    cu_seqlens_list: Optional[ValidatedOffsets],
 ) -> tuple[int, int, int, Optional[list[int]], bool, str]:
     _require_npu_tensor("x", x)
     _require_npu_tensor("weight", weight)
@@ -160,7 +174,10 @@ def _validate_forward_inputs(
     if x.shape[-2] <= 0:
         raise ValueError("empty token dimensions are not supported")
 
-    offsets = _as_int_list(cu_seqlens)
+    offsets = _as_int_list(
+        cu_seqlens,
+        validated_offsets=cu_seqlens_list,
+    )
     is_varlen = offsets is not None
     if is_varlen:
         if x.ndim == 3 and x.shape[0] != 1:
@@ -345,6 +362,7 @@ class AscendCCausalConv1dFunction(torch.autograd.Function):
         activation: Optional[str] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         output_final_state: bool = False,
+        cu_seqlens_list: Optional[ValidatedOffsets] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         (
             width,
@@ -363,6 +381,7 @@ class AscendCCausalConv1dFunction(torch.autograd.Function):
             activation,
             cu_seqlens,
             output_final_state,
+            cu_seqlens_list,
         )
         activation_mode = _activation_mode(activation)
         op_x = _flat_x(x, is_varlen=is_varlen)
@@ -517,8 +536,8 @@ class AscendCCausalConv1dFunction(torch.autograd.Function):
             )
         dh0 = _from_kernel_state_gradient(dh0, ctx.state_layout)
         # x, weight, head_num, bias, residual, initial_state, activation,
-        # cu_seqlens, output_final_state.
-        return dx, dw, None, db, dr, dh0, None, None, None
+        # cu_seqlens, output_final_state, cu_seqlens_list.
+        return dx, dw, None, db, dr, dh0, None, None, None, None
 
 
 __all__ = ["AscendCCausalConv1dFunction"]

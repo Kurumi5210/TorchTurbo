@@ -37,12 +37,15 @@ from typing import Optional
 
 import torch
 
+from torchturbo.ops.packed_params import PackedParams
+
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
 from .chunk_gated_delta_rule_function import ChunkGatedDeltaRuleFunction
 
 __all__ = [
     "AscendCCausalConv1dFunction",
     "ChunkGatedDeltaRuleFunction",
+    "PackedParams",
     "ascendc_causal_conv1d",
     "ascendc_chunk_gated_delta_rule",
 ]
@@ -81,6 +84,7 @@ def ascendc_causal_conv1d(
     initial_state: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    packed_params: Optional[PackedParams] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Drop-in AscendC replacement for ``fla.modules.convolution.causal_conv1d``.
 
@@ -99,6 +103,17 @@ def ascendc_causal_conv1d(
         raise ValueError(f"x must be [B, T, D], got shape={tuple(x.shape)}")
     batch, seq_len, dim = x.shape
     head_num = _conv_head_num(dim)
+    cu_seqlens_list = None
+    if packed_params is not None:
+        if cu_seqlens is not None:
+            raise ValueError("pass either cu_seqlens or packed_params, not both")
+        if packed_params.cu_seqlens.device != x.device:
+            raise ValueError(
+                "packed_params must be built on the same device as x, "
+                f"got {packed_params.cu_seqlens.device} and {x.device}"
+            )
+        cu_seqlens = packed_params.cu_seqlens
+        cu_seqlens_list = packed_params.cu_seqlens_list
     if cu_seqlens is not None and cu_seqlens.device != x.device:
         cu_seqlens = cu_seqlens.to(x.device)
 
@@ -115,6 +130,7 @@ def ascendc_causal_conv1d(
         activation,
         cu_seqlens,
         output_final_state,
+        cu_seqlens_list,
     )
     y = y_head.transpose(1, 2).reshape(batch, seq_len, dim).contiguous()
     return y, final_state
@@ -131,6 +147,8 @@ def ascendc_chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
+    packed_params: Optional[PackedParams] = None,
+    save_backward_intermediates: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Drop-in AscendC replacement for ``fla.ops.gated_delta_rule.chunk_gated_delta_rule``.
 
@@ -150,12 +168,27 @@ def ascendc_chunk_gated_delta_rule(
     scale = float(k.shape[-1] ** -0.5)
 
     cu_seqlens_list: Optional[list[int]] = None
+    chunk_indices = None
+    chunk_indices_list = None
+    if packed_params is not None:
+        if cu_seqlens is not None:
+            raise ValueError("pass either cu_seqlens or packed_params, not both")
+        if packed_params.cu_seqlens.device != q.device:
+            raise ValueError(
+                "packed_params must be built on the same device as q, "
+                f"got {packed_params.cu_seqlens.device} and {q.device}"
+            )
+        cu_seqlens = packed_params.cu_seqlens
+        cu_seqlens_list = packed_params.cu_seqlens_list
+        chunk_indices = packed_params.chunk_indices
+        chunk_indices_list = packed_params.chunk_indices_list
     if cu_seqlens is not None:
         if cu_seqlens.device != q.device:
             cu_seqlens = cu_seqlens.to(q.device)
-        # Pre-derive the offsets on the Python side (as the verified reference
-        # does) so the adapter does not re-sync inside ``_normalize_varlen``.
-        cu_seqlens_list = [int(item) for item in cu_seqlens.detach().cpu().tolist()]
+        if cu_seqlens_list is None:
+            cu_seqlens_list = [
+                int(item) for item in cu_seqlens.detach().cpu().tolist()
+            ]
 
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
@@ -168,10 +201,11 @@ def ascendc_chunk_gated_delta_rule(
         output_final_state,
         cu_seqlens,
         cu_seqlens_list,
-        None,            # chunk_indices (auto-derived by the adapter)
-        None,            # chunk_indices_list (auto-derived by the adapter)
+        chunk_indices,
+        chunk_indices_list,
         use_qk_l2norm_in_kernel,
         chunk_size,
+        save_backward_intermediates,
     )
     # o is already [B, T, H, V] (the adapter transposes back internally).
     return o, final_state

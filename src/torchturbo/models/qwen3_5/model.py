@@ -18,6 +18,15 @@ from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
 
 
+def _interleave_qkv_conv_parameter(q, k, v, num_key_heads):
+    """Match depthwise-conv channels to the post-all-to-all QKV layout."""
+    trailing_shape = q.shape[1:]
+    q = q.reshape(num_key_heads, -1, *trailing_shape)
+    k = k.reshape(num_key_heads, -1, *trailing_shape)
+    v = v.reshape(num_key_heads, -1, *trailing_shape)
+    return torch.cat((q, k, v), dim=1).reshape(-1, *trailing_shape)
+
+
 class Qwen3_5WeightConverter(BaseWeightConverter):
     def __init__(self, model, parallel_context, model_path):
         super().__init__(model, parallel_context, model_path)
@@ -112,6 +121,12 @@ class TurboQwen3_5ForConditionalGeneration(
                 self._patch_ulysses_fa_for_sp(num_attention_heads, sp_size)
 
             self.patch_ulysses_fa(sp_info)
+
+            device_runtime = get_device_runtime()
+            a2a_stream = device_runtime.new_stream()
+            for module in self.modules():
+                if isinstance(module, Qwen3_5GatedDeltaNet):
+                    module._sp_a2a_stream = a2a_stream
 
             self.patch_gated_delta_net_for_sp(
                 Qwen3_5GatedDeltaNet, sp_group, sp_size, sp_rank
@@ -219,7 +234,7 @@ class TurboQwen3_5ForConditionalGeneration(
             gather_seq_scatter_heads,
             gather_heads_scatter_seq,
         )
-        from .modeling_qwen3_5 import _get_cu_seqlens
+        from .modeling_qwen3_5 import _get_packed_params
         from torchturbo.ops import ops
         import torch.nn.functional as F
 
@@ -230,18 +245,14 @@ class TurboQwen3_5ForConditionalGeneration(
             return weight[tuple(slices)]
 
         def sp_forward(self_attn, hidden_states, **kwargs):
-            cu_seqlens = None
             attention_mask = kwargs.get("attention_mask", None)
-            cu_seqlens = _get_cu_seqlens(attention_mask)
+            packed_params = _get_packed_params(attention_mask)
             B, local_T, _ = hidden_states.shape
 
             nk_full, nv_full = self_attn.num_k_heads, self_attn.num_v_heads
             dk, dv = self_attn.head_k_dim, self_attn.head_v_dim
 
             mixed_qkv = self_attn.in_proj_qkv(hidden_states)
-            z = self_attn.in_proj_z(hidden_states)
-            b = self_attn.in_proj_b(hidden_states)
-            a = self_attn.in_proj_a(hidden_states)
 
             q_raw, k_raw, v_raw = torch.split(
                 mixed_qkv, [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim], dim=-1
@@ -260,25 +271,28 @@ class TurboQwen3_5ForConditionalGeneration(
             v_shaped = v_raw.reshape(B, local_T, sh, G_per_sh * dv)
             interleaved_qkv = torch.cat([q_shaped, k_shaped, v_shaped], dim=-1)
 
+            a2a_stream = self_attn._sp_a2a_stream
             interleaved_qkv = gather_seq_scatter_heads(
-                interleaved_qkv, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
+                interleaved_qkv,
+                seq_dim=1,
+                head_dim=2,
+                sp_group=sp_group,
+                sp_size=sp_size,
+                a2a_stream=a2a_stream,
             )
+            z = self_attn.in_proj_z(hidden_states)
+            b = self_attn.in_proj_b(hidden_states)
+            a = self_attn.in_proj_a(hidden_states)
+            get_device_runtime().current_stream().wait_stream(a2a_stream)
             T = interleaved_qkv.shape[1]
             nk = nk_full * sp_repeat // sp_size
             nv = nv_full // sp_size
 
-            q_raw = interleaved_qkv[..., :dk]
-            k_raw = interleaved_qkv[..., dk : 2 * dk]
-            v_raw = interleaved_qkv[..., 2 * dk :].reshape(B, T, nv, dv)
-
-            local_qkv = torch.cat(
-                [
-                    q_raw.reshape(B, T, nk * dk),
-                    k_raw.reshape(B, T, nk * dk),
-                    v_raw.reshape(B, T, nv * dv),
-                ],
-                dim=-1,
-            )
+            # The all-to-all result is already contiguous in per-key-head
+            # [Q, K, grouped-V] order. Causal conv is depthwise, so keep this
+            # layout and reorder only its tiny width-4 parameter instead of
+            # copying the full 64K activation into grouped Q/K/V blocks.
+            local_qkv = interleaved_qkv.flatten(2)
 
             w = self_attn.conv1d.weight
             wq, wk, wv = torch.split(
@@ -290,8 +304,11 @@ class TurboQwen3_5ForConditionalGeneration(
                 wq = wq.reshape(nk_full, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
                 wk = wk.reshape(nk_full, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
 
-            local_conv_weight = torch.cat(
-                [_slice_param(wq, 0), _slice_param(wk, 0), _slice_param(wv, 0)], dim=0
+            local_conv_weight = _interleave_qkv_conv_parameter(
+                _slice_param(wq, 0),
+                _slice_param(wk, 0),
+                _slice_param(wv, 0),
+                nk,
             )
 
             local_conv_bias = None
@@ -302,8 +319,11 @@ class TurboQwen3_5ForConditionalGeneration(
                 if sp_repeat > 1:
                     bq = bq.reshape(nk_full, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
                     bk = bk.reshape(nk_full, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
-                local_conv_bias = torch.cat(
-                    [_slice_param(bq, 0), _slice_param(bk, 0), _slice_param(bv, 0)], dim=0
+                local_conv_bias = _interleave_qkv_conv_parameter(
+                    _slice_param(bq, 0),
+                    _slice_param(bk, 0),
+                    _slice_param(bv, 0),
+                    nk,
                 )
 
             local_qkv, _ = ops.causal_conv1d(
@@ -313,28 +333,31 @@ class TurboQwen3_5ForConditionalGeneration(
                 activation=self_attn.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                packed_params=packed_params,
             )
 
-            q, k, v = torch.split(local_qkv, [nk * dk, nk * dk, nv * dv], dim=-1)
-            q = q.reshape(B, T, nk, dk)
-            k = k.reshape(B, T, nk, dk)
-            v = v.reshape(B, T, nv, dv)
+            local_qkv = local_qkv.reshape(B, T, nk, -1)
+            q = local_qkv[..., :dk]
+            k = local_qkv[..., dk : 2 * dk]
+            v = local_qkv[..., 2 * dk :].reshape(B, T, nv, dv)
 
             if nk < nv:
                 r = nv // nk
                 q = q.repeat_interleave(r, dim=2)
                 k = k.repeat_interleave(r, dim=2)
 
-            z = gather_seq_scatter_heads(
-                z.reshape(B, local_T, nv_full, dv), seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
+            # Z is consumed only after ``out`` returns to local-sequence/full-head
+            # layout, which is already Z's projection layout. Keep it local and
+            # avoid a redundant round trip through sequence parallelism.
+            local_z = z.reshape(B, local_T, nv_full, dv)
+            packed_ba = gather_seq_scatter_heads(
+                torch.stack((b, a), dim=-1),
+                seq_dim=1,
+                head_dim=2,
+                sp_group=sp_group,
+                sp_size=sp_size,
             )
-            b = gather_seq_scatter_heads(
-                b.unsqueeze(-1), seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
-            ).squeeze(-1)
-            a = gather_seq_scatter_heads(
-                a.unsqueeze(-1), seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
-            ).squeeze(-1)
+            b, a = packed_ba.unbind(dim=-1)
 
             beta = b.sigmoid()
             A_log_local = _slice_param(self_attn.A_log, 0)
@@ -350,17 +373,14 @@ class TurboQwen3_5ForConditionalGeneration(
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
+                packed_params=packed_params,
             )
 
             out = gather_heads_scatter_seq(
                 out, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
             )
-            z = gather_heads_scatter_seq(
-                z, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
-            )
 
-            out = self_attn.norm(out.reshape(-1, dv), z.reshape(-1, dv))
+            out = self_attn.norm(out.reshape(-1, dv), local_z.reshape(-1, dv))
             return self_attn.out_proj(out.reshape(B, local_T, -1))
 
         attn_cls.forward = sp_forward

@@ -65,12 +65,14 @@ logger = logging.get_logger(__name__)
 
 
 @cache
-def _get_cu_seqlens(attention_mask):
+def _get_packed_params(attention_mask):
     if attention_mask is not None and torch.max(attention_mask) > 1:
+        from torchturbo.ops.packed_params import build_packed_params
+
         _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
         if cu_seqlens[-1] != attention_mask.size(1):
             cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
-        return cu_seqlens
+        return build_packed_params(cu_seqlens)
     return None
 
 class Qwen3_5VisionRotaryEmbedding(nn.Module):
@@ -562,7 +564,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ):
         #hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        cu_seqlens = _get_cu_seqlens(attention_mask)
+        packed_params = _get_packed_params(attention_mask)
+        cu_seqlens = (
+            packed_params.cu_seqlens if packed_params is not None else None
+        )
 
         from torchturbo.ops import ops
 
@@ -612,7 +617,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                packed_params=packed_params,
             )
 
         query, key, value = torch.split(
@@ -647,7 +652,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 initial_state=None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens = cu_seqlens,
+                packed_params=packed_params,
             )
 
         else:

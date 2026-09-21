@@ -36,12 +36,20 @@ class FlaCausalConv1d(OpImpl):
         activation=None,
         initial_state=None,
         output_final_state: bool = False,
-        cu_seqlens=None,
+        packed_params=None,
         **kwargs,
     ):
         # fla's causal_conv1d is an autograd function returning (y, final_state).
         from fla.modules.convolution import causal_conv1d
 
+        # ``packed_params`` is the provider API. Keep accepting the legacy
+        # dispatcher keyword during the transition so older model paths do not
+        # lose their varlen metadata.
+        cu_seqlens = kwargs.pop("cu_seqlens", None)
+        if packed_params is not None:
+            if cu_seqlens is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            cu_seqlens = packed_params.cu_seqlens
         return causal_conv1d(
             x=x,
             weight=weight,

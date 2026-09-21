@@ -38,13 +38,20 @@ class FlaGatedDeltaRule(OpImpl):
         initial_state=None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
-        cu_seqlens=None,
+        packed_params=None,
         **kwargs,
     ):
         # fla's chunk_gated_delta_rule is an autograd function (head_first=False
         # convention); signature mirrors ascendc_chunk_gated_delta_rule.
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
+        # ``packed_params`` is the provider API. Keep accepting the legacy
+        # dispatcher keyword during the transition.
+        cu_seqlens = kwargs.pop("cu_seqlens", None)
+        if packed_params is not None:
+            if cu_seqlens is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            cu_seqlens = packed_params.cu_seqlens
         return chunk_gated_delta_rule(
             q=q,
             k=k,

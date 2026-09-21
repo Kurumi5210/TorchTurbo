@@ -7,6 +7,8 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
+from torchturbo.runtime import get_device_runtime
+
 from ...comm.comm import gather_from_sequence_parallel_region
 from .utils import (
     repeat_kv,
@@ -19,69 +21,165 @@ from torchturbo.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _all_to_all(
+    local_input: Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    sp_group: Optional[dist.ProcessGroup],
+    sp_size: int,
+):
+    input_list = [
+        t.contiguous() for t in torch.tensor_split(local_input, sp_size, scatter_dim)
+    ]
+    output_list = [torch.empty_like(input_list[0]) for _ in range(sp_size)]
+    comm = dist.all_to_all(output_list, input_list, group=sp_group, async_op=True)
+    comm.wait()
+    return torch.cat(output_list, dim=gather_dim).contiguous()
+
+
+def _all_to_all_single(
+    local_input: Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    sp_group: Optional[dist.ProcessGroup],
+    sp_size: int,
+    a2a_stream: Optional[Any] = None,
+) -> Tensor:
+    """Exchange equal tensor splits with ``all_to_all_single``.
+
+    The peer axis is packed in front for the collective, then moved to the
+    requested gather dimension. This works for either direction of the
+    Ulysses exchange; ``scatter_dim`` and ``gather_dim`` are not hard-coded.
+    """
+    assert local_input.size(0) == 1, (
+        "all_to_all_single optimization requires batch size 1; callers must "
+        "route other shapes through list all_to_all"
+    )
+    scatter_size = local_input.size(scatter_dim)
+    if scatter_size % sp_size != 0:
+        raise ValueError(
+            f"scatter dimension size {scatter_size} must be divisible by "
+            f"sequence parallel size {sp_size}"
+        )
+
+    split_shape = (
+        *local_input.shape[:scatter_dim],
+        sp_size,
+        scatter_size // sp_size,
+        *local_input.shape[scatter_dim + 1 :],
+    )
+    split_input = local_input.reshape(split_shape)
+    peer_dim = scatter_dim
+    packed_order = (
+        peer_dim,
+        *range(peer_dim),
+        peer_dim + 1,
+        *range(peer_dim + 2, local_input.ndim + 1),
+    )
+    # Allocate communication buffers on the caller stream. Only the collective
+    # is placed on the side stream, so large tensors stay in one allocator pool.
+    packed_input = split_input.permute(packed_order).contiguous()
+    packed_output = torch.empty_like(packed_input)
+
+    if a2a_stream is None:
+        comm = dist.all_to_all_single(
+            packed_output,
+            packed_input,
+            group=sp_group,
+            async_op=True,
+        )
+        comm.wait()
+    else:
+        device_runtime = get_device_runtime()
+        a2a_stream.wait_stream(device_runtime.current_stream())
+        with device_runtime.stream(a2a_stream):
+            comm = dist.all_to_all_single(
+                packed_output,
+                packed_input,
+                group=sp_group,
+                async_op=True,
+            )
+            comm.wait()
+        packed_input.record_stream(a2a_stream)
+        packed_output.record_stream(a2a_stream)
+
+    output = packed_output.movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
+    return output.contiguous()
+
+
 def all_to_all_tensor(
     local_input: Tensor,
     scatter_dim: int,
     gather_dim: int,
     sp_group: Optional[dist.ProcessGroup],
     sp_size: int,
-    async_op: bool = False,
-):
-    input_list = [
-        t.contiguous() for t in torch.tensor_split(local_input, sp_size, scatter_dim)
-    ]
-    output_list = [torch.empty_like(input_list[0]) for _ in range(sp_size)]
-    comm = dist.all_to_all(output_list, input_list, group=sp_group, async_op=async_op)
-    if async_op:
+    a2a_stream: Optional[Any] = None,
+) -> Tensor:
+    """Select the optimized collective from the tensor shape.
 
-        def wait():
-            comm.wait()
-            return torch.cat(output_list, dim=gather_dim).contiguous()
-
-        return wait
-    return torch.cat(output_list, dim=gather_dim).contiguous()
+    ``all_to_all_single`` is an implementation detail. Batch-one Ulysses
+    tensors use it automatically; callers do not need to know which collective
+    implements the exchange.
+    """
+    scatter_dim %= local_input.ndim
+    gather_dim %= local_input.ndim
+    if scatter_dim == gather_dim:
+        raise ValueError("scatter_dim and gather_dim must be different")
+    if local_input.size(scatter_dim) % sp_size != 0:
+        raise ValueError(
+            f"scatter dimension size {local_input.size(scatter_dim)} must be "
+            f"divisible by sequence parallel size {sp_size}"
+        )
+    if local_input.size(0) == 1:
+        return _all_to_all_single(
+            local_input,
+            scatter_dim,
+            gather_dim,
+            sp_group,
+            sp_size,
+            a2a_stream,
+        )
+    return _all_to_all(local_input, scatter_dim, gather_dim, sp_group, sp_size)
 
 
 class SeqAllToAll(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
+        local_input: Tensor,
         sp_group: dist.ProcessGroup,
         sp_size: int,
-        local_input: Tensor,
         scatter_dim: int,
         gather_dim: int,
-        async_op: bool = False,
+        a2a_stream: Optional[Any],
     ) -> Tensor:
         ctx.sp_group = sp_group
         ctx.sp_size = sp_size
         ctx.scatter_dim = scatter_dim
         ctx.gather_dim = gather_dim
-        ctx.async_op = async_op
         return all_to_all_tensor(
-            local_input, scatter_dim, gather_dim, sp_group, sp_size, async_op
+            local_input,
+            scatter_dim,
+            gather_dim,
+            sp_group,
+            sp_size,
+            a2a_stream,
         )
 
     @staticmethod
     def backward(
         ctx: Any, *grad_output: Tensor
-    ) -> Tuple[None, None, Tensor, None, None, None]:
-        input_t = (
-            torch.cat(grad_output[1:], dim=ctx.gather_dim).contiguous()
-            if ctx.async_op
-            else grad_output[0]
-        )
+    ) -> Tuple[Tensor, None, None, None, None, None]:
         return (
-            None,
-            None,
             all_to_all_tensor(
-                input_t,
+                grad_output[0],
                 ctx.gather_dim,
                 ctx.scatter_dim,
                 ctx.sp_group,
                 ctx.sp_size,
-                False,
             ),
+            None,
+            None,
             None,
             None,
             None,
@@ -95,6 +193,7 @@ def gather_seq_scatter_heads(
     sp_group: ProcessGroup,
     sp_size: int,
     unpadded_dim_size: int = 0,
+    a2a_stream: Optional[Any] = None,
 ) -> Tensor:
     """
     A func to sync embedding input with alltoall in sequence parallel
@@ -104,7 +203,14 @@ def gather_seq_scatter_heads(
     """
     if not sp_group:
         return x
-    x = SeqAllToAll.apply(sp_group, sp_size, x, head_dim, seq_dim)
+    x = SeqAllToAll.apply(
+        x,
+        sp_group,
+        sp_size,
+        head_dim,
+        seq_dim,
+        a2a_stream,
+    )
     if unpadded_dim_size and unpadded_dim_size % sp_size != 0:
         padding_size = x.size(seq_dim) - unpadded_dim_size
         x = unpad_tensor(x, seq_dim, padding_size)
@@ -126,10 +232,12 @@ def gather_heads_scatter_seq(
     if dim_size % sp_size != 0:
         padding_size = sp_size - (dim_size % sp_size)
         x = pad_tensor(x, seq_dim, padding_size)
-    return SeqAllToAll.apply(sp_group, sp_size, x, seq_dim, head_dim, False)
+    return SeqAllToAll.apply(x, sp_group, sp_size, seq_dim, head_dim, None)
 
 
-def patch_flash_attention_forward_for_sp(sp_info: dict[str, Any]) -> None:
+def patch_flash_attention_forward_for_sp(
+    sp_info: dict[str, Any],
+) -> None:
     """Patch ``_flash_attention_forward`` with Ulysses all-to-all if SP>1."""
     sp_group = sp_info.get("sp_group")
     sp_size = sp_info.get("sp_size", 1)
@@ -196,13 +304,25 @@ def ulysses_flash_attention_forward(
 
         # (bsz, seq_len/n, n_head, head_dim) -> (bsz, seq_len, n_head/n, head_dim)
         query_states = gather_seq_scatter_heads(
-            query_states, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
+            query_states,
+            seq_dim=1,
+            head_dim=2,
+            sp_group=sp_group,
+            sp_size=sp_size,
         )
         key_states = gather_seq_scatter_heads(
-            key_states, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
+            key_states,
+            seq_dim=1,
+            head_dim=2,
+            sp_group=sp_group,
+            sp_size=sp_size,
         )
         value_states = gather_seq_scatter_heads(
-            value_states, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
+            value_states,
+            seq_dim=1,
+            head_dim=2,
+            sp_group=sp_group,
+            sp_size=sp_size,
         )
 
         # all_gather position_ids when available

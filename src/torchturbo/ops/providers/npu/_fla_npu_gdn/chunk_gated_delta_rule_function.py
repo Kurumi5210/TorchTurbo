@@ -17,6 +17,7 @@ The public entry is ``ChunkGatedDeltaRuleFunction.apply`` with this signature::
         chunk_indices_list,
         use_qk_l2norm_in_kernel,
         chunk_size,
+        save_backward_intermediates,
     )
 
 The adapter implements the full forward and backward chains, including GVA
@@ -34,6 +35,8 @@ import math
 from typing import Dict, Optional
 
 import torch
+
+from torchturbo.ops.packed_params import ValidatedChunkLists, ValidatedOffsets
 
 from fla_npu.ops.ascendc import (
     npu_chunk_bwd_dqkwg as ascendc_chunk_bwd_dqkwg,
@@ -168,7 +171,10 @@ def _normalize_varlen_metadata(
         raise ValueError(
             f"GDR varlen mode supports only B=1, got B={batch}"
         )
-    if cu_seqlens_list is not None:
+    trusted_offsets = isinstance(cu_seqlens_list, ValidatedOffsets)
+    if trusted_offsets:
+        offsets = cu_seqlens_list
+    elif cu_seqlens_list is not None:
         offsets = [int(item) for item in cu_seqlens_list]
         if cu_seqlens.numel() != len(offsets):
             raise ValueError(
@@ -190,7 +196,10 @@ def _normalize_varlen_metadata(
     else:
         raise TypeError("chunk_indices must be a Tensor, dict, or None")
 
-    if isinstance(chunk_indices_list, dict):
+    trusted_lists = isinstance(chunk_indices_list, ValidatedChunkLists)
+    if trusted_lists:
+        list_indices = chunk_indices_list
+    elif isinstance(chunk_indices_list, dict):
         list_indices: ListIndexDict = {}
         for key, value in chunk_indices_list.items():
             list_indices[str(key)] = _as_int_list(
@@ -211,22 +220,36 @@ def _normalize_varlen_metadata(
     required_sizes.add(chunk_size)
     for size in sorted(required_sizes):
         key = str(size)
-        expected_pairs, expected_flat = _expected_chunk_metadata(offsets, size)
+        supplied_list = list_indices.get(key)
+        if trusted_lists:
+            if supplied_list is None:
+                raise ValueError(f"missing list chunk metadata for size {size}")
+            expected_flat = supplied_list
+            expected_pairs = None
+        else:
+            expected_pairs, expected_flat = _expected_chunk_metadata(offsets, size)
 
         supplied_tensor = tensor_indices.get(key)
         if supplied_tensor is None:
-            tensor_indices[key] = torch.tensor(
-                expected_pairs,
-                dtype=torch.int64,
-                device=g.device,
-            )
+            if expected_pairs is None:
+                tensor_indices[key] = torch.tensor(
+                    expected_flat,
+                    dtype=torch.int64,
+                    device=g.device,
+                ).view(-1, 2)
+            else:
+                tensor_indices[key] = torch.tensor(
+                    expected_pairs,
+                    dtype=torch.int64,
+                    device=g.device,
+                )
         else:
             _require_npu_tensor(f"chunk_indices[{key!r}]", supplied_tensor)
             if supplied_tensor.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
                     f"chunk_indices[{key!r}] must be int32/int64"
                 )
-            expected_shape = (len(expected_pairs), 2)
+            expected_shape = (len(expected_flat) // 2, 2)
             if tuple(supplied_tensor.shape) != expected_shape:
                 raise ValueError(
                     f"chunk_indices[{key!r}] must have shape "
@@ -237,9 +260,10 @@ def _normalize_varlen_metadata(
                 dtype=torch.int64,
             ).contiguous()
 
-        supplied_list = list_indices.get(key)
         if supplied_list is None:
             list_indices[key] = expected_flat
+        elif trusted_lists:
+            continue
         elif [int(item) for item in supplied_list] != expected_flat:
             raise ValueError(
                 f"chunk_indices_list[{key!r}] does not match cu_seqlens"
@@ -482,7 +506,16 @@ def _forward_chain(
     chunk_indices: Optional[TensorIndexDict],
     chunk_indices_list: Optional[ListIndexDict],
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     cumulative_g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -552,7 +585,7 @@ def _forward_chain(
     output = output_head.transpose(1, 2).contiguous()
     if not output_final_state:
         final_state = None
-    return cumulative_g, output, A_head, final_state
+    return cumulative_g, output, A_head, final_state, w, u, h, v_new
 
 
 def _backward_chain(
@@ -572,6 +605,10 @@ def _backward_chain(
     chunk_indices: Optional[TensorIndexDict],
     chunk_indices_list: Optional[ListIndexDict],
     chunk_size: int,
+    saved_w: Optional[torch.Tensor] = None,
+    saved_u: Optional[torch.Tensor] = None,
+    saved_h: Optional[torch.Tensor] = None,
+    saved_v_new: Optional[torch.Tensor] = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -611,31 +648,35 @@ def _backward_chain(
     beta_head = beta.transpose(1, 2).contiguous().float()
     do_head = do.transpose(1, 2).contiguous()
     chunk_list = _chunk_list(chunk_indices_list, chunk_size)
-    w, u = _recompute_w_u(
-        k,
-        v,
-        beta_head,
-        A_head,
-        g_head,
-        chunk_size=chunk_size,
-        cu_seqlens_list=cu_seqlens_list,
-        chunk_indices_list=chunk_list,
-    )
-    h, v_new, _ = ascendc_chunk_gated_delta_rule_fwd_h(
-        k,
-        w,
-        u,
-        g=g_head,
-        gk=None,
-        initial_state=initial_state,
-        output_final_state=False,
-        chunk_size=chunk_size,
-        save_new_value=True,
-        cu_seqlens=cu_seqlens_list,
-        chunk_indices=chunk_list,
-        use_exp2=False,
-        transpose_state_layout=False,
-    )
+    if saved_w is None:
+        w, u = _recompute_w_u(
+            k,
+            v,
+            beta_head,
+            A_head,
+            g_head,
+            chunk_size=chunk_size,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices_list=chunk_list,
+        )
+        h, v_new, _ = ascendc_chunk_gated_delta_rule_fwd_h(
+            k,
+            w,
+            u,
+            g=g_head,
+            gk=None,
+            initial_state=initial_state,
+            output_final_state=False,
+            chunk_size=chunk_size,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens_list,
+            chunk_indices=chunk_list,
+            use_exp2=False,
+            transpose_state_layout=False,
+        )
+    else:
+        assert saved_u is not None and saved_h is not None and saved_v_new is not None
+        w, u, h, v_new = saved_w, saved_u, saved_h, saved_v_new
     dv = ascendc_chunk_bwd_dv_local(
         q,
         k,
@@ -755,6 +796,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         ] = None,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
+        save_backward_intermediates: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         (
             batch,
@@ -823,7 +865,16 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q_rstd = None
             k_rstd = None
 
-        cumulative_g, output, A_head, final_state = _forward_chain(
+        (
+            cumulative_g,
+            output,
+            A_head,
+            final_state,
+            w,
+            u,
+            h,
+            v_new,
+        ) = _forward_chain(
             q=q,
             k=k,
             v=v,
@@ -844,9 +895,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             saved.extend((q_rstd, k_rstd))
         if initial_state is not None:
             saved.append(initial_state)
+        if save_backward_intermediates:
+            saved.extend((w, u, h, v_new))
         ctx.save_for_backward(*saved)
         ctx.has_l2norm = use_qk_l2norm_in_kernel
         ctx.has_initial_state = initial_state is not None
+        ctx.has_backward_intermediates = save_backward_intermediates
         ctx.scale = float(scale)
         ctx.cu_seqlens = cu_seqlens
         ctx.cu_seqlens_list = cu_seqlens_list
@@ -876,6 +930,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q_rstd = None
             k_rstd = None
         initial_state = saved.pop(0) if ctx.has_initial_state else None
+        if ctx.has_backward_intermediates:
+            saved_w, saved_u, saved_h, saved_v_new = saved
+        else:
+            saved_w = saved_u = saved_h = saved_v_new = None
 
         dq, dk, dv, dg, dbeta, dh0 = _backward_chain(
             q=q,
@@ -893,15 +951,19 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=ctx.chunk_indices,
             chunk_indices_list=ctx.chunk_indices_list,
             chunk_size=ctx.chunk_size,
+            saved_w=saved_w,
+            saved_u=saved_u,
+            saved_h=saved_h,
+            saved_v_new=saved_v_new,
         )
         if ctx.has_l2norm:
             assert q_rstd is not None and k_rstd is not None
             dq = l2norm_bwd(q, q_rstd, dq)
             dk = l2norm_bwd(k, k_rstd, dk)
-        # The order must match all 14 forward inputs exactly:
+        # The order must match all 15 forward inputs exactly:
         # q, k, v, g, beta, scale, initial_state, output_final_state,
         # cu_seqlens, cu_seqlens_list, chunk_indices, chunk_indices_list,
-        # use_qk_l2norm_in_kernel, chunk_size.
+        # use_qk_l2norm_in_kernel, chunk_size, save_backward_intermediates.
         return (
             dq.to(q),
             dk.to(k),
@@ -910,6 +972,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dbeta.to(beta),
             None,
             dh0,
+            None,
             None,
             None,
             None,

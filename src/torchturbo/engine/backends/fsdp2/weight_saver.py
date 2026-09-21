@@ -451,8 +451,7 @@ class ShardedParamManager:
     def save_model(self, save_path):
         save_path = Path(save_path)
 
-        if self.rank == 0:
-            save_path.mkdir(parents=True, exist_ok=True)
+        save_path.mkdir(parents=True, exist_ok=True)
 
         torch.distributed.barrier()  # Ensure directory is created
 

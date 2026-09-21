@@ -13,6 +13,7 @@ if "grouped_gemm" not in sys.modules:  # pragma: no cover - env shim
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from torchturbo.engine.backends.fsdp2.config import (
     CPUOffloadConfig,
@@ -176,6 +177,60 @@ def test_device_workspace_raises_when_capacity_insufficient():
         DeviceWorkspace(runtime, memory_fraction=0.5)
 
 
+def test_device_workspace_synchronizes_capacity_across_ranks(monkeypatch):
+    runtime = types.SimpleNamespace(
+        turbo_device=TurboDevice.NPU,
+        device=torch.device("cpu"),
+        memory_info=lambda: (100, 1000),
+    )
+
+    def all_reduce(tensor, op, group):
+        assert op is dist.ReduceOp.MIN
+        tensor.fill_(32)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+    workspace = DeviceWorkspace(runtime, memory_fraction=0.8)
+
+    assert workspace.capacity_bytes == 32
+
+
+def test_workspace_capacity_error_includes_param_name():
+    params = [torch.nn.Parameter(torch.ones(8))]
+    optimizer = _offload_adamw(
+        params, param_names={params[0]: "model.layers.3.mlp.up_proj"}
+    )
+    workspace = DeviceWorkspace.__new__(DeviceWorkspace)
+    workspace._storage = torch.empty(16, dtype=torch.uint8)
+    optimizer.workspace = workspace
+
+    with pytest.raises(RuntimeError, match="model.layers.3.mlp.up_proj"):
+        optimizer._ensure_workspace_capacity([(params[0], {})])
+
+
+def test_workspace_capacity_failure_is_synchronized(monkeypatch):
+    params = [torch.nn.Parameter(torch.ones(4))]
+    optimizer = _offload_adamw(
+        params, param_names={params[0]: "model.layers.3.mlp.up_proj"}
+    )
+    workspace = DeviceWorkspace.__new__(DeviceWorkspace)
+    workspace._storage = torch.empty(128, dtype=torch.uint8)
+    optimizer.workspace = workspace
+
+    def all_reduce(tensor, op, group):
+        assert op is dist.ReduceOp.MIN
+        tensor.fill_(0)
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        optimizer._ensure_workspace_capacity([(params[0], {})])
+
+
 def test_workspace_stages_multiple_batches_when_each_state_pair_fits():
     params = [torch.nn.Parameter(torch.ones(4)) for _ in range(5)]
     optimizer = _offload_adamw(params)
@@ -263,13 +318,14 @@ def test_prepare_optimizer_builds_adamw_swap():
     )
     backend._device_runtime = SyncRuntime()
     backend._mesh = {"edp": object()}
+    model = torch.nn.Linear(1, 1)
 
-    optimizer = backend.prepare_optimizer(
-        torch.nn.Linear(1, 1), torch.optim.AdamW, fused=True
-    )
+    optimizer = backend.prepare_optimizer(model, torch.optim.AdamW, fused=True)
 
     assert isinstance(optimizer, AdamWSwap)
     assert optimizer.defaults["fused"] is True
+    assert optimizer.param_to_name_map[model.weight] == "weight"
+    assert optimizer.param_to_name_map[model.bias] == "bias"
 
 
 def test_prepare_optimizer_builds_host_update_adamw():

@@ -1314,10 +1314,14 @@ class FSDP2Backend(BaseBackend):
                     f"got {optimizer_cls.__module__}.{optimizer_cls.__name__}"
                 )
             optimizer_cls = AdamWSwap
+            param_names = {
+                param: name for name, param in model.named_parameters()
+            }
             optimizer_kwargs.pop("fused", None)
             optimizer_kwargs.update(
                 device_runtime=self.device_runtime,
                 optimizer_memory_fraction=offload.optimizer_memory_fraction,
+                param_names=param_names,
             )
 
         optimizer = optimizer_cls(

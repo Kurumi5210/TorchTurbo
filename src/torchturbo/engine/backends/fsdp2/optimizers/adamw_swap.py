@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from itertools import groupby
-from typing import Union
+from typing import Mapping, Union
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
@@ -34,6 +35,7 @@ class DeviceWorkspace:
         device = device_runtime.device
         free_memory, _ = device_runtime.memory_info()
         capacity = int(free_memory * memory_fraction)
+        capacity = self._reduce_capacity_to_minimum(capacity, device)
         if capacity < self._ALIGNMENT_BYTES:
             raise RuntimeError(
                 f"workspace capacity {capacity} bytes is too small "
@@ -48,6 +50,19 @@ class DeviceWorkspace:
             capacity // (1024 * 1024),
             memory_fraction,
         )
+
+    @staticmethod
+    def _reduce_capacity_to_minimum(capacity: int, device: torch.device) -> int:
+        if not (dist.is_available() and dist.is_initialized()):
+            return capacity
+
+        capacity_tensor = torch.tensor([capacity], dtype=torch.int64, device=device)
+        dist.all_reduce(
+            capacity_tensor,
+            op=dist.ReduceOp.MIN,
+            group=dist.group.WORLD,
+        )
+        return int(capacity_tensor.item())
 
     @property
     def is_available(self) -> bool:
@@ -90,9 +105,13 @@ class AdamWSwapMixin:
         self,
         device_runtime: DeviceRuntime,
         optimizer_memory_fraction: float,
+        param_names: Mapping[torch.Tensor, str] | None = None,
     ) -> None:
         self.device_runtime = device_runtime
         self.optimizer_memory_fraction = optimizer_memory_fraction
+        self.param_to_name_map = (
+            dict(param_names) if param_names is not None else {}
+        )
         self.param_to_cpu_states_map = {}
         self.param_to_step_map = {}
         self.param_to_state_bytes_map = {}
@@ -187,20 +206,50 @@ class AdamWSwapMixin:
 
     def _ensure_workspace_capacity(self, params_with_groups) -> None:
         assert self.workspace is not None
-        if not params_with_groups:
+        error = self._workspace_capacity_error(params_with_groups)
+        if not (dist.is_available() and dist.is_initialized()):
+            if error is not None:
+                raise RuntimeError(error)
             return
+
+        status = torch.tensor(
+            [error is None], dtype=torch.int64, device=self.workspace.device
+        )
+        dist.all_reduce(
+            status,
+            op=dist.ReduceOp.MIN,
+            group=dist.group.WORLD,
+        )
+        if int(status.item()) == 1:
+            return
+
+        if error is not None:
+            raise RuntimeError(error)
+        raise RuntimeError(
+            "Per-step workspace capacity validation failed on another rank"
+        )
+
+    def _workspace_capacity_error(self, params_with_groups) -> str | None:
+        if not params_with_groups:
+            return None
+
         param, _ = max(
             params_with_groups,
             key=lambda item: self.param_to_state_bytes_map[item[0]],
         )
         if self._workspace_state_fits(self.param_to_cpu_states_map[param]):
-            return
+            return None
+
         state_bytes = self.param_to_state_bytes_map[param]
-        raise RuntimeError(
-            "optimizer state does not fit in the per-step workspace "
+        return (
+            f"optimizer state for parameter '{self._parameter_name(param)}' "
+            "does not fit in the per-step workspace "
             f"({state_bytes} bytes required per state pair, "
             f"workspace={self.workspace.capacity_bytes} bytes)"
         )
+
+    def _parameter_name(self, param: torch.Tensor) -> str:
+        return self.param_to_name_map.get(param, "<unnamed parameter>")
 
     def _workspace_state_fits(self, state: dict[str, torch.Tensor]) -> bool:
         assert self.workspace is not None
@@ -292,7 +341,9 @@ class AdamWSwapMixin:
                 param = params_with_groups[index][0]
                 state_bytes = self.param_to_state_bytes_map[param]
                 raise RuntimeError(
-                    "optimizer state does not fit in the per-step workspace "
+                    "optimizer state for parameter "
+                    f"'{self._parameter_name(param)}' does not fit in the "
+                    "per-step workspace "
                     f"({state_bytes} bytes required per state pair, "
                     f"workspace={self.workspace.capacity_bytes} bytes)"
                 )
@@ -365,6 +416,7 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
         maximize: bool = False,
         device_runtime: DeviceRuntime,
         optimizer_memory_fraction: float,
+        param_names: Mapping[torch.Tensor, str] | None = None,
     ) -> None:
         super().__init__(
             params,
@@ -381,7 +433,9 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
         )
         # Let GradScaler unscale and check overflow before the low-level fused call.
         self._step_supports_amp_scaling = False
-        AdamWSwapMixin.__init__(self, device_runtime, optimizer_memory_fraction)
+        AdamWSwapMixin.__init__(
+            self, device_runtime, optimizer_memory_fraction, param_names
+        )
 
     @torch.no_grad()
     def step(self, closure=None):

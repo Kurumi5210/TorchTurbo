@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from ..logging import get_logger
@@ -143,6 +143,12 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
 
     def __len__(self) -> int:
         return self.num_samples
+
+class EpochDrivenDataLoader(DataLoader):
+    """DataLoader that forwards set_epoch to the sampler
+    """
+    def set_epoch(self, epoch: int) -> None:
+        self.sampler.set_epoch(epoch)
 
 
 class TorchTurboEngine:
@@ -842,8 +848,6 @@ class TorchTurboEngine:
         batch_size:
             Per-rank micro-batch size.
         """
-        from torch.utils.data import DataLoader
-
         dp_info = self.get_dp_info()
         sp_info = self.get_sp_info()
 
@@ -871,7 +875,7 @@ class TorchTurboEngine:
             sp_info["sp_size"],
         )
 
-        return DataLoader(
+        return EpochDrivenDataLoader(
             dataset,
             batch_size=batch_size,
             sampler=sampler,

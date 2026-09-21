@@ -388,6 +388,7 @@ class TurboTrainerMixin:
             self.train_dataset,
             batch_size=self._train_batch_size,
             shuffle=self.args.train_dataloader_shuffle,
+            seed=self.args.data_seed,
             collate_fn=self.data_collator,
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,

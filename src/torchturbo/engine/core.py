@@ -101,13 +101,15 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
         self.num_samples = self.num_iterations * self.sp_size
 
         logger.info_rank0(
-            "SPDistributedSampler: world=%d, rank=%d, sp_size=%d, "
-            "dp_size=%d, dp_rank=%d, num_samples=%d",
+            "SPDistributedSampler: seed=%d, world=%d, rank=%d, sp_size=%d, "
+            "dp_size=%d, dp_rank=%d, total_samples=%d, num_samples_per_rank=%d",
+            self.seed,
             self.num_replicas,
             self.rank,
             self.sp_size,
             self.dp_size,
             self.dp_rank,
+            self.total_size,
             self.num_samples,
         )
 
@@ -138,6 +140,12 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
             base = i * self.dp_size * self.sp_size + self.dp_rank * self.sp_size
             for s in range(self.sp_size):
                 rank_indices.append(indices[base + s])
+
+        if self.shuffle:
+            g2 = torch.Generator()
+            g2.manual_seed(self.seed + self.epoch + self.dp_rank)
+            perm = torch.randperm(len(rank_indices), generator=g2)
+            rank_indices = [rank_indices[i] for i in perm.tolist()]
 
         return iter(rank_indices)
 
@@ -824,6 +832,7 @@ class TorchTurboEngine:
         num_workers: int = 0,
         pin_memory: bool = True,
         drop_last: bool = True,
+        seed: int = 0,
         **kwargs: Any,
     ) -> Any:
         """Create a DataLoader with SP-aware distributed sampling.
@@ -865,6 +874,7 @@ class TorchTurboEngine:
             num_replicas=dist.get_world_size(),
             rank=dist.get_rank(),
             shuffle=shuffle,
+            seed=seed,
             drop_last=drop_last,
         )
 

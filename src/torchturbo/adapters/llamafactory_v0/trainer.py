@@ -218,6 +218,7 @@ class TorchTurboTrainerBase:
             pin_memory=args.dataloader_pin_memory,
             drop_last=args.dataloader_drop_last,
             shuffle=not disable_shuffling,
+            seed=args.seed,
         )
 
     def _get_bd_train_dataloader(self):
@@ -289,6 +290,7 @@ class TorchTurboTrainerBase:
             pin_memory=args.dataloader_pin_memory,
             drop_last=args.dataloader_drop_last,
             shuffle=False,
+            seed=args.seed,
         )
 
     def train(self, *args, **kwargs):

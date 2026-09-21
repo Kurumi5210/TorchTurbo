@@ -123,6 +123,7 @@ fi
     --save_total_limit 5 \
     --bf16 true \
     --dataloader_num_workers "${dataloader_num_workers}" \
+    --data_seed 1234 \
     --report_to tensorboard \
     --output_dir "${OUTPUT_DIR}" \
     --ddp_timeout 1800000000 \

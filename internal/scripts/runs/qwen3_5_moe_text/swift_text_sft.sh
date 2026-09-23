@@ -2,8 +2,8 @@
 # Qwen3.8-Max (M)LLM SFT with torchturbo via ms-swift
 #
 # Usage:
-#   bash internal/scripts/runs/qwen3_8_max/install_swift_deps.sh
-#   bash internal/scripts/runs/qwen3_8_max/swift_text_sft.sh
+#   bash internal/scripts/runs/qwen3_5_moe_text/install_swift_deps.sh
+#   bash internal/scripts/runs/qwen3_5_moe_text/swift_text_sft.sh
 
 set -o pipefail
 set -eux

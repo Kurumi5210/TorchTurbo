@@ -262,6 +262,7 @@ def assert_close(name, actual, expected, atol=1e-5, rtol=1e-5):
 def make_modules(device):
     from torchturbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
     from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as modeling_module
+    from torchturbo.models.deepseek_v4 import packing_utils
 
     patch_modeling_hadamard(modeling_module)
     reference_module = load_infer_reference()
@@ -285,13 +286,22 @@ def copy_indexer_weights(src, dst):
 def test_topk_helpers(device="cpu"):
     modeling_module, reference_module, _config, _args = make_modules(device)
     bsz, seqlen, window_size, ratio, offset = 2, 16, 8, 4, 16
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, -1)
+    attention_mask = torch.ones_like(position_ids)
 
-    actual_window = modeling_module.GetWindowTopkIdxs()(window_size, bsz, seqlen, torch.device(device))
+    actual_window = modeling_module.GetWindowTopkIdxs()(
+        window_size, bsz, seqlen, torch.device(device), attention_mask=attention_mask
+    )
     expected_window = reference_module.get_window_topk_idxs(window_size, bsz, seqlen, start_pos=0).to(device)
     torch.testing.assert_close(actual_window, expected_window)
 
     x = torch.empty(bsz, seqlen, 1, device=device)
-    actual_compress = modeling_module.GetCompressTopkIdxs(ratio)(x, offset)
+    actual_compress = modeling_module.GetCompressTopkIdxs(ratio)(
+        x,
+        offset,
+        q_global_positions=position_ids,
+        attention_mask=attention_mask,
+    )
     expected_compress = reference_module.get_compress_topk_idxs(
         ratio, bsz, seqlen, start_pos=0, offset=offset
     ).to(device)
@@ -303,6 +313,8 @@ def test_sparse_attention(device="cpu"):
     torch.manual_seed(7)
     modeling_module, reference_module, config, _args = make_modules(device)
     bsz, seqlen = 2, 16
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, -1)
+    attention_mask = torch.ones_like(position_ids)
     n_heads, head_dim = config.num_attention_heads, config.head_dim
     offset = seqlen
 
@@ -315,7 +327,9 @@ def test_sparse_attention(device="cpu"):
     compress_topk = reference_module.get_compress_topk_idxs(4, bsz, seqlen, 0, offset).to(device)
     topk = torch.cat([window_topk, compress_topk], dim=-1).int()
 
-    actual = modeling_module.SparseAttention(config, layer_idx=0)(q, kv, attn_sink, kv_compress, compress_topk)
+    actual = modeling_module.SparseAttention(config, layer_idx=0)(
+        q, kv, attn_sink, position_ids, attention_mask, kv_compress=kv_compress, compress_topk_idxs=compress_topk
+    )
     expected = reference_module.sparse_attn(
         q, torch.cat([kv, kv_compress], dim=1), attn_sink, topk, head_dim**-0.5
     )
@@ -327,6 +341,8 @@ def test_compressor_prefill(device="cpu"):
     modeling_module, reference_module, config, args = make_modules(device)
     bsz, seqlen = 2, 16
     x = torch.randn(bsz, seqlen, config.hidden_size, device=device)
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, -1)
+    attention_mask = torch.ones_like(position_ids)
     freqs_cis = modeling_module.DeepseekV4Attention(config, layer_idx=0).freqs_cis.to(device)
 
     for rotate in (False, True):
@@ -340,7 +356,7 @@ def test_compressor_prefill(device="cpu"):
         expected_module.kv_cache = torch.empty(bsz, seqlen // 4, args.head_dim, device=device)
         expected_module.freqs_cis = freqs_cis
 
-        actual = actual_module(x, freqs_cis)
+        actual = actual_module(x, freqs_cis, attention_mask, position_ids)
         if rotate:
             actual = hadamard_transform_impl(actual, scale=actual.size(-1) ** -0.5)
         expected = expected_module(x, start_pos=0)
@@ -354,6 +370,8 @@ def test_indexer_prefill_topk(device="cpu"):
     offset = seqlen
     x = torch.randn(bsz, seqlen, config.hidden_size, device=device)
     qr = torch.randn(bsz, seqlen, config.q_lora_rank, device=device)
+    position_ids = torch.arange(seqlen, device=device).unsqueeze(0).expand(bsz, -1)
+    attention_mask = torch.ones_like(position_ids)
     attn = modeling_module.DeepseekV4Attention(config, layer_idx=0).to(device)
     freqs_cis = attn.freqs_cis
 
@@ -362,13 +380,59 @@ def test_indexer_prefill_topk(device="cpu"):
     copy_indexer_weights(actual_indexer, expected_indexer)
     expected_indexer.freqs_cis = freqs_cis
 
-    q_indexer, k_indexer, weights = actual_indexer(x, qr, freqs_cis, attn.hadamard_mat, offset)
+    q_indexer, k_indexer, weights = actual_indexer(
+        x, qr, freqs_cis, attn.hadamard_mat, offset, position_ids, attention_mask
+    )
     actual_topk, _index_score = modeling_module.LiCompute(4, config.index_topk)(
-        q_indexer, k_indexer, weights, seqlen, offset
+        q_indexer,
+        k_indexer,
+        weights,
+        seqlen,
+        offset,
+        q_global_positions=position_ids,
+        attention_mask=attention_mask,
     )
     expected_topk = expected_indexer(x, qr, start_pos=0, offset=offset)
     torch.testing.assert_close(actual_topk, expected_topk)
     print("indexer_prefill_topk: matched")
+
+
+def test_packed_compress_metadata():
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 0, 0, 2, 2, 2, 2, 2],
+            [0, 0, 3, 3, 3, 3, 3, 3, 0, 4, 4, 4],
+        ],
+        dtype=torch.long,
+    )
+    position_ids = torch.arange(attention_mask.size(1), dtype=torch.long).unsqueeze(0).expand_as(attention_mask)
+    modeling_module, _reference_module, _config, _args = make_modules("cpu")
+
+    for ratio, expected_ids, expected_positions in (
+        (
+            2,
+            [[1, 1, 2, 2], [3, 3, 3, 4]],
+            [[0, 2, 7, 9], [2, 4, 6, 9]],
+        ),
+        (
+            4,
+            [[1, 2], [3, 0]],
+            [[0, 7], [2, 0]],
+        ),
+        (
+            5,
+            [[1, 2], [3, 0]],
+            [[0, 7], [2, 0]],
+        ),
+    ):
+        actual_ids, actual_positions = packing_utils.packed_compress_kv_ids_and_positions(
+            attention_mask,
+            ratio,
+            position_ids,
+        )
+        assert torch.equal(actual_ids, torch.tensor(expected_ids))
+        assert torch.equal(actual_positions, torch.tensor(expected_positions))
+    print("packed_compress_metadata: matched")
 
 
 def main():
@@ -385,6 +449,7 @@ def main():
 
     test_topk_helpers(args.device)
     test_sparse_attention(args.device)
+    test_packed_compress_metadata()
     test_compressor_prefill(args.device)
     test_indexer_prefill_topk(args.device)
     print("All op precision tests passed")

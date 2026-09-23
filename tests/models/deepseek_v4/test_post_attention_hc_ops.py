@@ -87,13 +87,14 @@ def test_post_attention_ops_matches_reference_formula():
     post = PostAttentionOps(config)
     o = torch.randn(bsz, seqlen, config.num_attention_heads, config.head_dim)
     freqs_cis = attn.freqs_cis
+    position_ids = torch.arange(seqlen).unsqueeze(0).expand(bsz, -1)
 
-    actual = post(o, freqs_cis, bsz, seqlen, n_local_groups, attn.wo_a, attn.wo_b)
+    actual = post(o, freqs_cis, bsz, seqlen, n_local_groups, attn.wo_a, attn.wo_b, position_ids)
 
     o_nope, o_rope = torch.split(
         o, [config.head_dim - config.qk_rope_head_dim, config.qk_rope_head_dim], dim=-1
     )
-    o_rope = apply_rotary_emb(o_rope, freqs_cis[:seqlen], inverse=True)
+    o_rope = apply_rotary_emb(o_rope, freqs_cis[position_ids], inverse=True)
     expected_o = torch.cat([o_nope, o_rope], dim=-1)
     expected_o = expected_o.view(bsz, seqlen, n_local_groups, -1)
     wo_a_weight = attn.wo_a.weight.view(n_local_groups, config.o_lora_rank, -1)

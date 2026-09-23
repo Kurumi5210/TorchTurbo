@@ -11,9 +11,9 @@ set -eux
 [ -n "$USER_NAME" ] || { echo "Error: USER_NAME is not set" >&2; exit 1; }
 
 # model name or path
-MODEL=${MODEL:-/sfs_turbo/pretrained_models/small_dsv4}
+MODEL=${MODEL:-/mnt/aicompiler-a3/common/pretrained_models/DeepSeek-V4-Flash-0731-bf16}
 # sequence length
-SEQ_LEN=${SEQ_LEN:-4096}
+SEQ_LEN=${SEQ_LEN:-65536}
 # output directory
 OUTPUT_DIR=${OUTPUT_DIR:-/mnt/sfs_turbo/${USER_NAME}/ckpt/$(basename "${MODEL}")/lf/sft_seq$((${SEQ_LEN}/1024))k_node${NNODES:-1}}
 # tuner type: 'full' | 'lora'
@@ -31,16 +31,17 @@ export HCCL_EXEC_TIMEOUT=7200
 export HCCL_EVENT_TIMEOUT=14500
 export ACL_DEVICE_SYNC_TIMEOUT=14400
 export ASCEND_GLOBAL_LOG_LEVEL=3
+export HCCL_OP_EXPANSION_MODE="AI_CPU"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_ASYNC_ERROR_HANDLING=0
 export HCCL_IF_BASE_PORT=29972
 export GLOO_SOCKET_IFNAME=eth0
 export GLOO_LOG_LEVEL=DEBUG
-export MULTI_STREAM_MEMORY_REUSE=2 # 多流
+export MULTI_STREAM_MEMORY_REUSE=2
 export WANDB_DISABLED=True
 export ALLOW_EXTRA_ARGS=True
-export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 export TRANSFORMERS_VERBOSITY=error
+export TENSORBOARD_LOGGING_DIR=${TENSORBOARD_LOGGING_DIR:-/home/admin/logs/tfevent}
 export NPUS_PER_NODE=${NPUS_PER_NODE:-16}
 export NODE_RANK=${RANK:-0}
 export WORLD_SIZE=$NPUS_PER_NODE
@@ -64,7 +65,7 @@ DISTRIBUTED_ARGS="
     --master_port=${MASTER_PORT:-23556}
 "
 
-mkdir -p $OUTPUT_DIR
+mkdir -p "$OUTPUT_DIR" "$TENSORBOARD_LOGGING_DIR"
 LOG_FILE=$OUTPUT_DIR/log-$NODE_RANK.txt
 if [ "${NODE_RANK:-0}" -eq 0 ]; then
     cp -f "$0" $OUTPUT_DIR/
@@ -75,10 +76,9 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --tt_config ${TT_CONFIG} \
     --num_train_epochs 1 \
     --report_to tensorboard \
-    --logging_dir /home/admin/logs/tfevent \
     --gradient_checkpointing \
+    --tt_enable_chunk_loss true \
     --dataset_dir ${DATASET_DIR} \
-    --max_samples 1000 \
     --trust_remote_code \
     --disable_shuffling \
     --stage sft \
@@ -88,6 +88,7 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --dataset ${DATASET} \
     --preprocessing_num_workers 16 \
     --cutoff_len ${SEQ_LEN} \
+    --template deepseek_v4 \
     --neat_packing \
     --finetuning_type ${FINETUNING_TYPE} \
     --output_dir ${OUTPUT_DIR} \

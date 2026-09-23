@@ -2,7 +2,17 @@
 
 ## 运行脚本
 
-`scripts/runs/deepseek_v4/lf_sft.sh`
+`internal/scripts/runs/deepseek_v4/lf_sft.sh`
+
+## 镜像要求
+
+SFA(sparse_flash_mla)与 lightning indexer 融合算子依赖 CANN 9.1.0 及以上内置内核,请使用 0911 镜像:
+
+```
+hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-de08a85d-20260911165944
+```
+
+该镜像自带 custom_opp 内核与 `cann_ops_transformer` python 包,`lf_sft.sh` 无需再设置 `ASCEND_CUSTOM_OPP_PATH` 或从 NAS 安装算子包(旧镜像 CANN 9.0.0 及更早不含 smla v2 内核,需自行源码编译加载)。
 
 ## AIStudio 环境
 
@@ -30,8 +40,7 @@ def torch_train():
     a3_sfs_new = DataStore(mount_point="/mnt/sfs_turbo", store_name="wl02-02-aidc-aicompiler-sfs")
     a3_storage_sfs = DataStore(mount_point="/storage", store_name="wl02-02-aidc-aicompiler-sfs")
     km_conf = KMConf(
-        # deepseek v4
-        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-0b9af7b5-20260824140737"
+        image="hcr.meta-wulan01.hw-wulan.local/antsys/vllm:AsystemHybirdEngine-de08a85d-20260911165944"
     )
 
     labels={
@@ -85,8 +94,8 @@ if __name__ == "__main__":
 ## 运行方式
 
 ```bash
-sh scripts/runs/deepseek_v4/install_lf_deps.sh
-sh scripts/runs/deepseek_v4/lf_sft.sh
+sh internal/scripts/runs/deepseek_v4/install_lf_deps.sh
+sh internal/scripts/runs/deepseek_v4/lf_sft.sh
 ```
 
 ## torchturbo v2 对比

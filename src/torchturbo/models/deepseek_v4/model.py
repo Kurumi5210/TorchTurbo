@@ -1,11 +1,16 @@
 import math
 from functools import wraps
+from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from torchturbo.models.modules.attention.ulysses import all_gather_sp_with_grad_reduce
+
+from . import packing_utils as pu
 from torchturbo.models.modules.moe.moe_layer import MoELayer
+from torchturbo.runtime import is_npu_available
 
 from ..base import TurboModel
 from ..registry import register_model
@@ -115,7 +120,6 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
         deepseek_v4_model.DeepseekV4RMSNorm.forward = rms_norm_forward
-
         config._attn_implementation = "eager"
 
     def _post_init_patches(self):
@@ -168,77 +172,88 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
     def patch_deepseek_v4_attention_for_sp(cls, sp_group, sp_size, sp_rank):
         from . import modeling_deepseek_v4 as dsv4
 
-        def _save_origin(module_cls):
-            origin_attr = "_torchturbo_deepseek_v4_origin_forward"
-            if getattr(module_cls, origin_attr, None) is None:
-                setattr(module_cls, origin_attr, module_cls.forward)
-            return getattr(module_cls, origin_attr)
+        def inner_attention_forward(
+            self,
+            q: torch.Tensor,
+            kv: torch.Tensor,
+            kv_compress,
+            q_indexer,
+            k_indexer,
+            weights,
+            seqlen: int,
+            offset: int,
+            attn_sink: torch.Tensor,
+            q_global_positions: torch.LongTensor,
+            attention_mask: torch.Tensor,
+        ):
+            compress_topk_idxs = None
+            index_score = None
 
-        patched_classes = [
-            dsv4.DeepseekV4Compressor,
-            dsv4.DeepseekV4Indexer,
-            dsv4.GetWindowTopkIdxs,
-            dsv4.GetCompressTopkIdxs,
-            dsv4.LiCompute,
-            dsv4.PreAttentionOps,
-            dsv4.PostAttentionOps,
-        ]
-        origins = {module_cls: _save_origin(module_cls) for module_cls in patched_classes}
+            if (
+                self.compress_ratio == 4
+                and q_indexer is not None
+                and k_indexer is not None
+                and weights is not None
+                and k_indexer.size(1) > 0
+            ):
+                compress_topk_idxs, index_score = self.li_compute(
+                    q_indexer,
+                    k_indexer,
+                    weights,
+                    seqlen,
+                    offset,
+                    q_global_positions=q_global_positions,
+                    attention_mask=attention_mask,
+                )
 
-        if sp_size <= 1:
-            for module_cls, origin_forward in origins.items():
-                module_cls.forward = origin_forward
-            return
+            o = self.sparse_attn(
+                q,
+                kv,
+                attn_sink,
+                q_global_positions=q_global_positions,
+                attention_mask=attention_mask,
+                kv_compress=kv_compress,
+                compress_topk_idxs=compress_topk_idxs,
+            )
+            return o, compress_topk_idxs, index_score
 
-        def get_sp_local_freqs_cis(local_seq_len, freqs_cis):
-            start = sp_rank * local_seq_len
-            end = (sp_rank + 1) * local_seq_len
-            return freqs_cis[start:end]
-
-        def compressor_forward(self, x: torch.Tensor, freqs_cis: torch.Tensor):
-            _, local_seqlen, _ = x.size()
+        def compressor_forward(
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_ids: torch.LongTensor = None,
+        ):
             ratio, overlap = self.compress_ratio, self.overlap
             dtype = x.dtype
-
-            if local_seqlen * sp_size < ratio:
-                return None
-
             x = x.float()
             kv = self.wkv(x)
             score = self.wgate(x)
+            if sp_size > 1:
+                kv = all_gather_sp_with_grad_reduce(kv, dim=1, sp_group=sp_group, sp_size=sp_size)
+                score = all_gather_sp_with_grad_reduce(score, dim=1, sp_group=sp_group, sp_size=sp_size)
+                position_ids = all_gather_sp_with_grad_reduce(position_ids, dim=1, sp_group=sp_group, sp_size=sp_size)
 
-            seqlen = local_seqlen
-            kv = all_gather_sp_with_grad_reduce(
-                kv, dim=1, sp_group=sp_group, sp_size=sp_size
+            kv, compress_positions = pu.compress_packed_kv(
+                kv,
+                score,
+                self.ape,
+                attention_mask[:, : kv.size(1)],
+                position_ids[:, : kv.size(1)],
+                ratio,
+                self.head_dim,
+                overlap,
             )
-            score = all_gather_sp_with_grad_reduce(
-                score, dim=1, sp_group=sp_group, sp_size=sp_size
-            )
-            seqlen = seqlen * sp_size
-            assert seqlen == kv.size(1), "must be"
-            freqs_cis = freqs_cis[:seqlen]
+            if kv is None:
+                return None
 
-            remainder = seqlen % ratio
-            cutoff = seqlen - remainder
-            freqs_cis = freqs_cis[:cutoff:ratio]
-
-            if remainder > 0:
-                kv = kv[:, :cutoff]
-                score = score[:, :cutoff]
-
-            kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio)) + self.ape
-
-            if overlap:
-                kv = self.overlap_transform(kv, 0)
-                score = self.overlap_transform(score, float("-inf"))
-
-            kv = (kv * score.softmax(dim=2)).sum(dim=2)
             kv = self.norm(kv.to(dtype))
-
-            kv_rot = dsv4.apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
-            kv = torch.cat([kv[..., : -self.rope_head_dim], kv_rot], dim=-1)
-            return kv
+            kv_rot = pu.apply_rotary_emb(
+                kv[..., -self.rope_head_dim:],
+                freqs_cis,
+                position_ids=compress_positions,
+            )
+            return torch.cat([kv[..., :-self.rope_head_dim], kv_rot], dim=-1)
 
         def indexer_forward(
             self,
@@ -247,20 +262,21 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             freqs_cis: torch.Tensor,
             hadamard_mat: torch.Tensor,
             offset: int,
+            position_ids: torch.LongTensor,
+            attention_mask: torch.Tensor,
         ):
             bsz, seqlen, _ = x.size()
             rd = self.rope_head_dim
-            local_freq_cis = get_sp_local_freqs_cis(seqlen, freqs_cis)
 
             q = self.wq_b(qr)
             q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
             q = q.clone()
             q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-            q_rope = dsv4.apply_rotary_emb(q_rope, local_freq_cis)
+            q_rope = pu.apply_rotary_emb(q_rope, freqs_cis, position_ids=position_ids)
             q = torch.cat([q_nope, q_rope], dim=-1)
             q = dsv4.rotate_activation(q, hadamard_mat)
 
-            k = self.compressor(x, freqs_cis)
+            k = self.compressor(x, freqs_cis, attention_mask, position_ids)
             if k is None:
                 return None, None, None
             k = dsv4.rotate_activation(k, hadamard_mat)
@@ -269,7 +285,14 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
             return q, k, weights
 
-        def window_topk_forward(self, window_size: int, bsz: int, seqlen: int, device):
+        def window_topk_forward(
+            self,
+            window_size: int,
+            bsz: int,
+            seqlen: int,
+            device,
+            attention_mask: torch.Tensor,
+        ):
             base = torch.arange(
                 seqlen * sp_rank, seqlen * (sp_rank + 1), device=device
             ).unsqueeze(1)
@@ -278,20 +301,55 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 min(global_seqlen, window_size), device=device
             )
             window_topk = torch.where(window_topk > base, -1, window_topk)
-            return window_topk.unsqueeze(0).expand(bsz, -1, -1)
+            window_topk = window_topk.unsqueeze(0).expand(bsz, -1, -1)
+            window_token_indices = window_topk.clamp_min(0).reshape(bsz, -1)
+            batch_index = torch.arange(bsz, device=device).unsqueeze(1)
+            window_ids = attention_mask[batch_index, window_token_indices].view_as(
+                window_topk
+            )
+            query_ids = attention_mask[
+                :, sp_rank * seqlen : (sp_rank + 1) * seqlen
+            ].unsqueeze(-1)
+            mask = (window_ids == query_ids) & (query_ids > 0)
+            return torch.where(mask, window_topk, -1)
 
-        def compress_topk_forward(self, x: torch.Tensor, offset: int):
-            bsz, seqlen = x.shape[0], x.shape[1]
-            matrix = torch.arange(
-                seqlen * sp_size // self.ratio, device=x.device
-            ).repeat(seqlen, 1)
-            mask = matrix >= torch.arange(
-                1 + seqlen * sp_rank,
-                1 + seqlen * (sp_rank + 1),
-                device=x.device,
-            ).unsqueeze(1) // self.ratio
-            compress_topk = torch.where(mask, -1, matrix + offset)
-            return compress_topk.unsqueeze(0).expand(bsz, -1, -1)
+        def compress_topk_forward(
+            self,
+            x: torch.Tensor,
+            offset: int,
+            q_global_positions: torch.LongTensor,
+            attention_mask: torch.Tensor,
+        ):
+            seqlen = x.shape[1]
+            local_attention_mask = attention_mask[
+                :, sp_rank * seqlen : (sp_rank + 1) * seqlen
+            ]
+            position_ids = (
+                all_gather_sp_with_grad_reduce(
+                    q_global_positions, dim=1, sp_group=sp_group, sp_size=sp_size
+                )
+                if sp_size > 1
+                else q_global_positions
+            )
+            compress_kv_ids, compress_block_pos = (
+                pu.packed_compress_kv_ids_and_positions(
+                    attention_mask,
+                    self.ratio,
+                    position_ids,
+                )
+            )
+            mask = pu.packed_compress_mask(
+                local_attention_mask,
+                compress_kv_ids.unsqueeze(1),
+                compress_block_pos.unsqueeze(1),
+                self.ratio,
+                q_global_positions,
+            )
+            matrix = torch.arange(compress_kv_ids.size(1), device=x.device)
+            matrix = matrix.view(1, 1, -1).expand(
+                local_attention_mask.size(0), seqlen, -1
+            )
+            return torch.where(mask, -1, matrix + offset)
 
         def li_compute_forward(
             self,
@@ -300,26 +358,62 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             weights: torch.Tensor,
             seqlen: int,
             offset: int,
+            q_global_positions: torch.LongTensor,
+            attention_mask: torch.Tensor,
         ):
-            end_pos = seqlen * sp_size
             index_score = torch.einsum("bshd,btd->bsht", q_indexer, k_indexer)
             index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
-            device = index_score.device
-            base = torch.arange(seqlen, device=device).unsqueeze(1) + seqlen * sp_rank
-            mask = (
-                torch.arange(seqlen * sp_size // self.ratio, device=device).unsqueeze(0)
-                >= (base + 1) // self.ratio
+            T_kv = k_indexer.shape[1]
+            local_attention_mask = attention_mask[
+                :, sp_rank * seqlen : (sp_rank + 1) * seqlen
+            ]
+            position_ids = (
+                all_gather_sp_with_grad_reduce(
+                    q_global_positions, dim=1, sp_group=sp_group, sp_size=sp_size
+                )
+                if sp_size > 1
+                else q_global_positions
+            )
+            compress_kv_ids, compress_block_pos = (
+                pu.packed_compress_kv_ids_and_positions(
+                    attention_mask,
+                    self.ratio,
+                    position_ids,
+                )
+            )
+            if compress_kv_ids.size(1) * sp_size == T_kv:
+                compress_kv_ids = compress_kv_ids.repeat_interleave(sp_size, dim=1)
+                compress_block_pos = compress_block_pos.repeat_interleave(
+                    sp_size, dim=1
+                )
+            mask = pu.packed_compress_mask(
+                local_attention_mask,
+                compress_kv_ids.unsqueeze(1),
+                compress_block_pos.unsqueeze(1),
+                self.ratio,
+                q_global_positions,
             )
             index_score = index_score + torch.where(
                 mask, torch.finfo(q_indexer.dtype).min, 0
             )
 
             index_score, topk_idxs = index_score.topk(
-                min(self.index_topk, end_pos // self.ratio), dim=-1
+                min(self.index_topk, T_kv), dim=-1
             )
-
-            mask = topk_idxs >= (base + 1) // self.ratio
+            flat_topk = topk_idxs.reshape(local_attention_mask.size(0), -1)
+            batch_index = torch.arange(
+                attention_mask.size(0), device=attention_mask.device
+            ).unsqueeze(1)
+            topk_ids = compress_kv_ids[batch_index, flat_topk].view_as(topk_idxs)
+            topk_pos = compress_block_pos[batch_index, flat_topk].view_as(topk_idxs)
+            mask = pu.packed_compress_mask(
+                local_attention_mask,
+                topk_ids,
+                topk_pos,
+                self.ratio,
+                q_global_positions,
+            )
             compress_topk_idxs = torch.where(mask, -1, topk_idxs + offset)
             return compress_topk_idxs, index_score
 
@@ -335,38 +429,45 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             kv_norm,
             compressor,
             indexer,
+            position_ids: torch.LongTensor,
+            attention_mask: torch.Tensor,
         ):
             rd = self.rope_head_dim
-            local_seq_len = x.size(1)
-            local_freq_cis = get_sp_local_freqs_cis(local_seq_len, freqs_cis)
 
             qr = q_norm(wq_a(x))
             q = wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
             q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
             q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-            q_rope = dsv4.apply_rotary_emb(q_rope, local_freq_cis)
+            q_rope = pu.apply_rotary_emb(q_rope, freqs_cis, position_ids=position_ids)
             q = torch.cat([q_nope, q_rope], dim=-1)
 
             kv = wkv(x)
             kv = kv_norm(kv)
             kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
-            kv_rope = dsv4.apply_rotary_emb(kv_rope, local_freq_cis)
+            kv_rope = pu.apply_rotary_emb(kv_rope, freqs_cis, position_ids=position_ids)
             kv = torch.cat([kv_nope, kv_rope], dim=-1)
-            kv = all_gather_sp_with_grad_reduce(
-                kv, dim=1, sp_group=sp_group, sp_size=sp_size
-            )
+            if sp_size > 1:
+                kv = all_gather_sp_with_grad_reduce(
+                    kv, dim=1, sp_group=sp_group, sp_size=sp_size
+                )
 
             offset = kv.size(1)
 
             q_indexer = k_indexer = weights = None
             if self.compress_ratio > 1 and indexer is not None:
                 q_indexer, k_indexer, weights = indexer(
-                    x.detach(), qr.detach(), freqs_cis, hadamard_mat, offset
+                    x.detach(),
+                    qr.detach(),
+                    freqs_cis,
+                    hadamard_mat,
+                    offset,
+                    position_ids,
+                    attention_mask,
                 )
 
             kv_compress = None
             if self.compress_ratio > 1 and compressor is not None:
-                kv_compress = compressor(x, freqs_cis)
+                kv_compress = compressor(x, freqs_cis, attention_mask, position_ids)
 
             return q, kv, kv_compress, q_indexer, k_indexer, weights, offset
 
@@ -379,11 +480,16 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             n_local_groups: int,
             wo_a,
             wo_b,
+            position_ids: torch.LongTensor,
         ):
-            freqs_cis = get_sp_local_freqs_cis(o.size(1), freqs_cis)
             rd = self.rope_head_dim
             o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-            o_rope = dsv4.apply_rotary_emb(o_rope, freqs_cis, inverse=True)
+            o_rope = pu.apply_rotary_emb(
+                o_rope,
+                freqs_cis,
+                inverse=True,
+                position_ids=position_ids,
+            )
             o = torch.cat([o_nope, o_rope], dim=-1)
 
             o = o.view(bsz, seqlen, n_local_groups, -1)
@@ -391,10 +497,158 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             o = torch.einsum("bsgd,grd->bsgr", o, wo_a_weight)
             return wo_b(o.reshape(bsz, seqlen, -1))
 
+        def sparse_attention_forward(
+            self,
+            query_states: torch.Tensor,
+            kv_states: torch.Tensor,
+            attn_sink: torch.Tensor,
+            q_global_positions: torch.LongTensor,
+            attention_mask: torch.Tensor,
+            kv_compress: Optional[torch.Tensor] = None,
+            compress_topk_idxs: Optional[torch.Tensor] = None,
+        ):
+            bsz, seqlen, _, _ = query_states.size()
+
+            topk_idxs = self.get_window_topk_idxs(
+                self.window_size,
+                bsz,
+                seqlen,
+                query_states.device,
+                attention_mask=attention_mask,
+            )
+
+            if self.compress_ratio > 1 and kv_compress is not None:
+                offset = kv_states.size(1)
+                if compress_topk_idxs is None:
+                    compress_topk_idxs = self.get_compress_topk_idxs(
+                        query_states,
+                        offset,
+                        q_global_positions=q_global_positions,
+                        attention_mask=attention_mask,
+                    )
+                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+
+            topk_idxs = topk_idxs.int()
+
+            if self.compress_ratio > 1 and kv_compress is not None:
+                kv_states = torch.cat([kv_states, kv_compress], dim=1)
+
+            query_states = query_states.transpose(1, 2)
+            kv_states = kv_states.unsqueeze(1)
+            attn_weights = torch.matmul(query_states, kv_states.transpose(2, 3)) * self.softmax_scale
+
+            index_mask = torch.full(
+                (query_states.shape[0], 1, query_states.shape[2], kv_states.shape[2] + 1),
+                fill_value=torch.finfo(attn_weights.dtype).min,
+                dtype=attn_weights.dtype,
+                device=query_states.device,
+            )
+
+            valid_mask = topk_idxs >= 0
+            if valid_mask.any():
+                b_indices, s_indices, k_indices = torch.where(valid_mask)
+                valid_topk = topk_idxs[b_indices, s_indices, k_indices]
+                index_mask[b_indices, 0, s_indices, valid_topk] = 0
+
+            attn_weights = attn_weights + index_mask[..., :-1]
+
+            sinks = attn_sink.reshape(1, -1, 1, 1).expand(query_states.shape[0], -1, query_states.shape[2], -1)
+            combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+            combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+
+            probs = F.softmax(combined_logits.float(), dim=-1, dtype=attn_weights.dtype)
+            scores = probs[..., :-1]
+            attn_output = torch.matmul(scores, kv_states)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+
+            return attn_output
+
+        def attention_forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor = None,
+            position_ids: torch.LongTensor = None,
+            past_key_value=None,
+            use_cache: bool = False,
+            output_attentions: bool = False,
+        ):
+            bsz, seqlen, _ = hidden_states.size()
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    (bsz, seqlen * sp_size),
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+            freqs_cis = self.freqs_cis.to(hidden_states.device)
+            hadamard_mat = self.hadamard_mat if self.hadamard_mat is not None else None
+
+            compressor = getattr(self, "compressor", None)
+            indexer = getattr(self, "indexer", None)
+
+            q, kv, kv_compress, q_indexer, k_indexer, weights, offset = self.pre_attention_ops(
+                hidden_states, freqs_cis, hadamard_mat,
+                self.wq_a, self.q_norm, self.wq_b, self.wkv, self.kv_norm,
+                compressor, indexer, position_ids, attention_mask,
+            )
+
+            n_local_groups = self.n_groups // (self.n_heads // q.shape[2])
+
+            o, compress_topk_idxs, index_score = self.inner_attention_ops(
+                q,
+                kv,
+                kv_compress,
+                q_indexer,
+                k_indexer,
+                weights,
+                seqlen,
+                offset,
+                self.attn_sink,
+                q_global_positions=position_ids,
+                attention_mask=attention_mask,
+            )
+
+            attn_output = self.post_attention_ops(
+                o,
+                freqs_cis,
+                bsz,
+                seqlen,
+                n_local_groups,
+                self.wo_a,
+                self.wo_b,
+                position_ids,
+            )
+
+            if use_cache:
+                present_key_value = kv
+            else:
+                present_key_value = None
+
+            return (
+                attn_output,
+                None,
+                present_key_value,
+                compress_topk_idxs,
+                offset,
+                q,
+                kv_compress,
+                attention_mask,
+                index_score,
+                q_indexer,
+                k_indexer,
+                weights,
+            )
+
         dsv4.DeepseekV4Compressor.forward = compressor_forward
         dsv4.DeepseekV4Indexer.forward = indexer_forward
         dsv4.GetWindowTopkIdxs.forward = window_topk_forward
         dsv4.GetCompressTopkIdxs.forward = compress_topk_forward
         dsv4.LiCompute.forward = li_compute_forward
+        dsv4.InnerAttentionOps.forward = inner_attention_forward
         dsv4.PreAttentionOps.forward = pre_attention_forward
         dsv4.PostAttentionOps.forward = post_attention_forward
+        dsv4.SparseAttention.forward = sparse_attention_forward
+        dsv4.DeepseekV4Attention.forward = attention_forward
+        if is_npu_available():
+            from .npu import patch_deepseek_v4_npu_sfa_li
+
+            patch_deepseek_v4_npu_sfa_li(sp_rank, sp_group, sp_size)

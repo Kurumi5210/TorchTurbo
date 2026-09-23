@@ -13,7 +13,6 @@ from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
 from .providers import iter_provider_modules
 from .registry import OpRegistry
 
-
 logger = get_logger(__name__)
 
 
@@ -437,6 +436,52 @@ class OpDispatcher:
             cu_seqlens=cu_seqlens,
             packed_params=packed_params,
             impl=impl,
+        )
+
+    def sparse_flash_mla(
+        self,
+        query,
+        ori_kv,
+        cmp_kv,
+        cmp_sparse_indices,
+        cmp_residual_kv,
+        sinks,
+        softmax_scale,
+        cmp_ratio,
+        ori_win_left,
+        ori_win_right,
+        *,
+        cu_seq_lens_q=None,
+        cu_seq_lens_ori_kv=None,
+        cu_seq_lens_cmp_kv=None,
+        impl: str | None = None,
+    ):
+        return self._dispatch(
+            "sparse_flash_mla",
+            query,
+            ori_kv,
+            cmp_kv,
+            cmp_sparse_indices,
+            cmp_residual_kv,
+            sinks,
+            softmax_scale,
+            cmp_ratio,
+            ori_win_left,
+            ori_win_right,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_ori_kv=cu_seq_lens_ori_kv,
+            cu_seq_lens_cmp_kv=cu_seq_lens_cmp_kv,
+            impl=impl,
+        )
+
+    def lightning_indexer(self, *args, impl: str | None = None, **kwargs):
+        return self._dispatch("lightning_indexer", *args, impl=impl, **kwargs)
+
+    def lightning_indexer_metadata(
+        self, *args, impl: str | None = None, **kwargs
+    ):
+        return self._dispatch(
+            "lightning_indexer_metadata", *args, impl=impl, **kwargs
         )
 
     def __getattr__(self, name: str):

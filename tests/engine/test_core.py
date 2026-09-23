@@ -88,6 +88,13 @@ class ProfilingBackend(DummyBackend):
     def get_sp_info(self) -> dict[str, int]:
         return {"sp_rank": 0, "sp_size": 1, "sp_group": None}
 
+    def get_parallel_context(self):
+        return {
+            "dp": self.get_dp_info(),
+            "ep": self.get_ep_info(),
+            "sp": self.get_sp_info(),
+        }
+
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
         loss = torch.tensor(0.0)
         return (loss, None) if return_outputs else loss
@@ -279,6 +286,13 @@ class TestEngineSetup:
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 return torch.tensor(0.0)
 
+            def get_parallel_context(self):
+                return {
+                    "dp": {"dp_rank": 0, "dp_size": 1, "dp_group": None},
+                    "ep": {"ep_rank": 0, "ep_size": 1, "ep_group": None},
+                    "sp": {"sp_rank": 0, "sp_size": 1, "sp_group": None},
+                }
+
             def get_dp_info(self):
                 return {"dp_rank": 0, "dp_size": 1, "dp_group": None}
 
@@ -312,6 +326,7 @@ class TestEngineSetup:
         engine = object.__new__(TorchTurboEngine)
         engine.backend = RuntimeBackend()
         engine.metric_tracker = engine_core.MetricTracker()
+        engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
         model = RuntimeModel().train(training)
 
         engine.compute_loss(
@@ -339,6 +354,7 @@ class TestEngineSetup:
         engine = object.__new__(TorchTurboEngine)
         engine.backend = RuntimeBackend()
         engine.metric_tracker = engine_core.MetricTracker()
+        engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
 
         engine.compute_loss(TinyModel(), {})
 

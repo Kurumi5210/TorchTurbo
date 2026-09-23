@@ -18,10 +18,10 @@ from torchturbo.ops import (
     get_ops,
     get_or_create_ops,
 )
-from torchturbo.runtime import TurboDevice
-from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.ops.providers import iter_provider_modules
 from torchturbo.ops.registry import registry as ops_registry
+from torchturbo.runtime import TurboDevice
+from torchturbo.runtime.cpu import CpuRuntime
 
 
 def _reference_rms_norm(hidden_states, weight, eps):
@@ -108,6 +108,8 @@ def test_provider_modules_are_discovered_from_provider_packages():
     assert "torchturbo.ops.providers.npu.moe_token_permutation" in npu_modules
     assert "torchturbo.ops.providers.npu.moe_token_unpermutation" in npu_modules
     assert "torchturbo.ops.providers.npu.rotary_position_embedding" in npu_modules
+    assert "torchturbo.ops.providers.npu.lightning_indexer" in npu_modules
+    assert "torchturbo.ops.providers.npu.sparse_flash_mla" in npu_modules
     assert "torchturbo.ops.providers.native.cross_entropy_loss" in cpu_modules
     assert (
         "torchturbo.ops.providers.native.matmul_add"

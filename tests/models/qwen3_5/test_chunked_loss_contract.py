@@ -37,6 +37,7 @@ def test_qwen_dense_standard_forward_exposes_lm_head_input():
     nn.Module.__init__(model)
     model.config = SimpleNamespace(return_dict=True)
     model.model = _Backbone()
+    model.mtp = None
     model.lm_head = nn.Linear(3, 7, bias=False)
     model.train()
     input_ids = torch.ones(1, 4, dtype=torch.long)

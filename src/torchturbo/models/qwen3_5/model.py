@@ -106,6 +106,7 @@ class TurboQwen3_5ForConditionalGeneration(
             from torchturbo.models.qwen3_5.modeling_qwen3_5 import (
                 Qwen3_5TextModel,
                 Qwen3_5GatedDeltaNet,
+                Qwen3_5MultiTokenPredictor,
             )
 
             patch_forward_for_sp_input_slicing(Qwen3_5TextModel, sp_group, sp_size)
@@ -131,6 +132,11 @@ class TurboQwen3_5ForConditionalGeneration(
             self.patch_gated_delta_net_for_sp(
                 Qwen3_5GatedDeltaNet, sp_group, sp_size, sp_rank
             )
+            if self.mtp is not None:
+
+                self.patch_mtp_for_sp(
+                    Qwen3_5MultiTokenPredictor, sp_group, sp_size, sp_rank
+                )
 
     @classmethod
     def patch_vision_attention_interface(cls):
@@ -179,6 +185,66 @@ class TurboQwen3_5ForConditionalGeneration(
             return attn_output, None
 
         attn_cls.attention_interface = staticmethod(sp_attention_interface)
+
+    # ------------------------------------------------------------------
+    # MTP: SP input slicing
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def patch_mtp_for_sp(cls, mtp_cls, sp_group, sp_size, sp_rank):
+        """Keep MTP next-token inputs correct under sequence parallelism.
+
+        The VLM path provides global IDs, while the text path provides SP-local
+        IDs. The text path gathers local IDs before MTP builds next-token
+        embeddings so SP-boundary tokens use the next rank's first ID.
+        """
+        from ..modules.attention.ulysses import slice_input_tensor
+
+        original_forward = mtp_cls.forward
+
+        def _mtp_sp_forward(self_mtp, input_ids, hidden_states, embed_tokens, **kwargs):
+            position_embeddings = kwargs.pop("position_embeddings", None)
+            attention_mask = kwargs.pop("attention_mask", None)
+            position_ids = kwargs.pop("position_ids", None)
+            pad_token_id = int(kwargs.pop("pad_token_id", 0))
+
+            # The backbone is already SP-local. Reconstruct only IDs so MTP
+            # rolling sees the next token across an SP boundary.
+            local_seq_len = hidden_states.size(1)
+            if input_ids.size(1) == local_seq_len:
+                input_ids_list = [torch.empty_like(input_ids) for _ in range(sp_size)]
+                torch.distributed.all_gather(input_ids_list, input_ids, group=sp_group)
+                input_ids = torch.cat(input_ids_list, dim=1)
+
+            def localize(tensor, dim):
+                if tensor is None or tensor.size(dim) == local_seq_len:
+                    return tensor
+                return slice_input_tensor(
+                    tensor, dim=dim, group=sp_group, rank=sp_rank, padding=False
+                )
+
+            position_ids = localize(position_ids, -1)
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                position_embeddings = (localize(cos, 1), localize(sin, 1))
+
+            def sp_embed_tokens(ids):
+                return localize(embed_tokens(ids), 1)
+
+            return original_forward(
+                self_mtp,
+                input_ids,
+                hidden_states,
+                sp_embed_tokens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pad_token_id=pad_token_id,
+                **kwargs,
+            )
+
+        mtp_cls.forward = _mtp_sp_forward
+
 
     # ------------------------------------------------------------------
     # Full Attention: sp_repeat for Q heads

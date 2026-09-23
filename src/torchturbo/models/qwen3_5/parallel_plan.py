@@ -4,6 +4,7 @@ from ...parallel import FSDPPlanSpec, FSDPParallelPlan
 def get_parallel_plan() -> FSDPParallelPlan:
     return FSDPParallelPlan(
         plan={
+            "mtp.layers.*": FSDPPlanSpec(activation_checkpoint=True),
             "model.language_model.layers.*": FSDPPlanSpec(
                 activation_checkpoint=True,
             ),

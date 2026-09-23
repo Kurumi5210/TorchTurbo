@@ -43,6 +43,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
 from .configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+from ..qwen3_5_moe.modeling_qwen3_5_moe import _roll_left_one
 
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -938,6 +939,103 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+
+class Qwen3_5MTPLayer(Qwen3_5DecoderLayer):
+    """Dense MTP block, always using full attention beyond backbone layers."""
+
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int) -> None:
+        GradientCheckpointingLayer.__init__(self)
+        self.hidden_size = config.hidden_size
+        self.layer_type = "full_attention" # dense use full attention in mtp
+        self.self_attn = Qwen3_5Attention(config, layer_idx)
+        self.mlp = Qwen3_5MLP(config, config.intermediate_size)
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class Qwen3_5MultiTokenPredictor(nn.Module):
+    """Use the MoE prediction recurrence with dense decoder blocks.
+
+    Keep checkpoint names and embedding-before-hidden concatenation identical
+    to the MoE predictor. Bind its forward separately so SP patches on the MoE
+    predictor class cannot replace the dense predictor's forward.
+    """
+
+    def __init__(self, config: Qwen3_5TextConfig) -> None:
+        super().__init__()
+        self.num_mtp_layers = int(getattr(config, "mtp_num_hidden_layers", 0) or 0)
+        h = config.hidden_size
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(h, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(h, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(h * 2, h, bias=False)
+        self.norm = Qwen3_5RMSNorm(h, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList([
+            Qwen3_5MTPLayer(config, layer_idx=config.num_hidden_layers + i)
+            for i in range(self.num_mtp_layers)
+        ])
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: nn.Module,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        pad_token_id: int = 0,
+        **kwargs,
+    ) -> list[torch.Tensor]:
+        mtp_outputs: list[torch.Tensor] = []
+        cur_input_ids = input_ids
+        cur_hidden = hidden_states
+        for layer in self.layers:
+            cur_input_ids = _roll_left_one(cur_input_ids, fill=pad_token_id)
+            nxt_embeds = embed_tokens(cur_input_ids)
+
+            normed_embeds = self.pre_fc_norm_embedding(nxt_embeds)
+            normed_hidden = self.pre_fc_norm_hidden(cur_hidden)
+            h = self.fc(torch.cat([normed_embeds, normed_hidden], dim=-1))
+
+            h = layer(
+                h,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **kwargs,
+            )
+
+            h = self.norm(h)
+            mtp_outputs.append(h)
+            cur_hidden = h
+        return mtp_outputs
 
 
 class Qwen3_5PreTrainedModel(PreTrainedModel):
@@ -1855,6 +1953,9 @@ class Qwen3_5CausalLMOutputWithPast(ModelOutput):
     attentions: tuple[torch.FloatTensor] | None = None
     rope_deltas: torch.LongTensor | None = None
 
+    mtp_logits: list[torch.FloatTensor] | None = None
+    mtp_hidden_states: list[torch.FloatTensor] | None = None
+
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {}
@@ -1868,6 +1969,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         self.model = Qwen3_5Model(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
+        self.mtp = (
+            Qwen3_5MultiTokenPredictor(config.text_config)
+            if config.text_config.mtp_num_hidden_layers > 0
+            else None
+        )
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1993,6 +2099,33 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        mtp_logits = None
+        mtp_hidden_states = None
+        if self.mtp is not None and self.training and input_ids is not None:
+            rope_position_ids = position_ids
+            text_position_ids = position_ids
+            if position_ids is not None and position_ids.ndim == 3:
+                if position_ids.shape[0] == 4:
+                    text_position_ids = position_ids[0]
+                    rope_position_ids = position_ids[1:]
+                elif position_ids.shape[0] == 3:
+                    text_position_ids = position_ids[0]
+            position_embeddings = (
+                self.model.language_model.rotary_emb(hidden_states, rope_position_ids)
+                if rope_position_ids is not None else None
+            )
+            mtp_hidden_states = self.mtp(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                embed_tokens=self.model.language_model.embed_tokens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=text_position_ids,
+                pad_token_id=self.config.text_config.pad_token_id or 0,
+                **kwargs,
+            )
+            mtp_logits = [self.lm_head(h) for h in mtp_hidden_states]
+
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
@@ -2004,6 +2137,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3_5PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
+            mtp_logits=mtp_logits,
+            mtp_hidden_states=mtp_hidden_states,
         )
 
     def prepare_inputs_for_generation(
@@ -2238,4 +2373,6 @@ __all__ = [
     "Qwen3_5ForCausalLM",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5PreTrainedModel",
+    "Qwen3_5MTPLayer",
+    "Qwen3_5MultiTokenPredictor",
 ]

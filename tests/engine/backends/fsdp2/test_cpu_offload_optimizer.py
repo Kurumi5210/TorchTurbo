@@ -24,6 +24,7 @@ from torchturbo.engine.backends.fsdp2.optimizers.adamw_swap import (
     AdamWSwap,
     DeviceWorkspace,
 )
+from torchturbo.engine.optimizers import OptimizerClassPlan
 from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.cpu import CpuRuntime
 
@@ -309,9 +310,14 @@ def test_prepare_optimizer_rejects_unsupported_optimizer():
     )
     backend._device_runtime = CpuRuntime()
     backend._mesh = {"edp": object()}
+    plan = OptimizerClassPlan(
+        torch.nn.Linear(1, 1),
+        torch.optim.SGD,
+        {"lr": 1e-3, "weight_decay": 0.0},
+    )
 
     with pytest.raises(ValueError, match="only supports AdamW"):
-        backend.prepare_optimizer(torch.nn.Linear(1, 1), torch.optim.SGD)
+        backend.prepare_optimizer(plan)
 
 
 def test_prepare_optimizer_builds_adamw_swap():
@@ -325,8 +331,13 @@ def test_prepare_optimizer_builds_adamw_swap():
     backend._device_runtime = SyncRuntime()
     backend._mesh = {"edp": object()}
     model = torch.nn.Linear(1, 1)
+    plan = OptimizerClassPlan(
+        model,
+        torch.optim.AdamW,
+        {"lr": 1e-3, "weight_decay": 0.0, "fused": True},
+    )
 
-    optimizer = backend.prepare_optimizer(model, torch.optim.AdamW, fused=True)
+    optimizer = backend.prepare_optimizer(plan)
 
     assert isinstance(optimizer, AdamWSwap)
     assert optimizer.defaults["fused"] is True
@@ -345,10 +356,13 @@ def test_prepare_optimizer_builds_host_update_adamw():
     )
     backend._device_runtime = SyncRuntime()
     backend._mesh = {"edp": object()}
-
-    optimizer = backend.prepare_optimizer(
-        torch.nn.Linear(1, 1), torch.optim.AdamW, fused=True
+    plan = OptimizerClassPlan(
+        torch.nn.Linear(1, 1),
+        torch.optim.AdamW,
+        {"lr": 1e-3, "weight_decay": 0.0, "fused": True},
     )
+
+    optimizer = backend.prepare_optimizer(plan)
 
     assert isinstance(optimizer, AdamWSwap)
     assert optimizer.optimizer_memory_fraction == 0
@@ -362,9 +376,12 @@ def test_prepare_optimizer_keeps_original_class_without_optimizer_offload():
     )
     backend._device_runtime = SyncRuntime()
     backend._mesh = {"edp": object()}
-
-    optimizer = backend.prepare_optimizer(
-        torch.nn.Linear(1, 1), torch.optim.AdamW, fused=True
+    plan = OptimizerClassPlan(
+        torch.nn.Linear(1, 1),
+        torch.optim.AdamW,
+        {"lr": 1e-3, "weight_decay": 0.0, "fused": True},
     )
+
+    optimizer = backend.prepare_optimizer(plan)
 
     assert type(optimizer) is torch.optim.AdamW

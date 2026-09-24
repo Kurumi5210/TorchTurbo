@@ -53,7 +53,7 @@ engine_config:
     # CPU offload config
     cpu_offload:
       # if "enabled" is "false", CPU offload is disabled
-      enabled: true
+      enabled: false
       # "mode: optimizer" for swap-optimzier, or "full" for full-offload
       mode: optimizer
       # "optimizer_memory_fraction" controls workspace size on swap-optimzier mode
@@ -65,6 +65,48 @@ engine_config:
   activation_checkpointing:
     enabled: true
     use_reentrant: false
+
+  # Engine-managed optimizer configuration.
+  optimizer:
+    # Optimizer selected by the engine. Currently only "muon" is supported.
+    name: muon
+    # Runtime policy for distributed Muon and its fallback AdamW optimizer.
+    muon:
+      # Base learning rate shared by Muon and fallback AdamW parameter groups.
+      lr: 0.02
+      # Decoupled weight decay shared by Muon and AdamW decay parameter groups.
+      weight_decay: 0.01
+      # Momentum coefficient used by Muon.
+      momentum: 0.95
+      # Apply Nesterov momentum when preparing Muon updates.
+      nesterov: true
+      # Newton-Schulz iteration coefficients.
+      ns_coefficients: [3.4445, -4.7750, 2.0315]
+      # Minimum norm used when normalizing Newton-Schulz inputs.
+      eps: 1.0e-7
+      # Number of Newton-Schulz iterations per Muon update.
+      ns_steps: 5
+      # Matrix-shape LR adjustment: original, match_rms_adamw,
+      # spectral_unclamped, or null.
+      adjust_lr_fn: match_rms_adamw
+      # Overlap owned-parameter communication with Muon computation when
+      # supported.
+      overlap_comm_compute: true
+      # Beta coefficients used by the fallback AdamW optimizer.
+      adamw_betas: [0.9, 0.999]
+      # Numerical stability epsilon used by the fallback AdamW optimizer.
+      adamw_eps: 1.0e-8
+      # Enable fused fallback AdamW; null lets PyTorch choose its default.
+      adamw_fused: null
+      # Optional MLA QK clipping, declared by the model's Muon recipe.
+      # Set to {threshold: 100.0, alpha: 0.5} to enable it.
+      qk_clip: null
+      # Policy for combining Muon parameters into communication buckets.
+      bucket:
+        # Bucket strategy: parameter, size, or single.
+        strategy: parameter
+        # Size limit in MiB. Required for size and unused by other strategies.
+        bucket_cap_mb: null
 
   mtp:
     enabled: false

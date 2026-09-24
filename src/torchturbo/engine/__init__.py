@@ -45,13 +45,25 @@ from .config import (
     MixedPrecisionPolicy,
     MoEConfig,
     MTPConfig,
+    MuonOptimizerConfig,
     OpsConfig,
+    OptimizerBucketPolicy,
+    OptimizerConfig,
     ParameterGroup,
+    QKClipConfig,
     build_from_args,
 )
 from .core import TorchTurboEngine
 from .distributed import init_process_group_if_needed
 from .metrics import MetricTracker
+from .model_fqn import ModelFQNMap, build_model_fqn_map
+from .optimizers import (
+    MuonPlan,
+    MuonRecipe,
+    OptimizerClassPlan,
+    OptimizerPlan,
+    OptimizerRecipe,
+)
 from .plugins import (
     DatasetPlugin,
     Plugin,
@@ -63,7 +75,7 @@ from .plugins import (
 
 
 __all__ = [
-    # Shared EngineConfig builder (lf + msswift + ...)
+    # EngineConfig construction.
     "build_from_args",
     # CLI args
     "TorchTurboArgs",
@@ -83,18 +95,30 @@ __all__ = [
     "LossChunkConfig",
     "MixedPrecisionPolicy",
     "MetricTracker",
+    "ModelFQNMap",
     "MoEConfig",
     "MTPConfig",
+    "MuonOptimizerConfig",
     "OpsConfig",
+    "OptimizerBucketPolicy",
+    "OptimizerConfig",
     "ParameterGroup",
+    "QKClipConfig",
     # Engine
     "BaseBackend",
     "FSDP2Backend",
     "FSDPConfig",
-    # Registry
+    # Optimizers
+    "MuonPlan",
+    "MuonRecipe",
+    "OptimizerClassPlan",
+    "OptimizerPlan",
+    "OptimizerRecipe",
+    # Backend registry
     "get_available_backends",
     "get_backend",
     "register_backend",
+    "build_model_fqn_map",
     # Distributed
     "init_process_group_if_needed",
     # Plugins

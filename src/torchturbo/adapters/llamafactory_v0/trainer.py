@@ -8,6 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ...engine.distributed import assert_finite
 from ...logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,6 +40,10 @@ class TorchTurboTrainerBase:
         )
         self._mm_processor = kwargs.get("processor", None)
         super().__init__(*args, **kwargs)
+        if self.optimizer is not None:
+            raise ValueError(
+                "TorchTurbo does not support externally supplied optimizers"
+            )
         self._maybe_upgrade_collator_for_mllm_pt()
 
     def _move_model_to_device(self, model, _device):
@@ -128,7 +133,7 @@ class TorchTurboTrainerBase:
     def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
         self.engine.save_optimizer_and_scheduler(
             self.model,
-            self.optimizer,
+            self.engine.optimizer,
             self.lr_scheduler,
             output_dir,
         )
@@ -140,7 +145,7 @@ class TorchTurboTrainerBase:
         if checkpoint:
             self.engine.load_optimizer_and_scheduler(
                 self.model,
-                self.optimizer,
+                self.engine.optimizer,
                 self.lr_scheduler,
                 checkpoint,
             )
@@ -150,6 +155,14 @@ class TorchTurboTrainerBase:
             return self.optimizer
 
         engine = self._engine()
+
+        if engine.config.optimizer.name is not None:
+            self.optimizer = engine.prepare_optimizer()
+            logger.info_rank0(
+                "torchturbo: created engine-managed optimizer %s",
+                engine.config.optimizer.name,
+            )
+            return self.optimizer
 
         from transformers import Trainer
 
@@ -361,8 +374,9 @@ class TorchTurboTrainerBase:
         )
 
     def training_step(self, model, inputs, *args, **kwargs):
-        """Collect engine metrics after backward completes."""
+        """Check loss and collect engine metrics after backward."""
         result = super().training_step(model, inputs, *args, **kwargs)
+        assert_finite(result, "loss")
         engine = getattr(self, "engine", None)
         if engine is not None:
             engine.collect_metrics(model)

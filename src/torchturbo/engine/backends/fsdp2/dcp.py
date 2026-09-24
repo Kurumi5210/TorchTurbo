@@ -194,6 +194,23 @@ class DcpCheckpoint:
     # ------------------------------------------------------------------ #
     # Optimizer state.
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _unwrap_optimizer(
+        optimizer: torch.optim.Optimizer,
+    ) -> torch.optim.Optimizer | tuple[torch.optim.Optimizer, ...]:
+        """Return the optimizer instances DCP should traverse.
+
+        ``OptimizersContainer`` uses a named-child state format for generic
+        serialization. DCP needs the standard state owned by each child so it
+        can translate parameter identities to FQNs and reshard them
+        independently.
+        """
+        from ...optimizers import OptimizersContainer
+
+        if isinstance(optimizer, OptimizersContainer):
+            return tuple(optimizer)
+        return optimizer
+
     def has_optimizer(self, checkpoint_dir: str) -> bool:
         """True iff a *complete* DCP optimizer save is present (dir + ``.metadata``)."""
         return self._dcp_metadata_present(os.path.join(checkpoint_dir, OPTIMIZER_DISTCP_DIR))
@@ -220,7 +237,8 @@ class DcpCheckpoint:
         self._rank0_reset_dir(ckpt_dir)
 
         options = StateDictOptions(full_state_dict=False)
-        optim_state = get_optimizer_state_dict(model, optimizer, options=options)
+        optimizers = self._unwrap_optimizer(optimizer)
+        optim_state = get_optimizer_state_dict(model, optimizers, options=options)
         stamped = self._stamp_optim_state(
             optim_state,
             self._ep_rank(parallel_context),
@@ -247,8 +265,9 @@ class DcpCheckpoint:
 
         ckpt_dir = os.path.join(checkpoint_dir, OPTIMIZER_DISTCP_DIR)
         options = StateDictOptions(full_state_dict=False)
+        optimizers = self._unwrap_optimizer(optimizer)
 
-        optim_state = get_optimizer_state_dict(model, optimizer, options=options)
+        optim_state = get_optimizer_state_dict(model, optimizers, options=options)
         stamped = self._stamp_optim_state(
             optim_state,
             self._ep_rank(parallel_context),
@@ -257,6 +276,6 @@ class DcpCheckpoint:
         start = time.perf_counter()
         dcp.load({"optimizer": stamped}, checkpoint_id=ckpt_dir)
         set_optimizer_state_dict(
-            model, optimizer, self._strip_optim_state(stamped), options=options
+            model, optimizers, self._strip_optim_state(stamped), options=options
         )
         logger.info_rank0("[load] optimizer state loaded from %s in %.2fs", ckpt_dir, time.perf_counter() - start)

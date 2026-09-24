@@ -141,7 +141,7 @@ class TurboQwen3_5ForConditionalGeneration(
     @classmethod
     def patch_vision_attention_interface(cls):
         from . import modeling_qwen3_5
-        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+        from ..modules.attention.interface import attention_forward
 
         attn_cls = modeling_qwen3_5.Qwen3_5VisionAttention
         origin_attr = "_torchturbo_qwen3_5_vision_origin_attention_interface"
@@ -170,7 +170,7 @@ class TurboQwen3_5ForConditionalGeneration(
             value_states = value_states.transpose(1, 2)
 
             # Vision attention doesn't need SP; bypass the Ulysses all-to-all wrapper.
-            attn_output = _flash_attention_forward(
+            attn_output = attention_forward(
                 query_states,
                 key_states,
                 value_states,

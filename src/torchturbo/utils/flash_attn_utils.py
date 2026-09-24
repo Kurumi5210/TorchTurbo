@@ -104,11 +104,44 @@ def get_unpad_data_normal(attention_mask):
     )
 
 @cache
-def get_unpad_data(attention_mask):
+def _get_unpad_data(
+    attention_mask: torch.Tensor, _version: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     if torch.max(attention_mask) > 1:
         return get_unpad_data_lf(attention_mask)
     else:
         return get_unpad_data_normal(attention_mask)
+
+
+def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Reuse unpadding metadata until the padding or segment mask changes."""
+    if torch.is_inference_mode_enabled() or attention_mask.is_inference():
+        return _get_unpad_data.__wrapped__(attention_mask, None)
+    return _get_unpad_data(attention_mask, attention_mask._version)
+
+
+@cache
+def _cu_seqlens_to_attention_mask(
+    cu_seqlens: torch.Tensor, num_tokens: int, _version: int | None,
+) -> torch.Tensor:
+    token_indices = torch.arange(num_tokens, device=cu_seqlens.device)
+    segment_ids = torch.bucketize(token_indices, cu_seqlens[1:], right=True) + 1
+    return segment_ids.masked_fill(token_indices >= cu_seqlens[-1], 0).unsqueeze(0)
+
+
+def cu_seqlens_to_attention_mask(cu_seqlens: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Build a cached segment mask for attention backends that require one.
+
+    Args:
+        cu_seqlens: Cumulative lengths addressing flattened batch tokens.
+        num_tokens: Physical token count, including any masked tail padding.
+
+    Returns:
+        Integer segment IDs shaped [1, num_tokens], with zero for tail padding.
+    """
+    if torch.is_inference_mode_enabled() or cu_seqlens.is_inference():
+        return _cu_seqlens_to_attention_mask.__wrapped__(cu_seqlens, num_tokens, None)
+    return _cu_seqlens_to_attention_mask(cu_seqlens, num_tokens, cu_seqlens._version)
 
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py

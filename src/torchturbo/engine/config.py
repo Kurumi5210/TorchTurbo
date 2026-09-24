@@ -17,11 +17,12 @@ Usage::
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 from omegaconf import OmegaConf
 
@@ -64,12 +65,19 @@ class ParameterGroup(str, Enum):
 
 
 class MixedPrecisionPolicy(str, Enum):
-    """Mixed precision dtype policy."""
+    """Supported mixed precision policies."""
 
     BF16 = "bf16"
-    FP16 = "fp16"
     FP32 = "fp32"
-    FP8 = "fp8"
+
+
+def _parse_mixed_precision_policy(value: Any) -> MixedPrecisionPolicy:
+    if value in ("fp16", "fp8"):
+        raise ValueError(
+            f"TorchTurbo engine does not support mixed_precision={value!r}; "
+            "use bf16 or fp32."
+        )
+    return MixedPrecisionPolicy(value)
 
 
 @dataclass
@@ -138,6 +146,142 @@ class CommConfig:
     overlap_comm_compute: bool = False
     bucket_cap_mb: float = 25.0
     reduce_dtype: MixedPrecisionPolicy | None = None
+
+
+@dataclass
+class OptimizerBucketPolicy:
+    """Engine policy for combining optimizer parameters into buckets."""
+
+    strategy: str = "parameter"
+    bucket_cap_mb: float | None = None
+
+    def __post_init__(self) -> None:
+        self.strategy = str(self.strategy).lower()
+        if self.strategy not in {"parameter", "size", "single"}:
+            raise ValueError(
+                "optimizer bucket strategy must be parameter, size, or single"
+            )
+        if self.bucket_cap_mb is not None:
+            self.bucket_cap_mb = float(self.bucket_cap_mb)
+            if self.bucket_cap_mb <= 0:
+                raise ValueError("optimizer bucket_cap_mb must be positive")
+
+
+@dataclass
+class QKClipConfig:
+    """Post-step MLA weight rescaling based on maximum attention logits.
+
+    Args:
+        threshold: Maximum target logit, after the attention softmax scale.
+        alpha: Fraction of the NoPE correction applied to the query projection.
+    """
+
+    threshold: float = 100.0
+    alpha: float = 0.5
+
+    def __post_init__(self) -> None:
+        self.threshold = float(self.threshold)
+        self.alpha = float(self.alpha)
+        if not math.isfinite(self.threshold) or self.threshold <= 0:
+            raise ValueError("QK clip threshold must be finite and positive")
+        if not math.isfinite(self.alpha) or not 0 <= self.alpha <= 1:
+            raise ValueError("QK clip alpha must be in [0, 1]")
+
+
+@dataclass
+class MuonOptimizerConfig:
+    """Runtime hyperparameters for TorchTurbo's native distributed Muon."""
+
+    lr: float | None = None
+    weight_decay: float | None = None
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+    eps: float = 1e-7
+    ns_steps: int = 5
+    adjust_lr_fn: str | None = "match_rms_adamw"
+    overlap_comm_compute: bool = True
+    adamw_betas: tuple[float, float] = (0.9, 0.999)
+    adamw_eps: float = 1e-8
+    adamw_fused: bool | None = None
+    bucket: OptimizerBucketPolicy = field(default_factory=OptimizerBucketPolicy)
+    qk_clip: QKClipConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.lr is not None:
+            self.lr = float(self.lr)
+        if self.weight_decay is not None:
+            self.weight_decay = float(self.weight_decay)
+        self.momentum = float(self.momentum)
+        self.nesterov = string_to_bool(self.nesterov)
+        self.ns_coefficients = tuple(float(value) for value in self.ns_coefficients)
+        self.eps = float(self.eps)
+        self.ns_steps = int(self.ns_steps)
+        self.overlap_comm_compute = string_to_bool(self.overlap_comm_compute)
+        self.adamw_betas = tuple(float(value) for value in self.adamw_betas)
+        self.adamw_eps = float(self.adamw_eps)
+        if self.adamw_fused is not None:
+            self.adamw_fused = string_to_bool(self.adamw_fused)
+        if self.lr is not None and self.lr < 0:
+            raise ValueError("Muon lr must be non-negative")
+        if self.weight_decay is not None and self.weight_decay < 0:
+            raise ValueError("Muon weight_decay must be non-negative")
+        if self.momentum < 0:
+            raise ValueError("Muon momentum must be non-negative")
+        if len(self.ns_coefficients) != 3:
+            raise ValueError("Muon ns_coefficients must contain three values")
+        if not 0 <= self.ns_steps < 100:
+            raise ValueError("Muon ns_steps must be in [0, 100)")
+        if len(self.adamw_betas) != 2 or not all(
+            0 <= beta < 1 for beta in self.adamw_betas
+        ):
+            raise ValueError("Muon AdamW betas must contain two values in [0, 1)")
+        if self.adamw_eps < 0:
+            raise ValueError("Muon AdamW eps must be non-negative")
+        if self.adjust_lr_fn not in {
+            None,
+            "original",
+            "match_rms_adamw",
+            "spectral_unclamped",
+        }:
+            raise ValueError(f"unsupported Muon adjust_lr_fn {self.adjust_lr_fn!r}")
+        if self.bucket is None:
+            self.bucket = OptimizerBucketPolicy()
+        elif isinstance(self.bucket, dict):
+            self.bucket = OptimizerBucketPolicy(**self.bucket)
+        elif not isinstance(self.bucket, OptimizerBucketPolicy):
+            raise TypeError("Muon bucket must be an OptimizerBucketPolicy or dict")
+        if isinstance(self.qk_clip, dict):
+            self.qk_clip = QKClipConfig(**self.qk_clip)
+        elif self.qk_clip is not None and not isinstance(self.qk_clip, QKClipConfig):
+            raise TypeError("Muon qk_clip must be a QKClipConfig, dict, or None")
+
+
+@dataclass
+class OptimizerConfig:
+    """Engine-managed optimizer selection and runtime policy."""
+
+    name: str | None = None
+    muon: MuonOptimizerConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.name is not None:
+            self.name = str(self.name).strip().lower()
+
+        if self.name == "muon":
+            if self.muon is None:
+                self.muon = MuonOptimizerConfig()
+            elif isinstance(self.muon, dict):
+                self.muon = MuonOptimizerConfig(**self.muon)
+            elif not isinstance(self.muon, MuonOptimizerConfig):
+                raise TypeError(
+                    "optimizer.muon must be a MuonOptimizerConfig, dict, or None"
+                )
+        elif self.name is not None:
+            raise ValueError(
+                f"unsupported engine-managed optimizer {self.name!r}; "
+                "TorchTurbo currently supports 'muon'"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +504,9 @@ class EngineConfig:
     comm: CommConfig = field(default_factory=CommConfig)
     """Communication optimization settings."""
 
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    """Optimizer selection and distributed optimizer runtime policy."""
+
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     """Checkpoint loading / saving settings."""
 
@@ -393,7 +540,11 @@ class EngineConfig:
     """Catch-all for user-defined settings."""
 
     def __post_init__(self) -> None:
-        """Create missing nested configuration objects."""
+        """Normalize values and create missing nested configuration objects."""
+        if not isinstance(self.mixed_precision, MixedPrecisionPolicy):
+            self.mixed_precision = _parse_mixed_precision_policy(
+                self.mixed_precision
+            )
         self.use_deterministic_algorithms = string_to_bool(
             self.use_deterministic_algorithms
         )
@@ -403,6 +554,12 @@ class EngineConfig:
             self.ops = OpsConfig()
         if self.loss_chunk is None:
             self.loss_chunk = LossChunkConfig()
+        if self.optimizer is None:
+            self.optimizer = OptimizerConfig()
+        elif isinstance(self.optimizer, dict):
+            self.optimizer = OptimizerConfig(**self.optimizer)
+        elif not isinstance(self.optimizer, OptimizerConfig):
+            raise TypeError("optimizer must be an OptimizerConfig or dict")
 
     def _default_backend_config(self) -> Any:
         """Create the default config for the selected backend."""
@@ -420,7 +577,7 @@ class EngineConfig:
         nested keys (``{"parallel": {"dp_size": 4}}``).
         """
         backend = DistributedBackend(d.get("backend", "fsdp2"))
-        mp = MixedPrecisionPolicy(d.get("mixed_precision", "bf16"))
+        mp = _parse_mixed_precision_policy(d.get("mixed_precision", "bf16"))
         use_deterministic_algorithms = d.get("use_deterministic_algorithms", False)
 
         if "op_policy" in d:
@@ -479,6 +636,9 @@ class EngineConfig:
                 comm_d["overlap_comm_compute"] = d["comm_overlap"]
         comm = CommConfig(**comm_d)
 
+        optimizer_d = dict(d.get("optimizer") or {})
+        optimizer = OptimizerConfig(**optimizer_d)
+
         # Ops
         ops_d = d.get("ops", {})
         if isinstance(ops_d, OpsConfig):
@@ -526,6 +686,7 @@ class EngineConfig:
             "backend_config",
             "activation_checkpointing",
             "comm",
+            "optimizer",
             "ops",
             "checkpoint",
             "dp_size",
@@ -569,6 +730,7 @@ class EngineConfig:
             backend_config=backend_config,
             activation_checkpointing=ac,
             comm=comm,
+            optimizer=optimizer,
             checkpoint=ckpt,
             mtp=mtp_config,
             moe=moe_config,
@@ -681,15 +843,9 @@ def build_from_args(
 ) -> EngineConfig:
     """Assemble an :class:`EngineConfig` purely from a :class:`TorchTurboArgs`.
 
-    Every slice of the engine config is reconstructed from the parsed
-    ``--tt_*`` flags (the single source of truth for turbo-owned settings).
-    Both adapters (llamafactory_v0, msswift) — and future ones — fold any
-    adapter-resolved bits (mixed-precision seed from the adapter's bf16/fp16,
-    checkpoint paths from the adapter's model/output_dir, CPU-offload
-    reconciliation, gradient-checkpointing takeover) onto the
-    :class:`TorchTurboArgs` they pass in, so this function needs only that one
-    argument. Adding a new ``--tt_*`` flag touches only ``engine/args.py`` +
-    this builder, and every adapter picks it up.
+    Every slice of the engine config is reconstructed from one
+    :class:`TorchTurboArgs` object. Callers may seed its base configuration
+    fields before passing it here; ``--tt_*`` settings are merged uniformly.
 
     The final config is built once from a merged dict with four layers:
     ``TorchTurboArgs`` < ``TORCH_TURBO_*`` env < YAML/JSON file < explicit
@@ -709,7 +865,7 @@ def build_from_args(
     tt = torchturbo_args or TorchTurboArgs()
     arg_specs = get_arg_specs()
 
-    # Layer 1: TorchTurboArgs (adapter-seeded values are the base layer).
+    # Layer 1: TorchTurboArgs values.
     fields = OmegaConf.create()
     for arg_spec in arg_specs:
         if arg_spec.args_name is None or arg_spec.config_path is None:
@@ -723,19 +879,18 @@ def build_from_args(
             {
                 # --- Backend ---
                 "backend": "fsdp2",
-                # --- Mixed precision (adapter may have seeded tt.mixed_precision) ---
+                # --- Mixed precision ---
                 "mixed_precision": "fp32",
                 # --- Parallel plan (sp / ep) ---
                 "parallel_plan": {"sp_size": 1, "ep_size": 1},
-                # --- Backend config (prefetch from tt; cpu_offload resolved by adapter) ---
+                # --- Backend config ---
                 "backend_config": {"reshard_after_forward": True},
             }
         ),
         fields,
     )
 
-    # Layer 2: TORCH_TURBO_* environment variables — applies to ALL adapters
-    # and direct usage.
+    # Layer 2: TORCH_TURBO_* environment variables.
     for arg_spec in arg_specs:
         if arg_spec.env_name is None or arg_spec.config_path is None:
             continue
@@ -808,13 +963,14 @@ def build_from_args(
 
     config = EngineConfig(
         backend=DistributedBackend(fields["backend"]),
-        mixed_precision=MixedPrecisionPolicy(fields["mixed_precision"]),
+        mixed_precision=_parse_mixed_precision_policy(fields["mixed_precision"]),
         use_deterministic_algorithms=fields.get("use_deterministic_algorithms", False),
         parallel_plan=parallel_plan,
         ops=_build_ops_config(fields),
         backend_config=_build_fsdp_config(fields),
         activation_checkpointing=ActivationCheckpointingConfig(**ac_d),
         comm=CommConfig(**comm_d),
+        optimizer=_build_optimizer_config(fields),
         checkpoint=_build_checkpoint_config(fields),
         mtp=_build_mtp_config(fields),
         moe=_build_moe_config(fields),
@@ -837,13 +993,31 @@ def build_from_args(
     return config
 
 
+def _dataclass_config_paths(
+    config_type: type[Any],
+    parents: tuple[str, ...],
+) -> set[str]:
+    """Return dotted paths for all fields in a nested dataclass schema."""
+    paths = set()
+    type_hints = get_type_hints(config_type)
+    for field_info in dataclasses.fields(config_type):
+        field_parts = (*parents, field_info.name)
+        paths.add(".".join(field_parts))
+        field_type = type_hints[field_info.name]
+        candidates = get_args(field_type) or (field_type,)
+        for candidate in candidates:
+            if isinstance(candidate, type) and dataclasses.is_dataclass(candidate):
+                paths.update(_dataclass_config_paths(candidate, field_parts))
+    return paths
+
+
 def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()) -> None:
     allowed = {
         spec.config_path
         for spec in get_arg_specs()
         if spec.config_path is not None
     }
-    # Allow CPU offload options to pass the config file validation
+    # Allow config blocks that do not have corresponding CLI arguments.
     allowed.update(
         {
             "backend_config.cpu_offload.enabled",
@@ -851,6 +1025,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.optimizer_memory_fraction",
         }
     )
+    allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
 
     for key, value in data.items():
         parts = (*parents, key)
@@ -905,6 +1080,11 @@ def _build_checkpoint_config(fields: Mapping[str, Any]) -> CheckpointConfig:
         dcp_path=ckpt_d.get("dcp_path") or None,
         default_save_format=ckpt_d.get("default_save_format", "hf"),
     )
+
+
+def _build_optimizer_config(fields: Mapping[str, Any]) -> OptimizerConfig:
+    optimizer_d = dict(fields.get("optimizer") or {})
+    return OptimizerConfig(**optimizer_d)
 
 
 def _build_ops_config(fields: Mapping[str, Any]) -> OpsConfig:

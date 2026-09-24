@@ -115,6 +115,10 @@ class NpuRuntime(DeviceRuntime):
     def __init__(self) -> None:
         self._initialized = False
 
+    @property
+    def supports_async_streams(self) -> bool:
+        return True
+
     def available(self) -> bool:
         try:
             import torch_npu  # noqa: F401
@@ -177,6 +181,9 @@ class NpuRuntime(DeviceRuntime):
             return self._npu.Stream(priority=priority)
         except TypeError:
             return self._npu.Stream()
+
+    def new_event(self):
+        return self._npu.Event()
 
     def manual_seed_all(self, seed: int) -> None:
         self._npu.manual_seed_all(seed)

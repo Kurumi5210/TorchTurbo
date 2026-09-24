@@ -52,10 +52,17 @@ For the project overview and directory layout, see `README.md`.
 2. - **Commit messages** follow Conventional Commits: `type(scope): description` e.g. `fix(engine): validate config files`.
    - Keep each commit focused; PR titles follow the same format.
    - Keep commit messages concise. Use short sentences.
+   - Wrap commit message body lines at 72 characters. Indent continued
+     bullet lines by two spaces.
    - Describe only the core implementation idea.
    - Valid types: `feat` `fix` `docs` `style` `refactor` `perf` `test` `build` `ci` `chore` `revert`.
    - Under `## Summary`, list only the important code changes, with one `- ` bullet per change. Do not put effects, benefits, performance results, or motivation there.
-   - Add `## Root cause` only when the cause needs explanation. State the cause directly in simple sentences.
+   - Use `## Issue` or `## Root cause` only when the problem or its cause
+     needs explanation. State the problem and cause directly in simple
+     sentences.
+   - Do not add `## Validation`, `## Testing`, or similar sections to
+     commit messages. Put test commands, results, and validation limits
+     in the task response instead.
    - Write commit messages in proper English, with care and punctuation.
 3. Titles must be <= 80 characters.
 4. **Don't commit unless asked.** Do not commit unless the user explicitly requests it.

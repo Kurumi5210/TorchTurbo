@@ -1,11 +1,9 @@
-"""Tests for the pack-boundary bridging layer (swift position_ids → turbo int mask).
-
-Pure-torch, no swift import — same CI expectations as ``test_config.py``.
-"""
+"""CPU tests for Swift collation and the packed cu/max input contract."""
 
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,10 +12,10 @@ os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 import torch  # noqa: E402
 
 from torchturbo.adapters.msswift.inputs_bridging import (  # noqa: E402
+    SwiftInputCollator,
     bake_loss_scale_into_labels,
     bridge_packed_inputs,
     bridge_swift_inputs,
-    position_ids_reset_to_packed_mask,
 )
 
 
@@ -25,130 +23,153 @@ def _t(values):
     return torch.tensor(values)
 
 
-# --------------------------------------------------------------------------- #
-# position_ids_reset_to_packed_mask
-# --------------------------------------------------------------------------- #
+def _packed_inputs(lengths):
+    positions = [position for length in lengths for position in range(length)]
+    return {
+        "input_ids": torch.arange(len(positions)).unsqueeze(0),
+        "position_ids": _t([positions]),
+    }
 
 
-def test_multi_segment_reset_to_increasing_integers():
-    pos = _t([[0, 1, 2, 0, 1]])
-    mask = position_ids_reset_to_packed_mask(pos)
-    assert mask is not None
-    assert mask.tolist() == [[1, 1, 1, 2, 2]]
+@pytest.mark.parametrize("lengths,expected", [([3, 2], [0, 3, 5]), ([1], [0, 1]), ([2, 2, 3], [0, 2, 4, 7])])
+def test_sample_lengths_produce_cu_max(lengths, expected):
+    inputs = _packed_inputs(lengths)
+    positions = inputs["position_ids"]
+    out = bridge_packed_inputs(inputs, sequence_lengths=lengths)
+    assert "attention_mask" not in out
+    assert out["cu_seq_lens_q"].tolist() == expected
+    assert out["cu_seq_lens_k"].tolist() == expected
+    assert out["cu_seq_lens_q"].dtype == torch.int32
+    assert out["max_length_q"] == out["max_length_k"] == max(lengths)
+    assert out["position_ids"] is positions
 
 
-def test_single_segment_passthrough_none():
-    # ordinary arange — no boundary reset → single segment → None (passthrough)
-    assert position_ids_reset_to_packed_mask(_t([[0, 1, 2, 3]])) is None
+def test_preserves_explicit_cu_and_mrope_coordinates():
+    cu = _t([0, 3, 5]).int()
+    positions = _t([[[0, 1, 1, 0, 1]], [[0, 1, 2, 0, 1]], [[0, 1, 1, 0, 1]]])
+    inputs = {
+        "input_ids": _t([[10, 11, 12, 13, 14]]),
+        "position_ids": positions,
+        "text_position_ids": _t([[0, 1, 2, 0, 1]]),
+        "cu_seq_lens_q": cu,
+        "cu_seq_lens_k": cu,
+        "max_length_q": _t(3),
+        "max_length_k": _t(3),
+    }
+    out = bridge_packed_inputs(inputs, sequence_lengths=[3, 2])
+    assert out["cu_seq_lens_q"] is cu
+    assert out["cu_seq_lens_k"] is cu
+    assert out["position_ids"] is positions
+    assert type(out["max_length_q"]) is int
+    assert "attention_mask" not in out
 
 
-def test_none_input_returns_none():
-    assert position_ids_reset_to_packed_mask(None) is None
+def test_longlora_tail_padding_is_not_counted_as_samples():
+    inputs = {
+        "input_ids": _t([[10, 11, 12, 13, 14, 0, 0]]),
+        "position_ids": _t([[0, 1, 0, 1, 2, 0, 0]]),
+        "cu_seq_lens_q": _t([0, 2, 5, 6, 7]).int(),
+        "cu_seq_lens_k": _t([0, 2, 5, 6, 7]).int(),
+        "max_length_q": _t(3),
+        "max_length_k": _t(3),
+    }
+    out = bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
+    assert out["input_ids"].shape == (1, 7)
+    assert out["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert "attention_mask" not in out
 
 
-def test_n_leq_one_returns_none():
-    assert position_ids_reset_to_packed_mask(_t([[5]])) is None
+def test_packed_left_padding_moves_to_tail_with_all_token_fields():
+    inputs = {
+        "input_ids": _t([[0, 0, 10, 11, 12, 13, 14]]),
+        "labels": _t([[-100, -100, 10, 11, 12, 13, 14]]),
+        "position_ids": _t([[[0, 0, 0, 1, 0, 1, 2]]] * 3),
+        "text_position_ids": _t([[0, 0, 0, 1, 0, 1, 2]]),
+        "loss_scale": _t([[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0]]),
+        "mm_token_type_ids": _t([[0, 0, 0, 1, 0, 0, 0]]),
+        "cu_seq_lens_q": _t([0, 1, 2, 4, 7]).int(),
+        "cu_seq_lens_k": _t([0, 1, 2, 4, 7]).int(),
+        "max_length_q": _t(3),
+        "max_length_k": _t(3),
+        "pixel_values": torch.randn(4, 6),
+    }
+    pixels = inputs["pixel_values"]
+    out = bridge_swift_inputs(inputs, sequence_lengths=[2, 3], padding_side="left")
+    assert out["input_ids"].tolist() == [[10, 11, 12, 13, 14, 0, 0]]
+    assert out["labels"].tolist() == [[10, -100, 12, 13, 14, -100, -100]]
+    assert out["text_position_ids"].tolist() == [[0, 1, 0, 1, 2, 0, 0]]
+    assert out["position_ids"][0].tolist() == out["text_position_ids"].tolist()
+    assert out["mm_token_type_ids"].tolist() == [[0, 1, 0, 0, 0, 0, 0]]
+    assert out["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert out["pixel_values"] is pixels
 
 
-def test_fallback_attention_mask_zeros_padding():
-    # two segments with a trailing padding position
-    pos = _t([[0, 1, 0, 1, 0]])
-    am = _t([[1, 1, 1, 1, 0]])
-    mask = position_ids_reset_to_packed_mask(pos, fallback_attention_mask=am)
-    assert mask is not None
-    assert mask.tolist() == [[1, 1, 2, 2, 0]]
+def test_nonpacked_left_padding_is_unchanged():
+    inputs = {
+        "input_ids": _t([[0, 0, 10, 11], [0, 12, 13, 14]]),
+        "position_ids": _t([[0, 0, 0, 1], [0, 0, 1, 2]]),
+        "attention_mask": _t([[0, 0, 1, 1], [0, 1, 1, 1]]),
+    }
+    original = dict(inputs)
+    out = bridge_swift_inputs(inputs)
+    assert set(out) == set(original)
+    assert all(out[key] is value for key, value in original.items())
 
 
-def test_fallback_mask_can_collide_segments_to_single_then_none():
-    # If fallback mask keeps only one contiguous segment, result collapses to
-    # single segment → None (don't emit a spurious 1-only int mask).
-    pos = _t([[0, 1, 2, 0, 1]])
-    am = _t([[1, 1, 1, 0, 0]])  # second "segment" fully padded out
-    assert position_ids_reset_to_packed_mask(pos, fallback_attention_mask=am) is None
+def test_rejects_native_cu_with_different_sample_boundaries():
+    inputs = _packed_inputs([2, 3])
+    inputs["cu_seq_lens_q"] = _t([0, 3, 5]).int()
+    with pytest.raises(ValueError, match="original Swift sample boundaries"):
+        bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
 
 
-def test_mrope_3d_uses_text_row():
-    # mrope (3, B, N): row 0 is the text/segment row.
-    pos3 = torch.zeros(3, 1, 5)
-    pos3[0, 0] = _t([0, 1, 2, 0, 1])
-    pos3[1, 0] = _t([9, 9, 9, 9, 9])  # irrelevant spatial rows
-    pos3[2, 0] = _t([7, 7, 7, 7, 7])
-    mask = position_ids_reset_to_packed_mask(pos3)
-    assert mask is not None
-    assert mask.tolist() == [[1, 1, 1, 2, 2]]
+def test_rejects_position_resets_inconsistent_with_samples():
+    inputs = _packed_inputs([3, 2])
+    with pytest.raises(ValueError, match="position resets"):
+        bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
 
 
-def test_multiple_batch_rows_independent_segments():
-    pos = _t([[0, 1, 0, 1, 2], [0, 1, 2, 3, 4]])
-    mask = position_ids_reset_to_packed_mask(pos)
-    assert mask is not None
-    # row 0: two segments (1,1,2,2,2); row 1: single segment → but max>1 overall
-    # so it still emits, with row 1 labeled all-1.
-    assert mask.tolist() == [[1, 1, 2, 2, 2], [1, 1, 1, 1, 1]]
+def test_rejects_incorrect_native_maximum_length():
+    inputs = _packed_inputs([2, 3])
+    inputs["max_length_q"] = _t(5)
+    with pytest.raises(ValueError, match="longest packed sample"):
+        bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
 
 
-def test_three_segments_increasing_ids():
-    pos = _t([[0, 1, 0, 1, 0, 1, 2]])
-    mask = position_ids_reset_to_packed_mask(pos)
-    assert mask.tolist() == [[1, 1, 2, 2, 3, 3, 3]]
+@pytest.mark.parametrize("nested", [False, True])
+def test_collator_captures_lengths_before_native_batch_mutation(nested):
+    samples = [{"input_ids": [10, 11]}, {"input_ids": [12, 13, 14]}]
+    batch = [[samples[0]], [samples[1]]] if nested else samples
+    template = SimpleNamespace(padding_free=True, padding_side="right", is_training=True)
+
+    def native_collator(rows):
+        rows[:] = [{"input_ids": [10, 11, 12, 13, 14]}]
+        return {
+            "input_ids": _t([[10, 11, 12, 13, 14]]),
+            "position_ids": _t([[0, 1, 0, 1, 2]]),
+            "labels": _t([[10, 11, 12, 13, 14]]),
+            "loss_scale": _t([[1.0, 0.0, 1.0, 1.0, 1.0]]),
+        }
+
+    out = SwiftInputCollator(native_collator, template)(batch)
+    assert out["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert out["labels"].tolist() == [[10, -100, 12, 13, 14]]
+    assert "attention_mask" not in out
+    assert "loss_scale" not in out
+    assert out["cu_seq_lens_q"].device.type == "cpu"
 
 
-# --------------------------------------------------------------------------- #
-# bridge_packed_inputs
-# --------------------------------------------------------------------------- #
-
-
-def test_bridge_rewrites_attention_mask_when_packed():
-    pos = _t([[0, 1, 2, 0, 1]])
-    inputs = {"position_ids": pos, "attention_mask": _t([[1, 1, 1, 1, 1]])}
-    out = bridge_packed_inputs(inputs)
-    assert out["attention_mask"].tolist() == [[1, 1, 1, 2, 2]]
-    assert out["position_ids"] is pos  # position_ids untouched
-
-
-def test_bridge_passthrough_when_single_segment():
-    pos = _t([[0, 1, 2, 3]])
-    original_mask = _t([[1, 1, 1, 1]])
-    inputs = {"position_ids": pos, "attention_mask": original_mask.clone()}
-    out = bridge_packed_inputs(inputs)
-    assert torch.equal(out["attention_mask"], original_mask)
-    assert "attention_mask" in out  # not removed, left as-is
-
-
-def test_bridge_passthrough_when_no_position_ids():
-    inputs = {"input_ids": _t([[1, 2, 3]]), "attention_mask": _t([[1, 1, 1]])}
-    out = bridge_packed_inputs(inputs)
-    # unchanged
-    assert torch.equal(out["attention_mask"], _t([[1, 1, 1]]))
-
-
-def test_bridge_with_padding_preserves_zero_padding():
-    pos = _t([[0, 1, 0, 1, 0]])
-    am = _t([[1, 1, 1, 1, 0]])
-    inputs = {"position_ids": pos, "attention_mask": am}
-    out = bridge_packed_inputs(inputs)
-    assert out["attention_mask"].tolist() == [[1, 1, 2, 2, 0]]
-
-
-@pytest.mark.parametrize(
-    "pos,expected",
-    [
-        ([[0, 1, 2, 0, 1]], [[1, 1, 1, 2, 2]]),
-        ([[0, 1, 0, 1, 0, 1, 2]], [[1, 1, 2, 2, 3, 3, 3]]),
-        ([[0, 1, 2, 3]], None),
-    ],
-)
-def test_parametrated_segments(pos, expected):
-    mask = position_ids_reset_to_packed_mask(_t(pos))
-    if expected is None:
-        assert mask is None
-    else:
-        assert mask.tolist() == [expected[0]]
-
-
-# --------------------------------------------------------------------------- #
-# bake_loss_scale_into_labels
-# --------------------------------------------------------------------------- #
+def test_nonpacked_collator_preserves_binary_mask():
+    inputs = {
+        "input_ids": _t([[0, 0, 10, 11]]),
+        "position_ids": _t([[0, 0, 0, 1]]),
+        "attention_mask": _t([[0, 0, 1, 1]]),
+    }
+    template = SimpleNamespace(padding_free=False, padding_side="left", is_training=True)
+    out = SwiftInputCollator(lambda batch: inputs, template)([{"input_ids": [10, 11]}])
+    assert out is inputs
+    assert out["attention_mask"].tolist() == [[0, 0, 1, 1]]
+    assert "cu_seq_lens_q" not in out
 
 
 def test_loss_scale_zeros_masked_into_labels():
@@ -188,26 +209,3 @@ def test_loss_scale_non_binary_warns_but_still_masks_zeros(caplog):
     out = bake_loss_scale_into_labels(inputs)
     # zeros still masked; non-binary fractional weights dropped (warned).
     assert out["labels"].tolist() == [[10, 11, -100, 13]]
-
-
-# --------------------------------------------------------------------------- #
-# bridge_swift_inputs (end-to-end packing bridge)
-# --------------------------------------------------------------------------- #
-
-
-def test_bridge_swift_inputs_end_to_end():
-    # keep Swift's split position rows and native (unpadded) length.
-    inputs = {
-        "input_ids": _t([[1, 2, 3, 4, 5]]),
-        "position_ids": _t([[[0, 1, 0, 1, 2]], [[9, 9, 9, 9, 9]], [[7, 7, 7, 7, 7]]]),  # (3,1,5)
-        "text_position_ids": _t([[0, 1, 0, 1, 2]]),
-        "attention_mask": _t([[1, 1, 1, 1, 1]]),
-        "labels": _t([[10, 0, 12, 13, 14]]),
-        "loss_scale": _t([[1.0, 0.0, 1.0, 1.0, 1.0]]),  # idx 1 zeroed -> label -100
-    }
-    out = bridge_swift_inputs(inputs)
-    assert out["input_ids"].shape[-1] == 5             # native length, no padding
-    assert out["labels"].tolist() == [[10, -100, 12, 13, 14]]
-    assert "loss_scale" not in out                     # removed after folding
-    assert out["attention_mask"].tolist() == [[1, 1, 2, 2, 2]]  # packed mask rebuilt
-    assert out["position_ids"].shape == (3, 1, 5)      # mRoPE rows stay split

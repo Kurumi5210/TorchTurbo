@@ -137,7 +137,7 @@ def test_parse_explicit_default_value_still_an_override():
 
 YAML_CFG = """\
 engine_config:
-  mixed_precision: fp16
+  mixed_precision: fp32
   parallel_plan:
     sp_size: 2
     ep_size: 4
@@ -149,7 +149,7 @@ engine_config:
 def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     cfg = _build_from_argv(["--tt_config", _write(tmp_path, "cfg.yaml", YAML_CFG)])
 
-    assert cfg.mixed_precision is MixedPrecisionPolicy.FP16
+    assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
     assert cfg.parallel_plan.sp_size == 2
     assert cfg.parallel_plan.ep_size == 4
     assert cfg.activation_checkpointing.enabled is False
@@ -158,7 +158,7 @@ def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {
-            "mixed_precision": "fp16",
+            "mixed_precision": "fp32",
             "parallel_plan": {"sp_size": 2, "ep_size": 4},
             "activation_checkpointing": {"enabled": False},
         }
@@ -167,10 +167,69 @@ def test_build_from_json_with_engineconfig_wrapper(tmp_path):
         ["--tt_config", _write(tmp_path, "cfg.json", json.dumps(data))]
     )
 
-    assert cfg.mixed_precision is MixedPrecisionPolicy.FP16
+    assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
     assert cfg.parallel_plan.sp_size == 2
     assert cfg.parallel_plan.ep_size == 4
     assert cfg.activation_checkpointing.enabled is False
+
+
+def test_build_muon_runtime_policy_from_yaml(tmp_path):
+    path = _write(
+        tmp_path,
+        "muon.yaml",
+        _engine_config(
+            """\
+optimizer:
+  name: muon
+  muon:
+    ns_steps: 3
+    overlap_comm_compute: false
+    bucket:
+      strategy: size
+      bucket_cap_mb: 32
+"""
+        ),
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.optimizer.name == "muon"
+    assert cfg.optimizer.muon.ns_steps == 3
+    assert cfg.optimizer.muon.overlap_comm_compute is False
+    assert cfg.optimizer.muon.bucket.strategy == "size"
+    assert cfg.optimizer.muon.bucket.bucket_cap_mb == 32
+
+
+def test_optimizer_config_file_paths_follow_dataclass_schema():
+    from dataclasses import fields
+
+    from torchturbo.engine.config import (
+        MuonOptimizerConfig,
+        OptimizerBucketPolicy,
+        _validate_config_file,
+    )
+
+    muon = {
+        field_info.name: None
+        for field_info in fields(MuonOptimizerConfig)
+        if field_info.name != "bucket"
+    }
+    muon["bucket"] = {
+        field_info.name: None for field_info in fields(OptimizerBucketPolicy)
+    }
+
+    _validate_config_file({"optimizer": {"name": None, "muon": muon}})
+
+
+def test_unknown_optimizer_config_file_field_raises(tmp_path):
+    path = _write(
+        tmp_path,
+        "unknown_optimizer.yaml",
+        _engine_config("optimizer:\n  name: muon\n  muon:\n    typo_field: 1\n"),
+    )
+
+    with pytest.raises(ValueError, match="Unknown key: optimizer.muon.typo_field"):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_config_without_engineconfig_wrapper_raises(tmp_path):
@@ -292,13 +351,25 @@ def test_file_overrides_env(monkeypatch, tmp_path):
     path = _write(
         tmp_path,
         "cfg.yaml",
-        _engine_config("parallel_plan:\n  sp_size: 4\nmixed_precision: fp16\n"),
+        _engine_config("parallel_plan:\n  sp_size: 4\nmixed_precision: fp32\n"),
     )
 
     cfg = _build_from_argv(["--tt_config", path])
 
     assert cfg.parallel_plan.sp_size == 4
-    assert cfg.mixed_precision is MixedPrecisionPolicy.FP16
+    assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
+
+
+@pytest.mark.parametrize("policy", ["fp16", "fp8"])
+def test_file_rejects_unsupported_mixed_precision(tmp_path, policy):
+    path = _write(
+        tmp_path, "cfg.yaml", _engine_config(f"mixed_precision: {policy}\n")
+    )
+
+    with pytest.raises(
+        ValueError, match=f"does not support mixed_precision='{policy}'"
+    ):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_cli_overrides_file(tmp_path):
@@ -339,7 +410,7 @@ parallel_plan:
   sp_size: 4
 activation_checkpointing:
   enabled: true
-mixed_precision: fp16
+mixed_precision: bf16
 ops:
   policy: custom
 """
@@ -355,7 +426,7 @@ ops:
             "--tt_gradient_checkpointing",
             "false",
             "--tt_mixed_precision",
-            "fp8",
+            "fp32",
             "--tt_op_policy",
             "auto",
         ]
@@ -363,7 +434,7 @@ ops:
 
     assert cfg.parallel_plan.sp_size == 8
     assert cfg.activation_checkpointing.enabled is False
-    assert cfg.mixed_precision is MixedPrecisionPolicy.FP8
+    assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
     assert cfg.ops.policy is OpPolicy.AUTO
 
 

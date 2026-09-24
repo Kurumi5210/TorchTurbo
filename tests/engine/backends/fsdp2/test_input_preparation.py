@@ -53,10 +53,10 @@ def test_prepare_inputs_aligns_all_sequence_fields_and_packed_metadata():
     assert result["attention_mask"].tolist() == [[1, 1, 2, 2, 2, 0]]
     assert result["token_type_ids"][0, -1].item() == 0
     assert result["mm_token_type_ids"][0, -1].item() == 0
-    assert result["cu_seq_lens_q"].tolist() == [0, 2, 6]
-    assert result["cu_seq_lens_k"].tolist() == [0, 2, 6]
-    assert result["max_length_q"] == 4
-    assert result["max_length_k"] == 4
+    assert result["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert result["cu_seq_lens_k"].tolist() == [0, 2, 5]
+    assert result["max_length_q"] == 3
+    assert result["max_length_k"] == 3
 
 
 def test_prepare_inputs_creates_padding_mask_when_missing():

@@ -51,6 +51,9 @@ Core principles:
 3. **Pluggable into mainstream training frameworks:** Keep the training engine focused on model and training logic.
 4. **SuperNode-native:** Optimize the training engine for SuperNode architectures.
 
+FSDP2 Distributed Muon 的设计架构、计划编译和分布式执行见
+[`internal/docs/design/fsdp2_distributed_muon.md`](internal/docs/design/fsdp2_distributed_muon.md)。
+
 ### Model
 
 Each model directory is responsible for three tasks:

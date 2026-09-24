@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import logging
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,6 +24,8 @@ from torchturbo.ops.providers import iter_provider_modules
 from torchturbo.ops.registry import registry as ops_registry
 from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.cpu import CpuRuntime
+from torchturbo.runtime.cuda import CudaRuntime
+from torchturbo.runtime.npu import NpuRuntime
 
 
 def _reference_rms_norm(hidden_states, weight, eps):
@@ -65,6 +69,7 @@ class FallbackAddImpl(OpImpl):
 
 @pytest.fixture(autouse=True)
 def _reset_state(monkeypatch):
+    monkeypatch.setattr(logging.getLogger("torchturbo"), "propagate", True)
     monkeypatch.setattr(runtime_impl, "_SELECTED_RUNTIME", None)
     monkeypatch.setattr(
         importlib.import_module("torchturbo.ops.ops"), "_OPS", None
@@ -96,6 +101,9 @@ def test_provider_modules_are_discovered_from_provider_packages():
     assert "torchturbo.ops.providers.native.rms_norm" in cpu_modules
     assert "torchturbo.ops.providers.native.gated_activation" in cpu_modules
     assert "torchturbo.ops.providers.native.swiglu" in cpu_modules
+    assert "torchturbo.ops.providers.native.attention" in cpu_modules
+    assert "torchturbo.ops.providers.cuda.attention" in cuda_modules
+    assert "torchturbo.ops.providers.npu.attention" in npu_modules
     assert "torchturbo.ops.providers.cuda.gated_activation" in cuda_modules
     assert "torchturbo.ops.providers.cuda.swiglu" in cuda_modules
     assert "torchturbo.ops.providers.cuda.cross_entropy_loss" in cuda_modules
@@ -600,17 +608,25 @@ def test_dispatcher_logs_selected_ops(caplog):
     assert selected.spec.impl_name == "torch_rms_norm"
     assert {
         key[0] for key in dispatcher._candidate_impl_cache
-    } >= {"cross_entropy_loss", "grouped_matmul", "rms_norm", "swiglu"}
+    } >= {
+        "attention_with_max_logits", "cross_entropy_loss",
+        "grouped_matmul", "rms_norm", "swiglu",
+    }
     dispatcher.log_ops_selection()
 
     assert caplog.text.count("TorchTurbo ops selection (device=cpu, policy=auto):") == 1
     message = caplog.records[-1].message
-    lines = message.splitlines()
+    lines = message.split("\n\n", maxsplit=1)[0].splitlines()
     assert lines[2].startswith("Op")
     assert {"Implementation", "Kind", "Priority", "Status"} <= set(lines[2].split())
     assert lines[1] == lines[3] == lines[-1]
     assert "rms_norm" in message
     assert "torch_rms_norm" in message
+    rows = [line.split() for line in lines]
+    assert any(
+        row[:2] == ["attention_with_max_logits", "torch_attention_with_max_logits"]
+        for row in rows
+    )
     assert "selected" in message
 
 
@@ -689,3 +705,237 @@ def test_dispatcher_can_use_injected_device_runtime(monkeypatch):
     expected = _reference_rms_norm(hidden_states, weight, 1e-6)
 
     assert torch.allclose(actual, expected)
+
+
+@pytest.fixture
+def attention_providers(monkeypatch):
+    from torchturbo.ops.providers.cuda.attention import (
+        FlexAttentionWithMaxLogits,
+        TransformerEngineAttentionWithMaxLogits,
+    )
+    from torchturbo.ops.providers.native.attention import TorchAttentionWithMaxLogits
+    from torchturbo.ops.providers.npu.attention import NpuAttentionWithMaxLogits
+
+    provider_classes = (
+        TorchAttentionWithMaxLogits,
+        TransformerEngineAttentionWithMaxLogits,
+        FlexAttentionWithMaxLogits,
+        NpuAttentionWithMaxLogits,
+    )
+    registry = OpRegistry()
+    availability = {}
+    compute = {}
+    query = torch.ones(1, 3, 2, 4)
+    maxima = torch.ones(2)
+    for provider in provider_classes:
+        spec = provider.op_spec()
+        registry.register(ops_registry.get_by_impl_name(spec.impl_name))
+        availability[spec.impl_name] = Mock(return_value=True)
+        monkeypatch.setattr(provider, "available", availability[spec.impl_name])
+        compute[spec.impl_name] = Mock(return_value=(query, maxima))
+        monkeypatch.setattr(provider, "__call__", compute[spec.impl_name])
+
+    return SimpleNamespace(
+        registry=registry,
+        availability=availability,
+        compute=compute,
+        query=query,
+        maxima=maxima,
+    )
+
+
+def test_attention_provider_registration_keeps_capabilities_and_devices_separate(
+    attention_providers,
+):
+    expected = {
+        "torch_attention_with_max_logits": (
+            "attention_with_max_logits", OpImplKind.NATIVE, 0, (TurboDevice.CPU,),
+        ),
+        "te_attention_with_max_logits": (
+            "attention_with_max_logits", OpImplKind.CUSTOM, 100, (TurboDevice.CUDA,),
+        ),
+        "flex_attention_with_max_logits": (
+            "attention_with_max_logits", OpImplKind.NATIVE, 0, (TurboDevice.CUDA,),
+        ),
+        "npu_attention_with_max_logits": (
+            "attention_with_max_logits", OpImplKind.CUSTOM, 100, (TurboDevice.NPU,),
+        ),
+    }
+
+    for name, metadata in expected.items():
+        spec = attention_providers.registry.get_by_impl_name(name)
+        assert (spec.op_name, spec.kind, spec.priority, spec.devices) == metadata
+
+
+@pytest.mark.parametrize(
+    ("runtime_type", "maximum_impl"),
+    [
+        (CpuRuntime, "torch_attention_with_max_logits"),
+        (CudaRuntime, "te_attention_with_max_logits"),
+        (NpuRuntime, "npu_attention_with_max_logits"),
+    ],
+)
+def test_maximum_attention_op_selects_and_caches(
+    attention_providers, runtime_type, maximum_impl,
+):
+    runtime = runtime_type()
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry, device_runtime=runtime,
+    )
+    query = attention_providers.query
+    device = runtime.turbo_device.value
+    maximum = dispatcher._candidate_impl_cache[("attention_with_max_logits", device, None)]
+
+    for _ in range(2):
+        output, maxima = dispatcher.attention_with_max_logits(
+            query, query, query, None, 0.5, 0.0, True,
+        )
+        torch.testing.assert_close(output, query)
+        assert maxima is attention_providers.maxima
+
+    assert maximum.spec.impl_name == maximum_impl
+    assert dispatcher._candidate_impl_cache[("attention_with_max_logits", device, None)] is maximum
+    attention_providers.availability[maximum_impl].assert_called_once_with()
+    assert attention_providers.compute[maximum_impl].call_count == 2
+
+
+def test_maximum_attention_override_precedence(attention_providers):
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry,
+        device_runtime=CudaRuntime(),
+        overrides={"attention_with_max_logits": "flex_attention_with_max_logits"},
+    )
+    query = attention_providers.query
+
+    dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+    dispatcher.attention_with_max_logits(
+        query, query, query, None, 0.5, 0.0, True, impl="te_attention_with_max_logits",
+    )
+    dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+
+    assert attention_providers.compute["flex_attention_with_max_logits"].call_count == 2
+    attention_providers.compute["te_attention_with_max_logits"].assert_called_once()
+    assert set(dispatcher._candidate_impl_cache) == {
+        ("attention_with_max_logits", "cuda", "flex_attention_with_max_logits"),
+        ("attention_with_max_logits", "cuda", "te_attention_with_max_logits"),
+    }
+
+
+def test_native_attention_policy_selects_flex_instead_of_available_te(attention_providers):
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry,
+        device_runtime=CudaRuntime(),
+        default_policy=OpPolicy.NATIVE,
+    )
+    query = attention_providers.query
+
+    dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+
+    attention_providers.compute["flex_attention_with_max_logits"].assert_called_once()
+    attention_providers.availability["te_attention_with_max_logits"].assert_not_called()
+    attention_providers.compute["te_attention_with_max_logits"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("runtime_type", "maximum_impl"),
+    [
+        (CudaRuntime, "te_attention_with_max_logits"),
+        (NpuRuntime, "npu_attention_with_max_logits"),
+    ],
+)
+def test_custom_attention_policy_selects_custom_maximum_impl(
+    attention_providers, runtime_type, maximum_impl,
+):
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry,
+        device_runtime=runtime_type(),
+        default_policy=OpPolicy.CUSTOM,
+    )
+    query = attention_providers.query
+
+    dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+    attention_providers.compute[maximum_impl].assert_called_once()
+    attention_providers.compute["flex_attention_with_max_logits"].assert_not_called()
+
+
+def test_auto_attention_falls_back_only_when_te_is_unavailable(attention_providers, caplog):
+    caplog.set_level(logging.INFO, logger="torchturbo.ops.dispatcher")
+    attention_providers.availability["te_attention_with_max_logits"].return_value = False
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry, device_runtime=CudaRuntime(),
+    )
+    query = attention_providers.query
+
+    dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+    attention_providers.compute["flex_attention_with_max_logits"].assert_called_once()
+    attention_providers.compute["te_attention_with_max_logits"].assert_not_called()
+    dispatcher.log_ops_selection()
+    assert any(
+        "attention_with_max_logits" in line and "fallback" in line
+        for line in caplog.records[-1].message.splitlines()
+    )
+
+    custom = OpDispatcher(
+        registry=attention_providers.registry,
+        device_runtime=CudaRuntime(),
+        default_policy=OpPolicy.CUSTOM,
+    )
+    with pytest.raises(RuntimeError, match="No implementation.*policy=custom"):
+        custom.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+    with pytest.raises(RuntimeError, match="No implementation.*impl=te_attention_with_max_logits"):
+        dispatcher.attention_with_max_logits(
+            query, query, query, None, 0.5, 0.0, True, impl="te_attention_with_max_logits",
+        )
+    assert attention_providers.compute["flex_attention_with_max_logits"].call_count == 1
+
+
+def test_attention_does_not_fall_back_after_te_execution_fails(attention_providers):
+    failure = RuntimeError("TE kernel execution failed")
+    attention_providers.compute["te_attention_with_max_logits"].side_effect = failure
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry, device_runtime=CudaRuntime(),
+    )
+    query = attention_providers.query
+
+    with pytest.raises(RuntimeError) as raised:
+        dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+
+    assert raised.value is failure
+    attention_providers.compute["flex_attention_with_max_logits"].assert_not_called()
+    attention_providers.compute["torch_attention_with_max_logits"].assert_not_called()
+
+
+def test_unavailable_cuda_attention_cannot_fall_back_to_cpu(attention_providers):
+    for name in ("te_attention_with_max_logits", "flex_attention_with_max_logits"):
+        attention_providers.availability[name].return_value = False
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry, device_runtime=CudaRuntime(),
+    )
+    query = attention_providers.query
+
+    with pytest.raises(RuntimeError, match="No implementation.*device=cuda"):
+        dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+    with pytest.raises(RuntimeError, match="does not support device=cuda"):
+        dispatcher.attention_with_max_logits(
+            query, query, query, None, 0.5, 0.0, True, impl="torch_attention_with_max_logits",
+        )
+    attention_providers.availability["torch_attention_with_max_logits"].assert_not_called()
+    attention_providers.compute["torch_attention_with_max_logits"].assert_not_called()
+
+
+def test_cpu_attention_never_selects_cuda_providers(attention_providers):
+    dispatcher = OpDispatcher(
+        registry=attention_providers.registry, device_runtime=CpuRuntime(),
+    )
+    query = attention_providers.query
+
+    dispatcher.attention_with_max_logits(query, query, query, None, 0.5, 0.0, True)
+
+    attention_providers.compute["torch_attention_with_max_logits"].assert_called_once()
+    for name in ("te_attention_with_max_logits", "flex_attention_with_max_logits"):
+        attention_providers.availability[name].assert_not_called()
+        attention_providers.compute[name].assert_not_called()
+        with pytest.raises(RuntimeError, match="does not support device=cpu"):
+            dispatcher.attention_with_max_logits(
+                query, query, query, None, 0.5, 0.0, True, impl=name,
+            )

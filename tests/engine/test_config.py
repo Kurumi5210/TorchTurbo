@@ -88,6 +88,68 @@ def test_engine_config_from_dict_parses_moe_config():
     assert cfg.moe.aux_loss_coeff == 0.01
 
 
+def test_engine_config_from_dict_parses_muon_runtime_policy():
+    from torchturbo.engine.config import EngineConfig
+
+    cfg = EngineConfig.from_dict(
+        {
+            "optimizer": {
+                "name": "muon",
+                "muon": {
+                    "lr": 0.002,
+                    "weight_decay": 0.1,
+                    "momentum": 0.9,
+                    "ns_steps": 3,
+                    "overlap_comm_compute": "false",
+                    "bucket": {
+                        "strategy": "size",
+                        "bucket_cap_mb": 32,
+                    },
+                    "adamw_betas": [0.8, 0.95],
+                    "adamw_eps": 1e-6,
+                },
+            }
+        }
+    )
+
+    assert cfg.optimizer.name == "muon"
+    assert cfg.optimizer.muon.lr == 0.002
+    assert cfg.optimizer.muon.weight_decay == 0.1
+    assert cfg.optimizer.muon.momentum == 0.9
+    assert cfg.optimizer.muon.ns_steps == 3
+    assert cfg.optimizer.muon.overlap_comm_compute is False
+    assert cfg.optimizer.muon.bucket.strategy == "size"
+    assert cfg.optimizer.muon.bucket.bucket_cap_mb == 32
+    assert cfg.optimizer.muon.adamw_betas == (0.8, 0.95)
+    assert cfg.optimizer.muon.adamw_eps == 1e-6
+
+
+def test_engine_optimizer_defaults_to_framework_owned():
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import EngineConfig, build_from_args
+
+    assert EngineConfig().optimizer.name is None
+    assert EngineConfig().optimizer.muon is None
+    muon_config = build_from_args(TorchTurboArgs(optimizer_name="muon"))
+    assert muon_config.optimizer.muon.lr is None
+    assert muon_config.optimizer.muon.weight_decay is None
+    assert muon_config.optimizer.muon.bucket.strategy == "parameter"
+
+
+def test_engine_optimizer_rejects_unsupported_name():
+    from torchturbo.engine.config import OptimizerConfig
+
+    for name in ("future_optimizer", "adamw", "muno", ""):
+        with pytest.raises(ValueError, match="unsupported engine-managed optimizer"):
+            OptimizerConfig(name=name)
+
+
+def test_engine_optimizer_name_is_normalized():
+    from torchturbo.engine.config import OptimizerConfig
+
+    assert OptimizerConfig(name=" MUON ").name == "muon"
+
+
 def test_engine_config_parses_structured_cpu_offload():
     from torchturbo.engine.config import EngineConfig
 

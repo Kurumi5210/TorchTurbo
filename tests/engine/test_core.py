@@ -2,6 +2,7 @@
 
 import importlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -14,11 +15,22 @@ from torchturbo.engine import (
     EngineConfig,
     FSDP2Backend,
     MixedPrecisionPolicy,
+    MuonOptimizerConfig,
+    MuonPlan,
+    OptimizerClassPlan,
+    OptimizerConfig,
     TorchTurboEngine,
+    build_model_fqn_map,
     register_backend,
 )
 from torchturbo.engine.backend_registry import _BACKENDS
 from torchturbo.engine.backends.fsdp2.config import FSDPConfig
+from torchturbo.engine.optimizers import (
+    MuonParameterSpec,
+    MuonRecipe,
+    OptimizersContainer,
+    Owned,
+)
 from torchturbo.models.base import TurboModel
 from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
@@ -29,6 +41,7 @@ from torchturbo.runtime.cpu import CpuRuntime
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 class TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -36,6 +49,17 @@ class TinyModel(nn.Module):
 
     def forward(self, x):
         return self.linear(x)
+
+
+def test_turbo_model_requires_an_explicit_optimizer_recipe():
+    # Engine-managed optimizers are opt-in per architecture, so the base class
+    # never guesses a parameter split.
+    for optimizer_name in ("muon", "unknown"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"optimizer recipe for {optimizer_name!r}",
+        ):
+            TurboModel().get_optimizer_recipe(optimizer_name)
 
 
 class TinyLogitsModel(nn.Module):
@@ -59,14 +83,14 @@ class DummyBackend(BaseBackend):
 
     def prepare_optimizer(
         self,
-        model,
-        optimizer_cls,
-        *,
-        param_groups=None,
-        **kw,
+        plan,
     ):
-        params = param_groups if param_groups is not None else model.parameters()
-        return optimizer_cls(params, **kw)
+        name = plan.optimizer_name
+        groups = [
+            group.get_optimizer_param_group()
+            for group in plan.get_param_groups_by_optimizer_name()[name]
+        ]
+        return plan.optimizer_cls(groups, **plan.optimizer_kwargs)
 
 
 class ProfilingBackend(DummyBackend):
@@ -118,6 +142,7 @@ class RecordingProfiler:
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(autouse=True)
 def _clean_backends():
     saved = dict(_BACKENDS)
@@ -130,6 +155,7 @@ def _clean_backends():
 # Tests: Config
 # ---------------------------------------------------------------------------
 
+
 class TestEngineConfig:
     def test_defaults(self):
         cfg = EngineConfig()
@@ -137,15 +163,130 @@ class TestEngineConfig:
         assert isinstance(cfg.backend_config, FSDPConfig)
 
     def test_from_dict(self):
-        cfg = EngineConfig.from_dict({"backend": "fsdp2", "mixed_precision": "fp16"})
-        assert cfg.mixed_precision == MixedPrecisionPolicy.FP16
+        cfg = EngineConfig.from_dict(
+            {"backend": "fsdp2", "mixed_precision": "fp32"}
+        )
+        assert cfg.mixed_precision == MixedPrecisionPolicy.FP32
+
+    @pytest.mark.parametrize("policy", ["fp16", "fp8"])
+    def test_from_dict_rejects_unsupported_mixed_precision(self, policy):
+        with pytest.raises(
+            ValueError, match=f"does not support mixed_precision='{policy}'"
+        ):
+            EngineConfig.from_dict({"backend": "fsdp2", "mixed_precision": policy})
+
+    @pytest.mark.parametrize("policy", ["fp16", "fp8"])
+    def test_constructor_rejects_unsupported_mixed_precision(self, policy):
+        with pytest.raises(
+            ValueError, match=f"does not support mixed_precision='{policy}'"
+        ):
+            EngineConfig(mixed_precision=policy)
 
 
 # ---------------------------------------------------------------------------
 # Tests: Engine core functionality
 # ---------------------------------------------------------------------------
 
+
 class TestEngineSetup:
+    @pytest.mark.parametrize("entrypoint", ["build_model", "prepare_model"])
+    def test_model_build_patches_hf_before_parallelized_hook(self, monkeypatch, entrypoint):
+        from transformers import PretrainedConfig, PreTrainedModel
+        import transformers.integrations.flash_attention as flash_integration
+        import transformers.modeling_flash_attention_utils as flash_utils
+
+        from torchturbo.models.modules.attention.interface import attention_forward
+        from torchturbo.models.modules.attention.ulysses import ulysses_flash_attention_forward
+
+        order = []
+        sp_binding = []
+        parallel_context = {"sp": {"sp_group": object(), "sp_size": 2}}
+        original_binding = Mock()
+        monkeypatch.setattr(flash_integration, "_flash_attention_forward", original_binding)
+        monkeypatch.setattr(flash_utils, "_get_unpad_data", flash_utils._get_unpad_data)
+
+        class LifecycleModel(TurboModel, PreTrainedModel):
+            config_class = PretrainedConfig
+
+            def __init__(self, config: PretrainedConfig) -> None:
+                super().__init__(config)
+                self.projection = nn.Linear(2, 2, bias=False)
+
+            def on_parallelized(self, context: dict) -> None:
+                order.append("on_parallelized")
+                assert context is parallel_context
+                assert flash_integration._flash_attention_forward is attention_forward
+                self.patch_ulysses_fa(context["sp"])
+                sp_binding.append(flash_integration._flash_attention_forward)
+
+            def on_materialized(self) -> None:
+                order.append("on_materialized")
+                assert self.projection.weight.device.type == "cpu"
+                assert flash_integration._flash_attention_forward is sp_binding[0]
+
+        def backend_prepare(model, parallel_plan, peft_config):
+            order.append("backend_prepare")
+            assert isinstance(model, LifecycleModel)
+            assert model.projection.weight.is_meta
+            assert flash_integration._flash_attention_forward is original_binding
+            assert parallel_plan is engine.parallel_plan
+            assert peft_config is None
+            return model
+
+        def backend_context():
+            order.append("parallel_context")
+            assert flash_integration._flash_attention_forward is attention_forward
+            return parallel_context
+
+        def backend_load(model, model_name_or_path, load_weights):
+            order.append("backend_load")
+            assert model_name_or_path == "local_model"
+            assert load_weights is (entrypoint == "prepare_model")
+            assert flash_integration._flash_attention_forward is sp_binding[0]
+            return model.to_empty(device="cpu")
+
+        engine = object.__new__(TorchTurboEngine)
+        engine.config = EngineConfig()
+        engine.model = previous_model = TinyModel()
+        engine.model_name_or_path = "previous_model"
+        engine.parallel_plan = None
+        engine.backend = Mock(spec=BaseBackend)
+        engine.backend.prepare_model.side_effect = backend_prepare
+        engine.backend.get_parallel_context.side_effect = backend_context
+        engine.backend.load_model.side_effect = backend_load
+        monkeypatch.setattr(engine, "_log_info", lambda: None)
+        monkeypatch.setattr(engine_core.dist, "is_initialized", lambda: False)
+        patch_transformers = engine._patch_transformers
+
+        def record_patch():
+            order.append("hf_patch")
+            patch_transformers()
+
+        monkeypatch.setattr(engine, "_patch_transformers", record_patch)
+        arguments = dict(
+            model_name_or_path="local_model",
+            model_cls=LifecycleModel,
+            init_kwargs={"config": PretrainedConfig()},
+        )
+        if entrypoint == "build_model":
+            model = engine.build_model(**arguments, load_weights=False)
+            assert engine.model is previous_model
+            assert engine.model_name_or_path == "previous_model"
+        else:
+            model = engine.prepare_model(**arguments)
+            assert engine.model is model
+            assert engine.model_name_or_path == "local_model"
+
+        assert isinstance(model, LifecycleModel)
+        assert order == [
+            "backend_prepare", "hf_patch", "parallel_context", "on_parallelized",
+            "backend_load", "on_materialized",
+        ]
+        assert flash_integration._flash_attention_forward is sp_binding[0]
+        assert sp_binding[0].func is ulysses_flash_attention_forward
+        engine.backend.prepare_model.assert_called_once()
+        engine.backend.load_model.assert_called_once()
+
     def test_default_init(self):
         engine = TorchTurboEngine()
         assert isinstance(engine.backend, FSDP2Backend)
@@ -161,11 +302,11 @@ class TestEngineSetup:
     def test_prepare_optimizer(self):
         register_backend("dummy", DummyBackend)
         engine = TorchTurboEngine({"backend": "dummy"})
-        
+
         # Inject model manually to avoid huggingface download logic
         model = TinyModel()
         engine.model = engine.backend.shard_model(model)
-        
+
         engine.prepare_optimizer(
             torch.optim.AdamW,
             lr=0.01,
@@ -177,6 +318,184 @@ class TestEngineSetup:
         engine = TorchTurboEngine()
         with pytest.raises(RuntimeError, match="prepare_model"):
             engine.prepare_optimizer(torch.optim.AdamW)
+
+    def test_framework_optimizer_defaults_to_adamw(self):
+        register_backend("dummy", DummyBackend)
+        engine = TorchTurboEngine({"backend": "dummy"})
+        engine.model = engine.backend.shard_model(TinyModel())
+
+        optimizer = engine.prepare_optimizer(lr=0.01, weight_decay=0.0)
+
+        assert type(optimizer) is torch.optim.AdamW
+
+    def test_framework_optimizer_is_passed_to_backend_as_class_plan(self):
+        prepared = []
+        model = TinyModel()
+
+        class Backend:
+            def prepare_optimizer(self, plan):
+                assert isinstance(plan, OptimizerClassPlan)
+                assert plan.optimizer_cls is torch.optim.AdamW
+                assert plan.optimizer_kwargs["lr"] == 0.01
+                assert plan.optimizer_kwargs["weight_decay"] == 0.2
+                groups_by_optimizer_name = plan.get_param_groups_by_optimizer_name()
+                assert tuple(groups_by_optimizer_name) == ("AdamW",)
+                optimizer = torch.optim.AdamW(
+                    [
+                        group.get_optimizer_param_group()
+                        for group in groups_by_optimizer_name["AdamW"]
+                    ],
+                    **plan.optimizer_kwargs,
+                )
+                prepared.append(optimizer)
+                return optimizer
+
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = model
+        engine.backend = Backend()
+        engine.config = EngineConfig()
+
+        result = engine.prepare_optimizer(
+            torch.optim.AdamW,
+            lr=0.01,
+            weight_decay=0.2,
+        )
+
+        assert result is prepared[0]
+        assert engine.optimizer is result
+
+    def test_engine_builds_muon_plan_for_backend(self):
+        prepared = []
+        map_requests = []
+        model = TinyModel()
+
+        class Backend:
+            name = "test"
+
+            def get_model_fqn_map(self):
+                map_requests.append(model)
+                return build_model_fqn_map(model)
+
+            def prepare_optimizer(self, plan):
+                assert isinstance(plan, MuonPlan)
+                assert dict(plan.parameter_specs) == {
+                    "linear.weight": MuonParameterSpec(compute_placement=Owned())
+                }
+                assert plan.muon_kwargs["lr"] == engine.config.optimizer.muon.lr
+                assert (
+                    plan.overlap_comm_compute
+                    is engine.config.optimizer.muon.overlap_comm_compute
+                )
+                groups = [
+                    group.get_optimizer_param_group()
+                    for group in plan.get_param_groups_by_optimizer_name()["Muon"]
+                ]
+                optimizer = torch.optim.Optimizer(groups, {})
+                prepared.append(optimizer)
+                return optimizer
+
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = model
+        expected_recipe = MuonRecipe({})
+
+        def get_optimizer_recipe(optimizer_name):
+            assert optimizer_name == "muon"
+            return expected_recipe
+
+        engine.model.get_optimizer_recipe = get_optimizer_recipe
+        engine.backend = Backend()
+        engine.config = EngineConfig(
+            optimizer=OptimizerConfig(
+                name="muon",
+                muon=MuonOptimizerConfig(lr=0.1, weight_decay=0.01),
+            )
+        )
+
+        result = engine.prepare_optimizer()
+
+        assert result is prepared[0]
+        assert engine.optimizer is result
+        assert map_requests == [model]
+
+    def test_engine_preserves_backend_optimizer_container(self):
+        prepared = []
+
+        class Model(nn.Linear):
+            def __init__(self):
+                super().__init__(4, 1)
+
+            def get_optimizer_recipe(self, _optimizer_name):
+                return MuonRecipe({})
+
+        model = Model()
+
+        class Backend:
+            name = "test"
+
+            def get_model_fqn_map(self):
+                return build_model_fqn_map(model)
+
+            def prepare_optimizer(self, plan):
+                optimizers_by_name = {
+                    name: torch.optim.Optimizer(
+                        [group.get_optimizer_param_group() for group in groups],
+                        {},
+                    )
+                    for name, groups in plan.get_param_groups_by_optimizer_name().items()
+                }
+                optimizer = OptimizersContainer(plan, optimizers_by_name)
+                prepared.append(optimizer)
+                return optimizer
+
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = model
+        engine.backend = Backend()
+        engine.config = EngineConfig(
+            optimizer=OptimizerConfig(
+                name="muon",
+                muon=MuonOptimizerConfig(lr=0.1, weight_decay=0.01),
+            )
+        )
+
+        result = engine.prepare_optimizer()
+
+        assert result is prepared[0]
+        assert engine.optimizer is result
+        assert isinstance(result, OptimizersContainer)
+        assert tuple(result.optimizers_by_name) == ("Muon", "AdamW")
+
+    @pytest.mark.parametrize(
+        ("optimizer_cls", "optimizer_kwargs"),
+        [
+            (torch.optim.SGD, {}),
+            (None, {"lr": 0.1, "weight_decay": 0.01}),
+        ],
+    )
+    def test_engine_managed_optimizer_rejects_framework_inputs(
+        self,
+        optimizer_cls,
+        optimizer_kwargs,
+    ):
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = TinyModel()
+        engine.config = EngineConfig(optimizer=OptimizerConfig(name="muon"))
+
+        with pytest.raises(ValueError, match="cannot be supplied"):
+            engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
+
+    def test_engine_rejects_unsupported_engine_managed_optimizer(self):
+        engine = object.__new__(TorchTurboEngine)
+        engine.model = TinyModel()
+        engine.config = EngineConfig(optimizer=OptimizerConfig(name="muon"))
+        # OptimizerConfig rejects unknown names, so reach the engine's dispatch
+        # backstop by mutating the validated config.
+        engine.config.optimizer.name = "future_optimizer"
+
+        with pytest.raises(
+            NotImplementedError,
+            match="cannot prepare optimizer 'future_optimizer'",
+        ):
+            engine.prepare_optimizer()
 
     def test_compute_loss_defers_eval_metrics_until_explicit_collect(self):
         register_backend("dummy", ProfilingBackend)
@@ -417,14 +736,14 @@ class TestEngineSetup:
     def test_prepare_lr_scheduler(self):
         register_backend("dummy", DummyBackend)
         engine = TorchTurboEngine({"backend": "dummy"})
-        
+
         engine.model = engine.backend.shard_model(TinyModel())
         engine.prepare_optimizer(
             torch.optim.AdamW,
             lr=0.01,
             weight_decay=0.0,
         )
-        
+
         engine.prepare_lr_scheduler(torch.optim.lr_scheduler.StepLR, step_size=10)
         assert engine.lr_scheduler is not None
 
@@ -524,25 +843,24 @@ class TestEngineSetup:
         with pytest.raises(RuntimeError, match="No active profiler"):
             engine.step_profiling()
 
-
     def test_custom_backend(self):
         register_backend("dummy", DummyBackend)
         engine = TorchTurboEngine({"backend": "dummy"})
-        
+
         # We simulate what prepare_model does
         model = TinyModel()
         engine.model = engine.backend.shard_model(model)
-        
+
         assert getattr(engine.model, "_dummy_sharded", False)
 
     def test_repr(self):
         engine = TorchTurboEngine()
         assert "not prepared" in repr(engine).lower()
-        
+
         register_backend("dummy", DummyBackend)
         engine = TorchTurboEngine({"backend": "dummy"})
         engine.model = engine.backend.shard_model(TinyModel())
-        
+
         assert "model" in repr(engine).lower()
 
 

@@ -48,6 +48,11 @@ class DeviceRuntime(ABC):
         """Device passed to Torch APIs."""
         return torch.device(self.turbo_device.value)
 
+    @property
+    def supports_async_streams(self) -> bool:
+        """Whether this runtime provides asynchronous stream/event primitives."""
+        return False
+
     @abstractmethod
     def available(self) -> bool:
         ...
@@ -91,6 +96,15 @@ class DeviceRuntime(ABC):
     @abstractmethod
     def new_stream(self, priority: int = 0):
         ...
+
+    def new_event(self):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement device events."
+        )
+
+    def record_stream(self, tensor: torch.Tensor, stream) -> None:
+        if stream is not None:
+            tensor.record_stream(stream)
 
     def synchronize_stream(self, stream) -> None:
         if stream is not None:

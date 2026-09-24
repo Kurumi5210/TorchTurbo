@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 from transformers import PretrainedConfig
 
 import torch
 import torch.nn as nn
+from torch.optim import Optimizer
 
 from ...logging import get_logger
 from ...runtime import DeviceRuntime
+from ..model_fqn import ModelFQNMap
 
 if TYPE_CHECKING:
     from ..config import EngineConfig
+    from ..optimizers.plan import OptimizerPlan
 
 
 class BaseBackend(ABC):
@@ -36,6 +38,7 @@ class BaseBackend(ABC):
                 "select the process device runtime first."
             )
         self._device_runtime = device_runtime
+        self._model_fqn_map: ModelFQNMap | None = None
 
     @property
     def device_runtime(self) -> DeviceRuntime:
@@ -44,6 +47,14 @@ class BaseBackend(ABC):
     @property
     def device(self) -> torch.device:
         return self._device_runtime.device
+
+    def get_model_fqn_map(self) -> ModelFQNMap:
+        """Return the FQN map captured while preparing the current model."""
+        if self._model_fqn_map is None:
+            raise RuntimeError(
+                "Model FQN map is unavailable. Call prepare_model() first."
+            )
+        return self._model_fqn_map
 
     @abstractmethod
     def prepare_model(
@@ -128,13 +139,9 @@ class BaseBackend(ABC):
     @abstractmethod
     def prepare_optimizer(
         self,
-        model: nn.Module,
-        optimizer_cls: type,
-        *,
-        param_groups: list[dict[str, Any]] | None = None,
-        **optimizer_kwargs: Any,
-    ) -> Any:
-        """Create an optimizer from engine-prepared parameter groups."""
+        plan: OptimizerPlan,
+    ) -> Optimizer:
+        """Return a validated optimizer with all plan-defined step hooks installed."""
 
     @abstractmethod
     def get_dp_info(self) -> dict[str, Any]:

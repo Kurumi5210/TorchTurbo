@@ -18,6 +18,7 @@ from torchturbo.parallel.fsdp import (
     FSDPPlacementSpec,
     FSDPPlanSpec,
 )
+from torchturbo.engine.utils import match_fqn
 
 
 def test_standalone_world_shard_spec_is_valid():
@@ -53,3 +54,33 @@ def test_parallel_plan_still_normalizes_tuple_placement_specs():
     assert isinstance(spec, FSDPPlanSpec)
     assert isinstance(spec.placement, FSDPPlacementSpec)
     assert spec.placement.mesh_dim == "edp"
+
+
+def test_match_fqn_star_stays_within_one_segment():
+    assert match_fqn(
+        "model.layers.*.q_*.weight",
+        "model.layers.0.q_proj.weight",
+    )
+    assert not match_fqn(
+        "model.layers.*.weight",
+        "model.layers.0.projection.weight",
+    )
+
+
+def test_match_fqn_double_star_crosses_segment_boundaries():
+    assert match_fqn(
+        "model.layers.**.weight",
+        "model.layers.0.attention.q_proj.weight",
+    )
+
+
+def test_parallel_plan_matches_modeling_fqn_only():
+    spec = FSDPPlanSpec(no_shard=True)
+    plan = FSDPParallelPlan(
+        plan={"model.layers.*.projection.weight": spec}
+    )
+
+    assert plan.match("model.layers.0.projection.weight") is spec
+    assert plan.match(
+        "base_model.model.model.layers.0.projection.base_layer.weight"
+    ) is None

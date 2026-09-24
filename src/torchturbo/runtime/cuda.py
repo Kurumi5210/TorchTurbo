@@ -74,6 +74,10 @@ class CudaRuntime(DeviceRuntime):
     turbo_device = TurboDevice.CUDA
     dist_backend = "nccl"
 
+    @property
+    def supports_async_streams(self) -> bool:
+        return True
+
     def use_deterministic_algorithms(self) -> None:
         super().use_deterministic_algorithms()
         torch.backends.cudnn.deterministic = True
@@ -114,6 +118,9 @@ class CudaRuntime(DeviceRuntime):
 
     def new_stream(self, priority: int = 0):
         return torch.cuda.Stream(priority=priority)
+
+    def new_event(self):
+        return torch.cuda.Event()
 
     def manual_seed_all(self, seed: int) -> None:
         torch.cuda.manual_seed_all(seed)

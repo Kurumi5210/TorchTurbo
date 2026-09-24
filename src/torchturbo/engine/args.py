@@ -82,7 +82,7 @@ class TorchTurboArgs:
     backend:
         Distributed backend (``"fsdp2"``).
     mixed_precision:
-        Mixed precision policy (``"bf16"``, ``"fp16"``, ``"fp32"``, ``"fp8"``).
+        Mixed precision policy (``"bf16"``, ``"fp32"``).
     use_deterministic_algorithms:
         Require deterministic algorithms for the selected device runtime.
     op_policy:
@@ -139,6 +139,7 @@ class TorchTurboArgs:
     backend: str | None = None
     mixed_precision: str | None = None
     op_policy: str | None = None
+    optimizer_name: str | None = None
     use_deterministic_algorithms: bool = False
     sp_size: int | None = None
     ep_size: int | None = None
@@ -161,10 +162,8 @@ class TorchTurboArgs:
     memory_snapshot_steps: int | None = None
     log_level: LogLevel = LogLevel.INFO
 
-    # Adapter-seeded fields (NOT CLI ``--tt_*`` flags). Adapters fold values
-    # sourced from their own args (model path, output_dir, bf16/fp16 -> mixed
-    # precision, ...) onto these before calling ``build_from_args``, so the
-    # builder can reconstruct an EngineConfig from a single TorchTurboArgs.
+    # Base configuration fields that are not exposed as ``--tt_*`` flags.
+    # Callers may set them before passing this object to ``build_from_args``.
     model_path: str | None = None
     output_dir: str | None = None
     default_save_format: str | None = None
@@ -250,7 +249,7 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         env_name="TORCH_TURBO_MIXED_PRECISION",
         config_path="mixed_precision",
         metavar="POLICY",
-        help="Mixed precision policy (bf16, fp16, fp32, fp8). "
+        help="Mixed precision policy (bf16, fp32). "
         "Replaces TORCH_TURBO_MIXED_PRECISION.",
     ),
     TurboArgSpec(
@@ -262,6 +261,15 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         metavar="POLICY",
         help="Default op dispatch policy (auto, native, custom). "
         "Replaces TORCH_TURBO_OP_POLICY.",
+    ),
+    TurboArgSpec(
+        name="optimizer_name",
+        args_name="optimizer_name",
+        cli_name="--tt_optimizer",
+        config_path="optimizer.name",
+        metavar="NAME",
+        choices=("muon",),
+        help="Use an engine-managed optimizer (currently: muon).",
     ),
     TurboArgSpec(
         name="use_deterministic_algorithms",
@@ -338,8 +346,7 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         cli_name=None,
         env_name=None,
         config_path="backend_config.cpu_offload",
-        help="Structured CPU offload policy (see CPUOffloadConfig). Adapters "
-        "may seed this value before the YAML/JSON config is loaded.",
+        help="Structured CPU offload policy (see CPUOffloadConfig).",
     ),
     TurboArgSpec(
         name="cpu_offload_enabled",
@@ -567,7 +574,7 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         config_path="backend_config.reshard_after_forward",
         type=string_to_bool,
     ),
-    # Adapter-only Engine inputs
+    # Non-CLI Engine inputs
     TurboArgSpec(
         name="model_path",
         args_name="model_path",
@@ -684,7 +691,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
     Example::
 
         tt_args, remaining = parse_torchturbo_args(sys.argv[1:])
-        # remaining can be passed to LlamaFactory's run_exp()
+        # Pass remaining arguments to the caller's argument parser.
     """
     parser = _build_parser()
     parsed, remaining = parser.parse_known_args(argv)
@@ -718,6 +725,7 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.backend,
             args.mixed_precision,
             args.op_policy,
+            args.optimizer_name,
             args.sp_size,
             args.ep_size,
             args.cpu_offload_enabled,

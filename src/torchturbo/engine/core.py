@@ -6,7 +6,7 @@ import dataclasses
 import json
 import os
 import socket
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Iterator, Optional
 
 import math
@@ -21,6 +21,7 @@ from .backend_registry import get_available_backends, get_backend
 from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
 from .metrics import MetricTracker
+from .optimizers import MuonPlan, OptimizerClassPlan, OptimizersContainer
 from .utils import has_meta_tensor
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
@@ -163,8 +164,7 @@ class TorchTurboEngine:
     """One-stop-shop engine for distributed training.
 
     Owns model preparation, distributed sharding, optimizer setup, loss
-    computation, profiling, and checkpoint I/O.  Framework adapters keep
-    ownership of the trainer loop.
+    computation, profiling, and checkpoint I/O.
 
     Parameters
     ----------
@@ -185,9 +185,6 @@ class TorchTurboEngine:
             scheduler_cls=CosineAnnealingLR,
             T_max=1000,
         )
-
-        # Framework adapters use the engine for model/optimizer/loss plumbing
-        # while retaining ownership of their native Trainer loop.
     """
 
     def __init__(self, config: EngineConfig | dict[str, Any] | None = None) -> None:
@@ -230,7 +227,7 @@ class TorchTurboEngine:
         # These are set by setup()
         self.model: nn.Module | None = None
         self.model_name_or_path: str | None = None
-        self.optimizer: Any = None
+        self.optimizer: torch.optim.Optimizer | None = None
         self.lr_scheduler: Any = None
         self.parallel_plan: Any = None
 
@@ -243,6 +240,18 @@ class TorchTurboEngine:
     # ------------------------------------------------------------------
     # Model preparation (meta device → shard → load weights)
     # ------------------------------------------------------------------
+
+    def _patch_transformers(self) -> None:
+        """Connect Transformers attention and packing to TorchTurbo."""
+        import transformers.integrations.flash_attention as flash_integration
+        import transformers.modeling_flash_attention_utils as flash_utils
+
+        from ..models.modules.attention.interface import attention_forward
+        from ..utils.flash_attn_utils import get_unpad_data
+
+        flash_integration._flash_attention_forward = attention_forward
+        # Support packed sequence IDs as well as binary padding masks.
+        flash_utils._get_unpad_data = get_unpad_data
 
     def build_model(
         self,
@@ -348,6 +357,7 @@ class TorchTurboEngine:
                     model, parallel_plan=parallel_plan, peft_config=peft_config
                 )
 
+                self._patch_transformers()
                 parallel_context = self._get_parallel_context()
                 model.on_parallelized(parallel_context)
 
@@ -505,8 +515,9 @@ class TorchTurboEngine:
     ) -> None:
         """Save optimizer (per-rank, via backend) and LR scheduler (rank-0).
 
-        ``optimizer`` / ``model`` / ``lr_scheduler`` are the training loop's
-        live objects, threaded down from the trainer.
+        ``optimizer`` is the engine-owned optimizer, before any framework
+        wrapper is applied. ``model`` and ``lr_scheduler`` are the training
+        loop's live objects.
         """
         self.backend.save_optimizer(
             optimizer,
@@ -533,6 +544,11 @@ class TorchTurboEngine:
             checkpoint_dir,
             **kwargs,
         )
+        # Backends load into the child optimizers, and Optimizer.load_state_dict
+        # replaces their parameter-group dictionaries. Rebind the container so the
+        # LR scheduler keeps writing learning rates the children actually read.
+        if isinstance(optimizer, OptimizersContainer):
+            optimizer.refresh_param_groups()
 
         scheduler_state = self._load_scheduler(checkpoint_dir)
         if scheduler_state is not None and lr_scheduler is not None:
@@ -589,83 +605,59 @@ class TorchTurboEngine:
         self,
         optimizer_cls: type | None = None,
         **kwargs: Any,
-    ) -> Any:
-        """Create an optimizer for the prepared model.
-
-        Must be called **after** ``prepare_model()``. ``lr`` and
-        ``weight_decay`` must be passed explicitly.
-
-        Example::
-
-            model = engine.prepare_model("meta-llama/Llama-2-7b-hf")
-            optimizer = engine.prepare_optimizer(
-                torch.optim.AdamW,
-                lr=1e-4,
-                weight_decay=1e-2,
-            )
-
-        Returns the created optimizer (also stored as ``self.optimizer``).
-        """
+    ) -> torch.optim.Optimizer:
+        """Resolve an optimizer plan and receive the backend's complete optimizer."""
         if self.model is None:
             raise RuntimeError("No model prepared. Call engine.prepare_model() first.")
 
-        if optimizer_cls is None:
-            optimizer_cls = torch.optim.AdamW
-
-        required_kwargs = ("lr", "weight_decay")
-        missing_kwargs = [
-            name for name in required_kwargs if name not in kwargs or kwargs[name] is None
-        ]
-        if missing_kwargs:
-            raise ValueError(
-                "prepare_optimizer requires explicit values for "
-                f"{', '.join(missing_kwargs)}."
-            )
-
-        param_groups = self._prepare_optimizer_param_groups(
-            weight_decay=kwargs["weight_decay"]
-        )
-        self.optimizer = self.backend.prepare_optimizer(
-            self.model,
-            optimizer_cls,
-            param_groups=param_groups,
-            **kwargs,
-        )
-        logger.info_rank0("Created optimizer: %s with kwargs: %s", type(self.optimizer).__name__, kwargs)
-        return self.optimizer
-
-    def _prepare_optimizer_param_groups(
-        self,
-        *,
-        weight_decay: float,
-    ) -> list[dict[str, Any]]:
-        """Split trainable parameters into decay and no-decay optimizer groups."""
-        if self.model is None:
-            raise RuntimeError("No model prepared. Call engine.prepare_model() first.")
-
-        decay_params: list[nn.Parameter] = []
-        no_decay_params: list[nn.Parameter] = []
-        # Megatron Core default: biases and 1-D parameters do not decay.
-        # Reference: megatron.core.optimizer._get_param_groups
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if name.endswith(".bias") or param.ndim == 1:
-                no_decay_params.append(param)
+        optimizer_name = self.config.optimizer.name
+        if optimizer_name is not None:
+            if optimizer_cls is not None or kwargs:
+                raise ValueError(
+                    "optimizer_cls and optimizer kwargs cannot be supplied when "
+                    f"using engine-managed optimizer {optimizer_name!r}"
+                )
+            if optimizer_name == MuonPlan.name:
+                optimizer_config = self.config.optimizer.muon
+                # The training framework's own optimizer arguments never reach an
+                # engine-managed optimizer, and its LR scheduler then scales from
+                # the values below. Say so, or a run silently uses a different LR
+                # than the one on the command line.
+                logger.warning_rank0(
+                    "Engine-managed optimizer %r uses lr=%s and weight_decay=%s "
+                    "from engine config optimizer.muon; framework optimizer "
+                    "arguments such as learning_rate and weight_decay are ignored.",
+                    optimizer_name,
+                    optimizer_config.lr,
+                    optimizer_config.weight_decay,
+                )
+                recipe = self.model.get_optimizer_recipe(optimizer_name)
+                plan = MuonPlan(
+                    self.model,
+                    recipe=recipe,
+                    config=optimizer_config,
+                    model_fqn_map=self.backend.get_model_fqn_map(),
+                )
             else:
-                decay_params.append(param)
+                raise NotImplementedError(
+                    f"TorchTurboEngine cannot prepare optimizer {optimizer_name!r}"
+                )
+        else:
+            if optimizer_cls is None:
+                optimizer_cls = torch.optim.AdamW
+            plan = OptimizerClassPlan(
+                model=self.model,
+                optimizer_cls=optimizer_cls,
+                optimizer_kwargs=kwargs,
+            )
 
+        self.optimizer = self.backend.prepare_optimizer(plan)
         logger.info_rank0(
-            "Prepared optimizer parameter groups: decay=%d, no_decay=%d, "
-            "weight_decay=%s",
-            len(decay_params),
-            len(no_decay_params),
-            weight_decay,
+            "Created optimizer %s from %r",
+            type(self.optimizer).__name__,
+            plan,
         )
-        return [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ]
+        return self.optimizer
 
     def prepare_lr_scheduler(
         self,
@@ -909,10 +901,8 @@ class TorchTurboEngine:
         """Compatibility stub for the removed engine-owned training loop.
 
         TODO: Remove this compatibility surface after downstream callers have
-        migrated to the native LlamaFactory or ms-swift Trainer loop.
+        migrated to their own training loops.
         """
-        # TODO: Not used by current training flows (llamafactory/swift run their
-        # own Trainer loops); awaiting refactor.
         del (
             train_dataloader,
             num_epochs,
@@ -925,7 +915,7 @@ class TorchTurboEngine:
         )
         raise NotImplementedError(
             "TorchTurboEngine.fit() is no longer supported. "
-            "Use the LlamaFactory or ms-swift Trainer entry point instead."
+            "Drive training through the engine's per-step methods instead."
         )
 
     def get_sp_info(self) -> dict[str, Any]:
@@ -933,7 +923,7 @@ class TorchTurboEngine:
         return self.backend.get_sp_info()
 
     def resolve_gradient_accumulation_steps(self, framework_ga: int) -> int:
-        """Return the ``gradient_accumulation_steps`` the HF/swift loop should use.
+        """Return the ``gradient_accumulation_steps`` for the training loop.
 
         Two modes:
         - ``tt_gbs`` set (``--tt_gbs``): derive ``ga = tt_gbs * sp_size /
@@ -1014,7 +1004,27 @@ class TorchTurboEngine:
         gradient_accumulation_steps: int = 1,
         **kwargs,
     ):
-        """Compute the scalar loss for a single micro-batch."""
+        """Compute the scalar loss for a single micro-batch.
+
+        Packed SFT batches contain one token row and validated cu/max metadata.
+        """
+        if (
+            isinstance(inputs, Mapping)
+            and inputs.get("cu_seq_lens_q") is not None
+            and inputs.get("attention_mask") is None
+        ):
+            from ..utils.flash_attn_utils import cu_seqlens_to_attention_mask
+
+            inputs = dict(inputs)
+            cu_seqlens = inputs.pop("cu_seq_lens_q")
+            inputs.pop("cu_seq_lens_k")
+            inputs.pop("max_length_q")
+            inputs.pop("max_length_k")
+            # TODO: Pass cu/max directly to models and remove this mask conversion
+            # once all model attention branches consume explicit packed boundaries.
+            inputs["attention_mask"] = cu_seqlens_to_attention_mask(
+                cu_seqlens, inputs["input_ids"].shape[-1]
+            )
         inputs = self.backend.prepare_inputs(model, inputs)
         if model.training:
             self._record_micro(inputs)

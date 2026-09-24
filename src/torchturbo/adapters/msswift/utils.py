@@ -10,11 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...engine.config import (
-    EngineConfig,
-    MixedPrecisionPolicy,
-    build_from_args,
-)
+from ...engine.config import EngineConfig, build_from_args
 from ...engine.args import TorchTurboArgs, get_torchturbo_args
 from ...logging import get_logger
 
@@ -45,12 +41,12 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     # did not pass --tt_mixed_precision; explicit tt value wins, env overrides
     # still apply inside build_from_args.
     if tt.mixed_precision is None:
-        mixed_precision_hint = MixedPrecisionPolicy.FP32
+        mixed_precision_hint = "fp32"
         if getattr(args, "bf16", False):
-            mixed_precision_hint = MixedPrecisionPolicy.BF16
+            mixed_precision_hint = "bf16"
         elif getattr(args, "fp16", False):
-            mixed_precision_hint = MixedPrecisionPolicy.FP16
-        tt.mixed_precision = mixed_precision_hint.value
+            mixed_precision_hint = "fp16"
+        tt.mixed_precision = mixed_precision_hint
 
     # swift-native checkpoint paths.
     tt.model_path = getattr(args, "model", None)

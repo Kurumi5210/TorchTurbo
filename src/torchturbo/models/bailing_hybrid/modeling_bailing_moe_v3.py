@@ -1402,10 +1402,8 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
             )
             position_ids = position_ids.unsqueeze(0)
 
-        if self._use_flash_attention_2:
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._use_sdpa and not output_attentions:
+        # Keep the 2D FA2 mask: nonzero segment IDs also encode packing boundaries.
+        if self._use_sdpa and not output_attentions:
             # output_attentions=True can not be supported when using SDPA, and we fall back on
             # the manual implementation that requires a 4D causal mask in all cases.
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
@@ -1414,7 +1412,7 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
                 inputs_embeds,
                 past_seen_tokens,
             )
-        else:
+        elif not self._use_flash_attention_2:
             # 4d mask is passed through the layers
             attention_mask = _prepare_4d_causal_attention_mask(
                 attention_mask, (batch_size, seq_length), inputs_embeds, past_seen_tokens

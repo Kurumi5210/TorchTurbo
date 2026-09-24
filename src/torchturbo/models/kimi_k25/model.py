@@ -5,6 +5,7 @@ except ImportError:
 
 import torch
 
+from torchturbo.engine.optimizers import OptimizerRecipe
 from torchturbo.runtime import is_npu_available, get_device_name
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .configuration_kimi_k25 import KimiK25Config
@@ -48,6 +49,14 @@ class TurboKimiK25ForConditionalGeneration(
 
     def get_weight_converter(self, parallel_context, model_path):
         return KimiK25WeightConverter(self, parallel_context, model_path)
+
+    @override
+    def get_optimizer_recipe(self, optimizer_name: str) -> OptimizerRecipe:
+        if optimizer_name == "muon":
+            from .optimizer_recipe import get_muon_recipe
+
+            return get_muon_recipe(self)
+        return super().get_optimizer_recipe(optimizer_name)
 
     def get_norm(self):
         # Final text-model RMSNorm is nested at ``language_model.model.norm``;

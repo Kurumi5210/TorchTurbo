@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
+from torchturbo.engine.model_fqn import build_model_fqn_map
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 
 
@@ -65,6 +66,48 @@ def fsdp_config(*, full_offload=False):
     return types.SimpleNamespace(cpu_offload=cpu_offload)
 
 
+def resolve_plan(model, plan=None):
+    if plan is None:
+        plan = FSDPParallelPlan()
+    return FSDP2Backend._compile_parallel_plan(
+        plan,
+        build_model_fqn_map(model),
+    )
+
+
+def test_model_fqn_map_is_unavailable_before_prepare_model():
+    backend = make_backend()
+    backend._model_fqn_map = None
+
+    with pytest.raises(RuntimeError, match="prepare_model"):
+        backend.get_model_fqn_map()
+
+
+def test_compile_parallel_plan_warns_for_unmatched_patterns(monkeypatch):
+    from torchturbo.engine.backends.fsdp2 import backend as backend_module
+
+    warnings = []
+    monkeypatch.setattr(
+        backend_module,
+        "logger",
+        types.SimpleNamespace(
+            warning_rank0=lambda message, *args: warnings.append(message % args)
+        ),
+    )
+    model = nn.Linear(2, 2)
+
+    resolved = resolve_plan(
+        model,
+        FSDPParallelPlan(plan={"missing.*": FSDPPlanSpec(no_shard=True)}),
+    )
+
+    assert dict(resolved.modules) == {}
+    assert dict(resolved.parameters) == {}
+    assert warnings == [
+        "FSDPParallelPlan patterns matched no model FQNs: ['missing.*']"
+    ]
+
+
 def test_cpu_offload_grad_norm_counts_replicated_grad_once(monkeypatch):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend._device_runtime = types.SimpleNamespace(
@@ -87,6 +130,28 @@ def test_cpu_offload_grad_norm_counts_replicated_grad_once(monkeypatch):
     )
 
     torch.testing.assert_close(total_norm, torch.sqrt(torch.tensor(52.0)))
+
+
+@pytest.mark.parametrize("full_offload", [False, True])
+@pytest.mark.parametrize("norm_type", [2.0, float("inf")])
+@pytest.mark.parametrize("max_norm", [1.0, float("inf")])
+def test_grad_norm_matches_pytorch(monkeypatch, full_offload, norm_type, max_norm):
+    backend = make_backend()
+    backend.fsdp_config = fsdp_config(full_offload=full_offload)
+    backend._mesh = None
+    backend._device_runtime = types.SimpleNamespace(device=torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, **kwargs: None)
+    parameter = nn.Parameter(torch.ones(2))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    reference = nn.Parameter(parameter.detach().clone())
+    reference.grad = parameter.grad.clone()
+
+    norm = backend.clip_grad_norm_([parameter], max_norm, norm_type)
+    expected = nn.utils.clip_grad_norm_([reference], max_norm, norm_type)
+
+    torch.testing.assert_close(norm, expected)
+    torch.testing.assert_close(parameter.grad, reference.grad)
+    assert backend.clip_grad_norm_([], max_norm, norm_type).item() == 0.0
 
 
 class CheckpointBlock(TaggedModule):
@@ -130,7 +195,7 @@ def test_standalone_world_shard_skips_default_descendant_wrapping(monkeypatch):
         plan={"language_model": FSDPPlanSpec(standalone_world_shard=True)}
     )
 
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert calls == [
         ("language_model", "world"),
@@ -170,7 +235,7 @@ def test_no_shard_matches_parameter_names(monkeypatch):
         }
     )
 
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert len(calls) == 1
     assert calls[0][0] == "root"
@@ -178,6 +243,98 @@ def test_no_shard_matches_parameter_names(monkeypatch):
         model.hc_head_fn,
         model.layer.attn_sink,
     }
+
+
+def test_resolved_plan_targets_only_active_modules_to_save_copy():
+    other = pytest.importorskip("peft.utils.other")
+    model = TaggedModule("root")
+    model.projection = other.ModulesToSaveWrapper(
+        nn.Linear(2, 2),
+        "default",
+    )
+    spec = FSDPPlanSpec(no_shard=True)
+
+    resolved = resolve_plan(
+        model,
+        FSDPParallelPlan(
+            plan={
+                "projection": spec,
+                "projection.weight": spec,
+            }
+        ),
+    )
+
+    assert dict(resolved.modules) == {
+        "projection.modules_to_save.default": spec,
+    }
+    assert dict(resolved.parameters) == {
+        "projection.modules_to_save.default.weight": spec,
+    }
+
+
+def test_resolved_plan_maps_trainable_tokens_to_base_embedding():
+    other = pytest.importorskip("peft.utils.other")
+
+    model = nn.Module()
+    model.embed_tokens = other.TrainableTokensWrapper(
+        nn.Embedding(8, 4),
+        "default",
+        token_indices=[0, 1],
+    )
+    module_spec = FSDPPlanSpec(standalone_world_shard=True)
+    parameter_spec = FSDPPlanSpec(no_shard=True)
+
+    resolved = resolve_plan(
+        model,
+        FSDPParallelPlan(
+            plan={
+                "embed_tokens": module_spec,
+                "embed_tokens.weight": parameter_spec,
+            }
+        ),
+    )
+
+    assert dict(resolved.modules) == {"embed_tokens": module_spec}
+    assert dict(resolved.parameters) == {
+        "embed_tokens.token_adapter.base_layer.weight": parameter_spec,
+    }
+
+
+def test_inactive_modules_to_save_copy_gets_its_own_fsdp_unit(monkeypatch):
+    other = pytest.importorskip("peft.utils.other")
+    calls = []
+
+    def fake_fully_shard(module, mesh, **kwargs):
+        calls.append((module, kwargs.get("ignored_params", set())))
+
+    import torch.distributed.fsdp as fsdp
+
+    monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
+
+    backend = make_backend()
+    backend._mesh = object()
+    backend._world_mesh = "world"
+    backend.mixed_precision = types.SimpleNamespace(value="no")
+    backend.reshard_after_forward = True
+    backend.fsdp_config = fsdp_config()
+    backend.rank = 0
+    backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    model = TaggedModule("root")
+    wrapper = other.ModulesToSaveWrapper(nn.Linear(2, 2), "default")
+    model.layers = nn.ModuleList([wrapper])
+    active = wrapper.modules_to_save["default"]
+    inactive = wrapper.original_module
+
+    plan = FSDPParallelPlan(
+        plan={"layers": FSDPPlanSpec(no_shard=True)}
+    )
+    backend._shard_model(model, resolve_plan(model, plan))
+
+    assert any(inactive in modules for modules, _ in calls)
+    ignored_params = calls[0][1]
+    assert set(active.parameters()) <= ignored_params
+    assert set(inactive.parameters()).isdisjoint(ignored_params)
 
 
 def test_no_shard_module_skips_descendant_wrapping(monkeypatch):
@@ -211,7 +368,7 @@ def test_no_shard_module_skips_descendant_wrapping(monkeypatch):
 
     plan = FSDPParallelPlan(plan={"visual": FSDPPlanSpec(no_shard=True)})
 
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert [call[0] for call in calls] == ["L0", "root"]
     assert calls[-1][1]["ignored_params"] == set(model.visual.parameters())
@@ -239,7 +396,7 @@ def test_default_policy_wraps_module_list_children(monkeypatch):
     model = TaggedModule("root")
     model.layers = nn.ModuleList([TaggedModule("L0"), TaggedModule("L1")])
 
-    backend._shard_model(model, FSDPParallelPlan())
+    backend._shard_model(model, resolve_plan(model))
 
     assert calls == [
         ("L1", "world"),
@@ -270,7 +427,7 @@ def test_global_cpu_offload_applies_to_all_fsdp_units(monkeypatch):
     model = TaggedModule("root")
     model.layers = nn.ModuleList([TaggedModule("L0"), TaggedModule("L1")])
 
-    backend._shard_model(model, FSDPParallelPlan())
+    backend._shard_model(model, resolve_plan(model))
 
     assert [call[0] for call in calls] == ["L1", "L0", "root"]
     assert all("offload_policy" in kwargs for _, kwargs in calls)
@@ -306,7 +463,7 @@ def test_carves_tail_unit_with_reshard_false_and_root(monkeypatch):
     model.get_input_embeddings = lambda: embed
     model.get_output_embeddings = lambda: lm_head
 
-    backend._shard_model(model, FSDPParallelPlan())
+    backend._shard_model(model, resolve_plan(model))
 
     # Untied input embedding is carved into its own unit with global reshard.
     assert ("embed", True) in calls
@@ -349,7 +506,7 @@ def test_tail_unit_uses_input_embedding_when_tied(monkeypatch):
     model.get_input_embeddings = lambda: embed
     model.get_output_embeddings = lambda: lm_head
 
-    backend._shard_model(model, FSDPParallelPlan())
+    backend._shard_model(model, resolve_plan(model))
 
     # Tied: use the input embedding in the tail unit and skip lm_head.
     assert (["norm", "embed"], False) in calls
@@ -368,7 +525,7 @@ def test_chunked_loss_rejects_tied_embeddings(monkeypatch):
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=False),
         loss_chunk=types.SimpleNamespace(enabled=True)
@@ -391,7 +548,7 @@ def test_chunked_loss_rejects_tied_embeddings(monkeypatch):
     model.get_output_embeddings = lambda: lm_head
 
     with pytest.raises(ValueError, match="tied input/output"):
-        backend._shard_model(model, FSDPParallelPlan())
+        backend._shard_model(model, resolve_plan(model))
 
 
 def test_tail_unit_does_not_guess_lm_head_attr(monkeypatch):
@@ -419,7 +576,7 @@ def test_tail_unit_does_not_guess_lm_head_attr(monkeypatch):
     model.decoder.norm = FinalNorm("norm")
     model.lm_head = TaggedModule("lm_head")
 
-    backend._shard_model(model, FSDPParallelPlan())
+    backend._shard_model(model, resolve_plan(model))
 
     assert ("norm", False) in calls
     assert not any(
@@ -479,7 +636,7 @@ def test_vlm_nested_norm_via_get_norm_joins_tail_unit(monkeypatch):
     model.lm_head = lm_head
     model.get_input_embeddings = lambda: language_model.embed_tokens
 
-    backend._shard_model(model, FSDPParallelPlan())
+    backend._shard_model(model, resolve_plan(model))
 
     # The get_norm-declared nested norm is paired with lm_head in a resident
     # tail unit instead of falling through to the auto root unit.
@@ -526,7 +683,7 @@ def test_mtp_keeps_vlm_norm_separate_from_reused_lm_head(monkeypatch):
     plan = FSDPParallelPlan(
         plan={"lm_head": FSDPPlanSpec(standalone_world_shard=True)}
     )
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert ("norm", False) in calls
     assert ("lm_head", False) in calls
@@ -561,7 +718,7 @@ def test_tail_unit_skips_modules_inside_explicit_parent(monkeypatch):
     plan = FSDPParallelPlan(
         plan={"language_model": FSDPPlanSpec(standalone_world_shard=True)}
     )
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert ("language_model", True) in calls
     assert not any(
@@ -599,7 +756,7 @@ def test_explicit_output_embedding_merges_with_tail_norm(monkeypatch):
     plan = FSDPParallelPlan(
         plan={"lm_head": FSDPPlanSpec(standalone_world_shard=True)}
     )
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert (["norm", "lm_head"], False) in calls
     assert ("norm", False) not in calls
@@ -624,7 +781,7 @@ def test_chunked_loss_keeps_output_embedding_separate_from_tail_norm(
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")
     backend.reshard_after_forward = True
-    backend.fsdp_config = types.SimpleNamespace(cpu_offload=False, pin_memory=True)
+    backend.fsdp_config = fsdp_config()
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=False),
         loss_chunk=types.SimpleNamespace(enabled=True)
@@ -646,7 +803,7 @@ def test_chunked_loss_keeps_output_embedding_separate_from_tail_norm(
             else {}
         )
     )
-    backend._shard_model(model, plan)
+    backend._shard_model(model, resolve_plan(model, plan))
 
     assert ("norm", False) in calls
     assert ("lm_head", False) in calls
@@ -662,7 +819,6 @@ def test_prepare_model_applies_activation_checkpointing_before_sharding():
         setup=lambda model: order.append("prefetch")
     )
     backend.get_ep_info = lambda: {"ep_size": 1}
-    backend._patch_transformers = lambda: order.append("patch_transformers")
     backend._init_mesh = lambda plan: order.append("init_mesh")
     backend._replace_modules = lambda model, plan: order.append("replace") or model
     backend._apply_activation_checkpointing = (
@@ -678,8 +834,8 @@ def test_prepare_model_applies_activation_checkpointing_before_sharding():
         "activation_checkpointing",
         "shard",
         "prefetch",
-        "patch_transformers",
     ]
+    assert dict(backend.get_model_fqn_map().modules) == {"": ""}
 
 
 def test_activation_checkpointing_patches_plan_targets(monkeypatch):
@@ -711,7 +867,7 @@ def test_activation_checkpointing_patches_plan_targets(monkeypatch):
 
     monkeypatch.setattr("torch.utils.checkpoint.checkpoint", fake_checkpoint)
 
-    backend._apply_activation_checkpointing(model, plan)
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
 
     assert hasattr(model.layers[0], "_tt_original_forward")
     assert hasattr(model.layers[1], "_tt_original_forward")
@@ -755,7 +911,7 @@ def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
 
     monkeypatch.setattr("torch.utils.checkpoint.checkpoint", fake_checkpoint)
 
-    backend._apply_activation_checkpointing(model, plan)
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
     model.layers[0].eval()
 
     x = torch.ones(1, requires_grad=False)
@@ -790,7 +946,9 @@ def test_activation_checkpointing_disabled_warns_and_skips_plan_targets(monkeypa
         plan={"layers.*": FSDPPlanSpec(activation_checkpoint=True)}
     )
 
-    assert backend._apply_activation_checkpointing(model, plan) is model
+    assert backend._apply_activation_checkpointing(
+        model, resolve_plan(model, plan)
+    ) is model
 
     assert len(warnings) == 1
     assert "skipping activation checkpointing" in warnings[0][0]

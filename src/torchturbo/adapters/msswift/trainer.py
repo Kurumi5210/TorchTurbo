@@ -8,8 +8,7 @@ is mixed ahead of swift's trainer base for any stage:
 * ``create_optimizer`` — build via the engine (FSDP2-aware); ``create_scheduler``
   keeps HF's default around the engine optimizer.
 * ``compute_loss``  — ``engine.compute_loss`` (with SP loss re-scale).
-* ``_prepare_inputs`` — bridge swift-packed inputs (see
-  :mod:`torchturbo.adapters.msswift.inputs_bridging`).
+* ``_get_data_collator`` - normalize Swift packing on CPU before device transfer.
 * ``save_model`` — engine writes DCP weights; swift still records metadata.
 * ``get_train_dataloader`` — engine SP-aware sampler for all ``sp_size``.
 
@@ -26,10 +25,10 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
-from functools import partial
 from typing import Any
 
 from ...engine import CPUOffloadMode
+from ...engine.distributed import assert_finite
 from ...logging import get_logger
 from . import engine_registry
 
@@ -52,16 +51,11 @@ def apply_ulysses_sp_patch(engine: Any) -> bool:
     if not sp_group or sp_size <= 1:
         return False
 
-    import transformers.integrations.flash_attention as flash_integration
-    import transformers.modeling_flash_attention_utils as flash_utils
+    from torchturbo.models.modules.attention.ulysses import (
+        patch_flash_attention_forward_for_sp,
+    )
 
-    from torchturbo.models.modules.attention import ulysses
-
-    patched = partial(ulysses.ulysses_flash_attention_forward, sp_group=sp_group, sp_size=sp_size)
-    flash_utils._flash_attention_forward = patched
-    if hasattr(flash_integration, "_flash_attention_forward"):
-        flash_integration._flash_attention_forward = patched
-    logger.info_rank0("Ulysses SP flash-attention patch applied (sp_size=%d)", sp_size)
+    patch_flash_attention_forward_for_sp(sp_info)
     return True
 
 
@@ -86,7 +80,7 @@ def install_clip_override(trainer, engine) -> None:
     trainer.accelerator.clip_grad_norm_ = _clip
 
 
-def install_accelerator_overrides(trainer) -> None:
+def install_accelerator_overrides(trainer, engine) -> None:
     """Stop accelerate from re-wrapping the FSDP2 model / hijacking backward.
 
     HF ``Trainer._prepare_for_training`` calls
@@ -105,6 +99,8 @@ def install_accelerator_overrides(trainer) -> None:
       so HF/accelerate bookkeeping (``unwrap_model`` / ``get_state_dict``) works.
       The optimizer is still accelerated (grad accumulation / scheduling) via
       ``prepare_optimizer``.
+    * ``prepare_optimizer`` -> retain Accelerate's wrapper while leaving
+      optimizer-state placement to the TorchTurbo backend.
     * ``backward`` -> plain ``loss.backward()`` — FSDP2's own backward hooks do
       the gradient reduction, instead of accelerate's dispatch on DTensor grads.
 
@@ -121,7 +117,18 @@ def install_accelerator_overrides(trainer) -> None:
     def _plain_backward(loss, **kwargs):
         loss.backward()
 
+    original_prepare_optimizer = trainer.accelerator.prepare_optimizer
+
+    def _prepare_optimizer(optimizer, device_placement=None):
+        if optimizer is engine.optimizer:
+            device_placement = False
+        return original_prepare_optimizer(
+            optimizer,
+            device_placement=device_placement,
+        )
+
     trainer.accelerator.prepare_model = _passthrough_prepare_model
+    trainer.accelerator.prepare_optimizer = _prepare_optimizer
     trainer.accelerator.backward = _plain_backward
 
 
@@ -155,7 +162,7 @@ class TurboTrainerMixin:
         engine = engine_registry.get_engine()
         engine.save_optimizer_and_scheduler(
             self.model,
-            self.optimizer,
+            engine.optimizer,
             self.lr_scheduler,
             output_dir,
         )
@@ -165,13 +172,14 @@ class TurboTrainerMixin:
         engine.load_from_checkpoint(self.model, resume_from_checkpoint)
 
     def _load_optimizer_and_scheduler(self, checkpoint):
-        engine = engine_registry.get_engine()
-        engine.load_optimizer_and_scheduler(
-            self.model,
-            self.optimizer,
-            self.lr_scheduler,
-            checkpoint,
-        )
+        if checkpoint:
+            engine = engine_registry.get_engine()
+            engine.load_optimizer_and_scheduler(
+                self.model,
+                engine.optimizer,
+                self.lr_scheduler,
+                checkpoint,
+            )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -190,7 +198,7 @@ class TurboTrainerMixin:
 
         apply_ulysses_sp_patch(engine)
         install_clip_override(self, engine)
-        install_accelerator_overrides(self)
+        install_accelerator_overrides(self, engine)
 
         offload = engine.config.backend_config.cpu_offload
         if offload.enabled and offload.mode is CPUOffloadMode.FULL:
@@ -286,7 +294,14 @@ class TurboTrainerMixin:
         self.create_scheduler(num_training_steps, optimizer=optimizer)
 
     def create_optimizer(self, model=None):
+        if self.optimizer is not None:
+            return self.optimizer
+
         engine = engine_registry.get_engine()
+        if engine.config.optimizer.name is not None:
+            self.optimizer = engine.prepare_optimizer()
+            return self.optimizer
+
         opt_res = self.get_optimizer_cls_and_kwargs(self.args)
         # transformers' get_optimizer_cls_and_kwargs returns either
         # (optimizer_cls, optimizer_kwargs) [2-tuple] or
@@ -299,25 +314,26 @@ class TurboTrainerMixin:
         optimizer_kwargs = dict(optimizer_kwargs)
         optimizer_kwargs["weight_decay"] = self.args.weight_decay
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
-        self._optimizer_ori = self.optimizer
         return self.optimizer
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         from swift.trainers.mixin import SwiftMixin
 
         if optimizer is None:
-            optimizer = getattr(self, "_optimizer_ori", None) or self.optimizer
+            optimizer = self.optimizer
         # Skip swift's OptimizerCallback scheduler; use HF's default.
         self.lr_scheduler = super(SwiftMixin, self).create_scheduler(num_training_steps, optimizer)
         return self.lr_scheduler
 
+    def _get_data_collator(self, args, template):
+        from .inputs_bridging import SwiftInputCollator
+
+        return SwiftInputCollator(super()._get_data_collator(args, template), template)
+
     def _prepare_inputs(self, inputs):
         from transformers.trainer import Trainer as HfTrainer
 
-        inputs = HfTrainer._prepare_inputs(self, inputs)
-        from .inputs_bridging import bridge_swift_inputs
-
-        return bridge_swift_inputs(inputs)
+        return HfTrainer._prepare_inputs(self, inputs)
 
     def _report_engine_metrics(self, logs) -> None:
         engine = engine_registry.get_engine_or_none()
@@ -350,10 +366,11 @@ class TurboTrainerMixin:
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, *args, **kwargs):
-        """Collect engine metrics after backward completes."""
+        """Check loss and collect engine metrics after backward."""
         result = super().training_step(model, inputs, *args, **kwargs)
         engine = engine_registry.get_engine_or_none()
         if engine is not None:
+            assert_finite(result, "loss")
             engine.collect_metrics(model)
         return result
 

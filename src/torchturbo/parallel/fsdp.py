@@ -2,24 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..engine.utils import match_fqn
 from .parallel import ParallelPlan
-
-
-def check_fqn_match(pattern: str, fqn: str) -> bool:
-    """Check if a fully-qualified name matches a pattern.
-
-    ``*`` matches a single dot-separated segment (cannot cross ``.``).
-    ``**`` matches zero or more segments (crosses ``.`` boundaries).
-    """
-    regex_str = re.escape(pattern)
-    # Handle ** first (escaped as \*\*), then remaining single *
-    regex_str = regex_str.replace(r"\*\*", r".*")
-    regex_str = regex_str.replace(r"\*", r"[^.]+")
-    return bool(re.match(f"^{regex_str}$", fqn))
 
 
 @dataclass
@@ -88,7 +75,7 @@ class FSDPParallelPlan(ParallelPlan):
     Attributes
     ----------
     plan:
-        FQN to FSDPPlanSpec mapping dictionary.
+        FQN pattern to FSDPPlanSpec mapping dictionary.
     sp_size:
         Sequence Parallelism group size.
     ep_size:
@@ -119,6 +106,6 @@ class FSDPParallelPlan(ParallelPlan):
     def match(self, fqn: str) -> Any | None:
         """Find the specification for a given FQN. Returns None if no match."""
         for pattern, spec in self.plan.items():
-            if check_fqn_match(pattern, fqn):
+            if match_fqn(pattern, fqn):
                 return spec
         return None

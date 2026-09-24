@@ -1,13 +1,15 @@
 """FSDP2 distributed backend — ``torch.distributed.fsdp.fully_shard``."""
 
 import functools
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from types import MethodType
+from types import MappingProxyType, MethodType
 from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.optim import Optimizer
 
 try:
     from torch.nn.utils import clip_grads_with_norm_, get_total_norm
@@ -30,13 +32,19 @@ from torchturbo.parallel import (
     FSDPParallelPlan,
 )
 from torchturbo.runtime import DeviceRuntime
-from torchturbo.engine.utils import strip_peft_prefix
-from torchturbo.utils.flash_attn_utils import get_unpad_data
+from torchturbo.engine.model_fqn import ModelFQNMap, build_model_fqn_map
+from torchturbo.engine.optimizers import (
+    MuonPlan,
+    OptimizerClassPlan,
+    OptimizerPlan,
+    OptimizersContainer,
+)
+from torchturbo.engine.utils import match_fqn
 from torchturbo.utils.torch_utils import torch_version
 
 from ...backend_registry import register_backend
 from ...config import EngineConfig
-from ...distributed import init_process_group_if_needed
+from ...distributed import assert_finite, init_process_group_if_needed
 from ....logging import get_logger
 from ..base import BaseBackend
 from .config import CPUOffloadMode, FSDPConfig
@@ -70,6 +78,12 @@ class _FSDPUnit:
     modules: list[nn.Module]
     mesh: Any
     reshard_after_forward: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedFSDPPlan:
+    modules: Mapping[str, FSDPPlanSpec]
+    parameters: Mapping[str, FSDPPlanSpec]
 
 
 def _confidence_entropy_sum(logits: torch.Tensor, labels: torch.Tensor,
@@ -142,6 +156,7 @@ class FSDP2Backend(BaseBackend):
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
+        self._resolved_parallel_plan: _ResolvedFSDPPlan | None = None
         self.weight_converter: BaseWeightConverter = None
 
     def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
@@ -266,7 +281,11 @@ class FSDP2Backend(BaseBackend):
 
         world_size = world_size
         device_name = self.device.type
-        self._world_mesh = init_device_mesh(device_name, (world_size,))
+        self._world_mesh = init_device_mesh(
+            device_name,
+            (world_size,),
+            mesh_dim_names=("dp",),
+        )
         self._mesh = init_device_mesh(
             device_name, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
         )
@@ -275,11 +294,6 @@ class FSDP2Backend(BaseBackend):
 
         self._create_sp_group(sp_size)
         self._create_dp_group()
-
-    def _patch_transformers(self):
-        # currently assume packing or normal attention mask
-        import transformers.modeling_flash_attention_utils
-        transformers.modeling_flash_attention_utils._get_unpad_data = get_unpad_data
 
     def _replace_modules(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
         """Replace modules according to the parallel plan (e.g., MoE layers).
@@ -333,6 +347,41 @@ class FSDP2Backend(BaseBackend):
 
         return model
 
+    @staticmethod
+    def _compile_parallel_plan(
+        plan: FSDPParallelPlan,
+        model_fqn_map: ModelFQNMap,
+    ) -> _ResolvedFSDPPlan:
+        """Resolve model-authored patterns to exact prepared-tree FQNs."""
+        model_fqns = tuple(model_fqn_map.modules) + tuple(model_fqn_map.parameters)
+        unmatched_patterns = [
+            pattern
+            for pattern in plan.plan
+            if not any(match_fqn(pattern, fqn) for fqn in model_fqns)
+        ]
+        if unmatched_patterns:
+            # TODO: Raise ValueError when unmatched plan patterns become errors.
+            logger.warning_rank0(
+                "FSDPParallelPlan patterns matched no model FQNs: %s",
+                unmatched_patterns,
+            )
+
+        modules: dict[str, FSDPPlanSpec] = {}
+        for model_fqn, prepared_fqn in model_fqn_map.modules.items():
+            spec = plan.match(model_fqn)
+            if isinstance(spec, FSDPPlanSpec):
+                modules[prepared_fqn] = spec
+
+        parameters: dict[str, FSDPPlanSpec] = {}
+        for model_fqn, prepared_fqn in model_fqn_map.parameters.items():
+            spec = plan.match(model_fqn)
+            if isinstance(spec, FSDPPlanSpec):
+                parameters[prepared_fqn] = spec
+        return _ResolvedFSDPPlan(
+            modules=MappingProxyType(modules),
+            parameters=MappingProxyType(parameters),
+        )
+
     def _register_no_shard_params_grad_sync(self, model: nn.Module) -> None:
         """Synchronize gradients for ``no_shard`` parameters.
 
@@ -340,7 +389,10 @@ class FSDP2Backend(BaseBackend):
         not reduce their gradients. FSDP2 uses ReduceOp.AVG by default, so the
         manual synchronization uses AVG as well.
         """
-        no_shard_params, _ = self._collect_no_shard(model, self.parallel_plan)
+        resolved_plan = self._resolved_parallel_plan
+        if resolved_plan is None:
+            raise RuntimeError("FSDP plan has not been compiled")
+        no_shard_params, _ = self._collect_no_shard(model, resolved_plan)
 
         world_group = dist.group.WORLD
         for param in no_shard_params:
@@ -383,21 +435,28 @@ class FSDP2Backend(BaseBackend):
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
 
+        # Freeze model-authored patterns into exact targets before later
+        # transformations can add wrappers or replace parameter objects.
+        self._model_fqn_map = build_model_fqn_map(model)
+        self._resolved_parallel_plan = self._compile_parallel_plan(
+            plan, self._model_fqn_map
+        )
+
         # Phase 3: Activation checkpointing must be applied before FSDP2 so
         # checkpoint recompute runs inside the FSDP unit, not around it. Targets
         # are explicit in the parallel plan and patch module.forward directly, so
         # FQNs stay stable for later sharding/prefetch/weight logic.
-        model = self._apply_activation_checkpointing(model, plan)
+        model = self._apply_activation_checkpointing(
+            model, self._resolved_parallel_plan
+        )
 
         # Phase 4: FSDP2 sharding.
-        model = self._shard_model(model, plan)
+        model = self._shard_model(model, self._resolved_parallel_plan)
         self.prefetch_manager.setup(model)
 
         ep_size = self.get_ep_info()["ep_size"]
         if ep_size > 1:
             self.gradient_scaling_factor = 1 / ep_size
-
-        self._patch_transformers()
 
         return model
 
@@ -599,12 +658,6 @@ class FSDP2Backend(BaseBackend):
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.float32,
-                cast_forward_inputs=True,
-            )
-        elif self.mixed_precision.value == "fp16":
-            mp_policy = MixedPrecisionPolicy(
-                param_dtype=torch.float16,
-                reduce_dtype=torch.float16,
                 cast_forward_inputs=True,
             )
         if mp_policy:
@@ -815,14 +868,14 @@ class FSDP2Backend(BaseBackend):
         return optimized
 
     def _apply_activation_checkpointing(
-        self, model: nn.Module, plan: FSDPParallelPlan
+        self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> nn.Module:
         from contextlib import nullcontext
         from torch.utils.checkpoint import checkpoint
 
         target_modules: list[tuple[str, nn.Module]] = []
         for fqn, submodule in model.named_modules():
-            spec = plan.match(strip_peft_prefix(fqn))
+            spec = plan.modules.get(fqn)
             if isinstance(spec, FSDPPlanSpec) and spec.activation_checkpoint:
                 target_modules.append((fqn, submodule))
 
@@ -935,11 +988,11 @@ class FSDP2Backend(BaseBackend):
         return model
 
     def _collect_no_shard(
-        self, model: nn.Module, plan: FSDPParallelPlan
+        self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> tuple[set[nn.Parameter], list[nn.Module]]:
         """Identify ``no_shard`` params and module-level subtrees from *plan*.
 
-        Two matching modes, both driven by ``FSDPPlanSpec.no_shard``:
+        Two resolved target kinds, both driven by ``FSDPPlanSpec.no_shard``:
 
         - module-level: a spec matching a module FQN selects the whole subtree,
           so every parameter under it is collected (e.g. replicating a small
@@ -959,24 +1012,61 @@ class FSDP2Backend(BaseBackend):
         no_shard_params: set[nn.Parameter] = set()
         no_shard_modules: list[nn.Module] = []
 
-        for fqn, submodule in model.named_modules():
-            spec = plan.match(strip_peft_prefix(fqn))
-            if not isinstance(spec, FSDPPlanSpec) or not spec.no_shard:
+        inactive_roots = self._get_inactive_modules_to_save(model)
+        inactive_params = {
+            parameter
+            for root in inactive_roots
+            for parameter in root.parameters()
+        }
+
+        for fqn, spec in plan.modules.items():
+            if not spec.no_shard:
                 continue
+            submodule = model.get_submodule(fqn)
             no_shard_modules.append(submodule)
-            for name, param in submodule.named_parameters(recurse=True):
-                if param in no_shard_params:
+            for param in submodule.parameters():
+                if param in no_shard_params or param in inactive_params:
                     continue
                 no_shard_params.add(param)
 
-        for name, param in model.named_parameters():
+        named_parameters = dict(model.named_parameters())
+        for name, spec in plan.parameters.items():
+            if not spec.no_shard:
+                continue
+            param = named_parameters[name]
             if param in no_shard_params:
                 continue
-            spec = plan.match(strip_peft_prefix(name))
-            if isinstance(spec, FSDPPlanSpec) and spec.no_shard:
-                no_shard_params.add(param)
+            no_shard_params.add(param)
 
         return no_shard_params, no_shard_modules
+
+    @staticmethod
+    def _get_inactive_modules_to_save(model: nn.Module) -> tuple[nn.Module, ...]:
+        """Return PEFT modules-to-save copies that do not run in forward."""
+        try:
+            from peft.utils.other import ModulesToSaveWrapper
+        except ImportError:
+            return ()
+
+        inactive_modules: list[nn.Module] = []
+        for module in model.modules():
+            if not isinstance(module, ModulesToSaveWrapper):
+                continue
+
+            if not module.disable_adapters and module.active_adapters:
+                active_name = module.active_adapters[0]
+                active_module = module.modules_to_save[active_name]
+            else:
+                active_module = module.original_module
+
+            if module.original_module is not active_module:
+                inactive_modules.append(module.original_module)
+            inactive_modules.extend(
+                saved_module
+                for saved_module in module.modules_to_save.values()
+                if saved_module is not active_module
+            )
+        return tuple(inactive_modules)
 
     def _forward_for_lm_loss(
         self,
@@ -1087,7 +1177,7 @@ class FSDP2Backend(BaseBackend):
             raise TypeError("lm_head weight must be a tensor")
         return weight, prepared_reference, loss_anchor
 
-    def _shard_model(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
+    def _shard_model(self, model: nn.Module, plan: _ResolvedFSDPPlan) -> nn.Module:
         named_modules = list(model.named_modules())
 
         # no_shard identification is shared with _register_no_shard_params_grad_sync
@@ -1096,8 +1186,16 @@ class FSDP2Backend(BaseBackend):
         # Param-level matches (e.g. deepseek_v4 hc_*/attn_sink) keep their owning
         # module sharded and only route the matched params to ignored_params.
         no_shard_params, no_shard_modules = self._collect_no_shard(model, plan)
+        inactive_roots = self._get_inactive_modules_to_save(model)
+        inactive_subtree_modules = {
+            id(child)
+            for root in inactive_roots
+            for child in root.modules()
+        }
         for submodule in no_shard_modules:
             for child in submodule.modules():
+                if id(child) in inactive_subtree_modules:
+                    continue
                 setattr(child, "_fsdp_no_shard", True)
 
         fsdp_kwargs = self._build_fsdp_kwargs(no_shard_params)
@@ -1126,13 +1224,19 @@ class FSDP2Backend(BaseBackend):
             )
             wrapped_modules.update(unit_ids)
 
+        # PEFT keeps frozen and inactive copies registered under each
+        # ModulesToSaveWrapper. Give each copy an FSDP boundary so an ancestor
+        # unit cannot own and all-gather parameters that never run in forward.
+        for root in inactive_roots:
+            explicit_subtree_modules.update(id(child) for child in root.modules())
+            _add_unit(root, self._world_mesh)
+
         # Explicit sharding specs first, bottom-up.
         for fqn, submodule in reversed(named_modules):
             if fqn == "" or getattr(submodule, "_fsdp_no_shard", False):
                 continue
 
-            clean_fqn = strip_peft_prefix(fqn)
-            spec = plan.match(clean_fqn)
+            spec = plan.modules.get(fqn)
             if not isinstance(spec, FSDPPlanSpec):
                 continue
 
@@ -1265,70 +1369,126 @@ class FSDP2Backend(BaseBackend):
 
     def prepare_optimizer(
         self,
-        model: nn.Module,
-        optimizer_cls: type,
-        *,
-        param_groups: list[dict[str, Any]] | None = None,
-        **optimizer_kwargs: Any,
-    ) -> Any:
-        """Create the optimizer after splitting parameter groups by FSDP
-        topology.
-        """
-        if param_groups is None:
-            param_groups = [
-                {"params": [param for param in model.parameters() if param.requires_grad]}
-            ]
+        plan: OptimizerPlan,
+    ) -> Optimizer:
+        """Build and validate the complete optimizer, including plan-defined hooks."""
+        if not isinstance(plan, OptimizerPlan):
+            raise TypeError("plan must be an OptimizerPlan")
 
+        if isinstance(plan, OptimizerClassPlan):
+            groups_by_optimizer_name = plan.get_param_groups_by_optimizer_name()
+            expected_names = (plan.optimizer_name,)
+            if tuple(groups_by_optimizer_name) != expected_names:
+                raise ValueError(
+                    "optimizer parameter groups do not match OptimizerClassPlan: "
+                    f"expected {expected_names!r}, "
+                    f"got {tuple(groups_by_optimizer_name)!r}"
+                )
+            optimizer_params = self._split_optimizer_groups_by_topology(
+                tuple(
+                    group.get_optimizer_param_group()
+                    for group in groups_by_optimizer_name[plan.optimizer_name]
+                )
+            )
+            optimizer_cls = plan.optimizer_cls
+            optimizer_kwargs = dict(plan.optimizer_kwargs)
+            offload = self.fsdp_config.cpu_offload
+            if offload.enabled and offload.mode is CPUOffloadMode.OPTIMIZER:
+                if optimizer_cls is not torch.optim.AdamW:
+                    raise ValueError(
+                        "swap-optimizer mode currently only supports AdamW; "
+                        f"got {optimizer_cls.__module__}.{optimizer_cls.__name__}"
+                    )
+                optimizer_cls = AdamWSwap
+                param_names = {
+                    param: name
+                    for group in plan.get_param_groups()
+                    for name, param in group.params_by_fqn.items()
+                }
+                optimizer_kwargs.pop("fused", None)
+                optimizer_kwargs.update(
+                    device_runtime=self.device_runtime,
+                    optimizer_memory_fraction=offload.optimizer_memory_fraction,
+                    param_names=param_names,
+                )
+            # Keep the plan's optimizer name as the key so the container's
+            # validation stays aligned even when the class is swapped.
+            optimizer = optimizer_cls(optimizer_params, **optimizer_kwargs)
+            optimizers_by_name = {plan.optimizer_name: optimizer}
+
+        elif isinstance(plan, MuonPlan):
+            from .optimizers import prepare_fsdp_muon_optimizers
+
+            offload = self.fsdp_config.cpu_offload
+            optimizers_by_name = prepare_fsdp_muon_optimizers(
+                plan,
+                device_runtime=self.device_runtime,
+                cpu_offload=bool(offload.enabled),
+                split_param_groups=self._split_optimizer_groups_by_topology,
+            )
+
+        else:
+            raise TypeError(
+                f"FSDP2 does not support optimizer plan {type(plan).__name__}"
+            )
+
+        # Validate every result before returning a single optimizer or the
+        # composite facade. Step hooks must bind to that final object.
+        container = OptimizersContainer(plan, optimizers_by_name)
+        if len(container) == 1:
+            optimizer = container.optimizers[0]
+        else:
+            optimizer = container
+        if (
+            isinstance(plan, MuonPlan)
+            and plan.qk_clip_plan is not None
+            and plan.qk_clip_plan.layers
+        ):
+            from .qk_clip import install_qk_clip
+
+            install_qk_clip(
+                plan.qk_clip_plan,
+                optimizer,
+                sp_size=self._sp_size,
+            )
+        return optimizer
+
+    def _split_optimizer_groups_by_topology(
+        self,
+        param_groups: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Split native optimizer groups by FSDP mesh topology."""
         optimizer_params = []
         edp = self._mesh["edp"]
         for param_group in param_groups:
             group_options = {
-                key: value for key, value in param_group.items() if key != "params"
+                key: value
+                for key, value in param_group.items()
+                if key != "params"
             }
-            params = []
-            moe_params = []
-            ignored_params = []
+            split = {
+                "dense": [],
+                "moe": [],
+                "ignored": [],
+            }
             for param in param_group["params"]:
                 if not param.requires_grad:
                     continue
-                if hasattr(param, "device_mesh"):
+                if isinstance(param, DTensor):
                     if param.device_mesh == edp:
-                        moe_params.append(param)
+                        key = "moe"
                     else:
-                        params.append(param)
+                        key = "dense"
                 else:
-                    ignored_params.append(param)
+                    key = "ignored"
+                split[key].append(param)
 
-            # Drop empty groups: set_optimizer_state_dict allows at most one empty group.
-            for shard_params in (params, moe_params, ignored_params):
-                if shard_params:
-                    optimizer_params.append(
-                        {"params": shard_params, **group_options}
-                    )
+            for params in split.values():
+                if not params:
+                    continue
+                optimizer_params.append({"params": params, **group_options})
 
-        offload = self.fsdp_config.cpu_offload
-        if offload.enabled and offload.mode is CPUOffloadMode.OPTIMIZER:
-            if optimizer_cls is not torch.optim.AdamW:
-                raise ValueError(
-                    "swap-optimizer mode currently only supports AdamW; "
-                    f"got {optimizer_cls.__module__}.{optimizer_cls.__name__}"
-                )
-            optimizer_cls = AdamWSwap
-            param_names = {
-                param: name for name, param in model.named_parameters()
-            }
-            optimizer_kwargs.pop("fused", None)
-            optimizer_kwargs.update(
-                device_runtime=self.device_runtime,
-                optimizer_memory_fraction=offload.optimizer_memory_fraction,
-                param_names=param_names,
-            )
-
-        optimizer = optimizer_cls(
-            optimizer_params,
-            **optimizer_kwargs,
-        )
-        return optimizer
+        return optimizer_params
 
     @torch.no_grad()
     def _clip_grad_norm_cpu_offload(
@@ -1338,9 +1498,6 @@ class FSDP2Backend(BaseBackend):
         compute device (peak GPU mem = one chunk, ``CLIP_CHUNK_BYTES``).
         """
         all_params = list(moe_params) + list(params) + list(ignored_params)
-        if not all_params:
-            return torch.tensor(0.0)
-
         reduce_device = self.device if not isinstance(self.device, str) else torch.device(self.device)
         world_group = dist.group.WORLD
 
@@ -1361,7 +1518,7 @@ class FSDP2Backend(BaseBackend):
                 return acc
             if norm_type == float("inf"):
                 m = t.detach().float().abs().amax()
-                return m if bool(m > acc) else acc
+                return torch.maximum(m, acc)
             return acc + (t.detach().float().abs() ** norm_type).sum()
 
         acc = torch.zeros((), device=reduce_device, dtype=torch.float32)
@@ -1370,12 +1527,15 @@ class FSDP2Backend(BaseBackend):
             self.device_runtime.synchronize()  # H2D complete before reading chunk_dev
             for t in chunk_dev:
                 acc = _accumulate(t, acc)
+        # MAX reduction can hide a rank-local NaN.
+        local_norm = acc.clone()
         reduce_op = dist.ReduceOp.MAX if norm_type == float("inf") else dist.ReduceOp.SUM
         dist.all_reduce(acc, op=reduce_op, group=world_group)
         # no_shard gradients are already world-reduced and replicated.
         for grad in plain_grads:
             acc = _accumulate(grad, acc)
         total_norm = acc if norm_type == float("inf") else acc ** (1.0 / norm_type)
+        assert_finite(torch.stack((local_norm, total_norm)), "gradient norm")
 
         # --- Pass 3: clip scaling, chunked on the device.
         clip_coef = float(max_norm) / (float(total_norm) + 1e-6)
@@ -1470,9 +1630,6 @@ class FSDP2Backend(BaseBackend):
             )
             edp_total_norm_list.append(edp_total_norm)
 
-        if not edp_total_norm_list and not grads and not ignored_grads:
-            return torch.tensor(0.0)
-
         all_norms = edp_total_norm_list
         if grads:
             dp_total_norm = get_total_norm(grads, norm_type=norm_type)
@@ -1488,10 +1645,19 @@ class FSDP2Backend(BaseBackend):
         # every group norm onto one device before concatenating. total_norm's own
         # device is irrelevant to clip_grads_with_norm_, which re-homes the clip
         # coefficient per grad device.
-        ref_device = all_norms[0].device
-        total_norm = torch.linalg.vector_norm(
-            torch.cat([norm.to(ref_device) for norm in all_norms]), norm_type
-        )
+        total_norm = torch.zeros((), device=self.device)
+        if all_norms:
+            ref_device = all_norms[0].device
+            total_norm = torch.linalg.vector_norm(
+                torch.cat([norm.to(ref_device) for norm in all_norms]), norm_type
+            )
+        norm_values = [total_norm.to(self.device)]
+        if norm_type == float("inf") and (grads or moe_grads):
+            # DTensor can hide NaNs in MAX reductions inside get_total_norm.
+            local_grads = [grad.to_local() for grad in grads + moe_grads]
+            local_norm = get_total_norm(local_grads, norm_type=norm_type)
+            norm_values.append(local_norm.to(self.device))
+        assert_finite(torch.stack(norm_values), "gradient norm")
 
         if moe_params:
             clip_grads_with_norm_(moe_params, max_norm, total_norm)
@@ -1571,26 +1737,6 @@ class FSDP2Backend(BaseBackend):
                 ),
                 dim=-1,
             )
-
-        padded_seq_len = seq_len + pad_size
-        # Update packed sequence metadata after padding.
-        packed_metadata = (
-            ("cu_seqlens", None),
-            ("cu_seq_lens_q", "max_length_q"),
-            ("cu_seq_lens_k", "max_length_k"),
-        )
-        for key, max_length_key in packed_metadata:
-            cu_seqlens = inputs.get(key)
-            if (
-                torch.is_tensor(cu_seqlens)
-                and cu_seqlens.dim() == 1
-                and cu_seqlens.numel() > 1
-            ):
-                cu_seqlens = cu_seqlens.clone()
-                cu_seqlens[-1] = padded_seq_len
-                inputs[key] = cu_seqlens
-                if max_length_key is not None and max_length_key in inputs:
-                    inputs[max_length_key] = inputs[max_length_key] + pad_size
 
         return inputs
 

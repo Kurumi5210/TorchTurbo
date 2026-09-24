@@ -15,6 +15,7 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from ..engine.metrics.flops import BaseModelFlops
+    from ..engine.optimizers import OptimizerRecipe
     from .modules.moe.moe_layer import MoERuntimeInputs
 
 
@@ -142,6 +143,22 @@ class TurboModel:
             ParameterGroup.ALL: self.named_parameters(),
             ParameterGroup.LANGUAGE_MODEL: self.named_parameters(),
         }
+
+    def get_optimizer_recipe(self, optimizer_name: str) -> OptimizerRecipe:
+        """Return model semantics for an engine-managed optimizer.
+
+        Engine-managed optimizers are opt-in per architecture: whether a weight
+        may be treated as a Muon matrix is a correctness claim about the model,
+        not a default. A model that has not been validated must fail here rather
+        than train with a guessed parameter split.
+
+        Recipes are written against this model's own module tree. The engine
+        matches them against the prepared model, which may be a PEFT wrapper.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not provide an optimizer recipe for "
+            f"{optimizer_name!r}"
+        )
 
     def get_weight_converter(self, parallel_context: dict[str, Any], model_path: str):
         return BaseWeightConverter(self, parallel_context, model_path)

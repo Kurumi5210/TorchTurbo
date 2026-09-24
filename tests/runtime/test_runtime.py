@@ -109,6 +109,7 @@ def test_cpu_runtime_contract():
     assert runtime.turbo_device is TurboDevice.CPU
     assert runtime.device == torch.device("cpu")
     assert runtime.dist_backend == "gloo"
+    assert runtime.supports_async_streams is False
     assert runtime.new_stream() is None
     assert runtime.current_stream() is None
     free, total = runtime.memory_info()
@@ -116,6 +117,9 @@ def test_cpu_runtime_contract():
     assert total > 0
     with runtime.stream(None):
         pass
+
+    with pytest.raises(NotImplementedError, match="device events"):
+        runtime.new_event()
 
     with pytest.raises(NotImplementedError, match="profiler"):
         runtime.profiler(

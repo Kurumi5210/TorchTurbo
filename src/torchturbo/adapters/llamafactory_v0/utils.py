@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from ...engine import CPUOffloadConfig, CPUOffloadMode, EngineConfig
 from ...engine.args import TorchTurboArgs, get_arg_specs, string_to_bool
-from ...engine.config import MixedPrecisionPolicy
 from ...logging import get_logger
 
 
@@ -84,21 +83,21 @@ def _build_config_from_args(
     """
     from ...engine.config import build_from_args
 
-    tt = torchturbo_args  # shorthand
+    tt = torchturbo_args or TorchTurboArgs()  # shorthand
 
     # --- Mixed precision seed (bf16/fp16/fp8 from LF training args) ---
     # Only seed tt when the user did not pass --tt_mixed_precision; explicit tt
     # value wins; env overrides are merged later inside build_from_args.
     if tt.mixed_precision is None:
-        mixed_precision_hint = MixedPrecisionPolicy.FP32
+        mixed_precision_hint = "fp32"
         if training_args is not None:
             if getattr(training_args, "bf16", False):
-                mixed_precision_hint = MixedPrecisionPolicy.BF16
+                mixed_precision_hint = "bf16"
             elif getattr(training_args, "fp16", False):
-                mixed_precision_hint = MixedPrecisionPolicy.FP16
+                mixed_precision_hint = "fp16"
             if getattr(training_args, "fp8", False):
-                mixed_precision_hint = MixedPrecisionPolicy.FP8
-        tt.mixed_precision = mixed_precision_hint.value
+                mixed_precision_hint = "fp8"
+        tt.mixed_precision = mixed_precision_hint
 
     # --- FSDP CPU offload: reconcile LF fsdp options with the file/adapter config ---
     # Single source of truth, shared with the early process-group init in the

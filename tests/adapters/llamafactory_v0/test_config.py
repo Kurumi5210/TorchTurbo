@@ -96,6 +96,102 @@ def test_build_config_maps_op_policy_to_engine_config():
     assert cfg.ops.policy is OpPolicy.NATIVE
 
 
+@pytest.mark.parametrize("policy", ["fp16", "fp8"])
+def test_build_config_rejects_unsupported_mixed_precision(policy):
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+
+    training_args = types.SimpleNamespace(**{policy: True})
+
+    with pytest.raises(
+        ValueError, match=f"does not support mixed_precision='{policy}'"
+    ):
+        build_config_from_lf_args(training_args=training_args)
+
+
+@pytest.mark.parametrize("policy", ["fp16", "fp8"])
+def test_build_config_mixed_precision_override_wins(policy):
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import MixedPrecisionPolicy
+
+    training_args = types.SimpleNamespace(
+        fsdp=[],
+        fsdp_config={},
+        gradient_checkpointing=True,
+        **{policy: True},
+    )
+
+    cfg, _ = build_config_from_lf_args(
+        training_args=training_args,
+        torchturbo_args=TorchTurboArgs(mixed_precision="fp32"),
+    )
+
+    assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
+
+
+def test_lf_optimizer_hyperparameters_do_not_configure_muon():
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+    from torchturbo.engine.args import TorchTurboArgs
+
+    training_args = types.SimpleNamespace(
+        fsdp=[],
+        fsdp_config={},
+        gradient_checkpointing=True,
+        learning_rate=0.002,
+        weight_decay=0.1,
+        adam_beta1=0.8,
+        adam_beta2=0.95,
+        adam_epsilon=1e-6,
+    )
+
+    cfg, _ = build_config_from_lf_args(
+        training_args=training_args,
+        torchturbo_args=TorchTurboArgs(optimizer_name="muon"),
+    )
+
+    assert cfg.optimizer.muon.lr is None
+    assert cfg.optimizer.muon.weight_decay is None
+
+
+def test_muon_config_comes_from_torchturbo_yaml(tmp_path):
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+    from torchturbo.engine.args import TorchTurboArgs
+
+    config_path = tmp_path / "muon.yaml"
+    config_path.write_text(
+        """engine_config:
+  optimizer:
+    name: muon
+    muon:
+      lr: 0.004
+      weight_decay: 0.2
+      adamw_betas: [0.7, 0.9]
+      adamw_eps: 1e-5
+""",
+        encoding="utf-8",
+    )
+    training_args = types.SimpleNamespace(
+        fsdp=[],
+        fsdp_config={},
+        gradient_checkpointing=True,
+        learning_rate=0.002,
+        weight_decay=0.1,
+        adam_beta1=0.8,
+        adam_beta2=0.95,
+        adam_epsilon=1e-6,
+    )
+
+    cfg, _ = build_config_from_lf_args(
+        training_args=training_args,
+        torchturbo_args=TorchTurboArgs(config_path=str(config_path)),
+    )
+
+    assert cfg.optimizer.muon.lr == 0.004
+    assert cfg.optimizer.muon.weight_decay == 0.2
+    assert cfg.optimizer.muon.adamw_betas == (0.7, 0.9)
+    assert cfg.optimizer.muon.adamw_eps == 1e-5
+
+
 def test_build_config_cli_prefetch_ignores_lf_yaml_prefetch():
     """TorchTurbo prefetch config does not read LF fsdp_config prefetch fields."""
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args

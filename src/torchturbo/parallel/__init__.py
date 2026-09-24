@@ -1,6 +1,6 @@
 """Parallel specification configs."""
 
-from .fsdp import FSDPPlanSpec, FSDPParallelPlan, FSDPPlacementSpec, check_fqn_match
+from .fsdp import FSDPPlanSpec, FSDPParallelPlan, FSDPPlacementSpec
 from .parallel import ParallelPlan
 
 __all__ = [
@@ -8,5 +8,4 @@ __all__ = [
     "FSDPPlanSpec",
     "FSDPParallelPlan",
     "FSDPPlacementSpec",
-    "check_fqn_match",
 ]

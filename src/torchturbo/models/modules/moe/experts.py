@@ -6,6 +6,8 @@
   #
   # Modified by the TorchTurbo contributors.
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -13,6 +15,9 @@ from torch.nn.parameter import Parameter
 from .moe_config import MoEConfig
 from torchturbo.ops import ops
 from torchturbo.logging import get_logger
+
+if TYPE_CHECKING:
+    from torchturbo.engine.optimizers import MuonParameterSpec
 
 logger = get_logger(__name__)
 
@@ -132,6 +137,45 @@ class GroupedMLP(torch.nn.Module):
                     dtype=config.params_dtype,
                 )
             )
+
+    def get_muon_parameter_specs(self) -> dict[str, "MuonParameterSpec"]:
+        """Describe the independent matrices packed into fused expert storage."""
+        from torch.distributed.tensor import Shard
+
+        from torchturbo.engine.optimizers import (
+            ExpertDownComputeView,
+            ExpertUpComputeView,
+            MuonParameterSpec,
+        )
+
+        if transformer_engine_is_available() and self.use_te:
+            # GroupedLinear owns separate weights instead of fused expert tensors.
+            return {}
+
+        for name, parameter, matrix_rows in (
+            ("weight1", self.weight1, self.config.hidden_size),
+            ("weight2", self.weight2, self.config.moe_ffn_hidden_size),
+        ):
+            if parameter.shape[0] % matrix_rows:
+                raise ValueError(
+                    f"GroupedMLP parameter {name!r} has invalid shape "
+                    f"{tuple(parameter.shape)}"
+                )
+        return {
+            "weight1": MuonParameterSpec(
+                compute_placement=Shard(0),
+                compute_view=ExpertUpComputeView(
+                    num_experts=self.weight1.shape[0] // self.config.hidden_size,
+                    fused_gate_up=self.config.gated_linear_unit,
+                ),
+            ),
+            "weight2": MuonParameterSpec(
+                compute_placement=Shard(0),
+                compute_view=ExpertDownComputeView(
+                    num_experts=self.weight2.shape[0] // self.config.moe_ffn_hidden_size,
+                ),
+            ),
+        }
 
     def forward(
         self,

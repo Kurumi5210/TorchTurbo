@@ -1,6 +1,7 @@
 from sys import modules
 from typing import Any
 from functools import partial
+from torch import Tensor, nn
 import torch.distributed as dist
 
 from ...parallel import FSDPPlanSpec, FSDPParallelPlan
@@ -9,6 +10,7 @@ from ..modules.moe.module import ModuleSpec
 from ..modules.moe.experts import GroupedMLP
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.attention import ulysses
+from ..modules.attention.qk_clip import get_qk_clip_state
 
 
 def _is_kimi_moe_module(module: Any) -> bool:
@@ -50,14 +52,33 @@ def _replace_kimi_moe_only(
     return moe_layer
 
 
-def _replace_self_attn(original_module, hf_config, sp_info, ep_info, **kwargs):
-    if hasattr(original_module, "_flash_attention_forward"):
+def _replace_self_attn(
+    original_module: nn.Module,
+    hf_config: Any,
+    sp_info: dict[str, Any],
+    ep_info: Any,
+    **kwargs: Any,
+) -> nn.Module:
+    from .modeling_deepseek import DeepseekV3FlashAttention2
+
+    if isinstance(original_module, DeepseekV3FlashAttention2):
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         patched_forward = partial(
             ulysses.ulysses_flash_attention_forward, sp_group=sp_group, sp_size=sp_size
         )
-        original_module._flash_attention_forward = patched_forward
+
+        def attention_forward(*args: Any, **kwargs: Any) -> Tensor:
+            return patched_forward(
+                *args,
+                qk_clip_state=(
+                    get_qk_clip_state(original_module)
+                    if original_module.training else None
+                ),
+                **kwargs,
+            )
+
+        original_module._flash_attention_forward = attention_forward
     return original_module
 
 

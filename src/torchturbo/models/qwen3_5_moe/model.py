@@ -290,7 +290,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
     @classmethod
     def patch_vision_attention_interface(cls):
         from . import modeling_qwen3_5_moe
-        from transformers.modeling_flash_attention_utils import _flash_attention_forward
+        from ..modules.attention.interface import attention_forward
 
         attn_cls = modeling_qwen3_5_moe.Qwen3_5MoeVisionAttention
         origin_attr = "_torchturbo_qwen3_5_moe_vision_origin_attention_interface"
@@ -318,14 +318,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
-            # Call _flash_attention_forward directly — NOT through
-            # ulysses_flash_attention_forward. Vision attention doesn't
-            # need SP (sequence parallel), so we bypass the Ulysses
-            # all-to-all wrapper entirely. This also avoids interference
-            # from _patch_ulysses_fa_for_sp's head-repeat logic and
-            # monkey-patch (which routes through ulysses_fa with
-            # sp_group/sp_size from the language model).
-            attn_output = _flash_attention_forward(
+            # Vision attention does not use the language model's SP collectives.
+            attn_output = attention_forward(
                 query_states,
                 key_states,
                 value_states,

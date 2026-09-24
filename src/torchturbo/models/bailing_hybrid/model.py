@@ -1,4 +1,5 @@
 from typing_extensions import override
+from typing import Any
 
 import types
 import torch
@@ -7,6 +8,7 @@ from transformers import AutoModelForCausalLM
 from torchturbo.models.modules.attention.ulysses import (
     ulysses_flash_attention_forward,
 )
+from torchturbo.models.modules.attention.qk_clip import get_qk_clip_state
 from torchturbo.utils.flash_attn_utils import (
     index_first_axis,
     pad_input,
@@ -18,6 +20,7 @@ from torchturbo.models.modules.attention.ulysses.ulysses import (
     gather_seq_scatter_heads,
     gather_heads_scatter_seq,
 )
+from torchturbo.engine.optimizers import OptimizerRecipe
 from torchturbo.runtime import get_device_runtime
 
 from ..registry import register_model
@@ -51,6 +54,14 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
     @override
     def get_weight_converter(self, parallel_context, model_path):
         return BailingV3WeightConverter(self, parallel_context, model_path)
+
+    @override
+    def get_optimizer_recipe(self, optimizer_name: str) -> OptimizerRecipe:
+        if optimizer_name == "muon":
+            from .optimizer_recipe import get_muon_recipe
+
+            return get_muon_recipe(self)
+        return super().get_optimizer_recipe(optimizer_name)
 
     def get_flops_class(self):
         """Bailing v3 flops recipe (hybrid MLA+KDA attention, dense+MoE FFN, MTP)."""
@@ -243,7 +254,12 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
         bailing_moe_v3_model.BailingMoeV3KimiDeltaAttention.forward = sp_forward
 
     @classmethod
-    def patch_mla_attention_interface_for_sp(cls, sp_group, sp_size, sp_rank):
+    def patch_mla_attention_interface_for_sp(
+        cls,
+        sp_group: torch.distributed.ProcessGroup | None,
+        sp_size: int,
+        sp_rank: int,
+    ) -> None:
         from . import modeling_bailing_moe_v3 as bailing_moe_v3_model
         attn_cls = bailing_moe_v3_model.BailingMoeV3MultiLatentAttention
         origin_attr = "_torchturbo_bailing_moe_v3_origin_attention_interface"
@@ -251,14 +267,14 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
             setattr(attn_cls, origin_attr, attn_cls.attention_interface)
 
         def sp_attention_interface(
-            module,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            *args,
-            **kwargs,
-        ):
+            module: torch.nn.Module,
+            query_states: torch.Tensor,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            attention_mask: torch.Tensor | None,
+            *args: Any,
+            **kwargs: Any,
+        ) -> tuple[torch.Tensor, None]:
             call_kwargs = kwargs.copy()
             position_ids = call_kwargs.pop("position_ids", None)
             dropout = call_kwargs.pop("dropout", 0.0)
@@ -285,6 +301,7 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
                 softmax_scale=softmax_scale,
                 sp_group=sp_group,
                 sp_size=sp_size,
+                qk_clip_state=get_qk_clip_state(module) if module.training else None,
                 **call_kwargs,
             )
             return attn_output, None

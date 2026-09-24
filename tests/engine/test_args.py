@@ -60,6 +60,26 @@ def test_parse_torchturbo_args_op_policy():
     assert args.op_policy == "custom"
 
 
+def test_parse_torchturbo_args_optimizer():
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import build_from_args
+
+    args, remaining = parse_torchturbo_args(
+        ["--tt_optimizer", "muon", "--framework-flag"]
+    )
+
+    assert args.optimizer_name == "muon"
+    assert remaining == ["--framework-flag"]
+    assert build_from_args(args).optimizer.name == "muon"
+
+
+def test_parse_torchturbo_args_rejects_unsupported_optimizer():
+    from torchturbo.engine.args import parse_torchturbo_args
+
+    with pytest.raises(SystemExit, match="2"):
+        parse_torchturbo_args(["--tt_optimizer", "adamw"])
+
+
 def test_parse_torchturbo_args_use_deterministic_algorithms():
     from torchturbo.engine.args import parse_torchturbo_args
 

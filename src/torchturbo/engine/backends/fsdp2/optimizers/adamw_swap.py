@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from itertools import groupby
+from itertools import chain, groupby
 from typing import Mapping, Union
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .....logging import get_logger
@@ -117,6 +118,7 @@ class AdamWSwapMixin:
         self.param_to_state_bytes_map = {}
         self.workspace: DeviceWorkspace | None = None
         self._workspace_adamw_logged = False
+        self._checkpoint_meshes: dict[DeviceMesh, DeviceMesh] = {}
         self._opt_states_initialization()
 
     def _acquire_workspace(self) -> DeviceWorkspace | None:
@@ -143,6 +145,10 @@ class AdamWSwapMixin:
         )
 
     def _opt_states_initialization(self) -> None:
+        """Zero the swap state and publish it under ``self.state``, to avoid
+        the helper faking a zero-grad / lr-0 ``step()``, which would decay the
+        CPU moments and bump the step counters on every checkpoint save/load.
+        """
         for group in self.param_groups:
             for param in group["params"]:
                 local_param = param.to_local() if isinstance(param, DTensor) else param
@@ -154,8 +160,7 @@ class AdamWSwapMixin:
                     ).zero_()
                     for key in self.state_keys
                 }
-                self.param_to_cpu_states_map[param] = cpu_state
-                self.param_to_step_map[param] = torch.zeros(
+                step = torch.zeros(
                     (),
                     dtype=torch.float32,
                     device=(
@@ -164,6 +169,10 @@ class AdamWSwapMixin:
                         else local_param.device
                     ),
                 )
+                state = {"step": step, **cpu_state}
+                self.state[param] = state
+                self.param_to_cpu_states_map[param] = state
+                self.param_to_step_map[param] = step
                 self.param_to_state_bytes_map[param] = sum(
                     tensor.untyped_storage().nbytes() for tensor in cpu_state.values()
                 )
@@ -250,6 +259,33 @@ class AdamWSwapMixin:
 
     def _parameter_name(self, param: torch.Tensor) -> str:
         return self.param_to_name_map.get(param, "<unnamed parameter>")
+
+    def _checkpoint_mesh(self, source_mesh: DeviceMesh) -> DeviceMesh:
+        checkpoint_mesh = self._checkpoint_meshes.get(source_mesh)
+        if checkpoint_mesh is None:
+            checkpoint_mesh = DeviceMesh(
+                "cpu",
+                source_mesh.mesh,
+                mesh_dim_names=source_mesh.mesh_dim_names,
+                _init_backend=False,
+            )
+            self._checkpoint_meshes[source_mesh] = checkpoint_mesh
+        return checkpoint_mesh
+
+    def _wrap_checkpoint_tensor(
+        self, tensor: torch.Tensor, param: torch.Tensor
+    ) -> torch.Tensor:
+        if not isinstance(param, DTensor) or tensor.ndim == 0:
+            return tensor
+
+        return DTensor.from_local(
+            tensor,
+            self._checkpoint_mesh(param.device_mesh),
+            param.placements,
+            run_check=False,
+            shape=param.shape,
+            stride=param.stride(),
+        )
 
     def _workspace_state_fits(self, state: dict[str, torch.Tensor]) -> bool:
         assert self.workspace is not None
@@ -436,6 +472,95 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
         AdamWSwapMixin.__init__(
             self, device_runtime, optimizer_memory_fraction, param_names
         )
+
+    def state_dict(self, *args, **kwargs):
+        """Return a standard AdamW-format checkpoint view of the swap state.
+
+        Sharded moments are wrapped in metadata-only CPU DTensors while the
+        state and param_groups keys remain standard packed integer IDs.
+        """
+        state_dict = super().state_dict(*args, **kwargs)
+        params = chain.from_iterable(group["params"] for group in self.param_groups)
+        for (param_id, entry), param in zip(state_dict["state"].items(), params):
+            checkpoint_entry = dict(entry)
+            for key in self.state_keys:
+                checkpoint_entry[key] = self._wrap_checkpoint_tensor(
+                    entry[key], param
+                )
+            state_dict["state"][param_id] = checkpoint_entry
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        """Restore swap state from a standard AdamW-format state dict.
+
+        Unlike the base implementation, the loaded tensors are copied into the
+        existing buffers instead of being adopted.
+        """
+        saved_groups = state_dict["param_groups"]
+        groups = self.param_groups
+        if len(groups) != len(saved_groups):
+            raise ValueError(
+                f"loaded state dict has {len(saved_groups)} parameter groups; "
+                f"optimizer has {len(groups)}"
+            )
+        if [len(group["params"]) for group in groups] != [
+            len(group["params"]) for group in saved_groups
+        ]:
+            raise ValueError(
+                "loaded state dict has a different number of parameters per "
+                "group than the optimizer"
+            )
+
+        for group, saved in zip(groups, saved_groups):
+            for key, value in saved.items():
+                if key != "params":
+                    group[key] = value
+
+        current_params = [p for group in groups for p in group["params"]]
+        saved_ids = [p for group in saved_groups for p in group["params"]]
+        param_map = dict(zip(saved_ids, current_params))
+
+        for saved_id, saved_state in state_dict["state"].items():
+            param = param_map.get(saved_id)
+            if param is None:
+                raise ValueError(
+                    "loaded state dict contains state for unknown parameter "
+                    f"id {saved_id!r}"
+                )
+            cpu_state = self.param_to_cpu_states_map.get(param)
+            if cpu_state is None:
+                raise ValueError(
+                    "loaded state dict contains state for a parameter without "
+                    "swap state"
+                )
+            for key, value in saved_state.items():
+                if isinstance(value, DTensor):
+                    value = value.to_local()
+                if key == "step":
+                    step = self.param_to_step_map[param]
+                    if not torch.is_tensor(value):
+                        value = torch.tensor(value)
+                    self._validate_state_shape(param, key, value, step)
+                    step.copy_(value)
+                elif key in self.state_keys:
+                    self._validate_state_shape(param, key, value, cpu_state[key])
+                    cpu_state[key].copy_(value)
+                # Other keys (e.g. amsgrad ``max_exp_avg_sq``) have no swap
+                # counterpart and are ignored.
+
+    def _validate_state_shape(
+        self,
+        param: torch.Tensor,
+        key: str,
+        value: torch.Tensor,
+        destination: torch.Tensor,
+    ) -> None:
+        if value.shape != destination.shape:
+            raise ValueError(
+                f"loaded optimizer state '{key}' for parameter "
+                f"'{self._parameter_name(param)}' has shape "
+                f"{tuple(value.shape)}, expected {tuple(destination.shape)}"
+            )
 
     @torch.no_grad()
     def step(self, closure=None):

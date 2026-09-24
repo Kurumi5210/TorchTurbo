@@ -100,7 +100,13 @@ def test_cpu_offload_adamw_matches_adamw(monkeypatch):
             offload.param_to_step_map[offload_param],
             reference.state[reference_param]["step"],
         )
-    assert offload.state == {}
+    assert set(offload.state) == set(offloaded_params)
+    for offload_param in offloaded_params:
+        assert offload.state[offload_param]["step"] is offload.param_to_step_map[offload_param]
+        assert (
+            offload.state[offload_param]["exp_avg"]
+            is offload.param_to_cpu_states_map[offload_param]["exp_avg"]
+        )
     assert [group["lr"] for group in offload.param_groups] == [
         group["lr"] for group in reference.param_groups
     ]
@@ -141,7 +147,7 @@ def test_host_update_adamw_matches_adamw():
                 rtol=0,
                 atol=0,
             )
-    assert cpu_update.state == {}
+    assert set(cpu_update.state) == set(cpu_params)
 
 
 def test_step_on_device_requires_workspace():

@@ -16,6 +16,7 @@ Dense/router params are left untouched.
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from typing import Any
 
@@ -38,17 +39,6 @@ OPTIMIZER_DISTCP_DIR = "optimizer_distcp"
 # treated as incomplete by the guards below, not as a usable checkpoint.
 _DCP_METADATA_GLOBAL = ".metadata"
 
-
-def _dcp_metadata_present(dcp_dir: str) -> bool:
-    """True iff a finished DCP metadata file sits in ``dcp_dir``."""
-    if not os.path.isdir(dcp_dir):
-        return False
-    if os.path.isfile(os.path.join(dcp_dir, _DCP_METADATA_GLOBAL)):
-        return True
-    # Per-rank metadata layout: ``__<rank>.metadata``.
-    return any(name.endswith(_DCP_METADATA_GLOBAL) and name.startswith("__") for name in os.listdir(dcp_dir))
-
-
 class DcpCheckpoint:
     """Per-rank DCP save/load of model weights and optimizer state.
 
@@ -56,6 +46,10 @@ class DcpCheckpoint:
     unique across EP ranks (see module docstring); the suffix is stripped
     before writing back. Each shard is saved at its HF source-checkpoint dtype
     (mapped via the weight converter), not a single mixed-precision dtype.
+
+    Optimizer state follows the model-aware DTensor layout exposed by each
+    optimizer's ``state_dict()``; loading lets DCP fill local tensors in place
+    before the state dict is written back through the optimizer.
     """
 
     _EP_SUFFIX = "::ep"
@@ -71,10 +65,25 @@ class DcpCheckpoint:
     def _ep_rank(self, parallel_context: dict[str, Any]) -> int:
         return parallel_context["ep"]["ep_rank"]
 
-    def _rank0_makedirs(self, ckpt_dir: str) -> None:
+    def _rank0_reset_dir(self, ckpt_dir: str) -> None:
+        """Recreate a checkpoint dir so DCP never overwrites a stale save."""
         if self.rank == 0:
+            if os.path.isdir(ckpt_dir):
+                logger.info_rank0(
+                    "[save] replacing existing checkpoint dir %s", ckpt_dir
+                )
+                shutil.rmtree(ckpt_dir)
             os.makedirs(ckpt_dir, exist_ok=True)
         dist.barrier()
+
+    def _dcp_metadata_present(self, dcp_dir: str) -> bool:
+        """True iff a finished DCP metadata file sits in ``dcp_dir``."""
+        if not os.path.isdir(dcp_dir):
+            return False
+        if os.path.isfile(os.path.join(dcp_dir, _DCP_METADATA_GLOBAL)):
+            return True
+        # Per-rank metadata layout: ``__<rank>.metadata``.
+        return any(name.endswith(_DCP_METADATA_GLOBAL) and name.startswith("__") for name in os.listdir(dcp_dir))
 
     # ------------------------------------------------------------------ #
     # EP expert-FQN suffixing (private).
@@ -133,7 +142,7 @@ class DcpCheckpoint:
         Requires the ``model_distcp`` dir AND its finished ``.metadata`` file —
         a dir without metadata is an interrupted save and must not be loaded.
         """
-        return _dcp_metadata_present(os.path.join(checkpoint_dir, MODEL_DISTCP_DIR))
+        return self._dcp_metadata_present(os.path.join(checkpoint_dir, MODEL_DISTCP_DIR))
 
     def model_weights_dir_exists(self, checkpoint_dir: str) -> bool:
         """Shallow existence (dir present at all), for ''missing vs incomplete'' messaging."""
@@ -148,7 +157,7 @@ class DcpCheckpoint:
         import torch.distributed.checkpoint as dcp
 
         ckpt_dir = os.path.join(output_dir, MODEL_DISTCP_DIR)
-        self._rank0_makedirs(ckpt_dir)
+        self._rank0_reset_dir(ckpt_dir)
 
         # Store the natural state dict; expert weight1/weight2 get an EP-rank
         # suffix so DCP's (fqn, offset) keys stay unique across EP ranks.
@@ -187,7 +196,7 @@ class DcpCheckpoint:
     # ------------------------------------------------------------------ #
     def has_optimizer(self, checkpoint_dir: str) -> bool:
         """True iff a *complete* DCP optimizer save is present (dir + ``.metadata``)."""
-        return _dcp_metadata_present(os.path.join(checkpoint_dir, OPTIMIZER_DISTCP_DIR))
+        return self._dcp_metadata_present(os.path.join(checkpoint_dir, OPTIMIZER_DISTCP_DIR))
 
     def optimizer_dir_exists(self, checkpoint_dir: str) -> bool:
         """Shallow existence (dir present at all), for ''missing vs incomplete'' messaging."""
@@ -208,12 +217,14 @@ class DcpCheckpoint:
         )
 
         ckpt_dir = os.path.join(output_dir, OPTIMIZER_DISTCP_DIR)
-        self._rank0_makedirs(ckpt_dir)
+        self._rank0_reset_dir(ckpt_dir)
 
         options = StateDictOptions(full_state_dict=False)
         optim_state = get_optimizer_state_dict(model, optimizer, options=options)
         stamped = self._stamp_optim_state(
-            optim_state, self._ep_rank(parallel_context), self.weight_converter.is_expert_weight
+            optim_state,
+            self._ep_rank(parallel_context),
+            self.weight_converter.is_expert_weight,
         )
         start = time.perf_counter()
         dcp.save({"optimizer": stamped}, checkpoint_id=ckpt_dir)
@@ -239,7 +250,9 @@ class DcpCheckpoint:
 
         optim_state = get_optimizer_state_dict(model, optimizer, options=options)
         stamped = self._stamp_optim_state(
-            optim_state, self._ep_rank(parallel_context), self.weight_converter.is_expert_weight
+            optim_state,
+            self._ep_rank(parallel_context),
+            self.weight_converter.is_expert_weight,
         )
         start = time.perf_counter()
         dcp.load({"optimizer": stamped}, checkpoint_id=ckpt_dir)

@@ -18,6 +18,7 @@ SYS_OPEN = '<role>SYSTEM</role>'
 HUMAN_OPEN = '<role>HUMAN</role>'
 ASSISTANT_OPEN = '<role>ASSISTANT</role>'
 OBSERVATION_OPEN = '<role>OBSERVATION</role>'
+EOS = '<|endoftext|>'
 
 # ``detailed thinking`` directive options injected into the system prompt.
 DETAILED_THINKING_ON = 'detailed thinking on'
@@ -192,12 +193,13 @@ def _make_ling_v3_template_cls():
 
     return LingV3Template
 
-def _make_ling_v3_template_meta(template_type: str, template_cls) -> 'TemplateMeta':
+def _make_ling_v3_template_meta(
+    template_type: str,
+    template_cls,
+    *,
+    suffix: str | list[str] = ROLE_END,
+) -> 'TemplateMeta':
     """Build the shared ``TemplateMeta`` for the ling v3 template family.
-
-    ``template_cls`` selects the behavior: ``LingV3Template`` injects the
-    ``detailed thinking`` system directive; the plain swift ``Template`` leaves
-    the system untouched.
     """
     from swift.template.template_meta import TemplateMeta
 
@@ -207,7 +209,7 @@ def _make_ling_v3_template_meta(template_type: str, template_cls) -> 'TemplateMe
         system_prefix=[SYS_OPEN + '{{SYSTEM}}' + ROLE_END],
         prompt=[HUMAN_OPEN + '{{QUERY}}' + ROLE_END + ASSISTANT_OPEN + '\n'],
         chat_sep=[ROLE_END],
-        suffix=[ROLE_END],
+        suffix=[suffix] if isinstance(suffix, str) else suffix,
         template_cls=template_cls,
         default_system=None,
         is_thinking=True,
@@ -227,10 +229,9 @@ def _register_ling_v3_agent_template() -> None:
 
 
 def register() -> None:
-    """Register the ``ling_v3`` / ``ling_v3_simple`` templates + agent template
+    """Register the ``ling_v3`` / ``ling_v3_eos`` templates + agent template
     and point ``turbo_bailing_hybrid`` at ``ling_v3``."""
     from swift.model.model_meta import MODEL_MAPPING
-    from swift.template import Template
     from swift.template.register import TEMPLATE_MAPPING, register_template
 
     _register_ling_v3_agent_template()
@@ -240,12 +241,11 @@ def register() -> None:
         register_template(meta, exist_ok=True)
         logger.debug_rank0("Registered ms-swift template 'ling_v3'")
 
-    # ``ling_v3_simple``: plain swift ``Template``, no ``detailed thinking``
-    # system directive. System is taken verbatim (or ``default_system``).
-    if 'ling_v3_simple' not in TEMPLATE_MAPPING:
-        meta = _make_ling_v3_template_meta('ling_v3_simple', Template)
+    if 'ling_v3_eos' not in TEMPLATE_MAPPING:
+        meta = _make_ling_v3_template_meta(
+            'ling_v3_eos', _make_ling_v3_template_cls(), suffix=[ROLE_END, EOS])
         register_template(meta, exist_ok=True)
-        logger.debug_rank0("Registered ms-swift template 'ling_v3_simple'")
+        logger.debug_rank0("Registered ms-swift template 'ling_v3_eos'")
 
     # ``turbo_bailing_hybrid`` would otherwise inherit the V2.5 template: the
     # turbo name ``bailing_hybrid`` collides with swift's native V2.5

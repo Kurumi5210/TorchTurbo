@@ -11,17 +11,13 @@
       "user_tag": "HUMAN",
       "assistant_tag": "ASSISTANT",
       "system_tag": "SYSTEM"
-    },
-    "samplingMethod": "antllm_random",
-    "samplingSeed": 1234
+    }
   },
   "BailingV3-Fusion-0626-official-50w": {
     "uri": "mdata://id=379824db&label=sft_baseline&label_snapshot=BailingV3-Fusion-0626-official-50w&storage=pcache&datastore=ais-pcache-a3-dataset-amed&consume_mode=synced",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages"
-    },
-    "samplingMethod": "antllm_random",
-    "samplingSeed": 1234
+    }
   }
 }

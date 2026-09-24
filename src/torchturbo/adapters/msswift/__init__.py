@@ -1,4 +1,4 @@
-"""ms-swift adapter: ``activate()`` registers turbo models/trainers into swift's own registries and swaps each stage's pipeline global for the turbo pipeline (via ``stages.stage_wiring``) so native ``<stage>_main`` builds the turbo pipeline. Plugin consume is :func:`.plugins.install_plugins(engine.plugin_manager)` on the engine-build path."""
+"""ms-swift adapter"""
 
 from __future__ import annotations
 

@@ -1,1 +1,0 @@
-"""Internal mdata dataset provider (Ant-internal, not open-sourced)."""

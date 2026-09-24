@@ -54,11 +54,10 @@ from .distributed import init_process_group_if_needed
 from .metrics import MetricTracker
 from .plugins import (
     DatasetPlugin,
-    PackingPlugin,
     Plugin,
     PluginConsumer,
-    PluginKind,
     PluginManager,
+    DatasetPrepareContext,
     register_plugin,
 )
 
@@ -100,10 +99,9 @@ __all__ = [
     "init_process_group_if_needed",
     # Plugins
     "DatasetPlugin",
-    "PackingPlugin",
     "Plugin",
     "PluginConsumer",
-    "PluginKind",
     "PluginManager",
+    "DatasetPrepareContext",
     "register_plugin",
 ]

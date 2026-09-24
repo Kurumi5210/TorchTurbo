@@ -12,11 +12,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 TORCHTURBO_SRC_DIR="${TORCHTURBO_SRC_DIR:-${REPO_ROOT}/src}"
 
-MDATA_PLUGIN="${REPO_ROOT}/internal/dataset/mdata/mdata_plugin.py"
+MDATA_PLUGIN="${REPO_ROOT}/internal/dataset/mdata_demo/mdata_plugin.py"
 
 OUTPUT_DIR=/mnt/sfs_turbo/${USER_NAME}/datasets/cache/swift/math44w
 MODELSCOPE_CACHE=${OUTPUT_DIR}
-export HF_DATASETS_CACHE=/mnt/sfs_turbo/${USER_NAME}/datasets/cache/swift/math44w
+export HF_DATASETS_CACHE=${OUTPUT_DIR}
+rm -rf ${OUTPUT_DIR}
 
 
 if [ ! -d "${TORCHTURBO_SRC_DIR}/torchturbo" ]; then
@@ -36,9 +37,8 @@ PYTHON=${PYTHON:-python3}
     --dataset math-44w \
     --model_type turbo_bailing_hybrid \
     --model /mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_256k_enhance_0420_wthink/merge-step-mean-0baeb1658f223ec4bcfa8d7cf6b7e242 \
-    --dataset_shuffle false \
     --check_model false \
-    --template ling_v3_simple \
+    --template ling_v3_eos \
     --max_length 131072 \
     --dataset_num_proc 96 \
     --output_dir ${OUTPUT_DIR} \

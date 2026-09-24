@@ -55,9 +55,12 @@ class TurboEnginePipelineMixin:
         config = build_config_from_swift_args(self.args)
         engine = TorchTurboEngine(config)
 
-        from .plugins import install_plugins
+        from .plugins import SwiftPluginHost
 
-        install_plugins(engine.plugin_manager)
+        # Plugin host consumes the plugins carried by --tt_plugin and routes each
+        # DatasetPlugin to its bridge; reused by _prepare_dataset below.
+        self._plugin_host = SwiftPluginHost()
+        self._plugin_host.install_plugins(engine.plugin_manager)
         if getattr(self.args, "tuner_type", "full") == "lora":
             engine.peft_config = build_lora_config_from_swift_args(self.args)
         engine_registry.set_engine(engine, stage=type(self).turbo_stage)
@@ -70,6 +73,16 @@ class TurboEnginePipelineMixin:
         # The engine already built + sharded + applied freeze/LoRA inside
         # TurboModelLoader; skip swift's TunerMixin.prepare_model.
         return model if model is not None else self.model
+
+    def _prepare_dataset(self):
+        """A plugin-provided ``--dataset`` takes over preparation via ``try_takeover``;
+        else swift's native path."""
+        datasets = self._plugin_host.dataset_bridge.try_takeover(
+            args=self.args,
+            template=self.template,
+            show_dataset=getattr(self, "_show_dataset", None),
+        )
+        return datasets if datasets is not None else super()._prepare_dataset()
 
     def _get_dataset(self):
         # Gate raw rows before swift encodes them (its silent row drops would

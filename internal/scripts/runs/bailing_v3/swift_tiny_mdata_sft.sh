@@ -15,7 +15,7 @@ MODEL=${MODEL:-/mnt/sfs_turbo/pretrained_models/bailing_v3/ling_tiny_v3_formal_2
 # sequence length
 SEQ_LEN=${SEQ_LEN:-131072}
 # output directory
-OUTPUT_DIR=${OUTPUT_DIR:-/sfs_turbo/${USER_NAME}/ckpt/$(basename "${MODEL}")/swift/swift_tiny_sft_node${NNODES:-1}}
+OUTPUT_DIR=${OUTPUT_DIR:-/mnt/sfs_turbo/${USER_NAME}/ckpt/$(basename "${MODEL}")/swift/swift_tiny_sft_node${NNODES:-1}}
 # tuner type: 'full' | 'lora'
 FINETUNING_TYPE=${FINETUNING_TYPE:-full} # swift args: 'full' | 'lora' (megatron uses --finetune)
 # training dataset (LF dataset id resolved via --dataset_dir, or a local path)
@@ -26,7 +26,7 @@ TT_CONFIG=${TT_CONFIG:-"$(dirname "$0")/swift_tiny_sft.yaml"}
 dataset_num_proc=32
 dataloader_num_workers=8          # swift args: --dataloader_num_workers
 model_type=turbo_bailing_hybrid   # turbo-registered model_type (loader = TurboModelLoader)
-template=ling_v3_simple
+template=ling_v3_eos
 
 # python interpreter (defaults to python3)
 PYTHON=${PYTHON:-python3}
@@ -62,12 +62,11 @@ RUN_SWIFT="${REPO_ROOT}/scripts/runs/run_swift.py"
 # ms-swift repo root (the dir containing the `swift` package); empty if pip-installed.
 SWIFT_SRC_DIR=${SWIFT_SRC_DIR:-}
 export PYTHONPATH="${REPO_ROOT}/src${SWIFT_SRC_DIR:+:${SWIFT_SRC_DIR}}${PYTHONPATH:+:${PYTHONPATH}}"
-MDATA_DIR="${REPO_ROOT}/internal/dataset/mdata"
+MDATA_DIR="${REPO_ROOT}/internal/dataset/mdata_demo"
 MDATA_PLUGIN="${MDATA_DIR}/mdata_plugin.py"
 MDATA_PLUGIN_CONFIG="${MDATA_DIR}/datasets.json"
-PACKING_PLUGIN="${REPO_ROOT}/internal/dataset/packing/antllm_packing_plugin.py"
 export MAX_PACK_SAMPLE_NUM=${MAX_PACK_SAMPLE_NUM:-300}
-export HF_DATASETS_CACHE=/mnt/sfs_turbo/${USER_NAME}/datasets/cache/swift/math44w
+export HF_DATASETS_CACHE=/mnt/sfs_turbo/${USER_NAME}/datasets/cache/swift/math44w/${NODE_RANK}
 
 
 DISTRIBUTED_ARGS="
@@ -100,7 +99,6 @@ fi
     --add_non_thinking_prefix true \
     --loss_scale ignore_empty_think \
     --tt_plugin ${MDATA_PLUGIN}:${MDATA_PLUGIN_CONFIG} \
-    --tt_plugin ${PACKING_PLUGIN} \
     --dataset math-44w \
     --load_from_cache_file true \
     --max_length "${SEQ_LEN}" \

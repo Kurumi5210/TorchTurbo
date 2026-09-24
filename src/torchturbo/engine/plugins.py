@@ -1,47 +1,42 @@
 """Plugin system: ``--tt_plugin`` files register ``Plugin`` subclasses; ``PluginManager``
-loads them and drives plugin consumers via ``try_install``."""
+loads them and hands each to the ``PluginConsumer`` that recognizes it.
+"""
 
 from __future__ import annotations
 
 import importlib.util
 import os
 import sys
-from enum import Enum
-from typing import Any, Callable, Iterable
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping, Optional
 
 from ..logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class PluginKind(Enum):
-    """What a plugin provides; consumers gate on this."""
-
-    DATASET = "dataset"
-    PACKING = "packing"
-
-
 class Plugin:
-    """Base for every ``--tt_plugin``; ``self.config`` is the bound ``plugin:config``."""
-
-    kind: PluginKind
+    """Base for every ``--tt_plugin``; ``self.config`` is the bound ``plugin:config``.
+    A plugin's contract is its base class (e.g. :class:`DatasetPlugin`); consumers
+    match plugins by ``isinstance``."""
 
     def __init__(self, config: str | None = None) -> None:
         self.config: str | None = config
 
 
 class PluginConsumer:
-    """A framework's wiring for one :class:`PluginKind`; override ``matches`` and ``install``."""
+    """A component that uses plugins: ``matches`` recognizes the plugins it consumes,
+    ``consume`` puts a recognized plugin to use."""
 
     def matches(self, plugin: Plugin) -> bool:
         raise NotImplementedError
 
-    def install(self, plugin: Plugin) -> None:
+    def consume(self, plugin: Plugin) -> None:
         raise NotImplementedError
 
 
 class PluginManager:
-    """Loads ``--tt_plugin`` files and routes loaded plugins to consumers via ``try_install``."""
+    """Loads ``--tt_plugin`` files and hands each loaded plugin to a :class:`PluginConsumer`."""
 
     def __init__(self, paths: list[str] | None = None) -> None:
         self.plugins: list[Plugin] = []
@@ -64,17 +59,17 @@ class PluginManager:
                     continue
                 self.plugins.append(cls(config=bound))
                 logger.info_rank0(
-                    "Initialized %s plugin '%s' (%s)",
-                    getattr(cls, "kind", "?"), cls.plugin_name, cls.__name__,
+                    "Initialized plugin '%s' (%s)",
+                    cls.plugin_name, cls.__name__,
                 )
 
-    def try_install(self, consumer: PluginConsumer) -> None:
-        """Install each plugin the consumer claims; failures are logged and skipped."""
+    def try_consume(self, consumer: PluginConsumer) -> None:
+        """Hand each loaded plugin to the consumer if it ``matches``; failures are logged and skipped."""
         for plugin in self.plugins:
             if not consumer.matches(plugin):
                 continue
             try:
-                consumer.install(plugin)
+                consumer.consume(plugin)
             except Exception:
                 logger.warning_rank0(
                     "Plugin consumer %s failed on plugin '%s' (%s); skipping.",
@@ -102,57 +97,62 @@ class PluginManager:
         return module
 
 
-def register_plugin(name: str, kind: PluginKind) -> Callable:
-    """Decorator marking a ``Plugin`` subclass under ``name`` with ``kind``."""
+def register_plugin(name: str) -> Callable:
+    """Decorator naming a ``Plugin`` subclass ``name``."""
     def decorator(cls: type[Plugin]) -> type[Plugin]:
         if not issubclass(cls, Plugin):
             raise TypeError(f"{cls.__name__} must subclass Plugin")
         cls.plugin_name = name
-        cls.kind = kind
         return cls
 
     return decorator
 
 
 # ---------------------------------------------------------------------------
-# Plugin API surfaces (clearly-named, intent-obvious; consumers down-cast by `kind`)
+# Plugin API surface (consumers down-cast by plugin base class)
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class DatasetPrepareContext:
+    """Context for DatasetPlugin"""
+
+    encode_fn: Callable[[Mapping], dict]                         # encode function to produce input_ids
+    preprocess: Callable[[Any], Any]                             # normalize datasets
+    max_length: int                                              # length cap
+    show_dataset: Optional[Callable[[Any, Any], Any]] = None     # auxiluary logging function
+    cache_path: Optional[str] = None                             # cache dir
+    num_proc: int = 1                                            # parallel encode workers
+    seed: int = 42
+
+
 class DatasetPlugin(Plugin):
-    """A dataset source; ``dataset_info`` is provider-defined metadata, ``samples`` is the data."""
+    """Supplies a training dataset per name: build the complete dataset, or supply raw rows"""
 
-    kind = PluginKind.DATASET
-
-    def dataset_info(self) -> dict[str, dict[str, Any]]:
-        """``{dataset_name: <provider-defined metadata>}``; schema is owned by the provider."""
+    def dataset_names(self) -> list[str]:
         raise NotImplementedError
 
-    def samples(self, name: str, cache_dir: str | None = None) -> Iterable:
-        """The data rows for dataset ``name``."""
+    def dataset_info(self, name: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def provides_dataset(self, name: str) -> bool:
+        """Whether this plugin provides the complete dataset itself; default False."""
+        return False
 
-class PackingPlugin(Plugin):
-    """A packing algorithm: assigns tokenized samples to fixed-length packs."""
-
-    kind = PluginKind.PACKING
-
-    def pack_groups(self, sequences, packing_length: int, *, is_finished: bool = True):
-        """Group ``(idx, length)`` pairs into packs up to ``packing_length``."""
+    def build_dataset(self, name: str, ctx: DatasetPrepareContext) -> tuple[Any, Any]:
+        """Return ``(train_dataset, val_dataset)``; only called when ``provides_dataset`` is True."""
         raise NotImplementedError
 
-    def knapsack(self, numbers: list[int], capacity: int) -> list[list[int]]:
-        """Group raw lengths into packs up to ``capacity``."""
+    def samples(self, name: str, cache_dir: str | None = None) -> Any:
+        """Return raw rows (HF Dataset); only used when ``provides_dataset`` is False."""
         raise NotImplementedError
 
 
 __all__ = [
     "Plugin",
-    "PluginKind",
     "PluginConsumer",
     "PluginManager",
     "DatasetPlugin",
-    "PackingPlugin",
+    "DatasetPrepareContext",
     "register_plugin",
 ]

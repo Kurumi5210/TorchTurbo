@@ -198,9 +198,6 @@ class RunExpPatch(BasePatch):
 
             engine = TorchTurboEngine(config)
 
-            from .plugins import install_plugins
-            install_plugins(engine.plugin_manager)
-
             adapter.engine = engine
             adapter.stage = stage
             adapter.peft_config = peft_config

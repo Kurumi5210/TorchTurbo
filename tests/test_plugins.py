@@ -1,6 +1,5 @@
-"""Plugin system tests; ``torchturbo.engine.plugins`` loaded directly with a stubbed
-logger to avoid the torch chain. Each test gets a fresh ``PluginManager`` (no shared
-global state)."""
+"""Plugin system tests; ``torchturbo.engine.plugins`` loaded with a stubbed logger (no torch).
+"""
 
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ _PLUGINS_PATH = os.path.join(_REPO_ROOT, "src", "torchturbo", "engine", "plugins
 
 
 def _load_plugins_module():
-    """Load ``torchturbo.engine.plugins`` directly with ``torchturbo.logging`` stubbed."""
     tt = types.ModuleType("torchturbo")
     tt.__path__ = [os.path.join(_REPO_ROOT, "src", "torchturbo")]
     logging_mod = types.ModuleType("torchturbo.logging")
@@ -47,8 +45,9 @@ def _load_plugins_module():
 @pytest.fixture(autouse=True)
 def _cleanup_torchturbo_plugin_modules():
     yield
-    for name in [n for n in sys.modules if n.startswith("torchturbo_plugin.")]:
-        del sys.modules[n]
+    for name in list(sys.modules):
+        if name.startswith("torchturbo_plugin."):
+            del sys.modules[name]
 
 
 @pytest.fixture
@@ -61,7 +60,13 @@ def manager(module):
     return module.PluginManager()
 
 
-def _write_plugin(tmp_path, body: str, name: str = "plug.py") -> str:
+_counter = 0
+
+
+def _write_plugin(tmp_path, body: str, name: str | None = None) -> str:
+    global _counter
+    _counter += 1
+    name = name or f"plug_{_counter}.py"
     path = tmp_path / name
     path.write_text(body)
     return str(path)
@@ -70,8 +75,8 @@ def _write_plugin(tmp_path, body: str, name: str = "plug.py") -> str:
 def test_register_plugin_rejects_non_plugin_subclass(module, tmp_path):
     plugin_file = _write_plugin(
         tmp_path,
-        "from torchturbo.engine.plugins import Plugin, PluginKind, register_plugin\n"
-        "@register_plugin('bad', PluginKind.DATASET)\nclass Bad:\n"
+        "from torchturbo.engine.plugins import Plugin, register_plugin\n"
+        "@register_plugin('bad')\nclass Bad:\n"
         "    pass\n",
     )
     with pytest.raises(TypeError):
@@ -81,47 +86,30 @@ def test_register_plugin_rejects_non_plugin_subclass(module, tmp_path):
 def test_load_populates_dataset_plugin(module, manager, tmp_path):
     plugin_file = _write_plugin(
         tmp_path,
-        "from torchturbo.engine.plugins import DatasetPlugin, PluginKind, register_plugin\n"
-        "@register_plugin('ds', PluginKind.DATASET)\nclass Ds(DatasetPlugin):\n"
+        "from torchturbo.engine.plugins import DatasetPlugin, register_plugin\n"
+        "@register_plugin('ds')\nclass Ds(DatasetPlugin):\n"
         "    def __init__(self, config=None):\n"
         "        super().__init__(config)\n"
-        "        self.names_ = ['a','b']\n"
-        "    def dataset_info(self): return {n: {} for n in self.names_}\n"
-        "    def samples(self, name, cache_dir=None): return [name]\n",
+        "        self.names_ = ['a', 'b']\n"
+        "    def dataset_names(self): return list(self.names_)\n"
+        "    def dataset_info(self, name): return {}\n",
     )
     manager.load([plugin_file])
     assert len(manager.plugins) == 1
-    assert manager.plugins[0].kind == module.PluginKind.DATASET
-    assert manager.plugins[0].dataset_info() == {"a": {}, "b": {}}
-
-
-def test_load_populates_packing_plugin(module, manager, tmp_path):
-    plugin_file = _write_plugin(
-        tmp_path,
-        "from torchturbo.engine.plugins import PackingPlugin, PluginKind, register_plugin\n"
-        "@register_plugin('pk', PluginKind.PACKING)\nclass Pk(PackingPlugin):\n"
-        "    def __init__(self, config=None):\n"
-        "        super().__init__(config)\n"
-        "        self.max_pack_sample_num = 7\n"
-        "    def pack_groups(self, s, l, *, is_finished=True): return [], []\n"
-        "    def knapsack(self, n, c): return []\n",
-    )
-    manager.load([plugin_file])
-    assert manager.plugins[0].kind == module.PluginKind.PACKING
-    assert manager.plugins[0].max_pack_sample_num == 7
+    assert isinstance(manager.plugins[0], module.DatasetPlugin)
+    assert manager.plugins[0].dataset_names() == ["a", "b"]
+    assert manager.plugins[0].dataset_info("a") == {}
 
 
 def test_plugin_config_binding_passed_to_init(manager, tmp_path):
     plugin_file = _write_plugin(
         tmp_path,
-        "from torchturbo.engine.plugins import DatasetPlugin, PluginKind, register_plugin\n"
+        "from torchturbo.engine.plugins import DatasetPlugin, register_plugin\n"
         "RAN=[]\n"
-        "@register_plugin('ds', PluginKind.DATASET)\nclass Ds(DatasetPlugin):\n"
+        "@register_plugin('ds')\nclass Ds(DatasetPlugin):\n"
         "    def __init__(self, config=None):\n"
         "        super().__init__(config)\n"
-        "        RAN.append(self.config)\n"
-        "    def dataset_info(self): return {}\n"
-        "    def samples(self, name, cache_dir=None): return []\n",
+        "        RAN.append(self.config)\n",
     )
     cfg = tmp_path / "datasets.json"
     cfg.write_text("{}")
@@ -133,7 +121,8 @@ def test_load_only_does_not_register_modules_without_decorator(manager, tmp_path
     plugin_file = _write_plugin(tmp_path, "MARKER = 'loaded'\n")
     manager.load([plugin_file])
     assert manager.plugins == []
-    assert sys.modules[f"torchturbo_plugin.{os.path.splitext(os.path.basename(plugin_file))[0]}"].MARKER == "loaded"
+    mod_name = f"torchturbo_plugin.{os.path.splitext(os.path.basename(plugin_file))[0]}"
+    assert sys.modules[mod_name].MARKER == "loaded"
 
 
 def test_missing_file_raises(manager, tmp_path):
@@ -141,13 +130,13 @@ def test_missing_file_raises(manager, tmp_path):
         manager.load([str(tmp_path / "nope.py")])
 
 
-def test_try_install_runs_consumer_only_on_matching_plugins(module, manager, tmp_path):
+def test_try_consume_runs_consumer_only_on_matching_plugins(module, manager, tmp_path):
     plugin_file = _write_plugin(
         tmp_path,
-        "from torchturbo.engine.plugins import PackingPlugin, PluginKind, register_plugin\n"
-        "@register_plugin('pk', PluginKind.PACKING)\nclass Pk(PackingPlugin):\n"
-        "    def pack_groups(self, s, l, *, is_finished=True): return [], []\n"
-        "    def knapsack(self, n, c): return [[x] for x in n]\n",
+        "from torchturbo.engine.plugins import DatasetPlugin, register_plugin\n"
+        "@register_plugin('ds')\nclass Ds(DatasetPlugin):\n"
+        "    def dataset_names(self): return ['a']\n"
+        "    def dataset_info(self, name): return {}\n",
     )
     manager.load([plugin_file])
 
@@ -155,18 +144,18 @@ def test_try_install_runs_consumer_only_on_matching_plugins(module, manager, tmp
 
     class _C(module.PluginConsumer):
         def matches(self, plugin):
-            return plugin.kind == module.PluginKind.PACKING
+            return isinstance(plugin, module.DatasetPlugin)
 
-        def install(self, plugin):
-            seen.append(plugin.knapsack([1, 2, 3], 100))
+        def consume(self, plugin):
+            seen.append(plugin.dataset_names())
 
     class _NonMatching(module.PluginConsumer):
         def matches(self, plugin):
-            return plugin.kind == module.PluginKind.DATASET
+            return False
 
-        def install(self, plugin):
+        def consume(self, plugin):
             seen.append("nope")
 
-    manager.try_install(_C())
-    manager.try_install(_NonMatching())
-    assert seen == [[[1], [2], [3]]]
+    manager.try_consume(_C())
+    manager.try_consume(_NonMatching())
+    assert seen == [["a"]]

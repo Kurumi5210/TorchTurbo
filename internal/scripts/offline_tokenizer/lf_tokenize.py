@@ -85,12 +85,6 @@ def main() -> None:
     # Activate the LF adapter (registers turbo model templates).
     torchturbo.activate("llamafactory_v0")
 
-    # No engine here: build a standalone PluginManager and consume --tt_plugin into the now-active LF adapter.
-    if tt_args.plugins:
-        from torchturbo.adapters.llamafactory_v0.plugins import install_plugins
-        from torchturbo.engine.plugins import PluginManager
-
-        install_plugins(PluginManager(list(tt_args.plugins)))
 
     if os.path.exists(tokenized_path) and os.listdir(tokenized_path):
         if not overwrite:

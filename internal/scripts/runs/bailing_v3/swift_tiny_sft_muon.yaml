@@ -3,8 +3,6 @@ engine_config:
     sp_size: 8
     ep_size: 8
 
-  gbs: 256
-
   activation_checkpointing:
     enabled: true
     use_reentrant: true

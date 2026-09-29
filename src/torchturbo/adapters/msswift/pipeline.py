@@ -84,15 +84,6 @@ class TurboEnginePipelineMixin:
         )
         return datasets if datasets is not None else super()._prepare_dataset()
 
-    def _get_dataset(self):
-        # Gate raw rows before swift encodes them (its silent row drops would
-        # otherwise mask non-conforming data); see data_check.
-        from .data_check import validate_raw_dataset
-
-        train_dataset, val_dataset = super()._get_dataset()
-        validate_raw_dataset(train_dataset, "train")
-        validate_raw_dataset(val_dataset, "val")
-        return train_dataset, val_dataset
 
 
 class TurboSwiftSft(TurboEnginePipelineMixin, SwiftSft):  # type: ignore[misc]
@@ -113,4 +104,11 @@ class TurboSwiftPretrain(TurboEnginePipelineMixin, SwiftPretrain):  # type: igno
     args_class = TurboPretrainArguments
     turbo_stage = "pt"
 
+    def _get_dataset(self):
+        # PT consumes raw multimodal rows before swift encodes them.
+        from .data_check import validate_raw_dataset
 
+        train_dataset, val_dataset = super()._get_dataset()
+        validate_raw_dataset(train_dataset, "train")
+        validate_raw_dataset(val_dataset, "val")
+        return train_dataset, val_dataset

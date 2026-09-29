@@ -29,7 +29,7 @@ python internal/scripts/dataset/convert_lf_to_swift.py --check-only data/train.j
 
 ## 运行时拦截
 
-`src/torchturbo/adapters/msswift/data_check.py` 在训练启动时（swift encode 之前）对数据集逐行执行同一套标准检查，首个违规行即抛出 ValueError 并指向本脚本。纯文本数据集与 streaming 数据集自动跳过；gate 与转换脚本共用同一个 `check_row` 实现，标准唯一。
+`src/torchturbo/adapters/msswift/data_check.py` 在 Swift PT 启动时（swift encode 之前）对数据集逐行执行同一套标准检查，首个违规行即抛出 ValueError 并指向本脚本。纯文本数据集与 streaming 数据集自动跳过；gate 与转换脚本共用同一个 `check_row` 实现，标准唯一。
 
 ## 边界
 

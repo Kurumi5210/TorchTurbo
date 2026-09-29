@@ -500,8 +500,11 @@ class MuonPlan(OptimizerPlan):
             "ns_steps": config.ns_steps,
             "adjust_lr_fn": config.adjust_lr_fn,
         }
+        # The fallback AdamW rate is set independently of the Muon rate when a
+        # framework owns a scalar-optimizer
+        adamw_lr = config.lr if config.adamw_lr is None else config.adamw_lr
         adamw_kwargs = {
-            "lr": config.lr,
+            "lr": adamw_lr,
             "betas": config.adamw_betas,
             "eps": config.adamw_eps,
             "weight_decay": config.weight_decay,

@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, get_args, get_type_hints
@@ -78,6 +78,34 @@ def _parse_mixed_precision_policy(value: Any) -> MixedPrecisionPolicy:
             "use bf16 or fp32."
         )
     return MixedPrecisionPolicy(value)
+
+
+def _parse_ns_coefficients(
+    value: Sequence[float] | Sequence[Sequence[float]],
+) -> tuple[float, float, float] | tuple[tuple[float, float, float], ...]:
+    """Normalize Newton-Schulz coefficients to a flat triple or per-step triples.
+    A flat (a, b, c) triple applies to every iteration; a sequence of triples
+    applies one per iteration and must provide exactly one triple per
+    ``ns_steps`` iteration.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(
+            "Muon ns_coefficients must be a triple or a non-empty list of triples"
+        )
+    nested_entries = [entry for entry in value if isinstance(entry, (list, tuple))]
+    if nested_entries and len(nested_entries) != len(value):
+        raise ValueError("Muon ns_coefficients must not mix scalars and triples")
+    if nested_entries:
+        triples = tuple(
+            tuple(float(coefficient) for coefficient in entry) for entry in value
+        )
+        if any(len(triple) != 3 for triple in triples):
+            raise ValueError("Muon ns_coefficients entries must contain three values")
+        return triples
+    flat = tuple(float(coefficient) for coefficient in value)
+    if len(flat) != 3:
+        raise ValueError("Muon ns_coefficients must contain three values")
+    return flat
 
 
 @dataclass
@@ -196,11 +224,20 @@ class MuonOptimizerConfig:
     weight_decay: float | None = None
     momentum: float = 0.95
     nesterov: bool = True
-    ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+    # Newton-Schulz iteration coefficients: a flat (a, b, c) triple applies to
+    # every iteration; a sequence of triples applies one per iteration and
+    # must match ns_steps exactly
+    ns_coefficients: tuple[float, float, float] | tuple[tuple[float, float, float], ...] = (
+        3.4445,
+        -4.7750,
+        2.0315,
+    )
     eps: float = 1e-7
     ns_steps: int = 5
     adjust_lr_fn: str | None = "match_rms_adamw"
     overlap_comm_compute: bool = True
+    # Learning rate for the fallback AdamW
+    adamw_lr: float | None = None
     adamw_betas: tuple[float, float] = (0.9, 0.999)
     adamw_eps: float = 1e-8
     adamw_fused: bool | None = None
@@ -210,13 +247,24 @@ class MuonOptimizerConfig:
     def __post_init__(self) -> None:
         if self.lr is not None:
             self.lr = float(self.lr)
+        if self.adamw_lr is not None:
+            self.adamw_lr = float(self.adamw_lr)
         if self.weight_decay is not None:
             self.weight_decay = float(self.weight_decay)
         self.momentum = float(self.momentum)
         self.nesterov = string_to_bool(self.nesterov)
-        self.ns_coefficients = tuple(float(value) for value in self.ns_coefficients)
+        self.ns_coefficients = _parse_ns_coefficients(self.ns_coefficients)
         self.eps = float(self.eps)
         self.ns_steps = int(self.ns_steps)
+        if (
+            isinstance(self.ns_coefficients[0], tuple)
+            and len(self.ns_coefficients) != self.ns_steps
+        ):
+            raise ValueError(
+                "Muon ns_coefficients must provide one triple per ns_step: "
+                f"{len(self.ns_coefficients)} triples for "
+                f"ns_steps={self.ns_steps}"
+            )
         self.overlap_comm_compute = string_to_bool(self.overlap_comm_compute)
         self.adamw_betas = tuple(float(value) for value in self.adamw_betas)
         self.adamw_eps = float(self.adamw_eps)
@@ -224,6 +272,8 @@ class MuonOptimizerConfig:
             self.adamw_fused = string_to_bool(self.adamw_fused)
         if self.lr is not None and self.lr < 0:
             raise ValueError("Muon lr must be non-negative")
+        if self.adamw_lr is not None and self.adamw_lr < 0:
+            raise ValueError("Muon AdamW lr must be non-negative")
         if self.weight_decay is not None and self.weight_decay < 0:
             raise ValueError("Muon weight_decay must be non-negative")
         if self.momentum < 0:

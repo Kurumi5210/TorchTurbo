@@ -1185,6 +1185,23 @@ class FSDPDistributedMuon(Optimizer):
         self._workspace.configure(self._compiled_buckets)
         self._first_step_validated = False
 
+    def _validate_ns_coefficients(self, coefficients: Any, ns_steps: int) -> bool:
+        """Whether Newton-Schulz coefficients are a flat triple or per-step triples.
+        Per-step triples must provide exactly one triple per ``ns_steps`` iteration.
+        """
+        if not isinstance(coefficients, (tuple, list)) or not coefficients:
+            return False
+        if not any(isinstance(entry, (tuple, list)) for entry in coefficients):
+            return len(coefficients) == 3 and all(
+                isinstance(value, (int, float)) for value in coefficients
+            )
+        return len(coefficients) == ns_steps and all(
+            isinstance(entry, (tuple, list))
+            and len(entry) == 3
+            and all(isinstance(value, (int, float)) for value in entry)
+            for entry in coefficients
+        )
+
     def _validate_groups(self) -> None:
         if len(self.param_groups) != 1:
             raise ValueError("FSDPDistributedMuon requires exactly one parameter group")
@@ -1200,8 +1217,7 @@ class FSDPDistributedMuon(Optimizer):
             )
             or not isinstance(ns_steps, int)
             or not 0 <= ns_steps < 100
-            or len(coefficients) != 3
-            or not all(isinstance(value, (int, float)) for value in coefficients)
+            or not self._validate_ns_coefficients(coefficients, ns_steps)
             or group["adjust_lr_fn"]
             not in (None, "original", "match_rms_adamw", "spectral_unclamped")
         ):
@@ -1677,11 +1693,27 @@ class FSDPDistributedMuon(Optimizer):
         else:
             prepared.copy_(momentum_buffer)
         torch.autograd.graph.increment_version(momentum_state)
+    
+    def _ns_step_coefficients(
+        self,
+        coefficients: Sequence[float] | Sequence[Sequence[float]],
+        ns_steps: int,
+    ) -> tuple[Sequence[float], ...]:
+        """Return one Newton-Schulz (a, b, c) triple per iteration.
+        A flat triple applies to every one of the ``ns_steps`` iterations;
+        per-step triples already carry one triple per iteration (their count is
+        validated against ``ns_steps``).
+        """
+        if not any(isinstance(entry, (tuple, list)) for entry in coefficients):
+            return (tuple(coefficients),) * ns_steps
+        return tuple(coefficients)
 
     def _compute_update(self, item: _BoundMuonParameter, compute: Tensor) -> None:
         """Replace ``compute`` with Muon's approximate orthogonal direction."""
         group = self._group(item)
-        a, b, c = group["ns_coefficients"]
+        step_coefficients = self._ns_step_coefficients(
+            group["ns_coefficients"], group["ns_steps"]
+        )
         result = compute.to(dtype=torch.bfloat16, copy=True)
         # Newton-Schulz operates on the orientation with rows <= columns.
         transposed = result.shape[-2] > result.shape[-1]
@@ -1693,14 +1725,14 @@ class FSDPDistributedMuon(Optimizer):
 
         # Use matrix kernels for one matrix and batched kernels for compute views.
         if result.ndim == 2:
-            for _ in range(group["ns_steps"]):
+            for a, b, c in step_coefficients:
                 gram = result @ result.T
                 gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
                 result = torch.addmm(result, gram_update, result, beta=a)
         else:
             original_shape = result.shape
             matrices = result.reshape(-1, *original_shape[-2:])
-            for _ in range(group["ns_steps"]):
+            for a, b, c in step_coefficients:
                 gram = matrices @ matrices.transpose(-2, -1)
                 gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
                 matrices = torch.baddbmm(matrices, gram_update, matrices, beta=a)

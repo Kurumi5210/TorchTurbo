@@ -37,36 +37,26 @@ logger = get_logger(__name__)
 
 SCHEDULER_NAME = "scheduler.pt"
 
-class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
-    """DistributedSampler subclass that gives each SP group contiguous index blocks.
+class DPBlockDistributedSampler(DistributedSampler):
+    """DistributedSampler that parcels contiguous blocks over DP groups.
 
-    All ranks sharing the same ``dp_rank`` yield the identical sequence
-    of ``sp_size`` indices per iteration block.
-
-    Parameters
-    ----------
-    dataset:
-        Dataset to sample from.
-    sp_size:
-        Sequence-parallel group size.  ``1`` = standard DistributedSampler.
-    num_replicas:
-        Total world size.  Defaults to ``dist.get_world_size()``.
-    rank:
-        Global rank.  Defaults to ``dist.get_rank()``.
-    shuffle:
-        Whether to shuffle indices each epoch.
-    seed:
-        Random seed used when *shuffle* is True.
-    drop_last:
-        Drop the tail to make the dataset evenly divisible.
+    Each block covers ``dp_size * rank_block`` indices: every DP group gets
+    a disjoint contiguous ``rank_block`` slice, and ranks sharing a
+    ``dp_rank`` (e.g. an SP group) yield the identical sequence. The
+    sampler only knows the dp info and the block size; the engine picks
+    ``rank_block`` as ``ga * batch_size`` with ``tt_gbs`` (whole optimizer
+    steps) or ``sp_size`` (legacy full-world sweep).
     """
 
     def __init__(
         self,
         dataset: Dataset,
-        sp_size: int = 1,
         num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
+        *,
+        dp_size: int,
+        dp_rank: int,
+        rank_block: int,
         shuffle: bool = True,
         seed: int = 0,
         drop_last: bool = True,
@@ -81,35 +71,32 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
             drop_last=drop_last,
         )
 
-        if self.num_replicas % sp_size != 0:
-            raise ValueError(
-                f"world_size ({self.num_replicas}) must be divisible by sp_size ({sp_size})"
-            )
+        self.dp_size = dp_size
+        self.dp_rank = dp_rank
+        self.rank_block = rank_block
 
-        self.sp_size = sp_size
-        self.dp_size = self.num_replicas // sp_size
-        self.dp_rank = self.rank // sp_size
-
-        # Recompute sizing: each DP group consumes sp_size samples per
-        # iteration, so total iterations = dataset / (dp_size * sp_size).
+        # Recompute sizing: the epoch covers whole blocks of dp_size * rank_block.
         total = len(self.dataset)  # type: ignore[arg-type]
+        block = self.dp_size * self.rank_block
         if self.drop_last:
-            self.num_iterations = total // (self.dp_size * self.sp_size)
+            self.num_iterations = total // block
         else:
-            self.num_iterations = math.ceil(total / (self.dp_size * self.sp_size))
-        self.total_size = self.num_iterations * self.dp_size * self.sp_size
+            self.num_iterations = math.ceil(total / block)
+        self.total_size = self.num_iterations * block
         # Override parent's num_samples (used by __len__ in parent)
-        self.num_samples = self.num_iterations * self.sp_size
+        self.num_samples = self.num_iterations * self.rank_block
 
         logger.info_rank0(
-            "SPDistributedSampler: seed=%d, world=%d, rank=%d, sp_size=%d, "
-            "dp_size=%d, dp_rank=%d, total_samples=%d, num_samples_per_rank=%d",
+            "DPBlockDistributedSampler: seed=%d, world=%d, rank=%d, "
+            "dp_size=%d, dp_rank=%d, rank_block=%d, num_iterations=%d, "
+            "total_samples=%d, num_samples_per_rank=%d",
             self.seed,
             self.num_replicas,
             self.rank,
-            self.sp_size,
             self.dp_size,
             self.dp_rank,
+            self.rank_block,
+            self.num_iterations,
             self.total_size,
             self.num_samples,
         )
@@ -130,17 +117,13 @@ class GatherAndInnerLoopSPDistributedSampler(DistributedSampler):
         else:
             indices = indices[: self.total_size]
 
-        # Each iteration block has dp_size * sp_size indices laid out as:
-        #   [dp0_s0, dp0_s1, ..., dp0_sp-1, dp1_s0, ..., dpN_sp-1]
-        #
-        # DP rank d gets indices at offsets [d*sp_size .. d*sp_size+sp_size-1]
-        # within each block.  All ranks in the same SP group (same dp_rank)
-        # yield the identical list.
+        # Each block is consecutive per-group slices; DP rank d takes
+        # [d*rank_block, (d+1)*rank_block). Ranks sharing a dp_rank yield
+        # the identical list.
         rank_indices = []
         for i in range(self.num_iterations):
-            base = i * self.dp_size * self.sp_size + self.dp_rank * self.sp_size
-            for s in range(self.sp_size):
-                rank_indices.append(indices[base + s])
+            base = i * self.dp_size * self.rank_block + self.dp_rank * self.rank_block
+            rank_indices.extend(indices[base : base + self.rank_block])
 
         if self.shuffle:
             g2 = torch.Generator()
@@ -829,9 +812,9 @@ class TorchTurboEngine:
     ) -> Any:
         """Create a DataLoader with SP-aware distributed sampling.
 
-        When ``sp_size > 1``, uses ``DistributedSampler`` with
-        ``num_replicas=dp_size`` and ``rank=dp_rank``, so that all
-        ranks in the same SP group receive the **same batch**.
+        All ranks in an SP group receive the same batches. With ``tt_gbs``
+        set, ``drop_last`` drops only the tail that cannot fill one more
+        whole optimizer step.
 
         Example::
 
@@ -844,27 +827,30 @@ class TorchTurboEngine:
         ----------
         dataset:
             A ``torch.utils.data.Dataset``.
-        sp_size:
-            Sequence parallel size.  ``1`` = standard DP.
         batch_size:
             Per-rank micro-batch size.
         """
         dp_info = self.get_dp_info()
         sp_info = self.get_sp_info()
 
-        # sampler = DistributedSampler(
-        #     dataset,
-        #     num_replicas=dp_info["dp_size"],
-        #     rank=dp_info["dp_rank"],
-        #     shuffle=shuffle,
-        #     drop_last=drop_last,
-        # )
-        # To align with version v1
-        sampler = GatherAndInnerLoopSPDistributedSampler(
+        # Block granularity: whole optimizer steps (ga * batch_size per
+        # rank) with tt_gbs, else the legacy full-world-sweep layout.
+        gbs = self.config.gbs
+        if gbs is not None:
+            gradient_accumulation_steps = self._ga_from_gbs(
+                gbs, sp_info["sp_size"], dist.get_world_size()
+            )
+            rank_block = gradient_accumulation_steps * batch_size
+        else:
+            rank_block = sp_info["sp_size"]
+
+        sampler = DPBlockDistributedSampler(
             dataset,
-            sp_size=sp_info["sp_size"],
             num_replicas=dist.get_world_size(),
             rank=dist.get_rank(),
+            dp_size=dp_info["dp_size"],
+            dp_rank=dp_info["dp_rank"],
+            rank_block=rank_block,
             shuffle=shuffle,
             seed=seed,
             drop_last=drop_last,
@@ -922,6 +908,19 @@ class TorchTurboEngine:
         """Get sequence-parallel rank, size and group."""
         return self.backend.get_sp_info()
 
+    @staticmethod
+    def _ga_from_gbs(gbs: int, sp_size: int, world_size: int) -> int:
+        """ga = gbs * sp_size / world_size (= gbs / dp_size). Single source of
+        truth shared by the training loop and the sampler block sizing so the
+        two cannot drift apart."""
+        if (gbs * sp_size) % world_size != 0:
+            raise ValueError(
+                f"tt_gbs({gbs}) * sp_size({sp_size}) must be divisible by "
+                f"world_size({world_size}); got remainder "
+                f"{(gbs * sp_size) % world_size}."
+            )
+        return (gbs * sp_size) // world_size
+
     def resolve_gradient_accumulation_steps(self, framework_ga: int) -> int:
         """Return the ``gradient_accumulation_steps`` for the training loop.
 
@@ -940,13 +939,7 @@ class TorchTurboEngine:
                     f"gradient_accumulation_steps ({framework_ga}) at the same "
                     f"time; pick one — tt_gbs will derive ga from gbs*sp/world."
                 )
-            if (gbs * sp_size) % world_size != 0:
-                raise ValueError(
-                    f"tt_gbs({gbs}) * sp_size({sp_size}) must be divisible by "
-                    f"world_size({world_size}); got remainder "
-                    f"{(gbs * sp_size) % world_size}."
-                )
-            ga = (gbs * sp_size) // world_size
+            ga = self._ga_from_gbs(gbs, sp_size, world_size)
             logger.info_rank0(
                 "gbs=%d, sp=%d: gradient_accumulation_steps = %d*%d/%d = %d "
                 "(overriding framework ga=%d)",

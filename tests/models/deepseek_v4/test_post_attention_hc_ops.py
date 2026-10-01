@@ -24,8 +24,10 @@ if str(SRC_ROOT) not in sys.path:
 
 try:
     from .test_alignment import TEST_CONFIG_MODELING  # noqa: E402
+    from .test_ops_precision import packed_attention_ops  # noqa: E402
 except ImportError:  # pragma: no cover - direct script execution
     from test_alignment import TEST_CONFIG_MODELING  # noqa: E402
+    from test_ops_precision import packed_attention_ops  # noqa: E402
 
 
 def make_config(**overrides):
@@ -89,12 +91,17 @@ def test_post_attention_ops_matches_reference_formula():
     freqs_cis = attn.freqs_cis
     position_ids = torch.arange(seqlen).unsqueeze(0).expand(bsz, -1)
 
-    actual = post(o, freqs_cis, bsz, seqlen, n_local_groups, attn.wo_a, attn.wo_b, position_ids)
+    with packed_attention_ops():
+        actual = post(
+            o, freqs_cis, bsz, seqlen, n_local_groups, attn.wo_a, attn.wo_b, position_ids
+        )
 
     o_nope, o_rope = torch.split(
         o, [config.head_dim - config.qk_rope_head_dim, config.qk_rope_head_dim], dim=-1
     )
-    o_rope = apply_rotary_emb(o_rope, freqs_cis[position_ids], inverse=True)
+    # apply_rotary_emb broadcasts freqs across the batch, so gather per-token
+    # freqs from one row; both rows share the same arange positions.
+    o_rope = apply_rotary_emb(o_rope, freqs_cis[position_ids[0]], inverse=True)
     expected_o = torch.cat([o_nope, o_rope], dim=-1)
     expected_o = expected_o.view(bsz, seqlen, n_local_groups, -1)
     wo_a_weight = attn.wo_a.weight.view(n_local_groups, config.o_lora_rank, -1)

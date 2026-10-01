@@ -4,28 +4,28 @@ import torch
 
 
 def _packed_compress_block_metadata(
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     ratio: int,
     position_ids: torch.LongTensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build per-row metadata for complete packed compression blocks."""
-    bsz, seqlen = attention_mask.shape
+    bsz, seqlen = segment_ids.shape
     capacity = seqlen // ratio
     if capacity == 0:
-        empty = attention_mask.new_empty((bsz, 0))
+        empty = segment_ids.new_empty((bsz, 0))
         empty_positions = position_ids.new_empty((bsz, 0))
-        empty_starts = attention_mask.new_empty((bsz, 0), dtype=torch.long)
+        empty_starts = segment_ids.new_empty((bsz, 0), dtype=torch.long)
         empty_valid = torch.empty(
-            (bsz, 0), dtype=torch.bool, device=attention_mask.device
+            (bsz, 0), dtype=torch.bool, device=segment_ids.device
         )
         return empty, empty_positions, empty_starts, empty_valid
 
-    token_positions = torch.arange(seqlen, device=attention_mask.device).view(1, -1)
-    positive = attention_mask > 0
+    token_positions = torch.arange(seqlen, device=segment_ids.device).view(1, -1)
+    positive = segment_ids > 0
     segment_starts = positive & torch.cat(
         (
             torch.ones_like(positive[:, :1]),
-            attention_mask[:, 1:] != attention_mask[:, :-1],
+            segment_ids[:, 1:] != segment_ids[:, :-1],
         ),
         dim=1,
     )
@@ -35,36 +35,36 @@ def _packed_compress_block_metadata(
     ).values
     block_end_ids = torch.cat(
         (
-            attention_mask[:, ratio - 1 :],
-            attention_mask.new_zeros((bsz, ratio - 1)),
+            segment_ids[:, ratio - 1 :],
+            segment_ids.new_zeros((bsz, ratio - 1)),
         ),
         dim=1,
     )
     block_candidates = (
         positive
         & ((token_positions - segment_start_positions).remainder(ratio) == 0)
-        & (block_end_ids == attention_mask)
+        & (block_end_ids == segment_ids)
     )
 
     block_slots = (block_candidates.cumsum(dim=1) - 1).clamp_(
         min=0, max=capacity - 1
     )
     block_valid = (
-        attention_mask.new_zeros((bsz, capacity), dtype=torch.long)
+        segment_ids.new_zeros((bsz, capacity), dtype=torch.long)
         .scatter_add_(1, block_slots, block_candidates.long())
         .bool()
     )
-    block_ids = attention_mask.new_zeros((bsz, capacity)).scatter_add_(
+    block_ids = segment_ids.new_zeros((bsz, capacity)).scatter_add_(
         1,
         block_slots,
-        torch.where(block_candidates, attention_mask, 0),
+        torch.where(block_candidates, segment_ids, 0),
     )
     block_positions = position_ids.new_zeros((bsz, capacity)).scatter_add_(
         1,
         block_slots,
         torch.where(block_candidates, position_ids, 0),
     )
-    block_starts = attention_mask.new_zeros(
+    block_starts = segment_ids.new_zeros(
         (bsz, capacity), dtype=torch.long
     ).scatter_add_(
         1,
@@ -85,7 +85,7 @@ def compress_packed_kv(
     kv: torch.Tensor,
     score: torch.Tensor,
     ape: torch.Tensor,
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     position_ids: torch.LongTensor,
     ratio: int,
     head_dim: int,
@@ -93,7 +93,7 @@ def compress_packed_kv(
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Pool all complete packed blocks without per-segment device launches."""
     block_ids, block_positions, block_starts, block_valid = (
-        _packed_compress_block_metadata(attention_mask, ratio, position_ids)
+        _packed_compress_block_metadata(segment_ids, ratio, position_ids)
     )
     num_blocks = block_ids.size(1)
     if num_blocks == 0:
@@ -159,26 +159,31 @@ def compress_packed_kv(
 
 
 def packed_compress_kv_ids_and_positions(
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     ratio: int,
     position_ids: torch.LongTensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     block_ids, block_positions, _, _ = _packed_compress_block_metadata(
-        attention_mask, ratio, position_ids
+        segment_ids, ratio, position_ids
     )
     return block_ids, block_positions
 
 
 def packed_compress_mask(
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     compress_kv_ids: torch.Tensor,
     compress_pos: torch.Tensor,
     ratio: int,
-    position_ids: torch.LongTensor,
+    query_positions: torch.LongTensor,
 ) -> torch.Tensor:
-    current_ids = attention_mask.unsqueeze(-1)
-    next_block_pos = ((position_ids.unsqueeze(-1) + 1) // ratio) * ratio
-    return (compress_pos >= next_block_pos) | (compress_kv_ids != current_ids)
+    """Mask blocks outside each query's segment or physical causal prefix."""
+    current_ids = segment_ids.unsqueeze(-1)
+    block_ends = compress_pos + ratio
+    return (
+        (block_ends > query_positions.unsqueeze(-1) + 1)
+        | (compress_kv_ids != current_ids)
+        | (current_ids == 0)
+    )
 
 
 def _segment_spans(

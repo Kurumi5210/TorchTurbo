@@ -91,15 +91,13 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --overwrite_output_dir \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
-    --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 1 \
-    --eval_accumulation_steps 1 \
+    --eval_strategy no \
     --gradient_checkpointing \
     --lr_scheduler_type cosine \
     --logging_steps 1 \
     --overwrite_cache \
     --save_strategy "steps" \
-    --eval_steps 200000000 \
     --save_steps 200000000 \
     --warmup_ratio 0.0 \
     --learning_rate 1.25e-5 \

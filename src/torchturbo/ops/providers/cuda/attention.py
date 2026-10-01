@@ -297,12 +297,12 @@ class FlexAttentionWithMaxLogits(OpImpl):
 
         output_shape = value.shape
         if attention_mask is None and cu_seq_lens_q is not None:
-            from torchturbo.utils.flash_attn_utils import cu_seqlens_to_attention_mask
+            from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
             query, key, value = (
                 tensor.flatten(0, 1).unsqueeze(0) for tensor in (query, key, value)
             )
-            attention_mask = cu_seqlens_to_attention_mask(cu_seq_lens_q, query.shape[1])
+            attention_mask = cu_seqlens_to_segment_ids(cu_seq_lens_q, query.shape[1])
 
         seq_length = query.shape[1]
         if attention_mask is None:

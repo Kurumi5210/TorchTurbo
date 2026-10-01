@@ -9,22 +9,24 @@ os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 
 def test_engine_config_env_injects_gradient_checkpointing(monkeypatch):
-    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
 
     monkeypatch.setenv("TORCH_TURBO_GRADIENT_CHECKPOINTING", "f")
 
-    cfg = EngineConfig.from_dict({"backend": "fsdp2"})
+    cfg = build_from_args(TorchTurboArgs())
 
     assert cfg.activation_checkpointing.enabled is False
 
 
 def test_engine_config_env_injects_op_policy(monkeypatch):
-    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
     from torchturbo.ops.base import OpPolicy
 
     monkeypatch.setenv("TORCH_TURBO_OP_POLICY", "native")
 
-    cfg = EngineConfig.from_dict({"backend": "fsdp2"})
+    cfg = build_from_args(TorchTurboArgs())
 
     assert cfg.ops.policy is OpPolicy.NATIVE
 
@@ -225,6 +227,23 @@ def test_cpu_offload_config_defaults_to_unspecified():
     from torchturbo.engine import CPUOffloadConfig
 
     assert CPUOffloadConfig().enabled is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("true", True), ("1", True), ("false", False), ("0", False)],
+)
+def test_cpu_offload_config_parses_string_enabled(value, expected):
+    from torchturbo.engine import CPUOffloadConfig
+    from torchturbo.engine.config import EngineConfig
+
+    direct = CPUOffloadConfig(enabled=value)
+    from_dict = EngineConfig.from_dict(
+        {"backend_config": {"cpu_offload": {"enabled": value}}}
+    )
+
+    assert direct.enabled is expected
+    assert from_dict.backend_config.cpu_offload.enabled is expected
 
 
 def test_engine_config_from_dict_parses_freeze_policy():

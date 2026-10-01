@@ -68,15 +68,15 @@ from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
 
-from torchturbo.logging import get_logger
 from torchturbo.utils.flash_attn_utils import (
     get_unpad_data,
     index_first_axis,
     pad_input,
     unpad_input,
+    unpad_varlen_inputs,
 )
 
-logger = get_logger(__name__)
+logger = logging.get_logger(__name__)
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -84,7 +84,7 @@ if is_flash_attn_2_available():
     # from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 if is_torch_npu_available():
-    logger.info_rank0("Using npu_fusion_attention")
+    logger.info("Using npu_fusion_attention")
     from transformers.integrations.npu_flash_attention import (
         npu_flash_attn_varlen_func as flash_attn_varlen_func,
         npu_flash_attn_func as flash_attn_func,
@@ -760,7 +760,7 @@ class DeepseekV3Attention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         if layer_idx is None:
-            logger.warning_rank0_once(
+            logger.warning_once(
                 f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
@@ -1105,7 +1105,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                     else self.q_a_proj.weight.dtype
                 )
 
-            logger.warning_rank0_once(
+            logger.warning_once(
                 f"The input hidden states seems to be silently casted in float32, this might be related to"
                 f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
                 f" {target_dtype}."
@@ -1131,6 +1131,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             dropout=dropout_rate,
             softmax_scale=self.softmax_scale,
             position_ids=position_ids,
+            **kwargs,
         )
         if self.q_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
@@ -1156,6 +1157,10 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         dropout=0.0,
         softmax_scale=None,
         position_ids=None,
+        cu_seq_lens_q=None,
+        cu_seq_lens_k=None,
+        max_length_q=None,
+        max_length_k=None,
     ):
         """
         Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -1174,11 +1179,35 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             dropout (`int`, *optional*):
                 Attention dropout
             softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
+                The scaling of the QK^T before applying softmax. Default to 1 / sqrt(head_dim)
         """
 
         # Contains at least one padding token in the sequence
-        if attention_mask is not None:
+        if cu_seq_lens_q is not None and cu_seq_lens_k is not None:
+            # Explicit packed boundaries: varlen over the covered prefix, with
+            # the tail beyond the last boundary restored as zeros.
+            batch_size = query_states.shape[0]
+            query, key, value, query_padding = unpad_varlen_inputs(
+                query_states, key_states, value_states, cu_seq_lens_q, cu_seq_lens_k,
+            )
+            attn_output_unpad = flash_attn_varlen_func(
+                query.flatten(0, 1),
+                key.flatten(0, 1),
+                value.flatten(0, 1),
+                cu_seqlens_q=cu_seq_lens_q,
+                cu_seqlens_k=cu_seq_lens_k,
+                max_seqlen_q=max_length_q,
+                max_seqlen_k=max_length_k,
+                dropout_p=dropout,
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+            )
+            if query_padding:
+                attn_output_unpad = F.pad(attn_output_unpad, (0, 0, 0, 0, 0, query_padding))
+            attn_output = attn_output_unpad.reshape(
+                batch_size, -1, attn_output_unpad.size(-2), attn_output_unpad.size(-1)
+            )
+        elif attention_mask is not None:
             batch_size = query_states.shape[0]
             (
                 query_states,
@@ -1331,6 +1360,10 @@ class DeepseekV3DecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seq_lens_k: Optional[torch.Tensor] = None,
+        max_length_q: Optional[int] = None,
+        max_length_k: Optional[int] = None,
         **kwargs,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -1366,6 +1399,10 @@ class DeepseekV3DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1550,6 +1587,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seq_lens_k: Optional[torch.Tensor] = None,
+        max_length_q: Optional[int] = None,
+        max_length_k: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1599,7 +1640,9 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if self._use_flash_attention_2:
-            # 2d mask is passed through the layers
+            # 2d mask is passed through the layers. Packed training carries no
+            # mask at all (boundaries ride with cu_seq_lens_q/k); only
+            # generation keeps a 0/1 padding mask.
             attention_mask = (
                 attention_mask
                 if (attention_mask is not None and 0 in attention_mask)
@@ -1634,6 +1677,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     past_key_values,
                     output_attentions,
                     use_cache,
+                    cu_seq_lens_q,
+                    cu_seq_lens_k,
+                    max_length_q,
+                    max_length_k,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1643,6 +1690,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    cu_seq_lens_q=cu_seq_lens_q,
+                    cu_seq_lens_k=cu_seq_lens_k,
+                    max_length_q=max_length_q,
+                    max_length_k=max_length_k,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1726,6 +1777,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seq_lens_k: Optional[torch.Tensor] = None,
+        max_length_q: Optional[int] = None,
+        max_length_k: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1777,6 +1832,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
         )
 
         hidden_states = outputs[0]

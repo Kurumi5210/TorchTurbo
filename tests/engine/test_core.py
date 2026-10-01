@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 import torchturbo.engine.core as engine_core
@@ -51,6 +52,18 @@ class TinyModel(nn.Module):
         return self.linear(x)
 
 
+def _minimal_packed_inputs(**extra):
+    """Smallest batch satisfying the packed training input contract."""
+    inputs = {
+        "cu_seq_lens_q": torch.tensor([0, 1], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, 1], dtype=torch.int32),
+        "max_length_q": 1,
+        "max_length_k": 1,
+    }
+    inputs.update(extra)
+    return inputs
+
+
 def test_turbo_model_requires_an_explicit_optimizer_recipe():
     # Engine-managed optimizers are opt-in per architecture, so the base class
     # never guesses a parameter split.
@@ -77,9 +90,24 @@ class TinyLogitsModel(nn.Module):
 class DummyBackend(BaseBackend):
     name = "dummy"
 
-    def shard_model(self, model, parallel_plan=None):
+    def prepare_model(self, model, parallel_plan=None, peft_config=None):
         model._dummy_sharded = True
         return model
+
+    def load_model(self, model, model_name_or_path, load_weights=True):
+        raise NotImplementedError
+
+    def save_model(self, model, model_name_or_path, output_dir, format, **kwargs):
+        raise NotImplementedError
+
+    def load_from_checkpoint(self, model, checkpoint_dir, format, **kwargs):
+        raise NotImplementedError
+
+    def save_optimizer(self, optimizer, model, output_dir, **kwargs):
+        raise NotImplementedError
+
+    def load_optimizer(self, optimizer, model, checkpoint_dir, **kwargs):
+        raise NotImplementedError
 
     def prepare_optimizer(
         self,
@@ -92,24 +120,13 @@ class DummyBackend(BaseBackend):
         ]
         return plan.optimizer_cls(groups, **plan.optimizer_kwargs)
 
-
-class ProfilingBackend(DummyBackend):
-    def prepare_model(self, model, parallel_plan=None, peft_config=None):
-        return model
-
-    def load_model(self, model, model_name_or_path):
-        return model
-
-    def save_model(self, model, model_name_or_path, output_dir, **kw):
-        return None
-
-    def get_dp_info(self) -> dict[str, int]:
+    def get_dp_info(self) -> dict[str, int | None]:
         return {"dp_rank": 0, "dp_size": 1, "dp_group": None}
 
-    def get_ep_info(self) -> dict[str, int]:
+    def get_ep_info(self) -> dict[str, int | None]:
         return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
 
-    def get_sp_info(self) -> dict[str, int]:
+    def get_sp_info(self) -> dict[str, int | None]:
         return {"sp_rank": 0, "sp_size": 1, "sp_group": None}
 
     def get_parallel_context(self):
@@ -144,11 +161,21 @@ class RecordingProfiler:
 
 
 @pytest.fixture(autouse=True)
-def _clean_backends():
+def _clean_engine_state(monkeypatch):
     saved = dict(_BACKENDS)
+    ops_module = importlib.import_module("torchturbo.ops.ops")
+    monkeypatch.setattr(ops_module, "_OPS", None)
+    monkeypatch.setattr(engine_core, "get_device_runtime", CpuRuntime)
     yield
     _BACKENDS.clear()
     _BACKENDS.update(saved)
+
+
+@pytest.fixture
+def dummy_engine():
+    # EngineConfig selects a supported backend; the registry supplies its class.
+    register_backend("fsdp2", DummyBackend)
+    return TorchTurboEngine()
 
 
 # ---------------------------------------------------------------------------
@@ -188,16 +215,55 @@ class TestEngineConfig:
 # ---------------------------------------------------------------------------
 
 
+class TestPackedInputContract:
+    def test_compute_loss_rejects_attention_mask(self):
+        engine = object.__new__(TorchTurboEngine)
+        engine.backend = SimpleNamespace(
+            prepare_inputs=lambda model, inputs: inputs,
+            compute_loss=lambda model, inputs, **kwargs: torch.tensor(0.0),
+        )
+        engine.metric_tracker = engine_core.MetricTracker()
+        engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
+
+        with pytest.raises(ValueError, match="not attention_mask"):
+            engine.compute_loss(
+                TinyModel(), _minimal_packed_inputs(attention_mask=torch.ones(1, 2))
+            )
+
+    def test_compute_loss_requires_cu_metadata(self):
+        engine = object.__new__(TorchTurboEngine)
+        engine.backend = SimpleNamespace(
+            prepare_inputs=lambda model, inputs: inputs,
+            compute_loss=lambda model, inputs, **kwargs: torch.tensor(0.0),
+        )
+        engine.metric_tracker = engine_core.MetricTracker()
+        engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
+
+        with pytest.raises(ValueError, match="cu_seq_lens_q/k"):
+            engine.compute_loss(TinyModel(), {"input_ids": torch.ones(1, 4)})
+
+
 class TestEngineSetup:
     @pytest.mark.parametrize("entrypoint", ["build_model", "prepare_model"])
     def test_model_build_patches_hf_before_parallelized_hook(self, monkeypatch, entrypoint):
         from transformers import PretrainedConfig, PreTrainedModel
+        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         import transformers.integrations.flash_attention as flash_integration
         import transformers.modeling_flash_attention_utils as flash_utils
 
+        from torchturbo.models.base import TurboModel
         from torchturbo.models.modules.attention.interface import attention_forward
-        from torchturbo.models.modules.attention.ulysses import ulysses_flash_attention_forward
+        from torchturbo.models.modules.attention.ulysses import TURBO_ULYSSES_ATTENTION
+        from torchturbo.models.modules.attention.ulysses import (
+            ulysses_attention_forward,
+        )
 
+        monkeypatch.setattr(
+            type(ALL_MASK_ATTENTION_FUNCTIONS),
+            "_global_mapping",
+            ALL_MASK_ATTENTION_FUNCTIONS._global_mapping.copy(),
+        )
         order = []
         sp_binding = []
         parallel_context = {"sp": {"sp_group": object(), "sp_size": 2}}
@@ -209,6 +275,8 @@ class TestEngineSetup:
             config_class = PretrainedConfig
 
             def __init__(self, config: PretrainedConfig) -> None:
+                # This lifecycle fixture has no attention or flash-attn dependency.
+                config._attn_implementation = "eager"
                 super().__init__(config)
                 self.projection = nn.Linear(2, 2, bias=False)
 
@@ -216,13 +284,16 @@ class TestEngineSetup:
                 order.append("on_parallelized")
                 assert context is parallel_context
                 assert flash_integration._flash_attention_forward is attention_forward
-                self.patch_ulysses_fa(context["sp"])
-                sp_binding.append(flash_integration._flash_attention_forward)
+                self.register_sp_attention_interface(context["sp"])
+                sp_binding.append(ALL_ATTENTION_FUNCTIONS.get(TURBO_ULYSSES_ATTENTION))
+                # The registry path must leave the shared FA helper alone.
+                assert flash_integration._flash_attention_forward is attention_forward
 
             def on_materialized(self) -> None:
                 order.append("on_materialized")
                 assert self.projection.weight.device.type == "cpu"
-                assert flash_integration._flash_attention_forward is sp_binding[0]
+                assert flash_integration._flash_attention_forward is attention_forward
+                assert ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION] is sp_binding[0]
 
         def backend_prepare(model, parallel_plan, peft_config):
             order.append("backend_prepare")
@@ -242,7 +313,7 @@ class TestEngineSetup:
             order.append("backend_load")
             assert model_name_or_path == "local_model"
             assert load_weights is (entrypoint == "prepare_model")
-            assert flash_integration._flash_attention_forward is sp_binding[0]
+            assert flash_integration._flash_attention_forward is attention_forward
             return model.to_empty(device="cpu")
 
         engine = object.__new__(TorchTurboEngine)
@@ -268,61 +339,81 @@ class TestEngineSetup:
             model_cls=LifecycleModel,
             init_kwargs={"config": PretrainedConfig()},
         )
-        if entrypoint == "build_model":
-            model = engine.build_model(**arguments, load_weights=False)
-            assert engine.model is previous_model
-            assert engine.model_name_or_path == "previous_model"
-        else:
-            model = engine.prepare_model(**arguments)
-            assert engine.model is model
-            assert engine.model_name_or_path == "local_model"
+        try:
+            if entrypoint == "build_model":
+                model = engine.build_model(**arguments, load_weights=False)
+                assert engine.model is previous_model
+                assert engine.model_name_or_path == "previous_model"
+            else:
+                model = engine.prepare_model(**arguments)
+                assert engine.model is model
+                assert engine.model_name_or_path == "local_model"
+        finally:
+            ALL_ATTENTION_FUNCTIONS.pop(TURBO_ULYSSES_ATTENTION, None)
 
         assert isinstance(model, LifecycleModel)
         assert order == [
             "backend_prepare", "hf_patch", "parallel_context", "on_parallelized",
             "backend_load", "on_materialized",
         ]
-        assert flash_integration._flash_attention_forward is sp_binding[0]
-        assert sp_binding[0].func is ulysses_flash_attention_forward
+        assert flash_integration._flash_attention_forward is attention_forward
+        assert sp_binding[0].func is ulysses_attention_forward
+        assert sp_binding[0].keywords["sp_size"] == 2
         engine.backend.prepare_model.assert_called_once()
         engine.backend.load_model.assert_called_once()
 
-    def test_default_init(self):
-        engine = TorchTurboEngine()
-        assert isinstance(engine.backend, FSDP2Backend)
-        assert engine.model is None
+    def test_default_init(self, tmp_path):
+        dist.init_process_group(
+            "gloo",
+            init_method=(tmp_path / "process_group").as_uri(),
+            rank=0,
+            world_size=1,
+        )
+        try:
+            engine = TorchTurboEngine()
+            assert isinstance(engine.backend, FSDP2Backend)
+            assert engine.backend.rank == 0
+            assert engine.backend.device == torch.device("cpu")
+            assert engine.model is None
+        finally:
+            dist.destroy_process_group()
 
-    def test_prepare_model_not_supported_type(self):
-        engine = TorchTurboEngine()
-        # For tests, we want to mock prepare_model to just return our TinyModel
-        # since actual prepare_model tries to download from HuggingFace
-        engine.model = TinyModel()
-        assert engine.model is not None
+    def test_prepare_model_not_supported_type(self, dummy_engine):
+        from transformers import PretrainedConfig
 
-    def test_prepare_optimizer(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
+        with pytest.raises(TypeError, match="requires a TurboModel subclass"):
+            dummy_engine.prepare_model(
+                "local_model",
+                model_cls=TinyModel,
+                init_kwargs={"config": PretrainedConfig()},
+            )
+        assert dummy_engine.model is None
+
+    def test_prepare_optimizer(self, dummy_engine):
+        engine = dummy_engine
 
         # Inject model manually to avoid huggingface download logic
         model = TinyModel()
-        engine.model = engine.backend.shard_model(model)
+        engine.model = engine.backend.prepare_model(model)
 
         engine.prepare_optimizer(
             torch.optim.AdamW,
             lr=0.01,
             weight_decay=0.0,
         )
-        assert engine.optimizer is not None
+        assert isinstance(engine.optimizer, torch.optim.AdamW)
+        assert engine.optimizer.param_groups[0]["params"] == [model.linear.weight]
+        assert engine.optimizer.param_groups[0]["lr"] == 0.01
+        assert engine.optimizer.param_groups[0]["weight_decay"] == 0.0
 
-    def test_prepare_optimizer_without_model_raises(self):
-        engine = TorchTurboEngine()
+    def test_prepare_optimizer_without_model_raises(self, dummy_engine):
+        engine = dummy_engine
         with pytest.raises(RuntimeError, match="prepare_model"):
             engine.prepare_optimizer(torch.optim.AdamW)
 
-    def test_framework_optimizer_defaults_to_adamw(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
+    def test_framework_optimizer_defaults_to_adamw(self, dummy_engine):
+        engine = dummy_engine
+        engine.model = engine.backend.prepare_model(TinyModel())
 
         optimizer = engine.prepare_optimizer(lr=0.01, weight_decay=0.0)
 
@@ -497,13 +588,14 @@ class TestEngineSetup:
         ):
             engine.prepare_optimizer()
 
-    def test_compute_loss_defers_eval_metrics_until_explicit_collect(self):
-        register_backend("dummy", ProfilingBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
+    def test_compute_loss_defers_eval_metrics_until_explicit_collect(
+        self, dummy_engine
+    ):
+        engine = dummy_engine
         model = TinyModel().eval()
         model.pop_metrics = lambda: {"test_metric": torch.tensor(2.0)}
 
-        engine.compute_loss(model, {})
+        engine.compute_loss(model, _minimal_packed_inputs())
         logs = {}
         engine.report_metrics(logs, lambda value: value.reshape(1))
         assert logs == {}
@@ -513,13 +605,14 @@ class TestEngineSetup:
 
         assert logs == {"test_metric": 2.0}
 
-    def test_compute_loss_defers_training_metrics_until_explicit_collect(self):
-        register_backend("dummy", ProfilingBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
+    def test_compute_loss_defers_training_metrics_until_explicit_collect(
+        self, dummy_engine
+    ):
+        engine = dummy_engine
         model = TinyModel()
         model.pop_metrics = lambda: {"test_metric": torch.tensor(2.0)}
 
-        engine.compute_loss(model, {})
+        engine.compute_loss(model, _minimal_packed_inputs())
         logs = {}
         engine.report_metrics(logs, lambda value: value.reshape(1))
         assert logs == {}
@@ -582,7 +675,7 @@ class TestEngineSetup:
         padding_mask = torch.tensor([[False, True]])
         prepared_padding_mask = torch.tensor([[False, True, True]])
 
-        engine.compute_loss(model, {"padding_mask": padding_mask})
+        engine.compute_loss(model, _minimal_packed_inputs(padding_mask=padding_mask))
 
         assert model.moe._runtime_inputs.padding_mask is prepared_padding_mask
         assert calls == ["prepare_inputs", "moe_runtime", "compute_loss"]
@@ -650,7 +743,7 @@ class TestEngineSetup:
 
         engine.compute_loss(
             model,
-            {},
+            _minimal_packed_inputs(),
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
@@ -675,7 +768,7 @@ class TestEngineSetup:
         engine.metric_tracker = engine_core.MetricTracker()
         engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
 
-        engine.compute_loss(TinyModel(), {})
+        engine.compute_loss(TinyModel(), _minimal_packed_inputs())
 
         assert scales == []
 
@@ -733,29 +826,42 @@ class TestEngineSetup:
         with pytest.raises(NotImplementedError, match="no longer supported"):
             engine.fit([])
 
-    def test_prepare_lr_scheduler(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
+    def test_prepare_lr_scheduler(self, dummy_engine):
+        engine = dummy_engine
 
-        engine.model = engine.backend.shard_model(TinyModel())
+        engine.model = engine.backend.prepare_model(TinyModel())
         engine.prepare_optimizer(
             torch.optim.AdamW,
             lr=0.01,
             weight_decay=0.0,
         )
 
-        engine.prepare_lr_scheduler(torch.optim.lr_scheduler.StepLR, step_size=10)
-        assert engine.lr_scheduler is not None
+        engine.prepare_lr_scheduler(
+            torch.optim.lr_scheduler.StepLR, step_size=2, gamma=0.1
+        )
+        assert isinstance(engine.lr_scheduler, torch.optim.lr_scheduler.StepLR)
+        assert engine.lr_scheduler.optimizer is engine.optimizer
+        for _ in range(2):
+            engine.optimizer.step()
+            engine.lr_scheduler.step()
+        assert engine.optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
 
     def test_unknown_backend_raises(self):
-        with pytest.raises(ValueError, match="Unknown"):
+        with pytest.raises(
+            ValueError, match="'nonexistent' is not a valid DistributedBackend"
+        ):
             TorchTurboEngine({"backend": "nonexistent"})
+
+    def test_unregistered_backend_raises(self):
+        _BACKENDS.pop("fsdp2")
+        with pytest.raises(ValueError, match="Unknown distributed backend 'fsdp2'"):
+            TorchTurboEngine()
 
     def test_failed_backend_init_does_not_publish_ops(self, monkeypatch):
         ops_module = importlib.import_module("torchturbo.ops.ops")
         monkeypatch.setattr(ops_module, "_OPS", None)
 
-        class FailingBackend(ProfilingBackend):
+        class FailingBackend(DummyBackend):
             def __init__(self, config, device_runtime):
                 raise RuntimeError("backend init failed")
 
@@ -788,7 +894,7 @@ class TestEngineSetup:
         monkeypatch.setattr(
             engine_core,
             "get_backend",
-            lambda backend_name: ProfilingBackend if backend_name == "fsdp2" else None,
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
         )
 
         engine = TorchTurboEngine(EngineConfig())
@@ -829,7 +935,7 @@ class TestEngineSetup:
         monkeypatch.setattr(
             engine_core,
             "get_backend",
-            lambda backend_name: ProfilingBackend if backend_name == "fsdp2" else None,
+            lambda backend_name: DummyBackend if backend_name == "fsdp2" else None,
         )
 
         engine = TorchTurboEngine(EngineConfig())
@@ -843,25 +949,27 @@ class TestEngineSetup:
         with pytest.raises(RuntimeError, match="No active profiler"):
             engine.step_profiling()
 
-    def test_custom_backend(self):
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
+    def test_registered_backend_override(self, dummy_engine):
+        engine = dummy_engine
+        assert isinstance(engine.backend, DummyBackend)
+        assert engine.backend.config is engine.config
+        assert engine.backend.device_runtime is engine.device_runtime
 
-        # We simulate what prepare_model does
         model = TinyModel()
-        engine.model = engine.backend.shard_model(model)
+        engine.model = engine.backend.prepare_model(model)
 
-        assert getattr(engine.model, "_dummy_sharded", False)
+        assert engine.model is model
+        assert engine.model._dummy_sharded
 
-    def test_repr(self):
-        engine = TorchTurboEngine()
-        assert "not prepared" in repr(engine).lower()
+    def test_repr(self, dummy_engine):
+        engine = dummy_engine
+        assert "not setup" in repr(engine)
+        assert "DummyBackend" in repr(engine)
 
-        register_backend("dummy", DummyBackend)
-        engine = TorchTurboEngine({"backend": "dummy"})
-        engine.model = engine.backend.shard_model(TinyModel())
+        engine.model = engine.backend.prepare_model(TinyModel())
 
-        assert "model" in repr(engine).lower()
+        assert "ready" in repr(engine)
+        assert "not setup" not in repr(engine)
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +1006,7 @@ def test_resolve_ga_tt_gbs_derives_from_formula():
     # world=64, gbs=32, sp=4 -> ga = 32*4/64 = 2
     engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=32)
     try:
-        assert engine.resolve_gradient_accumulation_steps(4) == 2
+        assert engine.resolve_gradient_accumulation_steps(1) == 2
     finally:
         restore()
 
@@ -946,6 +1054,16 @@ def test_resolve_ga_tt_gbs_minimum_one():
     # so use gbs=16, sp=4, world=64 -> 16*4/64 = 1
     engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=16)
     try:
-        assert engine.resolve_gradient_accumulation_steps(8) == 1
+        assert engine.resolve_gradient_accumulation_steps(1) == 1
+    finally:
+        restore()
+
+
+@pytest.mark.parametrize("framework_ga", [2, 4, 8])
+def test_resolve_ga_tt_gbs_rejects_explicit_framework_ga(framework_ga):
+    engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=32)
+    try:
+        with pytest.raises(ValueError, match="Cannot set both tt_gbs"):
+            engine.resolve_gradient_accumulation_steps(framework_ga)
     finally:
         restore()

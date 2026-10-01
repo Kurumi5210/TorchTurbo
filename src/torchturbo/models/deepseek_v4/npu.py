@@ -22,27 +22,27 @@ def patch_deepseek_v4_npu_sfa_li(sp_rank: int, sp_group, sp_size: int):
     )
 
 
-def _get_li_query_tnd_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_li_query_tnd_data(segment_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     indices = []
     cu_seqlens = [0]
-    seq_len = attention_mask.size(1)
-    for batch_idx in range(attention_mask.size(0)):
+    seq_len = segment_ids.size(1)
+    for batch_idx in range(segment_ids.size(0)):
         # _segment_spans already keeps positive-ID spans only.
-        starts, ends, _ = _segment_spans(attention_mask[batch_idx])
+        starts, ends, _ = _segment_spans(segment_ids[batch_idx])
         for start, end in zip(starts.tolist(), ends.tolist()):
             indices.append(
                 torch.arange(
                     batch_idx * seq_len + start,
                     batch_idx * seq_len + end,
-                    device=attention_mask.device,
+                    device=segment_ids.device,
                 )
             )
             cu_seqlens.append(cu_seqlens[-1] + end - start)
     if not indices:
-        return attention_mask.new_empty((0,), dtype=torch.long), attention_mask.new_tensor(cu_seqlens, dtype=torch.int32)
+        return segment_ids.new_empty((0,), dtype=torch.long), segment_ids.new_tensor(cu_seqlens, dtype=torch.int32)
     return (
         torch.cat(indices),
-        attention_mask.new_tensor(cu_seqlens, dtype=torch.int32),
+        segment_ids.new_tensor(cu_seqlens, dtype=torch.int32),
     )
 
 
@@ -64,8 +64,8 @@ def _segment_block_info(row: torch.Tensor, ratio: int) -> dict[int, tuple[int, i
 
 def _get_compressed_kv_tnd_data(
     kv_compress: torch.Tensor,
-    query_attention_mask: torch.Tensor,
-    attention_mask: torch.Tensor,
+    query_segment_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
     local_start: int,
     ratio: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -73,17 +73,17 @@ def _get_compressed_kv_tnd_data(
     cu_seqlens = [0]
     residuals = []
     tnd_to_block = []
-    for batch_idx in range(query_attention_mask.size(0)):
-        block_info = _segment_block_info(attention_mask[batch_idx], ratio)
-        _, ends, segment_ids = _segment_spans(query_attention_mask[batch_idx])
-        for end, segment_id in zip(ends.tolist(), segment_ids.tolist()):
+    for batch_idx in range(query_segment_ids.size(0)):
+        block_info = _segment_block_info(segment_ids[batch_idx], ratio)
+        _, ends, span_ids = _segment_spans(query_segment_ids[batch_idx])
+        for end, segment_id in zip(ends.tolist(), span_ids.tolist()):
             if segment_id > 0:
                 segment_start, _, block_start, _ = block_info[segment_id]
                 visible_blocks = (local_start + end - segment_start) // ratio
                 block_indices = torch.arange(
                     block_start,
                     block_start + visible_blocks,
-                    device=attention_mask.device,
+                    device=segment_ids.device,
                 )
                 packed.append(kv_compress[batch_idx][block_indices])
                 tnd_to_block.append(block_indices)
@@ -92,22 +92,22 @@ def _get_compressed_kv_tnd_data(
     if not packed:
         return (
             kv_compress.new_empty((0, *kv_compress.shape[2:])),
-            attention_mask.new_tensor(cu_seqlens, dtype=torch.int32),
-            torch.empty(0, dtype=torch.long, device=attention_mask.device),
-            attention_mask.new_empty((0,), dtype=torch.int32),
+            segment_ids.new_tensor(cu_seqlens, dtype=torch.int32),
+            torch.empty(0, dtype=torch.long, device=segment_ids.device),
+            segment_ids.new_empty((0,), dtype=torch.int32),
         )
     return (
         torch.cat(packed, dim=0),
-        attention_mask.new_tensor(cu_seqlens, dtype=torch.int32),
+        segment_ids.new_tensor(cu_seqlens, dtype=torch.int32),
         torch.cat(tnd_to_block),
-        attention_mask.new_tensor(residuals, dtype=torch.int32),
+        segment_ids.new_tensor(residuals, dtype=torch.int32),
     )
 
 
 def _get_sfa_query_kv_tnd_data(
     query_states: torch.Tensor,
     kv_states: torch.Tensor,
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     sp_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     query_indices = []
@@ -117,23 +117,23 @@ def _get_sfa_query_kv_tnd_data(
     bsz, local_len = query_states.shape[:2]
     global_len = kv_states.size(1)
     local_start = sp_rank * local_len
-    local_attention_mask = attention_mask[:, local_start : local_start + local_len]
+    local_segment_ids = segment_ids[:, local_start : local_start + local_len]
 
     for batch_idx in range(bsz):
-        block_info = _segment_block_info(attention_mask[batch_idx], 1)
-        starts, ends, segment_ids = _segment_spans(local_attention_mask[batch_idx])
+        block_info = _segment_block_info(segment_ids[batch_idx], 1)
+        starts, ends, span_ids = _segment_spans(local_segment_ids[batch_idx])
         for start, end, segment_id in zip(
-            starts.tolist(), ends.tolist(), segment_ids.tolist()
+            starts.tolist(), ends.tolist(), span_ids.tolist()
         ):
             segment_start, _, _, _ = block_info[segment_id]
             kv_pos = torch.arange(
-                segment_start, local_start + end, device=attention_mask.device
+                segment_start, local_start + end, device=segment_ids.device
             )
             query_indices.append(
                 torch.arange(
                     batch_idx * local_len + start,
                     batch_idx * local_len + end,
-                    device=attention_mask.device,
+                    device=segment_ids.device,
                 )
             )
             kv_indices.append(batch_idx * global_len + kv_pos)
@@ -141,28 +141,28 @@ def _get_sfa_query_kv_tnd_data(
             cu_seqlens_kv.append(cu_seqlens_kv[-1] + kv_pos.numel())
 
     if not query_indices:
-        empty = attention_mask.new_empty((0,), dtype=torch.long)
+        empty = segment_ids.new_empty((0,), dtype=torch.long)
         return (
             empty,
             empty,
-            attention_mask.new_tensor(cu_seqlens_q, dtype=torch.int32),
-            attention_mask.new_tensor(cu_seqlens_kv, dtype=torch.int32),
-            local_attention_mask,
+            segment_ids.new_tensor(cu_seqlens_q, dtype=torch.int32),
+            segment_ids.new_tensor(cu_seqlens_kv, dtype=torch.int32),
+            local_segment_ids,
         )
     return (
         torch.cat(query_indices),
         torch.cat(kv_indices),
-        attention_mask.new_tensor(cu_seqlens_q, dtype=torch.int32),
-        attention_mask.new_tensor(cu_seqlens_kv, dtype=torch.int32),
-        local_attention_mask,
+        segment_ids.new_tensor(cu_seqlens_q, dtype=torch.int32),
+        segment_ids.new_tensor(cu_seqlens_kv, dtype=torch.int32),
+        local_segment_ids,
     )
 
 
 def _get_sfa_compressed_kv_tnd_data(
     kv_compress: torch.Tensor,
     compress_topk_idxs: torch.Tensor,
-    attention_mask: torch.Tensor,
-    local_attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
+    local_segment_ids: torch.Tensor,
     local_start: int,
     offset: int,
     ratio: int,
@@ -172,11 +172,11 @@ def _get_sfa_compressed_kv_tnd_data(
     sparse_indices = []
     residuals = []
     cu_seqlens = [0]
-    for batch_idx in range(local_attention_mask.size(0)):
-        block_info = _segment_block_info(attention_mask[batch_idx], ratio)
-        starts, ends, segment_ids = _segment_spans(local_attention_mask[batch_idx])
+    for batch_idx in range(local_segment_ids.size(0)):
+        block_info = _segment_block_info(segment_ids[batch_idx], ratio)
+        starts, ends, span_ids = _segment_spans(local_segment_ids[batch_idx])
         for start, end, segment_id in zip(
-            starts.tolist(), ends.tolist(), segment_ids.tolist()
+            starts.tolist(), ends.tolist(), span_ids.tolist()
         ):
             segment_start, _, block_start, _ = block_info[segment_id]
             visible_tokens = local_start + end - segment_start
@@ -184,11 +184,11 @@ def _get_sfa_compressed_kv_tnd_data(
             block_indices = torch.arange(
                 block_start,
                 block_start + visible_blocks,
-                device=attention_mask.device,
+                device=segment_ids.device,
             )
             packed.append(kv_compress[batch_idx][block_indices])
             if build_csi:
-                block_to_tnd = attention_mask.new_full(
+                block_to_tnd = segment_ids.new_full(
                     (kv_compress.size(1),), -1, dtype=torch.long
                 )
                 block_to_tnd[block_indices] = torch.arange(
@@ -203,9 +203,9 @@ def _get_sfa_compressed_kv_tnd_data(
 
     return (
         torch.cat(packed, dim=0).unsqueeze(1).contiguous(),
-        attention_mask.new_tensor(cu_seqlens, dtype=torch.int32),
+        segment_ids.new_tensor(cu_seqlens, dtype=torch.int32),
         torch.cat(sparse_indices, dim=0).unsqueeze(1).int().contiguous() if build_csi else None,
-        attention_mask.new_tensor(residuals, dtype=torch.int32),
+        segment_ids.new_tensor(residuals, dtype=torch.int32),
     )
 
 
@@ -215,14 +215,14 @@ def _npu_sfa(
     kv_states: torch.Tensor,
     attn_sink: torch.Tensor,
     q_global_positions: torch.LongTensor,
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     kv_compress: torch.Tensor = None,
     compress_topk_idxs: torch.Tensor = None,
     sp_rank: int = 0,
 ) -> torch.Tensor:
     """Fused SFA forward."""
-    query_indices, kv_indices, cu_seqlens_q, cu_seqlens_kv, local_attention_mask = (
-        _get_sfa_query_kv_tnd_data(query_states, kv_states, attention_mask, sp_rank)
+    query_indices, kv_indices, cu_seqlens_q, cu_seqlens_kv, local_segment_ids = (
+        _get_sfa_query_kv_tnd_data(query_states, kv_states, segment_ids, sp_rank)
     )
     if query_indices.numel() == 0:
         output = query_states * 0
@@ -245,14 +245,14 @@ def _npu_sfa(
                 query_states,
                 offset,
                 q_global_positions=q_global_positions,
-                attention_mask=attention_mask,
+                segment_ids=segment_ids,
             )
         cmp_kv_tnd, cu_seqlens_cmp_kv, cmp_sparse_indices, cmp_residual_kv = (
             _get_sfa_compressed_kv_tnd_data(
                 kv_compress,
                 compress_topk_idxs,
-                attention_mask,
-                local_attention_mask,
+                segment_ids,
+                local_segment_ids,
                 sp_rank * local_len,
                 offset,
                 self.compress_ratio,
@@ -298,7 +298,7 @@ def _npu_li(
     seqlen: int,
     offset: int,
     q_global_positions: torch.LongTensor,
-    attention_mask: torch.Tensor,
+    segment_ids: torch.Tensor,
     sp_rank: int = 0,
     sp_group=None,
     sp_size: int = 1,
@@ -315,7 +315,7 @@ def _npu_li(
         q_full = all_gather_sp_with_grad_reduce(q_indexer, dim=1, sp_group=sp_group, sp_size=sp_size)
         weights_full = all_gather_sp_with_grad_reduce(weights, dim=1, sp_group=sp_group, sp_size=sp_size)
 
-    query_indices, cu_seqlens_q = _get_li_query_tnd_data(attention_mask)
+    query_indices, cu_seqlens_q = _get_li_query_tnd_data(segment_ids)
     if query_indices.numel() == 0:
         return None, None
     n_seqs = cu_seqlens_q.numel() - 1
@@ -335,8 +335,8 @@ def _npu_li(
     )
     k_tnd, cu_seqlens_k, tnd_to_block, cmp_residual_k = _get_compressed_kv_tnd_data(
         k_indexer,
-        attention_mask,
-        attention_mask,
+        segment_ids,
+        segment_ids,
         0,
         self.ratio,
     )

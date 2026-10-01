@@ -1,4 +1,4 @@
-"""Packed SFT inputs are converted before backend preparation and model forward."""
+"""Packed SFT inputs flow to the backend and model with cu/max metadata."""
 
 from collections import UserDict
 from types import SimpleNamespace
@@ -9,7 +9,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchturbo.engine.core import TorchTurboEngine
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
-from torchturbo.utils.flash_attn_utils import cu_seqlens_to_attention_mask
+from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 
 class _NoScalarReads(TorchDispatchMode):
@@ -22,25 +22,30 @@ class _NoScalarReads(TorchDispatchMode):
 def test_cu_mask_uses_true_lengths_without_scalar_reads(num_tokens):
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
     with _NoScalarReads():
-        mask = cu_seqlens_to_attention_mask(cu, num_tokens)
+        mask = cu_seqlens_to_segment_ids(cu, num_tokens)
     assert mask.tolist() == [[1, 1, 2, 2, 2] + [0] * (num_tokens - 5)]
 
 
 @pytest.mark.parametrize(("physical_length", "sp_size"), [(5, 1), (5, 2), (7, 4)])
 @pytest.mark.parametrize("batch_type", [dict, UserDict])
-def test_compute_loss_builds_mask_before_sp_and_moe(physical_length, sp_size, batch_type):
+def test_compute_loss_passes_cu_through_backend_and_model(
+    physical_length, sp_size, batch_type
+):
     calls = []
-    expected_mask = [1, 1, 2, 2, 2] + [0] * ((-physical_length) % sp_size + physical_length - 5)
+    padded_length = physical_length + (-physical_length) % sp_size
 
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.config = SimpleNamespace(pad_token_id=99)
 
-        def forward(self, input_ids, position_ids, labels, attention_mask):
+        def forward(self, input_ids, position_ids, labels, cu_seq_lens_q, cu_seq_lens_k,
+                    max_length_q, max_length_k):
             calls.append("model")
-            assert attention_mask.tolist() == [expected_mask]
-            assert input_ids.shape == labels.shape == position_ids.shape == attention_mask.shape
+            # The model sees the packed boundaries directly; the SP padded
+            # tail stays outside every cu segment.
+            assert cu_seq_lens_q.tolist() == [0, 2, 5]
+            assert input_ids.shape == (1, padded_length)
             return torch.tensor(0.0)
 
     backend = FSDP2Backend.__new__(FSDP2Backend)
@@ -49,7 +54,7 @@ def test_compute_loss_builds_mask_before_sp_and_moe(physical_length, sp_size, ba
 
     def prepare(model, inputs):
         calls.append("prepare")
-        assert inputs["attention_mask"].tolist() == [[1, 1, 2, 2, 2] + [0] * (physical_length - 5)]
+        assert inputs["cu_seq_lens_q"].tolist() == [0, 2, 5]
         return original_prepare(model, inputs)
 
     backend.prepare_inputs = prepare
@@ -59,7 +64,7 @@ def test_compute_loss_builds_mask_before_sp_and_moe(physical_length, sp_size, ba
 
     def prepare_moe(model, inputs, gradient_accumulation_steps):
         calls.append("moe")
-        assert inputs["attention_mask"].tolist() == [expected_mask]
+        assert inputs["cu_seq_lens_q"].tolist() == [0, 2, 5]
 
     engine._prepare_moe_runtime = prepare_moe
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
@@ -80,7 +85,7 @@ def test_compute_loss_builds_mask_before_sp_and_moe(physical_length, sp_size, ba
     assert batch["cu_seq_lens_q"].tolist() == [0, 2, 5]
 
 
-def test_nonpacked_native_mask_and_kwargs_are_preserved():
+def test_nonpacked_mask_is_rejected():
     batch = {
         "attention_mask": torch.tensor([[1, 1, 0]]),
         "cu_seq_lens_q": torch.tensor([0, 2], dtype=torch.int32),
@@ -92,4 +97,123 @@ def test_nonpacked_native_mask_and_kwargs_are_preserved():
     )
     engine._prepare_moe_runtime = lambda *args: None
 
-    assert engine.compute_loss(torch.nn.Identity().eval(), batch) is batch
+    with pytest.raises(ValueError, match="not attention_mask"):
+        engine.compute_loss(torch.nn.Identity().eval(), batch)
+
+
+def test_text_batch_without_positions_gets_contiguous_default():
+    from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+
+    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_sp_info = lambda: {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+    backend.config = SimpleNamespace(
+        loss_chunk=SimpleNamespace(enabled=False),
+        mtp=SimpleNamespace(loss_scaling_factor=0.0, log_loss=False, enabled=False),
+    )
+    captured = {}
+    class _Outputs(SimpleNamespace):
+        pass
+
+    backend._forward_for_lm_loss = (
+        lambda model, inputs, use_chunked_loss: captured.update(inputs) or (_Outputs(), None)
+    )
+    backend._compute_lm_loss_with_sp = (
+        lambda **kw: (torch.tensor(0.0), (torch.tensor(0.0),))
+    )
+    backend.get_sequence_parallel_input_mode = lambda: "pre_embedding"
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(pad_token_id=0)
+            self.training = False
+
+        def get_sequence_parallel_input_mode(self):
+            return "post_embedding"
+
+    inputs = {
+        "input_ids": torch.arange(4).unsqueeze(0),
+        "labels": torch.full((1, 4), -100),
+        "position_ids": None,
+        "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, 4], dtype=torch.int32),
+        "max_length_q": 4,
+        "max_length_k": 4,
+    }
+    backend.compute_loss(Model(), inputs)
+
+    assert captured["position_ids"].tolist() == [[0, 1, 2, 3]]
+
+
+def test_multimodal_batch_without_positions_keeps_none_for_mrope():
+    from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+
+    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_sp_info = lambda: {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+    backend.config = SimpleNamespace(
+        loss_chunk=SimpleNamespace(enabled=False),
+        mtp=SimpleNamespace(loss_scaling_factor=0.0, log_loss=False, enabled=False),
+    )
+    captured = {}
+    class _Outputs(SimpleNamespace):
+        pass
+
+    backend._forward_for_lm_loss = (
+        lambda model, inputs, use_chunked_loss: captured.update(inputs) or (_Outputs(), None)
+    )
+    backend._compute_lm_loss_with_sp = (
+        lambda **kw: (torch.tensor(0.0), (torch.tensor(0.0),))
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(pad_token_id=0)
+            self.training = False
+
+        def get_sequence_parallel_input_mode(self):
+            return "post_embedding"
+
+    inputs = {
+        "input_ids": torch.arange(4).unsqueeze(0),
+        "labels": torch.full((1, 4), -100),
+        "position_ids": None,
+        "mm_token_type_ids": torch.tensor([[0, 1, 1, 0]]),
+        "cu_seq_lens_q": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, 4], dtype=torch.int32),
+        "max_length_q": 4,
+        "max_length_k": 4,
+    }
+    backend.compute_loss(Model(), inputs)
+
+    # The model must see None so it derives mrope grid coordinates itself;
+    # a linear default would silently corrupt image RoPE.
+    assert captured.get("position_ids") is None
+
+
+def test_sp_input_slicing_skips_absent_position_ids(monkeypatch):
+    """VLM batches without positions must not crash the sequence-parallel slice."""
+    import torch.distributed as dist
+
+    from torchturbo.models.modules.attention.ulysses import (
+        patch_forward_for_sp_input_slicing,
+    )
+
+    monkeypatch.setattr(dist, "get_rank", lambda _group: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
+
+    class FakeLanguageModel:
+        def forward(self, **kwargs):
+            return kwargs
+
+    patch_forward_for_sp_input_slicing(
+        FakeLanguageModel, sp_group=object(), sp_size=2
+    )
+    embeds = torch.zeros(1, 4, 2)
+    result = FakeLanguageModel().forward(
+        inputs_embeds=embeds,
+        position_ids=None,
+    )
+
+    assert result["inputs_embeds"].shape == (1, 2, 2)
+    assert result["position_ids"] is None

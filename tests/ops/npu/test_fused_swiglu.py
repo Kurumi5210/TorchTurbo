@@ -1,10 +1,12 @@
 import pytest
+pytest.importorskip("torch_npu")
+pytest.importorskip("mindspeed")
 import torch
 import torch_npu
 from mindspeed import megatron_adaptor
 import torch.nn.functional as F
 from megatron.core.jit import jit_fuser
-from torch_turbo.utils.torch_utils import compare_tensors
+from torchturbo.utils.torch_utils import compare_tensors
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 def test_npu_swiglu(dtype):

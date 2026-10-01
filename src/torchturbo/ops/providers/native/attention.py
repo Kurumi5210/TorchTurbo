@@ -37,14 +37,14 @@ class TorchAttentionWithMaxLogits(OpImpl):
     ) -> tuple[Tensor, Tensor]:
         output_shape = value.shape
         if attention_mask is None and cu_seq_lens_q is not None:
-            from torchturbo.utils.flash_attn_utils import cu_seqlens_to_attention_mask
+            from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
             num_tokens = query.shape[0] * query.shape[1]
             query, key, value = (
                 tensor.reshape(1, num_tokens, *tensor.shape[2:])
                 for tensor in (query, key, value)
             )
-            attention_mask = cu_seqlens_to_attention_mask(cu_seq_lens_q, num_tokens)
+            attention_mask = cu_seqlens_to_segment_ids(cu_seq_lens_q, num_tokens)
         batch_size, seq_length, _, _ = query.shape
         scores = query.transpose(1, 2).float() @ key.transpose(1, 2).float().transpose(-1, -2)
         scores = scores * scaling

@@ -64,6 +64,14 @@ class TurboModel:
         cls, config: Any, engine_config: EngineConfig
     ) -> Iterator[None]:
         """Adapt model config and temporary state for meta-device construction."""
+        # The training stack assumes flash-attention kernels: packed varlen
+        # inputs, the unpad helpers and per-head max-logit collection all
+        # ride the flash-attention wrapper. Default every Turbo model to
+        # flash_attention_2; the config setter propagates the value to
+        # subconfigs (VLM text/vision towers included). Families with
+        # special needs may override it in their own __init__.
+        config._attn_implementation = "flash_attention_2"
+
         n_mtp = getattr(config, "num_nextn_predict_layers", 0)
         if engine_config.mtp.enabled:
             if n_mtp > 0:
@@ -95,12 +103,35 @@ class TurboModel:
 
         return FSDPParallelPlan()
 
-    def patch_ulysses_fa(
-        self,
-        sp_info: dict[str, Any],
-    ) -> None:
-        from torchturbo.models.modules.attention.ulysses import patch_flash_attention_forward_for_sp
-        patch_flash_attention_forward_for_sp(sp_info)
+    def get_sp_attention_config(self) -> Any:
+        """Config object whose ``_attn_implementation`` drives text attention."""
+        return self.config
+
+    def register_sp_attention_interface(self, sp_info: dict[str, Any]) -> None:
+        """Enable the registered ``turbo_ulysses`` interface for SP attention.
+
+        Dispatch is per-config: the interface is registered in
+        ``ALL_ATTENTION_FUNCTIONS`` and bound to the SP group here, and the
+        text config switches to it. Subconfigs that keep their own
+        implementation (e.g. VLM vision towers on ``flash_attention_2``)
+        stay on the native flash path. Only families whose attention
+        resolves through
+        ``ALL_ATTENTION_FUNCTIONS[config._attn_implementation]`` at forward
+        time may use this; old-style modeling (attention class chosen at
+        ``__init__``) injects Ulysses per-module from its parallel plan
+        instead (see kimi_k25).
+
+        Registration does not depend on the SP size: at SP=1 the interface
+        skips the collectives and runs the same flash-attention path, while
+        still recording QK-clip statistics for modules that carry them.
+        """
+        from .modules.attention.ulysses import register_turbo_ulysses_attention
+
+        register_turbo_ulysses_attention(
+            self.get_sp_attention_config(),
+            sp_info["sp_group"],
+            sp_info["sp_size"],
+        )
 
     def on_parallelized(self, parallel_context: dict[str, Any]) -> None:
         """Hook called after backend module replacement/sharding."""
@@ -113,13 +144,16 @@ class TurboModel:
         inputs: dict[str, Any],
         parallel_context: dict[str, Any],
     ) -> MoERuntimeInputs:
+        """Build the SP-local padding mask from required packed boundaries."""
         from .modules.moe.moe_layer import MoERuntimeInputs
 
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is None or attention_mask.dim() != 2:
-            return MoERuntimeInputs()
-
-        padding_mask = attention_mask.eq(0)
+        cu_seq_lens = inputs["cu_seq_lens_q"]
+        input_ids = inputs["input_ids"]
+        token_indices = torch.arange(
+            input_ids.size(-1), device=input_ids.device
+        )
+        # The original cu excludes both dummy media and SP alignment tails.
+        padding_mask = (token_indices >= cu_seq_lens[-1]).unsqueeze(0)
         sp_info = parallel_context["sp"]
         if sp_info["sp_size"] > 1:
             from .modules.attention.ulysses import slice_input_tensor
@@ -204,6 +238,9 @@ class TurboVLMModel(TurboModel):
     vision_tower_module_names = ("vision_tower",)
     multi_modal_projector_module_names = ("multi_modal_projector", "mm_projector")
     language_model_module_names = ("language_model",)
+
+    def get_sp_attention_config(self) -> Any:
+        return self.config.text_config
 
     @classmethod
     @contextmanager

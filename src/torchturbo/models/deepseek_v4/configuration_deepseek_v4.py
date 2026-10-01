@@ -86,6 +86,8 @@ class DeepseekV4Config(PretrainedConfig):
             Head dimension for indexer.
         index_topk (`int`, *optional*, defaults to 512):
             Top-k value for indexer.
+        dsa_indexer_loss_coeff (`float`, *optional*, defaults to 0.0):
+            Coefficient for the indexer auxiliary KL loss.
         hc_mult (`int`, *optional*, defaults to 4):
             Hyper-connection multiplier.
         hc_sinkhorn_iters (`int`, *optional*, defaults to 20):
@@ -173,6 +175,7 @@ class DeepseekV4Config(PretrainedConfig):
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
+        dsa_indexer_loss_coeff: float = 0.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -207,6 +210,7 @@ class DeepseekV4Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
+        self.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps

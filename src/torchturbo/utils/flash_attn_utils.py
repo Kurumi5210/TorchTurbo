@@ -1,13 +1,7 @@
-import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from torchturbo.runtime import is_npu_available
 from torchturbo.utils.functools import cache
-
-if is_npu_available():
-    import math
-    import torch_npu
 
 
 def get_seqlens_in_batch(attention_mask: "torch.Tensor") -> "torch.Tensor":
@@ -121,7 +115,57 @@ def get_unpad_data(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 
 @cache
-def _cu_seqlens_to_attention_mask(
+def _packed_token_counts(
+    cu_seq_lens_q: torch.Tensor,
+    cu_seq_lens_k: torch.Tensor,
+    _query_version: int | None,
+    _key_version: int | None,
+) -> tuple[int, int]:
+    num_query_tokens = int(cu_seq_lens_q[-1])
+    num_key_tokens = (
+        num_query_tokens if cu_seq_lens_k is cu_seq_lens_q else int(cu_seq_lens_k[-1])
+    )
+    return num_query_tokens, num_key_tokens
+
+
+def unpad_varlen_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seq_lens_q: torch.Tensor,
+    cu_seq_lens_k: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Trim BSND attention inputs to the valid prefixes described by cu.
+
+    Returns:
+        Query, key and value tensors, and the number of query tail tokens
+        removed. Trimming combines batch rows into one; inputs without
+        padding retain their original shape and identity.
+    """
+    if (
+        torch.is_inference_mode_enabled()
+        or cu_seq_lens_q.is_inference()
+        or cu_seq_lens_k.is_inference()
+    ):
+        num_query_tokens, num_key_tokens = _packed_token_counts.__wrapped__(
+            cu_seq_lens_q, cu_seq_lens_k, None, None,
+        )
+    else:
+        num_query_tokens, num_key_tokens = _packed_token_counts(
+            cu_seq_lens_q, cu_seq_lens_k, cu_seq_lens_q._version, cu_seq_lens_k._version,
+        )
+    query_padding = query.shape[0] * query.shape[1] - num_query_tokens
+    key_padding = key.shape[0] * key.shape[1] - num_key_tokens
+    if query_padding == 0 and key_padding == 0:
+        return query, key, value, 0
+    query = query.flatten(0, 1)[:num_query_tokens].unsqueeze(0)
+    key = key.flatten(0, 1)[:num_key_tokens].unsqueeze(0)
+    value = value.flatten(0, 1)[:num_key_tokens].unsqueeze(0)
+    return query, key, value, query_padding
+
+
+@cache
+def _cu_seqlens_to_segment_ids(
     cu_seqlens: torch.Tensor, num_tokens: int, _version: int | None,
 ) -> torch.Tensor:
     token_indices = torch.arange(num_tokens, device=cu_seqlens.device)
@@ -129,19 +173,21 @@ def _cu_seqlens_to_attention_mask(
     return segment_ids.masked_fill(token_indices >= cu_seqlens[-1], 0).unsqueeze(0)
 
 
-def cu_seqlens_to_attention_mask(cu_seqlens: torch.Tensor, num_tokens: int) -> torch.Tensor:
-    """Build a cached segment mask for attention backends that require one.
+def cu_seqlens_to_segment_ids(cu_seqlens: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Derive per-token segment IDs from cu boundaries.
 
     Args:
         cu_seqlens: Cumulative lengths addressing flattened batch tokens.
-        num_tokens: Physical token count, including any masked tail padding.
+        num_tokens: Physical token count, including any tail padding.
 
     Returns:
-        Integer segment IDs shaped [1, num_tokens], with zero for tail padding.
+        Integer segment IDs shaped [1, num_tokens] (1..n per packed sample,
+        0 beyond the last boundary). Not an attention mask: consumers use
+        ID equality to build block-diagonal packing structure.
     """
     if torch.is_inference_mode_enabled() or cu_seqlens.is_inference():
-        return _cu_seqlens_to_attention_mask.__wrapped__(cu_seqlens, num_tokens, None)
-    return _cu_seqlens_to_attention_mask(cu_seqlens, num_tokens, cu_seqlens._version)
+        return _cu_seqlens_to_segment_ids.__wrapped__(cu_seqlens, num_tokens, None)
+    return _cu_seqlens_to_segment_ids(cu_seqlens, num_tokens, cu_seqlens._version)
 
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py

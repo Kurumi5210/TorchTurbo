@@ -214,6 +214,109 @@ def test_matmul_add_uses_reference_fallback_on_cpu():
     assert torch.allclose(accumulator, expected)
 
 
+@pytest.fixture
+def recurrent_providers(monkeypatch):
+    from torchturbo.ops.providers.native.causal_conv1d import FlaCausalConv1d
+    from torchturbo.ops.providers.native.gated_delta_rule import FlaGatedDeltaRule
+
+    registry = OpRegistry()
+    calls = {}
+    for provider in (FlaCausalConv1d, FlaGatedDeltaRule):
+        spec = provider.op_spec()
+        registry.register(ops_registry.get_by_impl_name(spec.impl_name))
+        monkeypatch.setattr(provider, "available", lambda self: True)
+        calls[spec.op_name] = Mock(return_value=(None, None))
+        monkeypatch.setattr(provider, "__call__", calls[spec.op_name])
+    dispatcher = OpDispatcher(registry=registry, device_runtime=CpuRuntime())
+    return dispatcher, calls
+
+
+def _call_recurrent_op(dispatcher, op_name, **kwargs):
+    if op_name == "causal_conv1d":
+        return dispatcher.causal_conv1d(
+            torch.zeros(1, 6, 2), torch.ones(2, 3), **kwargs
+        )
+    qkv = torch.zeros(1, 6, 1, 2)
+    gates = torch.zeros(1, 6, 1)
+    return dispatcher.gated_delta_rule(qkv, qkv, qkv, gates, gates, **kwargs)
+
+
+def test_recurrent_dispatch_shares_padding_metadata_and_refreshes_mutated_cu(
+    recurrent_providers,
+):
+    dispatcher, calls = recurrent_providers
+    cu = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    _call_recurrent_op(dispatcher, "causal_conv1d", cu_seqlens=cu)
+    before = calls["causal_conv1d"].call_args.kwargs["packed_params"]
+    _call_recurrent_op(dispatcher, "gated_delta_rule", cu_seqlens=cu)
+
+    assert calls["gated_delta_rule"].call_args.kwargs["packed_params"] is before
+    assert before.cu_seqlens_list == [0, 2, 5, 6]
+    assert before.cu_seqlens.tolist() == [0, 2, 5, 6]
+    assert before.chunk_indices_list["64"] == [0, 0, 1, 0, 2, 0]
+    assert cu.tolist() == [0, 2, 5]
+    assert cu.dtype == torch.int32
+    for call in calls.values():
+        assert call.call_args.kwargs.get("cu_seqlens") is None
+
+    cu[1] = 3
+    _call_recurrent_op(dispatcher, "gated_delta_rule", cu_seqlens=cu)
+    after = calls["gated_delta_rule"].call_args.kwargs["packed_params"]
+    _call_recurrent_op(dispatcher, "causal_conv1d", cu_seqlens=cu)
+
+    assert after is not before
+    assert calls["causal_conv1d"].call_args.kwargs["packed_params"] is after
+    assert before.cu_seqlens_list == [0, 2, 5, 6]
+    assert after.cu_seqlens_list == [0, 3, 5, 6]
+    assert cu.tolist() == [0, 3, 5]
+
+
+@pytest.mark.parametrize("op_name", ["causal_conv1d", "gated_delta_rule"])
+def test_recurrent_dispatch_without_cu_passes_no_metadata(recurrent_providers, op_name):
+    dispatcher, calls = recurrent_providers
+
+    _call_recurrent_op(dispatcher, op_name)
+
+    kwargs = calls[op_name].call_args.kwargs
+    assert kwargs["packed_params"] is None
+    assert kwargs.get("cu_seqlens") is None
+
+
+@pytest.mark.parametrize("op_name", ["causal_conv1d", "gated_delta_rule"])
+def test_recurrent_dispatch_preserves_explicit_metadata(
+    recurrent_providers, monkeypatch, op_name,
+):
+    from torchturbo.ops import packed_params as packed_module
+
+    dispatcher, calls = recurrent_providers
+    packed = packed_module.get_packed_params(torch.tensor([0, 2, 5]), 6)
+    build = Mock(side_effect=AssertionError("Explicit metadata must not be rebuilt."))
+    monkeypatch.setattr(packed_module, "build_packed_params", build)
+
+    _call_recurrent_op(dispatcher, op_name, packed_params=packed)
+
+    assert calls[op_name].call_args.kwargs["packed_params"] is packed
+    assert calls[op_name].call_args.kwargs.get("cu_seqlens") is None
+    build.assert_not_called()
+
+
+@pytest.mark.parametrize("op_name", ["causal_conv1d", "gated_delta_rule"])
+def test_recurrent_dispatch_rejects_raw_and_prepared_metadata(
+    recurrent_providers, op_name,
+):
+    from torchturbo.ops.packed_params import get_packed_params
+
+    dispatcher, calls = recurrent_providers
+    cu = torch.tensor([0, 2, 5], dtype=torch.int32)
+    packed = get_packed_params(cu, 6)
+
+    with pytest.raises(ValueError, match="cu_seqlens.*packed_params"):
+        _call_recurrent_op(dispatcher, op_name, cu_seqlens=cu, packed_params=packed)
+
+    calls[op_name].assert_not_called()
+
+
 def test_registry_register_is_idempotent_by_impl_name():
     registry = OpRegistry()
 

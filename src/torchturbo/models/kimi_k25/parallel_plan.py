@@ -59,6 +59,16 @@ def _replace_self_attn(
     ep_info: Any,
     **kwargs: Any,
 ) -> nn.Module:
+    # Standard SP attention injection for old-style modeling: HF's legacy
+    # attention classes pick their implementation at __init__ time
+    # (ATTENTION_CLASSES[config._attn_implementation]) and never consult
+    # ALL_ATTENTION_FUNCTIONS at forward time, so the registered
+    # "turbo_ulysses" interface used by the qwen3 families cannot reach
+    # them. Instead, bind the Ulysses forward onto the instance here in the
+    # parallel plan: the class forward calls self._flash_attention_forward,
+    # and an instance attribute shadows that method. The injection stays
+    # per-module (vision towers are untouched by construction) with no
+    # process-global state.
     from .modeling_deepseek import DeepseekV3FlashAttention2
 
     if isinstance(original_module, DeepseekV3FlashAttention2):

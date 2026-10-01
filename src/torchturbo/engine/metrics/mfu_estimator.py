@@ -87,19 +87,9 @@ class MFUEstimator:
         return 0, 0
 
     @staticmethod
-    def _read_segments(inputs: dict, seq: int) -> list[int]:
-        """Per-block attention lengths via ``get_seqlens_in_batch``; falls back to [seq]."""
-        am = inputs.get("attention_mask")
-        if am is None:
-            return [seq]
-        try:
-            from ...utils.flash_attn_utils import get_seqlens_in_batch
-
-            segs = get_seqlens_in_batch(am).tolist()
-        except Exception:
-            segs = []
-        segs = [int(s) for s in segs if int(s) > 0]
-        return segs or [seq]
+    def _read_segments(inputs: dict) -> list[int]:
+        """Per-sample attention lengths from the packed cu boundaries."""
+        return inputs["cu_seq_lens_q"].diff().tolist()
 
     @staticmethod
     def _read_vision_grids(inputs: dict) -> tuple[list, list]:
@@ -125,7 +115,7 @@ class MFUEstimator:
         batch, seq = self._read_dims(inputs)
         if batch <= 0 or seq <= 0:
             return 0
-        segments = self._read_segments(inputs, seq)
+        segments = self._read_segments(inputs)
         s_eff = sum(segments)
         if s_eff <= 0:
             return 0

@@ -106,6 +106,13 @@ def get_parallel_plan() -> FSDPParallelPlan:
 + `llamafactory_v0`: hook LlamaFactory 的模型加载、训练和保存流程
 + `msswift`: 以插件形式接入 ms-swift
 
+TorchTurbo 目前只支持训练，不支持评估、预测和生成，无论是否开启序列并行。
+LlamaFactory 和 ms-swift adapter 会拒绝不满足以下条件的配置：`eval_strategy="no"`、
+`do_eval=False`、`do_predict=False`、`predict_with_generate=False`、`eval_on_start=False`。
+
+SFT 样本始终相互隔离，包括 LlamaFactory 的 `packing=True, neat_packing=False`。
+`train_on_prompt=True` 只增加各样本内部的 prompt 监督，不产生跨样本的预测目标。
+
 `src/torchturbo/adapters/rl/` 提供强化学习框架可复用的 packed-sequence / SP 工具；它是工具包，不是已注册的 adapter。
 
 模型如需注册 LlamaFactory template，可在模型目录提供 `lf_template.py`。  

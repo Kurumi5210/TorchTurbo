@@ -60,10 +60,9 @@ def get_muon_recipe(model: nn.Module) -> MuonRecipe:
         attention_class = type(layer.attention)
         for suffix, spec in specs_by_attention_type[attention_class].items():
             parameter_overrides[f"{attention_fqn}.{suffix}"] = spec
-        if (
-            model.config._attn_implementation == "flash_attention_2"
-            and attention_class is BailingMoeV3MultiLatentAttention
-        ):
+        # QK clipping applies to the MLA layers only: KDA linear attention
+        # has no per-head QK logits to observe.
+        if attention_class is BailingMoeV3MultiLatentAttention:
             qk_clip_specs[attention_fqn] = MLAQKClipSpec(
                 query_projection=query_projection,
                 key_value_projection="kv_b_proj",

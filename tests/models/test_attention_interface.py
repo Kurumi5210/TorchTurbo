@@ -10,14 +10,18 @@ import torch
 import torch.nn.functional as F
 import transformers.integrations.flash_attention as flash_integration
 import transformers.modeling_flash_attention_utils as flash_utils
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchturbo.engine.core import TorchTurboEngine
 from torchturbo.models.modules.attention import interface
-from torchturbo.models.modules.attention.ulysses import patch_flash_attention_forward_for_sp
-from torchturbo.models.modules.attention.ulysses import ulysses
+from torchturbo.models.modules.attention.ulysses import register_turbo_ulysses_attention
+from torchturbo.models.modules.attention.ulysses import TURBO_ULYSSES_ATTENTION, ulysses
 from torchturbo.ops import OpDispatcher, OpPolicy, ops, registry
 from torchturbo.runtime.cpu import CpuRuntime
+from torchturbo.utils import flash_attn_utils
+
+from .flash_attention_fakes import lazy_flash_attention_kernels
 
 
 def _configure_ops(monkeypatch, runtime):
@@ -29,6 +33,8 @@ def _configure_ops(monkeypatch, runtime):
 @pytest.fixture(autouse=True)
 def _cpu_ops(monkeypatch):
     interface._position_sequence_lengths.cache_clear()
+    interface._matching_cumulative_lengths.cache_clear()
+    flash_attn_utils._packed_token_counts.cache_clear()
     return _configure_ops(monkeypatch, CpuRuntime())
 
 
@@ -186,7 +192,7 @@ def test_hf_integration_preserves_the_original_helper(
     monkeypatch.setattr(
         flash_utils, "lazy_import_flash_attention",
         Mock(return_value=(
-            (kernel, unused_kernel, flash_utils._pad_input, flash_utils._unpad_input),
+            lazy_flash_attention_kernels(kernel, unused_kernel),
             process_kwargs,
         )),
     )
@@ -196,22 +202,29 @@ def test_hf_integration_preserves_the_original_helper(
     monkeypatch.setattr(ulysses, "gather_heads_scatter_seq", scatter)
 
     engine = object.__new__(TorchTurboEngine)
-    for _ in range(2):
-        for patch_kind in patch_sequence:
-            if patch_kind == "ordinary":
-                engine._patch_transformers()
-            else:
-                patch_flash_attention_forward_for_sp({"sp_group": object(), "sp_size": 2})
-            assert flash_utils._flash_attention_forward is original
     module = SimpleNamespace(
         config=SimpleNamespace(_attn_implementation="flash_attention_2"),
         is_causal=True,
         layer_idx=0,
+        training=False,
     )
+    try:
+        for _ in range(2):
+            for patch_kind in patch_sequence:
+                if patch_kind == "ordinary":
+                    engine._patch_transformers()
+                else:
+                    register_turbo_ulysses_attention(module.config, object(), 2)
+                assert flash_utils._flash_attention_forward is original
 
-    output, weights = flash_integration.flash_attention_forward(
-        module, query, query, query, None, scaling=0.5,
-    )
+        # Dispatch the way attention modules do: by config name.
+        attention_fn = ALL_ATTENTION_FUNCTIONS[module.config._attn_implementation]
+        output, weights = attention_fn(module, query, query, query, None, scaling=0.5)
+    finally:
+        # The attention entry is SP-bound and instance-local; drop it. The
+        # mask-table entry is a class-level global declaration with no
+        # instance state, so it intentionally outlives the test.
+        ALL_ATTENTION_FUNCTIONS.pop(TURBO_ULYSSES_ATTENTION, None)
 
     torch.testing.assert_close(output, query.transpose(1, 2))
     assert weights is None
@@ -473,6 +486,152 @@ def test_explicit_cumulative_lengths_take_precedence_over_position_resets() -> N
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("is_causal", [False, True])
+def test_prefix_lengths_exclude_padding_from_maxima_and_gradients(
+    batch_size: int, is_causal: bool,
+) -> None:
+    query = torch.tensor([1.0, 2.0, 3.0, 4.0, 100.0, 100.0]).reshape(batch_size, -1, 1, 1)
+    query.requires_grad_()
+    key = query.detach().clone().requires_grad_()
+    value = torch.arange(12.0).reshape(batch_size, -1, 1, 2).requires_grad_()
+    lengths = torch.tensor([0, 2, 4], dtype=torch.int32)
+    mask = torch.tensor([[1, 1, 2, 2, 0, 0]])
+    expected_output, expected_maxima = interface.attention_forward(
+        query.reshape(1, 6, 1, 1), key.reshape(1, 6, 1, 1), value.reshape(1, 6, 1, 2),
+        mask, 6, is_causal, softmax_scale=1.0, return_max_logits=True,
+    )
+
+    output, maxima = interface.attention_forward(
+        query, key, value, None, query.shape[1], is_causal,
+        cu_seq_lens_q=lengths, cu_seq_lens_k=lengths,
+        max_length_q=2, max_length_k=2, softmax_scale=1.0, return_max_logits=True,
+    )
+
+    torch.testing.assert_close(output, expected_output.reshape_as(value))
+    torch.testing.assert_close(maxima, expected_maxima)
+    torch.testing.assert_close(maxima, torch.tensor([16.0]))
+    gradients = torch.autograd.grad(output.square().sum(), (query, key, value))
+    expected_gradients = torch.autograd.grad(expected_output.square().sum(), (query, key, value))
+    for actual, expected in zip(gradients, expected_gradients):
+        torch.testing.assert_close(actual, expected)
+        assert not actual.flatten(0, 1)[4:].any()
+
+
+def test_ordinary_prefix_lengths_preserve_unequal_query_key_lengths(monkeypatch) -> None:
+    query = torch.randn(2, 3, 1, 2, requires_grad=True)
+    key = torch.randn(2, 4, 1, 2, requires_grad=True)
+    value = torch.randn(2, 4, 1, 3, requires_grad=True)
+    query_lengths = torch.tensor([0, 2, 4], dtype=torch.int32)
+    key_lengths = torch.tensor([0, 3, 6], dtype=torch.int32)
+    observed = []
+
+    def varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, **kwargs):
+        observed.append((q.shape, k.shape, v.shape, cu_seqlens_q, cu_seqlens_k))
+        outputs = []
+        for qs, qe, ks, ke in zip(
+            cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:],
+        ):
+            outputs.append(F.scaled_dot_product_attention(
+                q[qs:qe].transpose(0, 1), k[ks:ke].transpose(0, 1), v[ks:ke].transpose(0, 1),
+            ).transpose(0, 1))
+        return torch.cat(outputs)
+
+    monkeypatch.setattr(
+        flash_utils, "lazy_import_flash_attention",
+        lambda *args, **kwargs: (
+            lazy_flash_attention_kernels(None, varlen_attention),
+            lambda **kwargs: {},
+        ),
+    )
+    output = interface.attention_forward(
+        query, key, value, None, 3, False,
+        cu_seq_lens_q=query_lengths, cu_seq_lens_k=key_lengths,
+        max_length_q=2, max_length_k=3,
+    )
+
+    flat_query, flat_key, flat_value = (tensor.flatten(0, 1) for tensor in (query, key, value))
+    expected = torch.cat([
+        F.scaled_dot_product_attention(
+            flat_query[qs:qs + 2].transpose(0, 1),
+            flat_key[ks:ks + 3].transpose(0, 1),
+            flat_value[ks:ks + 3].transpose(0, 1),
+        ).transpose(0, 1)
+        for qs, ks in ((0, 0), (2, 3))
+    ])
+    expected = F.pad(expected, (0, 0, 0, 0, 0, 2)).reshape(2, 3, 1, 3)
+    torch.testing.assert_close(output, expected)
+    assert observed[0][:3] == ((4, 1, 2), (6, 1, 2), (6, 1, 3))
+    assert observed[0][3] is query_lengths
+    assert observed[0][4] is key_lengths
+    gradients = torch.autograd.grad(output.square().sum(), (query, key, value))
+    expected_gradients = torch.autograd.grad(expected.square().sum(), (query, key, value))
+    for actual, expected_gradient in zip(gradients, expected_gradients):
+        torch.testing.assert_close(actual, expected_gradient)
+
+
+@pytest.mark.parametrize("return_max_logits", [False, True])
+@pytest.mark.parametrize("num_valid_tokens", [3, 4])
+@pytest.mark.parametrize("separate_key_lengths", [False, True])
+def test_prefix_counts_are_reused_across_layers_and_invalidated_on_mutation(
+    monkeypatch, return_max_logits: bool, num_valid_tokens: int, separate_key_lengths: bool,
+) -> None:
+    class RejectScalarReads(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func in (torch.ops.aten._local_scalar_dense.default, torch.ops.aten.equal.default):
+                raise AssertionError("Cached prefix counts must not read device scalars.")
+            return func(*args, **(kwargs or {}))
+
+    query = torch.ones(1, 4, 1, 1)
+    lengths = torch.tensor([0, num_valid_tokens], dtype=torch.int32)
+    key_lengths = lengths.clone() if separate_key_lengths else lengths
+    compute = Mock(side_effect=lambda q, k, v, *args, **kwargs: (v, torch.ones(1)))
+    monkeypatch.setattr(interface, "ops", SimpleNamespace(attention_with_max_logits=compute))
+    ordinary = Mock(side_effect=lambda q, k, v, *args, **kwargs: v)
+    monkeypatch.setattr(flash_utils, "_flash_attention_forward", ordinary)
+
+    def forward(cu, cu_key):
+        return interface.attention_forward(
+            query, query, query, None, 4, True,
+            cu_seq_lens_q=cu, cu_seq_lens_k=cu_key, max_length_q=4, max_length_k=4,
+            return_max_logits=return_max_logits,
+        )
+
+    forward(lengths, key_lengths)
+    with RejectScalarReads():
+        forward(lengths.view_as(lengths), key_lengths.view_as(key_lengths))
+        forward(lengths, key_lengths)
+
+    lengths[-1] = 2
+    key_lengths[-1] = 2
+    output = forward(lengths, key_lengths)
+    if return_max_logits:
+        output = output[0]
+    torch.testing.assert_close(output.flatten(), torch.tensor([1.0, 1.0, 0.0, 0.0]))
+
+
+@pytest.mark.parametrize("inference_scope", ["metadata", "execution"])
+def test_prefix_count_cache_bypasses_inference_tensors_and_mode(
+    monkeypatch, inference_scope: str,
+) -> None:
+    query = torch.ones(1, 4, 1, 1)
+    ordinary = Mock(side_effect=lambda q, k, v, *args, **kwargs: v)
+    monkeypatch.setattr(flash_utils, "_flash_attention_forward", ordinary)
+    with torch.inference_mode(inference_scope == "metadata"):
+        lengths = torch.tensor([0, 3], dtype=torch.int32)
+
+    with torch.inference_mode():
+        for num_valid_tokens in (3, 2):
+            lengths[-1] = num_valid_tokens
+            output = interface.attention_forward(
+                query, query, query, None, 4, True,
+                cu_seq_lens_q=lengths, cu_seq_lens_k=lengths,
+                max_length_q=3, max_length_k=3,
+            )
+            assert output.shape == query.shape
+            assert output.sum() == num_valid_tokens
 
 
 @pytest.mark.parametrize(

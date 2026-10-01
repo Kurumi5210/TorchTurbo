@@ -26,6 +26,19 @@ class SyncRuntime(CpuRuntime):
     """Plain CPU runtime for exercising host-side control flow."""
 
 
+# torch mis-dispatches CPU fused AdamW to the MPS backend on MPS builds
+# without CUDA (Apple silicon laptops): it raises "missing kernel for mps"
+# or crashes the process inside torch._fused_adamw_. CUDA/NPU hosts are
+# unaffected. Skip the tests that must run optimizer steps.
+CPU_FUSED_ADAMW_BROKEN = (
+    torch.backends.mps.is_built() and not torch.cuda.is_available()
+)
+requires_optimizer_step = pytest.mark.skipif(
+    CPU_FUSED_ADAMW_BROKEN,
+    reason="CPU fused AdamW mis-dispatches to the MPS backend on this torch build",
+)
+
+
 def _param_groups(params):
     return [
         {"params": list(params[:2]), "lr": 2e-3, "weight_decay": 0.1},
@@ -56,6 +69,7 @@ def _step_all(optimizer, params, seed):
     optimizer.zero_grad()
 
 
+@requires_optimizer_step
 def test_state_dict_exposes_standard_adamw_format():
     optimizer, params = _fresh_optimizer()
     _step_all(optimizer, params, seed=1)
@@ -76,6 +90,7 @@ def test_state_dict_exposes_standard_adamw_format():
     assert entry["exp_avg_sq"] is optimizer.param_to_cpu_states_map[param]["exp_avg_sq"]
 
 
+@requires_optimizer_step
 def test_state_dict_round_trip_restores_swap_state():
     trained, trained_params = _fresh_optimizer()
     for step in range(4):
@@ -128,6 +143,7 @@ def test_state_dict_round_trip_restores_swap_state():
         )
 
 
+@requires_optimizer_step
 def test_state_dict_routes_moments_through_checkpoint_wrapper():
     optimizer, params = _fresh_optimizer()
     calls = []
@@ -230,6 +246,7 @@ def test_load_state_dict_refreshes_hyperparameters():
     assert optimizer.param_groups[1]["betas"] == (0.8, 0.99)
 
 
+@requires_optimizer_step
 def test_load_state_dict_with_empty_state_keeps_buffers():
     optimizer, params = _fresh_optimizer()
     _step_all(optimizer, params, seed=3)
@@ -261,6 +278,7 @@ def test_load_state_dict_ignores_unknown_state_entries():
     assert "max_exp_avg_sq" not in optimizer.param_to_cpu_states_map[params[0]]
 
 
+@requires_optimizer_step
 def test_load_state_dict_accepts_python_step():
     optimizer, params = _fresh_optimizer()
     saved = copy.deepcopy(optimizer.state_dict())

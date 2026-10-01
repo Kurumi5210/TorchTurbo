@@ -33,6 +33,9 @@ class DummyAdapter(BaseAdapter):
     def deactivate(self):
         self._activated = False
 
+    def get_framework_version(self) -> str:
+        return "1.0.0"
+
 
 class NeverDetectAdapter(BaseAdapter):
     def detect(self) -> bool:
@@ -40,6 +43,9 @@ class NeverDetectAdapter(BaseAdapter):
 
     def activate(self, config=None):
         pass
+
+    def get_framework_version(self) -> str:
+        return "1.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +73,8 @@ class TestRegistration:
                 return True
             def activate(self, config=None):
                 pass
+            def get_framework_version(self) -> str:
+                return "1.0.0"
 
         adapter = get_adapter("test_framework")
         assert adapter is not None

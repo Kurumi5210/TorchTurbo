@@ -1669,8 +1669,12 @@ class FSDP2Backend(BaseBackend):
         return total_norm
 
     def prepare_inputs(self, model, inputs):
-        """Pad inputs for Ulysses sequence parallelism."""
-        if not isinstance(inputs, dict):
+        """Pad inputs for Ulysses sequence parallelism.
+
+        ``cu_seq_lens_q/k`` keep describing the valid prefix, so attention and
+        MoE statistics exclude the dummy media and SP alignment tails.
+        """
+        if not isinstance(inputs, Mapping):
             return inputs
 
         sp_size = self.get_sp_info()["sp_size"]
@@ -1702,23 +1706,14 @@ class FSDP2Backend(BaseBackend):
             pad_value=pad_token_id,
         )
 
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        if torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
-            if attention_mask.size(-1) != seq_len:
-                raise ValueError(
-                    "attention_mask must be aligned with input_ids before "
-                    "FSDP2 Ulysses padding"
-                )
-            inputs["attention_mask"] = nn.functional.pad(
-                attention_mask, (0, pad_size), value=0
+        mm_token_type_ids = inputs.get("mm_token_type_ids")
+        if (
+            torch.is_tensor(mm_token_type_ids)
+            and mm_token_type_ids.size(-1) == seq_len
+        ):
+            inputs["mm_token_type_ids"] = nn.functional.pad(
+                mm_token_type_ids, (0, pad_size), value=0
             )
-
-        for key in ("token_type_ids", "mm_token_type_ids"):
-            tensor = inputs.get(key)
-            if torch.is_tensor(tensor) and tensor.size(-1) == seq_len:
-                inputs[key] = nn.functional.pad(tensor, (0, pad_size), value=0)
 
         text_position_ids = inputs.get("text_position_ids")
         if (
@@ -1741,7 +1736,14 @@ class FSDP2Backend(BaseBackend):
         return inputs
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        if inputs.get("position_ids", None) is None:
+        if (
+            inputs.get("position_ids", None) is None
+            and inputs.get("mm_token_type_ids") is None
+        ):
+            # Text batches default to contiguous coordinates. Multimodal
+            # batches keep position_ids absent so the model derives mrope
+            # grid coordinates from the media tokens instead of receiving
+            # linear positions that silently corrupt image RoPE.
             inputs["position_ids"] = torch.arange(
                 inputs["input_ids"].size(1), device=inputs["input_ids"].device
             ).unsqueeze(0)
@@ -1789,6 +1791,7 @@ class FSDP2Backend(BaseBackend):
             model=model,
             outputs=outputs,
             labels=labels,
+            cu_seq_lens=inputs.get("cu_seq_lens_q"),
             chunk_hidden_states=chunk_hidden_states,
             sp_size=sp_size,
             sp_group=sp_group,
@@ -1825,6 +1828,7 @@ class FSDP2Backend(BaseBackend):
         sp_group: Any,
         sp_rank: int,
         num_items_in_batch: int | torch.Tensor | None,
+        cu_seq_lens: torch.Tensor | None = None,
         ignore_index: int = -100,
     ) -> tuple[list[torch.Tensor], list[float | torch.Tensor]]:
         """Build shifted labels and normalizers for each LM prediction stream.
@@ -1871,13 +1875,28 @@ class FSDP2Backend(BaseBackend):
                     float(num_items_local * sp_size) / float(world_size)
                 )
 
+        sequence_ends = None
+        if cu_seq_lens is not None:
+            token_positions = torch.arange(labels.size(-1), device=labels.device)
+            # Segment index per token; padding beyond the last boundary clamps
+            # to it, and its positions always cross that boundary once shifted.
+            segment_index = torch.bucketize(
+                token_positions, cu_seq_lens[1:], right=True
+            ).clamp(max=cu_seq_lens.numel() - 2)
+            sequence_ends = cu_seq_lens[segment_index + 1]
+
         shifted_labels: list[torch.Tensor] = []
         normalizers: list[float | torch.Tensor] = []
         for shift_extra, prediction in enumerate(predictions):
+            shift = 1 + shift_extra
             labels_i = nn.functional.pad(
-                labels, (0, 1 + shift_extra), value=ignore_index
+                labels, (0, shift), value=ignore_index
             )
-            labels_i = labels_i[..., 1 + shift_extra :].contiguous()
+            labels_i = labels_i[..., shift:].contiguous()
+            if sequence_ends is not None:
+                # Every prediction stream must target a token in its own sample.
+                crosses_boundary = token_positions + shift >= sequence_ends
+                labels_i.masked_fill_(crosses_boundary, ignore_index)
             # Count before SP slicing because the denominator covers the full
             # sequence. A fully masked stream uses one as a neutral denominator.
             label_num = (
@@ -1913,6 +1932,7 @@ class FSDP2Backend(BaseBackend):
         sp_rank: int,
         num_items_in_batch: int | torch.Tensor | None,
         mtp_loss_scale: float,
+        cu_seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Select the LM loss path and handle its SP-specific preparation.
 
@@ -1929,6 +1949,7 @@ class FSDP2Backend(BaseBackend):
                 sp_group=sp_group,
                 sp_rank=sp_rank,
                 num_items_in_batch=num_items_in_batch,
+                cu_seq_lens=cu_seq_lens,
             )
             loss_scales = [1.0] + [mtp_loss_scale] * (len(hidden_states) - 1)
             (
@@ -1966,6 +1987,7 @@ class FSDP2Backend(BaseBackend):
                 sp_group=sp_group,
                 sp_rank=sp_rank,
                 num_items_in_batch=num_items_in_batch,
+                cu_seq_lens=cu_seq_lens,
             )
             loss_scales = [1.0] + [mtp_loss_scale] * (len(logits) - 1)
             total_loss, component_losses = logits_loss(

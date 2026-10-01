@@ -38,7 +38,7 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
     add_start_docstrings,
@@ -89,9 +89,7 @@ if is_torch_fx_available():
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
 
-from torchturbo.logging import get_logger
-
-logger = get_logger(__name__)
+logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "BailingMoeV3Config"
 
@@ -653,8 +651,6 @@ def yarn_get_mscale(scale=1, mscale=1):
 class BailingMoeV3MultiLatentAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    attention_interface = staticmethod(eager_attention_forward)
-
     def __init__(self, config: BailingMoeV3Config, layer_idx: int):
         super().__init__()
         self.config = config
@@ -763,10 +759,16 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+        # Attention implementations other than eager/sdpa run
+        # flash-attention-style kernels, which require V padded to the QK
+        # head dim (and the output sliced back to the V head dim).
+        _uses_fa_kernel = self.config._attn_implementation not in ("eager", "sdpa")
+        if _uses_fa_kernel and self.qk_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
 
-        attention_interface: Callable = self.attention_interface
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -779,7 +781,7 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
             **kwargs,
         )
 
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+        if _uses_fa_kernel and self.qk_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
 
         if self.g_proj is not None:
@@ -1037,6 +1039,10 @@ class BailingMoeV3MTPLayer(nn.Module):
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seq_lens_k: Optional[torch.Tensor] = None,
+        max_length_q: Optional[int] = None,
+        max_length_k: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         input_embeds = self.enorm(input_embeds)
@@ -1055,6 +1061,11 @@ class BailingMoeV3MTPLayer(nn.Module):
             output_attentions=output_attentions,
             position_embeddings=position_embeddings,
             use_cache=use_cache,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -1119,6 +1130,10 @@ class BailingMoeV3DecoderLayer(nn.Module):
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        cu_seq_lens_k: Optional[torch.Tensor] = None,
+        max_length_q: Optional[int] = None,
+        max_length_k: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1156,6 +1171,10 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
                 **kwargs,
             )
         else:
@@ -1166,6 +1185,7 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 position_ids=position_ids,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
+                cu_seqlens=cu_seq_lens_q,
             )
 
         hidden_states = residual + hidden_states
@@ -1371,7 +1391,7 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
-                logger.warning_rank0_once(
+                logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`transformers."
                 )
                 use_cache = False
@@ -1434,6 +1454,13 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
 
         # tptest miss causal_mask = create_causal_mask(
 
+        # Attention retains prefix boundaries; KDA derives its full-length
+        # operator metadata without changing these shared inputs.
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        cu_seq_lens_k = kwargs.get("cu_seq_lens_k")
+        max_length_q = kwargs.get("max_length_q")
+        max_length_k = kwargs.get("max_length_k")
+
         for decoder_layer in layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1450,6 +1477,10 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
                     output_router_logits,
                     use_cache,
                     position_embeddings,
+                    cu_seq_lens_q,
+                    cu_seq_lens_k,
+                    max_length_q,
+                    max_length_k,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1462,6 +1493,10 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
+                    cu_seq_lens_q=cu_seq_lens_q,
+                    cu_seq_lens_k=cu_seq_lens_k,
+                    max_length_q=max_length_q,
+                    max_length_k=max_length_k,
                 )
             hidden_states = layer_outputs[0]
 
@@ -1500,6 +1535,10 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
                         output_router_logits,
                         use_cache,
                         position_embeddings,
+                        cu_seq_lens_q,
+                        cu_seq_lens_k,
+                        max_length_q,
+                        max_length_k,
                     )
                 else:
                     layer_outputs = decoder_layer(
@@ -1512,6 +1551,10 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
                         output_router_logits=output_router_logits,
                         use_cache=use_cache,
                         position_embeddings=position_embeddings,
+                        cu_seq_lens_q=cu_seq_lens_q,
+                        cu_seq_lens_k=cu_seq_lens_k,
+                        max_length_q=max_length_q,
+                        max_length_k=max_length_k,
                     )
                 if mtp_hidden_states is None:
                     mtp_hidden_states = []

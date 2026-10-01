@@ -1,4 +1,6 @@
 import inspect
+import math
+from functools import partial
 from typing import Any, Optional, Tuple
 
 import torch
@@ -10,7 +12,7 @@ from torchturbo.runtime import get_device_runtime
 
 from ...comm.comm import gather_from_sequence_parallel_region
 from ..interface import attention_forward
-from ..qk_clip import QKClipState
+from ..qk_clip import QKClipState, get_qk_clip_state
 from .utils import (
     repeat_kv,
     unpad_tensor,
@@ -236,30 +238,6 @@ def gather_heads_scatter_seq(
     return SeqAllToAll.apply(x, sp_group, sp_size, seq_dim, head_dim, None)
 
 
-def patch_flash_attention_forward_for_sp(sp_info: dict[str, Any]) -> None:
-    """Route HF's FlashAttention integration through Ulysses when SP > 1."""
-    sp_group = sp_info.get("sp_group")
-    sp_size = sp_info.get("sp_size", 1)
-    if not sp_group or sp_size <= 1:
-        return
-    try:
-        import transformers.integrations.flash_attention as flash_integration
-    except ImportError:
-        return
-    from functools import partial
-    patched_forward = partial(
-        ulysses_flash_attention_forward,
-        sp_group=sp_group,
-        sp_size=sp_size,
-    )
-    flash_integration._flash_attention_forward = patched_forward
-
-    logger.info_rank0(
-        "Patched transformers.integrations.flash_attention._flash_attention_forward for SP size=%d",
-        sp_size,
-    )
-
-
 def ulysses_flash_attention_forward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -281,6 +259,9 @@ def ulysses_flash_attention_forward(
         key_states (torch.Tensor): (batch_size, seqlen/sp_size, nheads_k, head_dim)
         value_states (torch.Tensor): (batch_size, seqlen/sp_size, nheads_k, head_dim)
         position_ids (torch.Tensor, optional): (batch_size, seqlen/sp_size)
+        cu_seq_lens_q/k, max_length_q/k: explicit global packed boundaries.
+            Each rank holds the same copy, so no position_ids all_gather is
+            needed to reconstruct them after the sequence gather.
         qk_clip_state (QKClipState, optional): Accumulator in global query-head order.
 
     Returns:
@@ -291,8 +272,6 @@ def ulysses_flash_attention_forward(
         num_heads = query_states.size(2)
         if num_heads != qk_clip_state.max_logits.numel() or num_heads % sp_size:
             raise ValueError("QK clipping requires a matching global head count divisible by SP size.")
-        if sp_size > 1 and attention_mask is not None and attention_mask.ndim == 4:
-            raise ValueError("QK clipping does not support 4D attention masks with SP.")
 
     ########## AlltoAll for Ulysses ##########
     if sp_size > 1:
@@ -329,18 +308,26 @@ def ulysses_flash_attention_forward(
             sp_size=sp_size,
         )
 
-        # all_gather position_ids when available
-        if position_ids is not None and (
+        # Explicit cu/max describe the full gathered sequence: drop the
+        # rank-local position_ids so boundaries are not re-derived from the
+        # local shard. Legacy callers without cu (e.g. kimi's position-based
+        # path) still rebuild boundaries from the gathered positions.
+        explicit_varlen = (
+            kwargs.get("cu_seq_lens_q") is not None
+            and kwargs.get("cu_seq_lens_k") is not None
+        )
+        if explicit_varlen:
+            position_ids = None
+        elif position_ids is not None and (
             qk_clip_state is None or position_ids.size(-1) == local_seq_length
         ):
-            # TODO: eliminate this all_gather by passing cu_seq_lens explicitly.
-            # https://github.com/huggingface/transformers/pull/33932
             position_ids_list = [torch.empty_like(position_ids) for _ in range(sp_size)]
             torch.distributed.all_gather(position_ids_list, position_ids, group=sp_group)
             position_ids = torch.concat(position_ids_list, dim=-1)
         if (
             qk_clip_state is not None
             and attention_mask is not None
+            and attention_mask.ndim == 2
             and attention_mask.size(-1) == local_seq_length
         ):
             masks = [torch.empty_like(attention_mask) for _ in range(sp_size)]
@@ -378,6 +365,117 @@ def ulysses_flash_attention_forward(
         )
 
     return attn_output
+
+
+TURBO_ULYSSES_ATTENTION = "turbo_ulysses"
+
+
+def ulysses_attention_forward(
+    module: torch.nn.Module,
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    sliding_window: int | None = None,
+    softcap: float | None = None,
+    is_causal: bool | None = None,
+    sp_group: Optional[ProcessGroup] = None,
+    sp_size: int = 1,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Ulysses SP attention as an HF attention-interface function.
+
+    Follows the ``ALL_ATTENTION_FUNCTIONS`` contract: inputs use the
+    [batch, heads, seq, head_dim] layout, outputs use [batch, seq, heads,
+    head_dim] (HF's ``flash_attention_forward`` does not transpose its
+    result back), the module supplies ``is_causal`` and dtype context, and
+    varlen kwargs (``cu_seq_lens_q/k`` etc.) flow through ``**kwargs``. The
+    body splices the DeepSpeed-Ulysses all-to-all pair around
+    :func:`ulysses_flash_attention_forward`. Training modules that carry a
+    QK-clip state (installed by the QK clipping controller) also record
+    their per-head maximum logits through it.
+    """
+    from transformers.integrations.flash_attention import get_target_dtype
+
+    seq_len = query_states.shape[2]
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    target_dtype = get_target_dtype(query_states, module)
+    is_causal = is_causal if is_causal is not None else module.is_causal
+
+    # Q heads can be fewer than SP ranks (e.g. 16 heads with SP=32): repeat
+    # them so the all-to-all has enough heads to scatter, then dedup on the
+    # way back. K/V heads are repeated inside ulysses_flash_attention_forward.
+    sp_repeat = 1
+    if sp_size > 1:
+        num_q_heads = query_states.size(2)
+        sp_repeat = math.lcm(sp_size, num_q_heads) // num_q_heads
+        if sp_repeat > 1:
+            query_states = query_states.repeat_interleave(sp_repeat, dim=2)
+
+    attn_output = ulysses_flash_attention_forward(
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        seq_len,
+        is_causal=is_causal,
+        dropout=dropout,
+        softmax_scale=scaling,
+        sliding_window=sliding_window,
+        softcap=softcap,
+        target_dtype=target_dtype,
+        sp_group=sp_group,
+        sp_size=sp_size,
+        qk_clip_state=get_qk_clip_state(module) if module.training else None,
+        **kwargs,
+    )
+
+    if sp_repeat > 1:
+        attn_output = attn_output[:, :, ::sp_repeat, :]
+    return attn_output, None
+
+
+def register_turbo_ulysses_attention(
+    attn_config: Any,
+    sp_group: Optional[ProcessGroup],
+    sp_size: int,
+) -> None:
+    """Bind the ``turbo_ulysses`` attention interface to one SP group.
+
+    Registers the SP-bound interface in ``ALL_ATTENTION_FUNCTIONS`` and
+    switches ``attn_config._attn_implementation`` to it. Attention modules
+    resolve the interface from the registry at forward time, so the switch
+    takes effect on models that are already built. Subconfigs that keep
+    their own implementation (e.g. VLM vision towers on ``flash_attention_2``)
+    stay on the native flash path.
+
+    The name is also mapped in HF's mask registry to the flash-attention
+    mask function, so mask factories dispatch for it instead of taking the
+    unrecognized-name early exit.
+    """
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION] = partial(
+        ulysses_attention_forward, sp_group=sp_group, sp_size=sp_size
+    )
+    # HF checks the global mask registry before dispatching mask creation.
+    ALL_MASK_ATTENTION_FUNCTIONS.register(
+        TURBO_ULYSSES_ATTENTION,
+        ALL_MASK_ATTENTION_FUNCTIONS["flash_attention_2"],
+    )
+    attn_config._attn_implementation = TURBO_ULYSSES_ATTENTION
+
+    logger.info_rank0(
+        "Registered %s attention interface for SP size=%d",
+        TURBO_ULYSSES_ATTENTION,
+        sp_size,
+    )
 
 
 def _forward_arg_index(forward, names: tuple[str, ...], skip_first: int):
@@ -598,9 +696,12 @@ def patch_forward_for_sp_input_slicing(
                 call_kwargs["inputs_embeds"] = slice_input_tensor(
                     inputs_embeds, dim=1, group=sp_group, rank=sp_rank, padding=False
                 )
-                call_kwargs["position_ids"] = slice_input_tensor(
-                    position_ids, dim=-1, group=sp_group, rank=sp_rank, padding=False
-                )
+                # VLM batches without explicit positions (the model derives
+                # mrope coordinates) stay None instead of crashing the slice.
+                if position_ids is not None:
+                    call_kwargs["position_ids"] = slice_input_tensor(
+                        position_ids, dim=-1, group=sp_group, rank=sp_rank, padding=False
+                    )
                 # Also slice visual_pos_masks and deepstack_visual_embeds for Qwen3 VL models
                 if visual_pos_masks is not None:
                     original_visual_mask = visual_pos_masks

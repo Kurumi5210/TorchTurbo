@@ -610,6 +610,10 @@ class EngineConfig:
             self.optimizer = OptimizerConfig(**self.optimizer)
         elif not isinstance(self.optimizer, OptimizerConfig):
             raise TypeError("optimizer must be an OptimizerConfig or dict")
+        if self.gbs is not None and self.gbs <= 0:
+            raise ValueError(
+                f"gbs (--tt_gbs) must be a positive integer, got {self.gbs}."
+            )
 
     def _default_backend_config(self) -> Any:
         """Create the default config for the selected backend."""
@@ -922,6 +926,11 @@ def build_from_args(
             continue
         value = getattr(tt, arg_spec.args_name)
         if value is not None:
+            # Merge dataclasses as plain dicts. A typed OmegaConf node matches
+            # enum strings by member name, so it would reject file values
+            # such as "cpu_offload.mode: optimizer".
+            if dataclasses.is_dataclass(value):
+                value = dataclasses.asdict(value)
             OmegaConf.update(fields, arg_spec.config_path, value, force_add=True)
     # Defaults without a --tt_* flag (tt values above win via merge).
     fields = OmegaConf.merge(
@@ -963,7 +972,12 @@ def build_from_args(
                 "Put TorchTurbo config fields under engine_config."
             )
         config_from_file = raw_config_from_file["engine_config"]
-        config_data = OmegaConf.to_container(config_from_file, resolve=False) or {}
+        if config_from_file is None:
+            # A section whose entries are all commented out loads as null.
+            config_from_file = OmegaConf.create()
+        elif not OmegaConf.is_dict(config_from_file):
+            raise ValueError("engine_config must be a mapping.")
+        config_data = OmegaConf.to_container(config_from_file, resolve=False)
         _validate_config_file(config_data)
 
     # Layer 4: explicitly supplied --tt_* CLI flags.
@@ -1080,6 +1094,10 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
     for key, value in data.items():
         parts = (*parents, key)
         path = ".".join(parts)
+        if parts == ("ops", "overrides"):
+            # Op names are free-form keys; OpsConfig and the dispatcher
+            # validate the mapping itself.
+            continue
         if parts == ("parallel_plan", "plan"):
             from torchturbo.parallel import FSDPPlanSpec
 

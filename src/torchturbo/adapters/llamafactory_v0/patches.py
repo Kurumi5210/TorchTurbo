@@ -6,12 +6,16 @@ automatically skipped by the adapter.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from ...logging import get_logger
 from ...registry import BasePatch
 
 if TYPE_CHECKING:
+    import torch
+
     from ...engine import TorchTurboEngine
 
 logger = get_logger(__name__)
@@ -160,6 +164,12 @@ class RunExpPatch(BasePatch):
                 )
                 return self._original(args, callbacks)
 
+            if stage == "sft" and not data_args.ignore_pad_token_for_loss:
+                raise ValueError(
+                    "TorchTurbo packed SFT requires ignore_pad_token_for_loss=True; "
+                    "padding tokens are removed before loss computation."
+                )
+
             peft_config = None
             if (
                 stage != "dpo"
@@ -257,13 +267,15 @@ class RunExpPatch(BasePatch):
 
 
 # ---------------------------------------------------------------------------
-# PackedFA2CollatorPatch - normalize neat-packed FA2 batches
+# PackedInputCollatorPatch - normalize training batches
 # ---------------------------------------------------------------------------
 
 
-def _normalize_packed_features(
+def _normalize_training_features(
     batch: dict[str, Any],
     *,
+    cu_seqlens: torch.Tensor,
+    max_length: int,
     num_dummy_tokens: int,
     original_first_length: int,
     padding_side: str,
@@ -275,6 +287,9 @@ def _normalize_packed_features(
     from ...engine.utils import assert_packed_inputs
 
     attention_mask = batch.pop("attention_mask")
+    # No Turbo model consumes token_type_ids; drop it rather than carry a
+    # stale [batch, seq] tensor alongside the flattened packed rows.
+    batch.pop("token_type_ids", None)
     batch_size, seq_len = batch["input_ids"].shape
     if attention_mask.shape != (batch_size, seq_len):
         # LF's dummy-image mRoPE path appends an extra zero mask tail.
@@ -287,19 +302,27 @@ def _normalize_packed_features(
             raise ValueError("LF packed attention_mask must match input_ids.")
         attention_mask = attention_mask[:, :seq_len]
 
-    valid = attention_mask != 0
-    valid_indices = torch.nonzero(valid.flatten(), as_tuple=False).flatten()
-    if valid_indices.numel() == 0:
-        raise ValueError("LF packed batches must contain at least one valid token.")
+    position_ids = batch.get("position_ids")
+    if position_ids is not None and position_ids.dim() == 2 and position_ids.size(1) < seq_len:
+        # LF does not extend text position_ids for collator or dummy padding.
+        missing = seq_len - position_ids.size(1)
+        if padding_side == "right":
+            padding = (0, missing)
+            missing_mask = attention_mask[:, -missing:]
+        else:
+            padding = (missing, 0)
+            missing_mask = attention_mask[:, :missing]
+        if torch.any(missing_mask != 0):
+            raise ValueError("LF position_ids are missing valid token positions.")
+        position_ids = F.pad(position_ids, padding)
+    if position_ids is not None and (
+        position_ids.dim() not in (2, 3) or position_ids.shape[-2:] != (batch_size, seq_len)
+    ):
+        raise ValueError("LF position_ids must align with the collated token rows.")
 
-    starts = valid.clone()
-    starts[:, 1:] &= attention_mask[:, 1:] != attention_mask[:, :-1]
-    packed_starts = starts.flatten().index_select(0, valid_indices)
-    cu_seqlens = torch.cat([
-        torch.nonzero(packed_starts, as_tuple=False).flatten(),
-        torch.tensor([valid_indices.numel()]),
-    ]).to(torch.int32)
-    max_length = int(cu_seqlens.diff().max())
+    valid_indices = torch.nonzero(attention_mask.flatten() != 0, as_tuple=False).flatten()
+    if valid_indices.numel() != int(cu_seqlens[-1]):
+        raise ValueError("LF collation must preserve the original valid tokens.")
 
     selected = valid_indices
     if num_dummy_tokens:
@@ -312,26 +335,20 @@ def _normalize_packed_features(
         dummy_indices = torch.arange(dummy_start, dummy_start + num_dummy_tokens)
         selected = torch.cat([selected, dummy_indices])
 
-    position_ids = batch["position_ids"]
-    if position_ids.dim() == 2 and position_ids.size(1) < seq_len:
-        # LF does not extend text position_ids for collator or dummy padding.
-        missing = seq_len - position_ids.size(1)
-        padding = (0, missing) if padding_side == "right" else (missing, 0)
-        if padding_side == "right":
-            missing_mask = valid[:, -missing:]
-        else:
-            missing_mask = valid[:, :missing]
-        if torch.any(missing_mask):
-            raise ValueError("LF position_ids are missing valid token positions.")
-        position_ids = F.pad(position_ids, padding)
-    if position_ids.dim() not in (2, 3) or position_ids.shape[-2:] != (batch_size, seq_len):
-        raise ValueError("LF position_ids must align with the collated token rows.")
-    if position_ids.dim() == 3:
+    if position_ids is None:
+        # Text positions would be wrong for media tokens, so multimodal batches
+        # must bring the collator's RoPE coordinates.
+        if batch.get("mm_token_type_ids") is None:
+            positions = torch.cat([
+                torch.arange(length) for length in cu_seqlens.diff().tolist()
+            ])
+            batch["position_ids"] = F.pad(positions, (0, num_dummy_tokens)).unsqueeze(0)
+    elif position_ids.dim() == 3:
         batch["position_ids"] = position_ids.flatten(1).index_select(1, selected).unsqueeze(1)
     else:
         batch["position_ids"] = position_ids.flatten().index_select(0, selected).unsqueeze(0)
 
-    for key in ("input_ids", "labels", "token_type_ids", "mm_token_type_ids", "cross_attention_mask"):
+    for key in ("input_ids", "labels", "mm_token_type_ids", "cross_attention_mask"):
         value = batch.get(key)
         if value is not None:
             if value.shape[:2] != (batch_size, seq_len):
@@ -339,10 +356,9 @@ def _normalize_packed_features(
             batch[key] = value.flatten(0, 1).index_select(0, selected).unsqueeze(0)
 
     if "labels" in batch:
-        # Shifted loss originally omitted each batch row's first token.
-        row_lengths = valid.sum(dim=1)
-        row_starts = row_lengths.cumsum(0) - row_lengths
-        batch["labels"][0, row_starts[row_lengths != 0]] = -100
+        # Trainer counts supervision before the backend shifts labels. Sample
+        # starts have no preceding prediction within their attention segment.
+        batch["labels"][0, cu_seqlens[:-1]] = -100
 
     batch["cu_seq_lens_q"] = cu_seqlens
     batch["cu_seq_lens_k"] = cu_seqlens
@@ -351,10 +367,49 @@ def _normalize_packed_features(
     assert_packed_inputs(batch)
 
 
-class PackedFA2CollatorPatch(BasePatch):
-    """Normalize LF neat-packed FA2 batches to one row with cu/max metadata."""
+def _collate_training_features(
+    collator: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    features: list[dict[str, Any]],
+    *,
+    padding_side: str,
+) -> dict[str, Any]:
+    """Normalize native LF collation, retaining injected dummy media tokens."""
+    import torch
+    from torch.nn.utils.rnn import pad_sequence
 
-    name = "packed_fa2_collator"
+    from ...engine.utils import get_packed_boundaries
+
+    # LF can overwrite packed text positions when computing mRoPE. Capture
+    # sample boundaries before collation; model-specific coordinates stay intact.
+    attention_masks = []
+    text_positions = []
+    for feature in features:
+        num_tokens = len(feature["input_ids"])
+        # Pretraining features may contain only input_ids.
+        attention_masks.append(torch.as_tensor(feature.get("attention_mask", [1] * num_tokens)))
+        text_positions.append(torch.as_tensor(feature.get("position_ids", range(num_tokens))))
+    _, cu_seqlens, max_length = get_packed_boundaries(
+        pad_sequence(attention_masks, batch_first=True),
+        pad_sequence(text_positions, batch_first=True),
+    )
+    original_first_length = len(features[0]["input_ids"])
+    batch = collator(features)
+    batch.pop("has_dummy_image", None)
+    _normalize_training_features(
+        batch,
+        cu_seqlens=cu_seqlens,
+        max_length=max_length,
+        num_dummy_tokens=len(features[0]["input_ids"]) - original_first_length,
+        original_first_length=original_first_length,
+        padding_side=padding_side,
+    )
+    return batch
+
+
+class PackedInputCollatorPatch(BasePatch):
+    """Normalize LF training batches to one row with cu/max metadata."""
+
+    name = "packed_input_collator"
     supported_versions = _LF_V0
 
     def __init__(self) -> None:
@@ -371,35 +426,20 @@ class PackedFA2CollatorPatch(BasePatch):
 
         self._cls = SFTDataCollatorWith4DAttentionMask
         self._original_call = SFTDataCollatorWith4DAttentionMask.__call__
-        original_call = self._original_call
 
-        def _call_with_packed_sequences(collator_self, features):
-            if not (
-                collator_self.neat_packing
-                and collator_self.attn_implementation == "flash_attention_2"
-            ):
-                return original_call(collator_self, features)
-
-            # LF also uses this collator for unpacked generation prompts.
-            is_packed = any(feature.get("packing_params") is not None for feature in features)
-            original_first_length = len(features[0]["input_ids"])
-            batch = MultiModalDataCollatorForSeq2Seq.__call__(collator_self, features)
-            batch.pop("has_dummy_image", None)
-            if is_packed:
-                first_length = len(features[0]["input_ids"])
-                _normalize_packed_features(
-                    batch,
-                    num_dummy_tokens=first_length - original_first_length,
-                    original_first_length=original_first_length,
-                    padding_side=collator_self.tokenizer.padding_side,
-                )
+        def _call_with_packed_inputs(collator_self, features):
+            batch = _collate_training_features(
+                partial(MultiModalDataCollatorForSeq2Seq.__call__, collator_self),
+                features,
+                padding_side=collator_self.tokenizer.padding_side,
+            )
             for key, value in batch.items():
                 if torch.is_tensor(value) and torch.is_floating_point(value):
                     batch[key] = value.to(collator_self.compute_dtype)
             return batch
 
-        SFTDataCollatorWith4DAttentionMask.__call__ = _call_with_packed_sequences
-        logger.info_rank0("PackedFA2CollatorPatch applied")
+        SFTDataCollatorWith4DAttentionMask.__call__ = _call_with_packed_inputs
+        logger.info_rank0("PackedInputCollatorPatch applied")
 
     def revert(self) -> None:
         if self._cls and self._original_call:

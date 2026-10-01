@@ -34,6 +34,30 @@ def test_init_context_retains_mtp_when_enabled():
     assert model_config.num_nextn_predict_layers == 2
 
 
+def test_init_context_forces_flash_attention_2():
+    model_config = SimpleNamespace(dtype=torch.bfloat16)
+    engine_config = EngineConfig()
+
+    with TurboModel.init_context(model_config, engine_config):
+        assert model_config._attn_implementation == "flash_attention_2"
+
+
+def test_vlm_init_context_propagates_flash_attention_2_to_subconfigs():
+    from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+    )
+
+    model_config = Qwen3_5MoeConfig()
+    model_config._attn_implementation = "sdpa"
+    model_config.text_config._attn_implementation = "sdpa"
+    model_config.vision_config._attn_implementation = "sdpa"
+
+    with TurboVLMModel.init_context(model_config, EngineConfig()):
+        assert model_config._attn_implementation == "flash_attention_2"
+        assert model_config.text_config._attn_implementation == "flash_attention_2"
+        assert model_config.vision_config._attn_implementation == "flash_attention_2"
+
+
 def test_vlm_init_context_forwards_engine_config_and_restores_nested_dtype():
     model_config = SimpleNamespace(
         dtype=torch.bfloat16,

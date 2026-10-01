@@ -1,5 +1,6 @@
 import math
 from functools import wraps
+from types import MethodType
 from typing import Optional
 
 import torch
@@ -7,9 +8,11 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from torchturbo.models.modules.attention.ulysses import all_gather_sp_with_grad_reduce
+from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 from . import packing_utils as pu
 from torchturbo.models.modules.moe.moe_layer import MoELayer
+from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.runtime import is_npu_available
 
 from ..base import TurboModel
@@ -160,12 +163,36 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 attn.hadamard_mat = None
 
     def on_parallelized(self, parallel_context):
+        from . import modeling_deepseek_v4 as dsv4
+
         sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
         assert sp_size >= 1, "must be"
 
+        def indexer_loss_forward(
+            self,
+            selected_main_attn_dist: torch.Tensor,
+            index_score: torch.Tensor,
+            topk_indices: torch.Tensor,
+        ) -> torch.Tensor:
+            loss = dsv4.DSAIndexerLoss.forward(
+                self, selected_main_attn_dist, index_score, topk_indices
+            )
+            if sp_size > 1:
+                local_count = (topk_indices >= 0).any(dim=-1).sum()
+                global_count = local_count.clone()
+                torch.distributed.all_reduce(global_count, group=sp_group)
+                # Undo the local mean and account for FSDP gradient averaging.
+                loss = loss * local_count.clamp_min(1) * sp_size
+                loss = loss / global_count.clamp_min(1)
+            return loss
+
+        for layer in self.layers:
+            if layer.cal_index_loss is not None:
+                loss_fn = layer.cal_index_loss.li_loss.compute_dsa_indexer_loss
+                loss_fn.forward = MethodType(indexer_loss_forward, loss_fn)
         self.patch_deepseek_v4_attention_for_sp(sp_group, sp_size, sp_rank)
 
     @classmethod
@@ -184,7 +211,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             offset: int,
             attn_sink: torch.Tensor,
             q_global_positions: torch.LongTensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
         ):
             compress_topk_idxs = None
             index_score = None
@@ -203,7 +230,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                     seqlen,
                     offset,
                     q_global_positions=q_global_positions,
-                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
                 )
 
             o = self.sparse_attn(
@@ -211,7 +238,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 kv,
                 attn_sink,
                 q_global_positions=q_global_positions,
-                attention_mask=attention_mask,
+                segment_ids=segment_ids,
                 kv_compress=kv_compress,
                 compress_topk_idxs=compress_topk_idxs,
             )
@@ -221,7 +248,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             self,
             x: torch.Tensor,
             freqs_cis: torch.Tensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
             position_ids: torch.LongTensor = None,
         ):
             ratio, overlap = self.compress_ratio, self.overlap
@@ -238,7 +265,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 kv,
                 score,
                 self.ape,
-                attention_mask[:, : kv.size(1)],
+                segment_ids[:, : kv.size(1)],
                 position_ids[:, : kv.size(1)],
                 ratio,
                 self.head_dim,
@@ -263,7 +290,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             hadamard_mat: torch.Tensor,
             offset: int,
             position_ids: torch.LongTensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
         ):
             bsz, seqlen, _ = x.size()
             rd = self.rope_head_dim
@@ -276,7 +303,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             q = torch.cat([q_nope, q_rope], dim=-1)
             q = dsv4.rotate_activation(q, hadamard_mat)
 
-            k = self.compressor(x, freqs_cis, attention_mask, position_ids)
+            k = self.compressor(x, freqs_cis, segment_ids, position_ids)
             if k is None:
                 return None, None, None
             k = dsv4.rotate_activation(k, hadamard_mat)
@@ -291,7 +318,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             bsz: int,
             seqlen: int,
             device,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
         ):
             base = torch.arange(
                 seqlen * sp_rank, seqlen * (sp_rank + 1), device=device
@@ -304,10 +331,10 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             window_topk = window_topk.unsqueeze(0).expand(bsz, -1, -1)
             window_token_indices = window_topk.clamp_min(0).reshape(bsz, -1)
             batch_index = torch.arange(bsz, device=device).unsqueeze(1)
-            window_ids = attention_mask[batch_index, window_token_indices].view_as(
+            window_ids = segment_ids[batch_index, window_token_indices].view_as(
                 window_topk
             )
-            query_ids = attention_mask[
+            query_ids = segment_ids[
                 :, sp_rank * seqlen : (sp_rank + 1) * seqlen
             ].unsqueeze(-1)
             mask = (window_ids == query_ids) & (query_ids > 0)
@@ -318,28 +345,24 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             x: torch.Tensor,
             offset: int,
             q_global_positions: torch.LongTensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
         ):
             seqlen = x.shape[1]
-            local_attention_mask = attention_mask[
+            local_segment_ids = segment_ids[
                 :, sp_rank * seqlen : (sp_rank + 1) * seqlen
             ]
-            position_ids = (
-                all_gather_sp_with_grad_reduce(
-                    q_global_positions, dim=1, sp_group=sp_group, sp_size=sp_size
-                )
-                if sp_size > 1
-                else q_global_positions
-            )
+            global_positions = torch.arange(
+                segment_ids.size(1), device=segment_ids.device
+            ).unsqueeze(0).expand_as(segment_ids)
             compress_kv_ids, compress_block_pos = (
                 pu.packed_compress_kv_ids_and_positions(
-                    attention_mask,
+                    segment_ids,
                     self.ratio,
-                    position_ids,
+                    global_positions,
                 )
             )
             mask = pu.packed_compress_mask(
-                local_attention_mask,
+                local_segment_ids,
                 compress_kv_ids.unsqueeze(1),
                 compress_block_pos.unsqueeze(1),
                 self.ratio,
@@ -347,7 +370,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             )
             matrix = torch.arange(compress_kv_ids.size(1), device=x.device)
             matrix = matrix.view(1, 1, -1).expand(
-                local_attention_mask.size(0), seqlen, -1
+                local_segment_ids.size(0), seqlen, -1
             )
             return torch.where(mask, -1, matrix + offset)
 
@@ -359,27 +382,23 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             seqlen: int,
             offset: int,
             q_global_positions: torch.LongTensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
         ):
             index_score = torch.einsum("bshd,btd->bsht", q_indexer, k_indexer)
             index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
             T_kv = k_indexer.shape[1]
-            local_attention_mask = attention_mask[
+            local_segment_ids = segment_ids[
                 :, sp_rank * seqlen : (sp_rank + 1) * seqlen
             ]
-            position_ids = (
-                all_gather_sp_with_grad_reduce(
-                    q_global_positions, dim=1, sp_group=sp_group, sp_size=sp_size
-                )
-                if sp_size > 1
-                else q_global_positions
-            )
+            global_positions = torch.arange(
+                segment_ids.size(1), device=segment_ids.device
+            ).unsqueeze(0).expand_as(segment_ids)
             compress_kv_ids, compress_block_pos = (
                 pu.packed_compress_kv_ids_and_positions(
-                    attention_mask,
+                    segment_ids,
                     self.ratio,
-                    position_ids,
+                    global_positions,
                 )
             )
             if compress_kv_ids.size(1) * sp_size == T_kv:
@@ -388,7 +407,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                     sp_size, dim=1
                 )
             mask = pu.packed_compress_mask(
-                local_attention_mask,
+                local_segment_ids,
                 compress_kv_ids.unsqueeze(1),
                 compress_block_pos.unsqueeze(1),
                 self.ratio,
@@ -401,14 +420,14 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             index_score, topk_idxs = index_score.topk(
                 min(self.index_topk, T_kv), dim=-1
             )
-            flat_topk = topk_idxs.reshape(local_attention_mask.size(0), -1)
+            flat_topk = topk_idxs.reshape(local_segment_ids.size(0), -1)
             batch_index = torch.arange(
-                attention_mask.size(0), device=attention_mask.device
+                segment_ids.size(0), device=segment_ids.device
             ).unsqueeze(1)
             topk_ids = compress_kv_ids[batch_index, flat_topk].view_as(topk_idxs)
             topk_pos = compress_block_pos[batch_index, flat_topk].view_as(topk_idxs)
             mask = pu.packed_compress_mask(
-                local_attention_mask,
+                local_segment_ids,
                 topk_ids,
                 topk_pos,
                 self.ratio,
@@ -430,7 +449,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             compressor,
             indexer,
             position_ids: torch.LongTensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
         ):
             rd = self.rope_head_dim
 
@@ -462,12 +481,12 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                     hadamard_mat,
                     offset,
                     position_ids,
-                    attention_mask,
+                    segment_ids,
                 )
 
             kv_compress = None
             if self.compress_ratio > 1 and compressor is not None:
-                kv_compress = compressor(x, freqs_cis, attention_mask, position_ids)
+                kv_compress = compressor(x, freqs_cis, segment_ids, position_ids)
 
             return q, kv, kv_compress, q_indexer, k_indexer, weights, offset
 
@@ -503,7 +522,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             kv_states: torch.Tensor,
             attn_sink: torch.Tensor,
             q_global_positions: torch.LongTensor,
-            attention_mask: torch.Tensor,
+            segment_ids: torch.Tensor,
             kv_compress: Optional[torch.Tensor] = None,
             compress_topk_idxs: Optional[torch.Tensor] = None,
         ):
@@ -514,7 +533,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 bsz,
                 seqlen,
                 query_states.device,
-                attention_mask=attention_mask,
+                segment_ids=segment_ids,
             )
 
             if self.compress_ratio > 1 and kv_compress is not None:
@@ -524,7 +543,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                         query_states,
                         offset,
                         q_global_positions=q_global_positions,
-                        attention_mask=attention_mask,
+                        segment_ids=segment_ids,
                     )
                 topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
 
@@ -571,10 +590,20 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             past_key_value=None,
             use_cache: bool = False,
             output_attentions: bool = False,
+            cu_seq_lens: torch.Tensor = None,
         ):
             bsz, seqlen, _ = hidden_states.size()
-            if attention_mask is None:
-                attention_mask = torch.ones(
+            # Segment ids drive every packed operator (compression blocks,
+            # window/compress top-k, sparse attention). Packed batches carry
+            # global cu boundaries; attention_mask is never set (the engine
+            # rejects it and DPO passes None), so batches without cu are
+            # treated as one causal sequence per row.
+            if cu_seq_lens is not None:
+                segment_ids = cu_seqlens_to_segment_ids(
+                    cu_seq_lens, seqlen * sp_size
+                ).to(hidden_states.device)
+            else:
+                segment_ids = torch.ones(
                     (bsz, seqlen * sp_size),
                     dtype=torch.long,
                     device=hidden_states.device,
@@ -588,11 +617,17 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             q, kv, kv_compress, q_indexer, k_indexer, weights, offset = self.pre_attention_ops(
                 hidden_states, freqs_cis, hadamard_mat,
                 self.wq_a, self.q_norm, self.wq_b, self.wkv, self.kv_norm,
-                compressor, indexer, position_ids, attention_mask,
+                compressor, indexer, position_ids, segment_ids,
             )
 
             n_local_groups = self.n_groups // (self.n_heads // q.shape[2])
 
+            # Causal order follows physical token offsets, not RoPE coordinates.
+            q_global_positions = torch.arange(
+                sp_rank * seqlen,
+                (sp_rank + 1) * seqlen,
+                device=hidden_states.device,
+            ).unsqueeze(0).expand(bsz, -1)
             o, compress_topk_idxs, index_score = self.inner_attention_ops(
                 q,
                 kv,
@@ -603,9 +638,32 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 seqlen,
                 offset,
                 self.attn_sink,
-                q_global_positions=position_ids,
-                attention_mask=attention_mask,
+                q_global_positions=q_global_positions,
+                segment_ids=segment_ids,
             )
+
+            compressed_attention_mask = None
+            if (
+                self.training
+                and self.config.dsa_indexer_loss_coeff > 0
+                and compress_topk_idxs is not None
+            ):
+                global_positions = torch.arange(
+                    segment_ids.size(1), device=hidden_states.device
+                ).unsqueeze(0).expand_as(segment_ids)
+                block_ids, block_positions = pu.packed_compress_kv_ids_and_positions(
+                    segment_ids, self.compress_ratio, global_positions
+                )
+                local_segment_ids = segment_ids[
+                    :, sp_rank * seqlen : (sp_rank + 1) * seqlen
+                ]
+                compressed_attention_mask = pu.packed_compress_mask(
+                    local_segment_ids,
+                    block_ids.unsqueeze(1),
+                    block_positions.unsqueeze(1),
+                    self.compress_ratio,
+                    q_global_positions,
+                )
 
             attn_output = self.post_attention_ops(
                 o,
@@ -631,7 +689,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 offset,
                 q,
                 kv_compress,
-                attention_mask,
+                compressed_attention_mask,
                 index_score,
                 q_indexer,
                 k_indexer,
@@ -648,6 +706,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
         dsv4.PostAttentionOps.forward = post_attention_forward
         dsv4.SparseAttention.forward = sparse_attention_forward
         dsv4.DeepseekV4Attention.forward = attention_forward
+        dsv4.DSAIndexerLossAutoScaler = MoEAuxLossAutoScaler
         if is_npu_available():
             from .npu import patch_deepseek_v4_npu_sfa_li
 

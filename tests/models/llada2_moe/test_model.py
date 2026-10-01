@@ -9,6 +9,8 @@ from torch import nn
 import torchturbo.models.llada2_moe.model as model_module
 import torchturbo.models.llada2_moe.modeling_llada2_moe as modeling_module
 import torchturbo.models.llada2_moe.parallel_plan as parallel_plan_module
+from torchturbo.engine.config import EngineConfig
+from torchturbo.models.llada2_moe.configuration_llada2_moe import LLaDA2MoeConfig
 from torchturbo.models.llada2_moe.generate import _load_torchturbo_runtime
 from torchturbo.models.llada2_moe.model import TurboLLaDA2MoeForCausalLM
 from torchturbo.models.llada2_moe.modeling_llada2_moe import LLaDA2MoeRMSNorm
@@ -43,6 +45,34 @@ class _MaterializedModel(nn.Module):
 
 def test_llada2_model_is_registered():
     assert get_model("llada2_moe") is TurboLLaDA2MoeForCausalLM
+
+
+def test_llada2_builds_with_sdpa_inside_init_context():
+    config = LLaDA2MoeConfig(
+        vocab_size=16,
+        pad_token_id=0,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=16,
+        first_k_dense_replace=1,
+        partial_rotary_factor=1.0,
+        attn_implementation="sdpa",
+    )
+
+    original_forward = LLaDA2MoeRMSNorm.forward
+    try:
+        with TurboLLaDA2MoeForCausalLM.init_context(config, EngineConfig()):
+            with torch.device("meta"):
+                model = TurboLLaDA2MoeForCausalLM._from_config(config)
+
+        assert model.config._attn_implementation == "sdpa"
+        assert model.model._use_sdpa is True
+        assert all(parameter.is_meta for parameter in model.parameters())
+    finally:
+        LLaDA2MoeRMSNorm.forward = original_forward
 
 
 def test_llada2_rms_norm_patch_uses_ops_dispatcher(monkeypatch):

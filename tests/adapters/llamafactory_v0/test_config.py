@@ -19,6 +19,32 @@ def _reset_cli(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pytest"])
 
 
+def _training_args(**options):
+    defaults = dict(
+        do_eval=False,
+        do_predict=False,
+        predict_with_generate=False,
+        eval_strategy="no",
+        eval_on_start=False,
+    )
+    defaults.update(options)
+    return types.SimpleNamespace(**defaults)
+
+
+@pytest.mark.parametrize("option,value", [
+    ("do_eval", True),
+    ("do_predict", True),
+    ("predict_with_generate", True),
+    ("eval_strategy", "steps"),
+    ("eval_on_start", True),
+])
+def test_build_config_rejects_evaluation_and_generation(option, value):
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+
+    with pytest.raises(NotImplementedError, match="does not support evaluation or generation"):
+        build_config_from_lf_args(training_args=_training_args(**{option: value}))
+
+
 def test_build_config_cli_prefetch_takes_effect():
     """--tt_prefetch_strategy / --tt_prefetch_direction must reach backend_config."""
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
@@ -28,8 +54,13 @@ def test_build_config_cli_prefetch_takes_effect():
         FSDPPrefetchStrategy,
     )
 
-    training_args = types.SimpleNamespace(
-        fsdp=[], fsdp_config={}, gradient_checkpointing=True
+    training_args = _training_args(
+        fsdp=[],
+        fsdp_config={
+            "prefetch_strategy": "expert_lookahead",
+            "prefetch_direction": "forward_backward",
+        },
+        gradient_checkpointing=True,
     )
     tt = TorchTurboArgs(
         prefetch_strategy="expert_with_layer", prefetch_direction="forward"
@@ -45,7 +76,7 @@ def test_build_config_maps_freeze_args_to_engine_policy():
     from torchturbo.engine.args import TorchTurboArgs
     from torchturbo.engine.config import ParameterGroup
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=True
     )
     tt = TorchTurboArgs(
@@ -65,7 +96,7 @@ def test_build_config_maps_mtp_args_to_engine_config():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=True
     )
     tt = TorchTurboArgs(
@@ -86,7 +117,7 @@ def test_build_config_maps_op_policy_to_engine_config():
     from torchturbo.engine.args import TorchTurboArgs
     from torchturbo.ops.base import OpPolicy
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=True
     )
     tt = TorchTurboArgs(op_policy="native")
@@ -100,7 +131,7 @@ def test_build_config_maps_op_policy_to_engine_config():
 def test_build_config_rejects_unsupported_mixed_precision(policy):
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
 
-    training_args = types.SimpleNamespace(**{policy: True})
+    training_args = _training_args(**{policy: True})
 
     with pytest.raises(
         ValueError, match=f"does not support mixed_precision='{policy}'"
@@ -114,7 +145,7 @@ def test_build_config_mixed_precision_override_wins(policy):
     from torchturbo.engine.args import TorchTurboArgs
     from torchturbo.engine.config import MixedPrecisionPolicy
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[],
         fsdp_config={},
         gradient_checkpointing=True,
@@ -133,7 +164,7 @@ def test_lf_optimizer_hyperparameters_do_not_configure_muon():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[],
         fsdp_config={},
         gradient_checkpointing=True,
@@ -170,7 +201,7 @@ def test_muon_config_comes_from_torchturbo_yaml(tmp_path):
 """,
         encoding="utf-8",
     )
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[],
         fsdp_config={},
         gradient_checkpointing=True,
@@ -196,24 +227,31 @@ def test_build_config_cli_prefetch_ignores_lf_yaml_prefetch():
     """TorchTurbo prefetch config does not read LF fsdp_config prefetch fields."""
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
-    from torchturbo.engine.backends.fsdp2.config import FSDPPrefetchStrategy
+    from torchturbo.engine.backends.fsdp2.config import (
+        FSDPPrefetchDirection,
+        FSDPPrefetchStrategy,
+    )
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[],
-        fsdp_config={"prefetch_strategy": "expert_lookahead"},
+        fsdp_config={
+            "prefetch_strategy": "expert_lookahead",
+            "prefetch_direction": "forward",
+        },
         gradient_checkpointing=True,
     )
     tt = TorchTurboArgs()  # defaults: auto / forward_backward
     cfg, _ = build_config_from_lf_args(training_args=training_args, torchturbo_args=tt)
 
     assert cfg.backend_config.prefetch_strategy == FSDPPrefetchStrategy.AUTO
+    assert cfg.backend_config.prefetch_direction == FSDPPrefetchDirection.FORWARD_BACKWARD
 
 
 def test_build_config_maps_lf_fsdp_without_offload_to_disabled_cpu_offload():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=["full_shard"], fsdp_config={}, gradient_checkpointing=True
     )
 
@@ -228,7 +266,7 @@ def test_build_config_maps_lf_fsdp_offload_to_enabled_cpu_offload():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=["full_shard", "offload"], fsdp_config={}, gradient_checkpointing=True
     )
 
@@ -245,7 +283,7 @@ def test_build_config_cpu_offload_cannot_disable_lf_offload():
     from torchturbo.engine.args import TorchTurboArgs
     from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=["full_shard", "offload"], fsdp_config={}, gradient_checkpointing=True
     )
     with pytest.raises(ValueError, match="must use mode='full'"):
@@ -282,7 +320,7 @@ def test_build_config_cpu_offload_overrides_lf():
     from torchturbo.engine.args import TorchTurboArgs
     from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=["full_shard"], fsdp_config={}, gradient_checkpointing=True
     )
 
@@ -309,7 +347,7 @@ def test_lf_gradient_checkpointing_is_taken_over_by_engine():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=True
     )
     model_args = types.SimpleNamespace(
@@ -332,7 +370,7 @@ def test_lf_gradient_checkpointing_uses_lf_value_when_tt_arg_is_default():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=False
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=True)
@@ -350,7 +388,7 @@ def test_lf_disable_gradient_checkpointing_does_not_enable_engine_ac():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=False
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=False)
@@ -372,7 +410,7 @@ def test_lf_gradient_checkpointing_torchturbo_cli_mismatch_raises(
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=adapter_gc
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=True)
@@ -400,7 +438,7 @@ def test_lf_gradient_checkpointing_torchturbo_cli_match_takes_effect(
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=adapter_gc
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=True)
@@ -424,7 +462,7 @@ def test_lf_gradient_checkpointing_env_mismatch_raises(monkeypatch):
     from torchturbo.engine.args import TorchTurboArgs
 
     monkeypatch.setenv("TORCH_TURBO_GRADIENT_CHECKPOINTING", "false")
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=True
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=True)
@@ -445,7 +483,7 @@ def test_lf_gradient_checkpointing_env_match_takes_effect(monkeypatch):
     from torchturbo.engine.args import TorchTurboArgs
 
     monkeypatch.setenv("TORCH_TURBO_GRADIENT_CHECKPOINTING", "false")
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=False
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=True)
@@ -463,7 +501,7 @@ def test_lf_gradient_checkpointing_raw_args_are_disabled():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs
 
-    training_args = types.SimpleNamespace(
+    training_args = _training_args(
         fsdp=[], fsdp_config={}, gradient_checkpointing=False
     )
     model_args = types.SimpleNamespace(disable_gradient_checkpointing=True)

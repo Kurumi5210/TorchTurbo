@@ -97,6 +97,7 @@ class _ContractModel(TurboModel, nn.Module):
         use_cache,
         return_dict=None,
         logits_to_keep=None,
+        **kwargs,
     ):
         self.forward_calls.append((return_dict, logits_to_keep))
         hidden = self.hidden.expand(input_ids.shape[0], -1, -1)
@@ -156,7 +157,7 @@ def test_chunked_loss_bypass_preserves_lm_head_registration():
     outputs, hidden_states = backend._forward_for_lm_loss(
         model,
         {
-            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "input_ids": torch.ones(2, 4, dtype=torch.long),
             "position_ids": torch.arange(4).unsqueeze(0),
             "use_cache": False,
         },
@@ -165,10 +166,23 @@ def test_chunked_loss_bypass_preserves_lm_head_registration():
 
     assert outputs.logits is None
     assert len(hidden_states) == 1
-    assert hidden_states[0] is model.hidden
+    torch.testing.assert_close(hidden_states[0], model.hidden.expand(2, -1, -1))
+    assert real_lm_head.calls == 0
     assert "lm_head" not in vars(model)
     assert model._modules["lm_head"] is real_lm_head
     assert model.lm_head is real_lm_head
+
+    reference_hidden = model.hidden.detach().clone().requires_grad_()
+    reference_weight = real_lm_head.weight.detach().clone().requires_grad_()
+    reference_logits = F.linear(reference_hidden.expand(2, -1, -1), reference_weight)
+    reference_grads = torch.autograd.grad(
+        reference_logits.square().sum(), (reference_hidden, reference_weight)
+    )
+    logits = model.lm_head(hidden_states[0])
+    torch.testing.assert_close(logits, reference_logits)
+    logits.square().sum().backward()
+    torch.testing.assert_close(model.hidden.grad, reference_grads[0])
+    torch.testing.assert_close(real_lm_head.weight.grad, reference_grads[1])
 
 
 def test_chunked_loss_noops_nested_lm_head():
@@ -313,6 +327,108 @@ def test_zero_mtp_scale_keeps_diagnostics_but_excludes_mtp_from_total():
     assert len(outputs.mtp_loss) == 1
     assert outputs.mtp_loss_scaled.item() == 0.0
     assert torch.allclose(total, outputs.main_loss)
+
+
+@pytest.mark.parametrize("adapter", ["lf", "swift"])
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("num_items", [None, 6, torch.tensor(6)])
+def test_flattened_mtp_loss_matches_independent_rows(
+    monkeypatch, adapter, chunked, num_items
+):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 1)
+    input_ids = torch.tensor([[1, 2, 3, 4], [2, 4, 5, 6]])
+    inputs = {
+        "input_ids": input_ids.clone(),
+        "labels": input_ids.clone(),
+        "attention_mask": torch.ones_like(input_ids),
+    }
+    if adapter == "lf":
+        from torchturbo.adapters.llamafactory_v0.patches import _normalize_training_features
+
+        _normalize_training_features(
+            inputs,
+            cu_seqlens=torch.tensor([0, 4, 8], dtype=torch.int32),
+            max_length=4,
+            num_dummy_tokens=0,
+            original_first_length=4,
+            padding_side="right",
+        )
+    else:
+        from torchturbo.adapters.msswift.inputs_bridging import bridge_swift_inputs
+
+        inputs = bridge_swift_inputs(inputs)
+
+    # Keep physical padding so its hidden-state gradients must also stay zero.
+    for key, value in (("input_ids", 0), ("labels", -100), ("position_ids", 0)):
+        inputs[key] = F.pad(inputs[key], (0, 2), value=value)
+    model = _ContractModel(mtp=True)
+    model.hidden = nn.Parameter(torch.randn(1, 10, 3))
+    reference_hidden = model.hidden.detach().clone().requires_grad_()
+    reference_weight = model.lm_head.weight.detach().clone().requires_grad_()
+    row_hidden = reference_hidden[:, :8].reshape(2, 4, 3)
+
+    reference_losses = []
+    for shift, scale in ((1, 1.0), (2, 0.5)):
+        row_labels = F.pad(input_ids, (0, shift), value=-100)[:, shift:]
+        normalizer = num_items if num_items is not None else (row_labels != -100).sum()
+        reference_losses.append(
+            F.cross_entropy(
+                F.linear(row_hidden * scale, reference_weight).flatten(0, 1),
+                row_labels.flatten(),
+                reduction="sum",
+            ) / normalizer
+        )
+    reference_total = reference_losses[0] + 0.2 * reference_losses[1]
+    reference_grads = torch.autograd.grad(
+        reference_total, (reference_hidden, reference_weight)
+    )
+
+    total, outputs = _backend(enabled=chunked, mtp=True).compute_loss(
+        model, inputs, return_outputs=True, num_items_in_batch=num_items
+    )
+    total.backward()
+
+    torch.testing.assert_close(total, reference_total)
+    torch.testing.assert_close(outputs.main_loss, reference_losses[0])
+    torch.testing.assert_close(outputs.mtp_loss[0], reference_losses[1])
+    torch.testing.assert_close(model.hidden.grad, reference_grads[0])
+    torch.testing.assert_close(model.lm_head.weight.grad, reference_grads[1])
+
+
+@pytest.mark.parametrize("sp_size", [1, 2, 3])
+def test_packed_mtp_targets_respect_short_sequences_and_sp_shards(monkeypatch, sp_size):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: sp_size)
+    rows = [torch.tensor([10, 11, 12]), torch.tensor([20]), torch.tensor([30, 31, -100, 33, 34])]
+    # Non-ignored tail labels exercise masking from cu, independently of the adapter.
+    labels = torch.cat([*rows, torch.tensor([90, 91, 92])]).unsqueeze(0)
+    original_labels = labels.clone()
+    cu = torch.tensor([0, 3, 4, 9], dtype=torch.int32)
+    predictions = [torch.empty(1, 12 // sp_size, 1) for _ in range(6)]
+
+    for rank in range(sp_size):
+        shifted_labels, normalizers = FSDP2Backend._prepare_loss_labels(
+            predictions,
+            labels,
+            sp_size=sp_size,
+            sp_group=None,
+            sp_rank=rank,
+            num_items_in_batch=None,
+            cu_seq_lens=cu,
+        )
+        for shift, (actual, normalizer) in enumerate(zip(shifted_labels, normalizers), 1):
+            expected = torch.full_like(labels, -100)
+            offset = 0
+            for row in rows:
+                if shift < row.numel():
+                    expected[0, offset : offset + row.numel() - shift] = row[shift:]
+                offset += row.numel()
+            expected_normalizer = (expected != -100).sum().clamp(min=1) * sp_size
+            expected_shard = expected.chunk(sp_size, dim=1)[rank]
+
+            torch.testing.assert_close(actual, expected_shard)
+            torch.testing.assert_close(normalizer, expected_normalizer)
+
+    torch.testing.assert_close(labels, original_labels)
 
 
 def test_chunk_loss_lm_head_detached_fallback_receives_positional_input(monkeypatch):

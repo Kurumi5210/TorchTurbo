@@ -1,7 +1,7 @@
 """Unit tests for ``build_config_from_swift_args`` and LoRA config mapping.
 
-Mirrors ``tests/adapters/llamafactory_v0/test_config.py``: pure-function tests
-on a lightweight args namespace, no swift import, no model build.
+Most cases use a lightweight args namespace without Swift or model loading.
+Optional native cases verify Swift's derived evaluation settings.
 
 turbo ``--tt_*`` flags now live on the shared ``TorchTurboArgs``
 (``set_torchturbo_args`` stashes them); swift-native fields (bf16/fp16, model
@@ -74,6 +74,13 @@ def _base_args(**overrides):
         output_dir="/tmp/out",
         tuner_type="full",
         rlhf_type=None,
+        training_args=SimpleNamespace(
+            do_eval=False,
+            do_predict=False,
+            predict_with_generate=False,
+            eval_strategy="no",
+            eval_on_start=False,
+        ),
         # lora fields (unused for full)
         lora_rank=8,
         lora_alpha=16,
@@ -89,6 +96,57 @@ def _base_args(**overrides):
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("do_eval", True),
+        ("do_predict", True),
+        ("predict_with_generate", True),
+        ("eval_strategy", "steps"),
+        ("eval_on_start", True),
+    ],
+)
+def test_rejects_eval_and_generation_during_config_build(option, value):
+    args = _base_args()
+    setattr(args.training_args, option, value)
+    tt = _set_tt()
+    with pytest.raises(NotImplementedError, match="does not support evaluation or generation"):
+        build_config_from_swift_args(args)
+    assert tt.model_path is None
+    assert tt.mixed_precision is None
+
+
+@pytest.mark.parametrize("validation_dataset", [False, True])
+def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, validation_dataset):
+    pytest.importorskip("swift", minversion="4.0")
+    from transformers import LlamaConfig
+
+    from torchturbo.adapters.msswift.args import TurboSftArguments
+
+    model_dir = tmp_path / "model"
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"], vocab_size=16, hidden_size=8,
+        intermediate_size=16, num_hidden_layers=1, num_attention_heads=1,
+        num_key_value_heads=1,
+    ).save_pretrained(model_dir)
+    args = TurboSftArguments(
+        model=str(model_dir), model_type="llama", template="llama", dataset=["training-data"],
+        val_dataset=["validation-data"] if validation_dataset else [],
+        output_dir=str(tmp_path / "output"), add_version=False,
+        tuner_type="full", report_to=[], use_cpu=True, check_model=False,
+    )
+    _set_tt()
+    expected_strategy = "steps" if validation_dataset else "no"
+    assert args.training_args.eval_strategy == expected_strategy
+    assert args.training_args.do_eval is validation_dataset
+    if validation_dataset:
+        with pytest.raises(NotImplementedError, match="does not support evaluation or generation"):
+            build_config_from_swift_args(args)
+    else:
+        config = build_config_from_swift_args(args)
+        assert config.checkpoint.hf_model_path == str(model_dir)
 
 
 def test_mixed_precision_from_bf16():

@@ -13,6 +13,8 @@ from torchturbo.models.modules.attention.ulysses import ulysses
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.runtime.cuda import CudaRuntime
 
+from .flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
+
 
 @pytest.fixture(autouse=True)
 def _cpu_ops(monkeypatch):
@@ -154,14 +156,11 @@ def test_binary_mask_with_position_resets_matches_hf_mask_first_dispatch(monkeyp
             outputs.append(output.squeeze(0).transpose(0, 1))
         return torch.cat(outputs)
 
-    def process_kwargs(**kwargs):
-        return {"softmax_scale": kwargs["softmax_scale"], "causal": kwargs["is_causal"]}
-
     monkeypatch.setattr(
         hf_attention, "lazy_import_flash_attention",
         lambda *args, **kwargs: (
-            (None, varlen_attention, hf_attention._pad_input, hf_attention._unpad_input),
-            process_kwargs,
+            lazy_flash_attention_kernels(None, varlen_attention),
+            process_flash_kwargs,
         ),
     )
     expected = hf_attention._flash_attention_forward(
@@ -332,6 +331,35 @@ def test_sp_collects_once_at_global_head_offsets(monkeypatch, local_mask, local_
     assert len(gathered) == int(local_mask) + int(local_positions)
     assert len(forward_collectives) == 3
     assert len(output_collectives) == 1
+
+
+def test_sp_explicit_prefix_lengths_exclude_padding_without_gathering_positions(monkeypatch):
+    query = torch.tensor([1.0, 1.0, 1.0, 100.0]).reshape(1, 4, 1, 1).expand(1, 4, 2, 1)
+    head_shards = iter(tensor[:, :, :1] for tensor in (query, query, query))
+    lengths = torch.tensor([0, 2, 3], dtype=torch.int32)
+    state = QKClipState(torch.full((2,), -torch.inf))
+
+    monkeypatch.setattr(ulysses, "gather_seq_scatter_heads", lambda tensor, **kwargs: next(head_shards))
+    monkeypatch.setattr(
+        ulysses, "gather_heads_scatter_seq",
+        lambda tensor, **kwargs: tensor[:, :2].expand(1, 2, 2, 1),
+    )
+    monkeypatch.setattr(ulysses.dist, "get_rank", lambda group: 0)
+
+    def unexpected_gather(*args, **kwargs):
+        pytest.fail("Explicit global boundaries must not gather local position IDs.")
+
+    monkeypatch.setattr(ulysses.dist, "all_gather", unexpected_gather)
+    output = ulysses.ulysses_flash_attention_forward(
+        query[:, :2], query[:, :2], query[:, :2], None, 2, True,
+        position_ids=torch.tensor([[0, 1]]), cu_seq_lens_q=lengths, cu_seq_lens_k=lengths,
+        max_length_q=2, max_length_k=2, softmax_scale=1.0,
+        sp_group=object(), sp_size=2, qk_clip_state=state,
+    )
+
+    torch.testing.assert_close(output, torch.ones_like(output))
+    torch.testing.assert_close(state.max_logits, torch.tensor([1.0, -torch.inf]))
+    torch.testing.assert_close(lengths, torch.tensor([0, 2, 3], dtype=torch.int32))
 
 
 def test_disabled_path_preserves_flash_attention_arguments(monkeypatch):

@@ -12,6 +12,7 @@ from typing import Any
 
 from ...engine.config import EngineConfig, build_from_args
 from ...engine.args import TorchTurboArgs, get_torchturbo_args
+from ...engine.utils import raise_if_evaluation_enabled
 from ...logging import get_logger
 
 logger = get_logger(__name__)
@@ -26,6 +27,7 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     are read back from it by :func:`build_from_args`. Env-var overrides are
     merged inside ``build_from_args``.
     """
+    raise_if_evaluation_enabled(args.training_args)
     _raise_if_unsupported(args)
 
     tt = get_torchturbo_args()

@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
+import torch
+
 from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
+from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
 
@@ -379,17 +382,15 @@ class OpDispatcher:
         initial_state=None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
         packed_params=None,
         save_backward_intermediates: bool | None = None,
         impl: str | None = None,
-        **kwargs,
     ):
-        # Keep the old keyword working while making packed metadata the public
-        # API shared by the causal-conv and GDN operators.
-        cu_seqlens = kwargs.pop("cu_seqlens", None)
-        if kwargs:
-            unexpected = next(iter(kwargs))
-            raise TypeError(f"unexpected gated_delta_rule argument: {unexpected}")
+        if cu_seqlens is not None:
+            if packed_params is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            packed_params = get_packed_params(cu_seqlens, q.size(1), device=q.device)
         return self._dispatch(
             "gated_delta_rule",
             q,
@@ -400,7 +401,6 @@ class OpDispatcher:
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            cu_seqlens=cu_seqlens,
             packed_params=packed_params,
             save_backward_intermediates=save_backward_intermediates,
             impl=impl,
@@ -415,16 +415,14 @@ class OpDispatcher:
         activation=None,
         initial_state=None,
         output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
         packed_params=None,
         impl: str | None = None,
-        **kwargs,
     ):
-        # Backward-compatible bridge for callers that still provide raw
-        # cu_seqlens; new code should pass the cached PackedParams object.
-        cu_seqlens = kwargs.pop("cu_seqlens", None)
-        if kwargs:
-            unexpected = next(iter(kwargs))
-            raise TypeError(f"unexpected causal_conv1d argument: {unexpected}")
+        if cu_seqlens is not None:
+            if packed_params is not None:
+                raise ValueError("pass either cu_seqlens or packed_params, not both")
+            packed_params = get_packed_params(cu_seqlens, x.size(1), device=x.device)
         return self._dispatch(
             "causal_conv1d",
             x,
@@ -433,7 +431,6 @@ class OpDispatcher:
             activation=activation,
             initial_state=initial_state,
             output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
             packed_params=packed_params,
             impl=impl,
         )

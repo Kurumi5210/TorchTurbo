@@ -1,21 +1,15 @@
 from typing_extensions import override
-from typing import Any
 
 import types
 import torch
 from transformers import AutoModelForCausalLM
 
-from torchturbo.models.modules.attention.ulysses import (
-    ulysses_flash_attention_forward,
-)
-from torchturbo.models.modules.attention.qk_clip import get_qk_clip_state
 from torchturbo.utils.flash_attn_utils import (
     index_first_axis,
     pad_input,
     unpad_input,
-    get_unpad_data_lf,
 )
-from torchturbo.utils.functools import cache
+from torchturbo.ops.packed_params import get_packed_params
 from torchturbo.models.modules.attention.ulysses.ulysses import (
     gather_seq_scatter_heads,
     gather_heads_scatter_seq,
@@ -34,15 +28,6 @@ class BailingV3WeightConverter(BaseWeightConverter):
     def get_hf_gate_bias_name(self):
         return "gate.expert_bias"
 
-
-@cache
-def _get_cu_seqlens(attention_mask):
-    if attention_mask is not None and torch.max(attention_mask) > 1:
-        _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
-        if cu_seqlens[-1] != attention_mask.size(1):
-            cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
-        return cu_seqlens
-    return None
 
 @register_model(
     "bailing_hybrid", config_cls=BailingMoeV3Config, auto_class=AutoModelForCausalLM
@@ -92,7 +77,9 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
                 "for MLA layers. Pass `--flash_attn fa2` to enable it."
             )
 
-        self.patch_mla_attention_interface_for_sp(sp_group, sp_size, sp_rank)
+        # MLA layers dispatch through the registered turbo_ulysses interface;
+        # KDA layers rewrite their forward instead.
+        self.register_sp_attention_interface(sp_info)
         self.patch_kda_forward(sp_group, sp_size, sp_rank)
 
     @classmethod
@@ -146,7 +133,12 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
             assert past_key_value == None, "must be"
             assert self.mode == 'chunk', "Only chunk mode is supported in training."
 
-            cu_seqlens = _get_cu_seqlens(attention_mask)
+            # Global packed boundaries ride with the forward kwargs; the
+            # a2a gathers below rebuild the full sequence on each rank.
+            cu_seqlens = kwargs.get("cu_seqlens")
+            packed_params = get_packed_params(cu_seqlens, q_len * sp_size)
+            if packed_params is not None:
+                cu_seqlens = packed_params.cu_seqlens
 
             q = self.q_proj(hidden_states)   # [1, valid_local, H*K] or [B, T/sp, H*K]
             k = self.k_proj(hidden_states)   # [1, valid_local, H*K] or [B, T/sp, H*K]
@@ -167,7 +159,7 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
                 activation=self.q_conv1d.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                packed_params=packed_params,
             )
             k, _ = ops.causal_conv1d(
                 x=k,
@@ -176,7 +168,7 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
                 activation=self.k_conv1d.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                packed_params=packed_params,
             )
             v, _ = ops.causal_conv1d(
                 x=v,
@@ -185,7 +177,7 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
                 activation=self.v_conv1d.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                packed_params=packed_params,
             )
 
             # Compute g, beta from padded hidden_states (always [B, T/sp, H] format)
@@ -253,85 +245,10 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
         from . import modeling_bailing_moe_v3 as bailing_moe_v3_model
         bailing_moe_v3_model.BailingMoeV3KimiDeltaAttention.forward = sp_forward
 
-    @classmethod
-    def patch_mla_attention_interface_for_sp(
-        cls,
-        sp_group: torch.distributed.ProcessGroup | None,
-        sp_size: int,
-        sp_rank: int,
-    ) -> None:
-        from . import modeling_bailing_moe_v3 as bailing_moe_v3_model
-        attn_cls = bailing_moe_v3_model.BailingMoeV3MultiLatentAttention
-        origin_attr = "_torchturbo_bailing_moe_v3_origin_attention_interface"
-        if getattr(attn_cls, origin_attr, None) is None:
-            setattr(attn_cls, origin_attr, attn_cls.attention_interface)
-
-        def sp_attention_interface(
-            module: torch.nn.Module,
-            query_states: torch.Tensor,
-            key_states: torch.Tensor,
-            value_states: torch.Tensor,
-            attention_mask: torch.Tensor | None,
-            *args: Any,
-            **kwargs: Any,
-        ) -> tuple[torch.Tensor, None]:
-            call_kwargs = kwargs.copy()
-            position_ids = call_kwargs.pop("position_ids", None)
-            dropout = call_kwargs.pop("dropout", 0.0)
-            softmax_scale = call_kwargs.pop("scaling", None)
-
-            if position_ids is None:
-                raise ValueError(
-                    "position_ids is required for BailingMoeV3 MLA Ulysses SP."
-                )
-            if query_states.size(1) % sp_size != 0:
-                raise ValueError(
-                    "BailingMoeV3 MLA requires num_heads to be divisible by sp_size."
-                )
-
-            attn_output = ulysses_flash_attention_forward(
-                query_states.transpose(1, 2).contiguous(),
-                key_states.transpose(1, 2).contiguous(),
-                value_states.transpose(1, 2).contiguous(),
-                attention_mask,
-                query_states.size(2),
-                module.is_causal,
-                dropout=dropout,
-                position_ids=position_ids,
-                softmax_scale=softmax_scale,
-                sp_group=sp_group,
-                sp_size=sp_size,
-                qk_clip_state=get_qk_clip_state(module) if module.training else None,
-                **call_kwargs,
-            )
-            return attn_output, None
-
-        attn_cls.attention_interface = staticmethod(sp_attention_interface)
-
-    @staticmethod
-    def _patch_mla_attention_interface_for_config(attn_cls, attn_implementation):
-        origin_attr = "_torchturbo_bailing_moe_v3_origin_attention_interface"
-        if getattr(attn_cls, origin_attr, None) is None:
-            setattr(attn_cls, origin_attr, attn_cls.attention_interface)
-        if attn_implementation == "eager":
-            attn_cls.attention_interface = staticmethod(getattr(attn_cls, origin_attr))
-            return
-
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-        attn_cls.attention_interface = staticmethod(
-            ALL_ATTENTION_FUNCTIONS[attn_implementation]
-        )
-
     @staticmethod
     def _pre_init_patches(config):
         from . import modeling_bailing_moe_v3 as bailing_moe_v3_model
         from torchturbo.ops import ops
-
-        TurboBailingMoeV3ForCausalLM._patch_mla_attention_interface_for_config(
-            bailing_moe_v3_model.BailingMoeV3MultiLatentAttention,
-            config._attn_implementation,
-        )
 
         def rms_norm_forward(self, hidden_states):
             return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)

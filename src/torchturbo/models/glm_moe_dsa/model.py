@@ -90,6 +90,7 @@ class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
         sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
+        self.model._sp_size = sp_size
 
         if is_npu_available():
             from .npu import npu_fused_dsa_attn_forward

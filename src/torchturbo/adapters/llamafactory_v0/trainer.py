@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -12,6 +13,22 @@ from ...engine.distributed import assert_finite
 from ...logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class LlamaFactoryInputCollator:
+    """Normalize native pretraining collation before device transfer."""
+
+    collator: Any
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        from .patches import _collate_training_features
+
+        return _collate_training_features(
+            self.collator,
+            features,
+            padding_side=self.collator.tokenizer.padding_side,
+        )
 
 
 class TorchTurboTrainerBase:
@@ -45,6 +62,8 @@ class TorchTurboTrainerBase:
                 "TorchTurbo does not support externally supplied optimizers"
             )
         self._maybe_upgrade_collator_for_mllm_pt()
+        if self.stage == "pt":
+            self.data_collator = LlamaFactoryInputCollator(self.data_collator)
 
     def _move_model_to_device(self, model, _device):
         # TorchTurbo already materializes and shards the model before Trainer init.

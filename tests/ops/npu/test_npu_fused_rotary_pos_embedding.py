@@ -1,6 +1,10 @@
 from copy import deepcopy
 import sys
 import pytest
+
+pytest.importorskip("torch_npu")
+pytest.importorskip("mindspeed")
+
 import torch
 import torch_npu
 from tests_extend.unit_tests.common import DistributedTest

@@ -43,6 +43,9 @@ def test_qwen3_moe_standard_forward_exposes_lm_head_input():
     )
 
     assert outputs.logits is None
-    assert hidden_states[0] is model.model.hidden
+    # transformers 5.x slices hidden_states (hidden_states[:, slice_indices, :])
+    # before the lm_head, so the exposed tensor is a value-equal copy, not the
+    # backbone's last_hidden_state object itself.
+    assert torch.equal(hidden_states[0], model.model.hidden)
     assert model.lm_head is real_lm_head
     assert model.lm_head(hidden_states[0]).shape == (1, 4, 7)

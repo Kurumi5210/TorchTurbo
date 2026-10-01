@@ -95,6 +95,7 @@ echo $OUTPUT_DIR >> $LOG_FILE
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
+    --eval_strategy no \
     --weight_decay 0.1 \
     --adam_beta2 0.95 \
     --learning_rate 1e-5 \

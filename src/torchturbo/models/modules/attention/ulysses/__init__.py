@@ -1,16 +1,17 @@
 from .ulysses import (
     ulysses_flash_attention_forward,
-    patch_flash_attention_forward_for_sp,
     patch_vlm_for_ulysses_input_slicing,
     patch_forward_for_sp_input_slicing,
     patch_kda_attention_forward_for_sp,
     all_gather_sp_with_grad_reduce,
+    ulysses_attention_forward,
+    register_turbo_ulysses_attention,
+    TURBO_ULYSSES_ATTENTION,
 )
 from .utils import slice_input_tensor, ulysses_pad_and_slice_inputs, ulysses_pad
 
 __all__ = [
     "ulysses_flash_attention_forward",
-    "patch_flash_attention_forward_for_sp",
     "slice_input_tensor",
     "ulysses_pad_and_slice_inputs",
     "ulysses_pad",
@@ -18,4 +19,7 @@ __all__ = [
     "patch_forward_for_sp_input_slicing",
     "patch_kda_attention_forward_for_sp",
     "all_gather_sp_with_grad_reduce",
+    "ulysses_attention_forward",
+    "register_turbo_ulysses_attention",
+    "TURBO_ULYSSES_ATTENTION",
 ]

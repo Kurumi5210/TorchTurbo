@@ -6,7 +6,7 @@ import dataclasses
 import json
 import os
 import socket
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from typing import Any, Iterator, Optional
 
 import math
@@ -940,10 +940,6 @@ class TorchTurboEngine:
                     f"gradient_accumulation_steps ({framework_ga}) at the same "
                     f"time; pick one — tt_gbs will derive ga from gbs*sp/world."
                 )
-            if gbs <= 0:
-                raise ValueError(
-                    f"tt_gbs must be a positive integer, got {gbs}."
-                )
             if (gbs * sp_size) % world_size != 0:
                 raise ValueError(
                     f"tt_gbs({gbs}) * sp_size({sp_size}) must be divisible by "
@@ -1007,23 +1003,19 @@ class TorchTurboEngine:
         """Compute the scalar loss for a single micro-batch.
 
         Packed SFT batches contain one token row and validated cu/max metadata.
+        Sequence boundaries reach the models only as ``cu_seq_lens_q/k``;
+        batches carrying ``attention_mask`` are rejected.
         """
-        if (
-            isinstance(inputs, Mapping)
-            and inputs.get("cu_seq_lens_q") is not None
-            and inputs.get("attention_mask") is None
-        ):
-            from ..utils.flash_attn_utils import cu_seqlens_to_attention_mask
-
-            inputs = dict(inputs)
-            cu_seqlens = inputs.pop("cu_seq_lens_q")
-            inputs.pop("cu_seq_lens_k")
-            inputs.pop("max_length_q")
-            inputs.pop("max_length_k")
-            # TODO: Pass cu/max directly to models and remove this mask conversion
-            # once all model attention branches consume explicit packed boundaries.
-            inputs["attention_mask"] = cu_seqlens_to_attention_mask(
-                cu_seqlens, inputs["input_ids"].shape[-1]
+        if inputs.get("attention_mask") is not None:
+            raise ValueError(
+                "Training batches must express sequence boundaries with "
+                "cu_seq_lens_q/k, not attention_mask. Normalize the batch "
+                "on the adapter side before it reaches the engine."
+            )
+        if inputs.get("cu_seq_lens_q") is None:
+            raise ValueError(
+                "Training batches must be flattened packed inputs carrying "
+                "cu_seq_lens_q/k and max_length_q/k metadata."
             )
         inputs = self.backend.prepare_inputs(model, inputs)
         if model.training:

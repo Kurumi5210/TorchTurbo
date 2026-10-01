@@ -116,6 +116,16 @@ Currently registered adapters:
 - `llamafactory_v0`: Hooks into LlamaFactory's model loading, training, and saving workflows
 - `msswift`: Integrates with ms-swift as a plugin
 
+TorchTurbo currently supports training only. Evaluation, prediction, and generation
+are not supported, with or without sequence parallelism. The LlamaFactory and
+ms-swift adapters reject configurations unless `eval_strategy="no"`,
+`do_eval=False`, `do_predict=False`, `predict_with_generate=False`, and
+`eval_on_start=False`.
+
+SFT samples are always isolated, including with LlamaFactory's
+`packing=True, neat_packing=False`. `train_on_prompt=True` enables prompt
+supervision within each sample; predictions never cross sample boundaries.
+
 The `src/torchturbo/adapters/rl/` package provides reusable packed-sequence and SP helpers for reinforcement learning frameworks; it is a utilities package rather than a registered adapter.
 
 To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.

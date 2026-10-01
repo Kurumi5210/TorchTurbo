@@ -156,29 +156,33 @@ def test_recipe_rejects_invalid_attention_binding(invalid):
 
 
 @pytest.mark.parametrize("q_lora_rank", [None, 4])
-@pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "eager"])
-def test_bailing_recipe_selects_only_supported_mla_and_configured_query(
-    q_lora_rank, attn_implementation
-):
+def test_bailing_recipe_selects_only_mla_and_configured_query(q_lora_rank):
+    from torchturbo.models.bailing_hybrid.modeling_bailing_moe_v3 import (
+        BailingMoeV3KimiDeltaAttention,
+        BailingMoeV3MultiLatentAttention,
+    )
     from torchturbo.models.bailing_hybrid.optimizer_recipe import get_muon_recipe
 
     config = SimpleNamespace(
         q_lora_rank=q_lora_rank, num_attention_heads=2,
         qk_nope_head_dim=2, qk_rope_head_dim=1, v_head_dim=2,
-        _attn_implementation=attn_implementation,
     )
-    layers = [SimpleNamespace(attention_layer_type=kind)
-              for kind in ("attention", "linear_attention", "attention")]
+    # The recipe reads module types without running attention kernels.
+    layers = [
+        SimpleNamespace(attention=object.__new__(attention_type))
+        for attention_type in (
+            BailingMoeV3MultiLatentAttention,
+            BailingMoeV3KimiDeltaAttention,
+            BailingMoeV3MultiLatentAttention,
+        )
+    ]
     model = SimpleNamespace(config=config, get_decoder=lambda: SimpleNamespace(layers=layers))
     recipe = get_muon_recipe(model)
     query = "q_proj" if q_lora_rank is None else "q_b_proj"
-    if attn_implementation == "flash_attention_2":
-        assert tuple(recipe.qk_clip_specs) == (
-            "model.layers.0.attention", "model.layers.2.attention"
-        )
-        assert all(spec.query_projection == query for spec in recipe.qk_clip_specs.values())
-    else:
-        assert not recipe.qk_clip_specs
+    assert tuple(recipe.qk_clip_specs) == (
+        "model.layers.0.attention", "model.layers.2.attention"
+    )
+    assert all(spec.query_projection == query for spec in recipe.qk_clip_specs.values())
     assert f"model.layers.0.attention.{query}.weight" in recipe.parameter_overrides
     assert "model.layers.1.attention.q_proj.weight" in recipe.parameter_overrides
 

@@ -18,6 +18,9 @@ class AlwaysDetect(BaseAdapter):
     def activate(self, config=None):
         pass
 
+    def get_framework_version(self) -> str:
+        return "1.0.0"
+
 
 class NeverDetect(BaseAdapter):
     def detect(self) -> bool:
@@ -26,6 +29,9 @@ class NeverDetect(BaseAdapter):
     def activate(self, config=None):
         pass
 
+    def get_framework_version(self) -> str:
+        return "1.0.0"
+
 
 class BrokenDetect(BaseAdapter):
     def detect(self) -> bool:
@@ -33,6 +39,9 @@ class BrokenDetect(BaseAdapter):
 
     def activate(self, config=None):
         pass
+
+    def get_framework_version(self) -> str:
+        return "1.0.0"
 
 
 # ---------------------------------------------------------------------------

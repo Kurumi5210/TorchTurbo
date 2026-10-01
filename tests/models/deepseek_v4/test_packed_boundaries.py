@@ -5,6 +5,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from torchturbo.models.deepseek_v4.npu import (
+    _get_compressed_kv_tnd_data,
     _get_li_query_tnd_data,
     _get_sfa_compressed_kv_tnd_data,
     _get_sfa_query_kv_tnd_data,
@@ -13,6 +14,7 @@ from torchturbo.models.deepseek_v4.packing_utils import (
     _segment_spans,
     compress_packed_kv,
     packed_compress_kv_ids_and_positions,
+    packed_compress_mask,
 )
 
 
@@ -44,6 +46,34 @@ def test_compression_metadata_handles_padding_and_multiple_rows():
 
     assert block_ids.tolist() == [[1, 2], [3, 0]]
     assert block_positions.tolist() == [[0, 7], [2, 0]]
+
+
+@pytest.mark.parametrize("sp_rank", [0, 1])
+def test_compressed_mask_uses_physical_block_ends_across_sp_shards(sp_rank):
+    segment_ids = torch.tensor([[1] * 3 + [2] * 9 + [0] * 2])
+    positions = torch.arange(14).unsqueeze(0)
+    block_ids, block_positions = packed_compress_kv_ids_and_positions(
+        segment_ids, 4, positions
+    )
+    local_slice = slice(sp_rank * 7, (sp_rank + 1) * 7)
+
+    mask = packed_compress_mask(
+        segment_ids[:, local_slice],
+        block_ids.unsqueeze(1),
+        block_positions.unsqueeze(1),
+        4,
+        positions[:, local_slice],
+    )
+
+    # The second segment starts at offset 3; its blocks end at offsets 6 and
+    # 10. Its visibility cannot be rounded to multiples of 4 in the full row.
+    expected_visible = torch.tensor(
+        [[False, False]] * 6
+        + [[True, False]] * 4
+        + [[True, True]] * 2
+        + [[False, False]] * 2
+    ).unsqueeze(0)
+    torch.testing.assert_close(~mask, expected_visible[:, local_slice])
 
 
 def _reference_compress_packed_kv(kv, score, ape, mask, ratio, head_dim, overlap):
@@ -204,3 +234,89 @@ def test_sfa_preserves_partial_compression_blocks(
 
     assert cu_seqlens.tolist() == expected_cu_seqlens
     assert residuals.tolist() == expected_residuals
+
+
+def _multirow_segment_ids(ratio):
+    return torch.tensor(
+        [
+            [1] * (ratio + 1) + [2] * (2 * ratio + 1) + [0] * 2,
+            [0] * 2 + [3] * (2 * ratio + 1) + [4] * (ratio + 1),
+        ],
+        dtype=torch.long,
+    )
+
+
+@pytest.mark.parametrize(
+    "sp_rank,expected_q,expected_kv,expected_cu_q,expected_cu_kv",
+    [
+        (0, [*range(8), *range(10, 16)], [*range(8), *range(18, 24)], [0, 5, 8, 14], [0, 5, 8, 14]),
+        (1, [*range(6), *range(8, 16)], [*range(5, 14), *range(18, 32)], [0, 6, 9, 14], [0, 9, 18, 23]),
+    ],
+)
+def test_sfa_tnd_indices_preserve_multiple_rows_and_sp_history(
+    sp_rank, expected_q, expected_kv, expected_cu_q, expected_cu_kv
+):
+    segment_ids = _multirow_segment_ids(4)
+    query = torch.empty(2, 8, 1, 2)
+    kv = torch.empty(2, 16, 2)
+
+    query_indices, kv_indices, cu_q, cu_kv, local_ids = _get_sfa_query_kv_tnd_data(
+        query, kv, segment_ids, sp_rank
+    )
+
+    assert query_indices.tolist() == expected_q
+    assert kv_indices.tolist() == expected_kv
+    assert cu_q.tolist() == expected_cu_q
+    assert cu_kv.tolist() == expected_cu_kv
+    torch.testing.assert_close(local_ids, segment_ids[:, sp_rank * 8 : (sp_rank + 1) * 8])
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("sp_rank", [0, 1])
+def test_compressed_tnd_values_preserve_multiple_rows_and_sp_history(ratio, sp_rank):
+    segment_ids = _multirow_segment_ids(ratio)
+    global_len = segment_ids.size(1)
+    local_len = global_len // 2
+    local_start = sp_rank * local_len
+    local_ids = segment_ids[:, local_start : local_start + local_len]
+    compressed = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+    topk = torch.tensor([global_len, global_len + 1, global_len + 2, -1])
+    topk = topk.view(1, 1, 4).expand(2, local_len, -1)
+
+    li_kv, li_cu, block_indices, li_residuals = _get_compressed_kv_tnd_data(
+        compressed, local_ids, segment_ids, local_start, ratio
+    )
+    sfa_kv, sfa_cu, csi, sfa_residuals = _get_sfa_compressed_kv_tnd_data(
+        compressed, topk, segment_ids, local_ids, local_start, global_len, ratio
+    )
+
+    if sp_rank == 0:
+        expected_kv = torch.stack([compressed[0, 0], compressed[1, 0]])
+        expected_cu = [0, 1, 1, 2]
+        expected_blocks = [0, 0]
+        expected_residuals = [1, ratio // 2 + 1, ratio // 2]
+        sparse_rows = (
+            [[0, -1, -1, -1]] * (ratio + 1)
+            + [[-1, -1, -1, -1]] * (ratio // 2 + 1)
+            + [[0, -1, -1, -1]] * (local_len - 2)
+        )
+    else:
+        expected_kv = torch.cat([compressed[0, 1:], compressed[1]], dim=0)
+        expected_cu = [0, 2, 4, 5]
+        expected_blocks = [1, 2, 0, 1, 2]
+        expected_residuals = [1, 1, 1]
+        sparse_rows = (
+            [[-1, 0, 1, -1]] * (local_len - 2)
+            + [[0, 1, -1, -1]] * (ratio // 2 + 1)
+            + [[-1, -1, 0, -1]] * (ratio + 1)
+        )
+
+    torch.testing.assert_close(li_kv, expected_kv)
+    torch.testing.assert_close(sfa_kv, expected_kv.unsqueeze(1))
+    assert li_cu.tolist() == sfa_cu.tolist() == expected_cu
+    assert block_indices.tolist() == expected_blocks
+    assert li_residuals.tolist() == sfa_residuals.tolist() == expected_residuals
+    if ratio == 4:
+        assert csi[:, 0].tolist() == sparse_rows
+    else:
+        assert csi is None

@@ -1,6 +1,9 @@
 
 import pytest
 
+pytest.importorskip("torch_npu")
+pytest.importorskip("mindspeed")
+
 import torch
 import torch_npu
 
@@ -10,7 +13,7 @@ from megatron.core.transformer.moe.moe_utils import unpermute
 from mindspeed.ops.npu_moe_token_permute import npu_moe_token_permute
 from mindspeed.ops.npu_moe_token_unpermute import npu_moe_token_unpermute
 
-from torch_turbo.utils.torch_utils import compare_tensors
+from torchturbo.utils.torch_utils import compare_tensors
 
 import time
 

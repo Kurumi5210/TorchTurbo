@@ -1,11 +1,16 @@
+import pytest
 import torch
 
 from torchturbo.ops.packed_params import build_packed_params
-from torchturbo.ops.providers.npu import _fla_npu_gdn as gdn
-from torchturbo.ops.providers.npu._fla_npu_gdn import (
-    ascendc_causal_conv1d_function as conv_function,
-)
 from torchturbo.utils.functools import cache
+
+
+def _gdn_module():
+    """Import the fla_npu-backed provider; these tests need an NPU container."""
+    pytest.importorskip("fla_npu")
+    from torchturbo.ops.providers.npu import _fla_npu_gdn as gdn
+
+    return gdn
 
 
 def test_packed_params_builds_reusable_offsets_and_chunk_indices():
@@ -36,9 +41,10 @@ def test_packed_params_cache_is_owned_by_the_caller():
 
 
 def test_causal_conv_consumes_prevalidated_offsets_without_host_conversion():
+    gdn = _gdn_module()
     packed = build_packed_params(torch.tensor([0, 3], dtype=torch.int32))
 
-    offsets = conv_function._as_int_list(
+    offsets = gdn.ascendc_causal_conv1d_function._as_int_list(
         packed.cu_seqlens,
         validated_offsets=packed.cu_seqlens_list,
     )
@@ -47,6 +53,7 @@ def test_causal_conv_consumes_prevalidated_offsets_without_host_conversion():
 
 
 def test_gdr_consumes_packed_params_directly(monkeypatch):
+    gdn = _gdn_module()
     calls = []
 
     def fake_apply(*args):
@@ -74,6 +81,7 @@ def test_gdr_consumes_packed_params_directly(monkeypatch):
 
 
 def test_gdr_backward_intermediate_saving_is_opt_in(monkeypatch):
+    gdn = _gdn_module()
     calls = []
 
     def fake_apply(*args):

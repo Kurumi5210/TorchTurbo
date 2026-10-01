@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from torchturbo.ops import ops
+from torchturbo.utils.flash_attn_utils import unpad_varlen_inputs
 from torchturbo.utils.functools import cache
 
 
@@ -36,6 +37,16 @@ def _position_sequence_lengths(
         position_ids[:, 0] = 0
     lengths, max_lengths = prepare_fa_kwargs_from_position_ids(position_ids)
     return (*lengths, *max_lengths)
+
+
+@cache
+def _matching_cumulative_lengths(
+    cu_seq_lens_q: Tensor,
+    cu_seq_lens_k: Tensor,
+    _query_version: int | None,
+    _key_version: int | None,
+) -> bool:
+    return cu_seq_lens_q is cu_seq_lens_k or torch.equal(cu_seq_lens_q, cu_seq_lens_k)
 
 
 def attention_forward(
@@ -104,10 +115,23 @@ def attention_forward(
             _flash_attention_forward,
         )
 
-        return _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
+        query, key, value = query_states, key_states, value_states
+        query_padding = 0
+        if attention_mask is None and all(
+            item is not None
+            for item in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
+        ):
+            query, key, value, query_padding = unpad_varlen_inputs(
+                query, key, value, cu_seq_lens_q, cu_seq_lens_k,
+            )
+            if query is not query_states:
+                position_ids = None
+                query_length = query.shape[1]
+
+        output = _flash_attention_forward(
+            query,
+            key,
+            value,
             attention_mask,
             query_length,
             is_causal,
@@ -126,6 +150,12 @@ def attention_forward(
             attn_implementation=attn_implementation,
             **kwargs,
         )
+        if query is not query_states:
+            output = torch.nn.functional.pad(
+                output.flatten(0, 1), (0, 0, 0, 0, 0, query_padding),
+            )
+            output = output.reshape(*query_states.shape[:-1], value_states.shape[-1])
+        return output
 
     from transformers.modeling_flash_attention_utils import fa_peft_integration_check
 
@@ -162,6 +192,7 @@ def attention_forward(
 
     batch_size, seq_length = query.shape[:2]
     varlen_kwargs = {}
+    query_padding = 0
     if attention_mask is not None:
         if attention_mask.ndim == 2 and attention_mask.shape != (batch_size, seq_length):
             raise ValueError("Maximum-logit attention expects a [batch, sequence] padding or packing mask.")
@@ -171,9 +202,22 @@ def attention_forward(
         for lengths in (cu_seq_lens_q, cu_seq_lens_k):
             if lengths.ndim != 1 or lengths.numel() < 2 or lengths.dtype not in (torch.int32, torch.int64):
                 raise ValueError("Cumulative sequence lengths must be a 1D integer tensor with at least two entries.")
-        if cu_seq_lens_q.shape != cu_seq_lens_k.shape or (
-            cu_seq_lens_q is not cu_seq_lens_k and not torch.equal(cu_seq_lens_q, cu_seq_lens_k)
+        if cu_seq_lens_q.shape != cu_seq_lens_k.shape:
+            raise ValueError("Maximum logits require matching query/key sequence lengths.")
+        if (
+            torch.is_inference_mode_enabled()
+            or cu_seq_lens_q.is_inference()
+            or cu_seq_lens_k.is_inference()
         ):
+            matching_lengths = _matching_cumulative_lengths.__wrapped__(
+                cu_seq_lens_q, cu_seq_lens_k, None, None,
+            )
+        else:
+            matching_lengths = _matching_cumulative_lengths(
+                cu_seq_lens_q, cu_seq_lens_k,
+                cu_seq_lens_q._version, cu_seq_lens_k._version,
+            )
+        if not matching_lengths:
             raise ValueError("Maximum logits require matching query/key sequence lengths.")
     elif position_ids is not None:
         if position_ids.ndim != 2 or position_ids.shape[0] not in (1, batch_size):
@@ -191,6 +235,9 @@ def attention_forward(
             position_ids, batch_size, version,
         )
     if attention_mask is None and cu_seq_lens_q is not None:
+        query, key, value, query_padding = unpad_varlen_inputs(
+            query, key, value, cu_seq_lens_q, cu_seq_lens_k,
+        )
         varlen_kwargs = dict(
             cu_seq_lens_q=cu_seq_lens_q,
             cu_seq_lens_k=cu_seq_lens_k,
@@ -201,4 +248,8 @@ def attention_forward(
     output, max_logits = ops.attention_with_max_logits(
         query, key, value, attention_mask, scaling, dropout, is_causal, **varlen_kwargs
     )
+    if query_padding:
+        output = torch.nn.functional.pad(
+            output.flatten(0, 1), (0, 0, 0, 0, 0, query_padding),
+        )
     return output.reshape(output_shape), max_logits

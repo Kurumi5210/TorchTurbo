@@ -96,7 +96,8 @@ def test_packed_left_padding_moves_to_tail_with_all_token_fields():
     pixels = inputs["pixel_values"]
     out = bridge_swift_inputs(inputs, sequence_lengths=[2, 3], padding_side="left")
     assert out["input_ids"].tolist() == [[10, 11, 12, 13, 14, 0, 0]]
-    assert out["labels"].tolist() == [[10, -100, 12, 13, 14, -100, -100]]
+    # Sample starts are unsupervised; loss_scale then drops token 11.
+    assert out["labels"].tolist() == [[-100, -100, -100, 13, 14, -100, -100]]
     assert out["text_position_ids"].tolist() == [[0, 1, 0, 1, 2, 0, 0]]
     assert out["position_ids"][0].tolist() == out["text_position_ids"].tolist()
     assert out["mm_token_type_ids"].tolist() == [[0, 1, 0, 0, 0, 0, 0]]
@@ -104,16 +105,44 @@ def test_packed_left_padding_moves_to_tail_with_all_token_fields():
     assert out["pixel_values"] is pixels
 
 
-def test_nonpacked_left_padding_is_unchanged():
+def test_nonpacked_left_padding_flattens_to_cu_rows():
     inputs = {
         "input_ids": _t([[0, 0, 10, 11], [0, 12, 13, 14]]),
         "position_ids": _t([[0, 0, 0, 1], [0, 0, 1, 2]]),
         "attention_mask": _t([[0, 0, 1, 1], [0, 1, 1, 1]]),
     }
-    original = dict(inputs)
     out = bridge_swift_inputs(inputs)
-    assert set(out) == set(original)
-    assert all(out[key] is value for key, value in original.items())
+    # Left padding dropped; every batch row is one cu segment.
+    assert out["input_ids"].tolist() == [[10, 11, 12, 13, 14]]
+    assert out["position_ids"].tolist() == [[0, 1, 0, 1, 2]]
+    assert out["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert out["cu_seq_lens_k"].tolist() == [0, 2, 5]
+    assert out["max_length_q"] == out["max_length_k"] == 3
+    assert "attention_mask" not in out
+
+
+def test_nonpacked_mrope_left_padding_resets_text_positions_only():
+    positions = _t([
+        [[0, 0, 0, 1], [0, 1, 1, 2]],
+        [[0, 0, 0, 1], [0, 1, 2, 3]],
+        [[0, 0, 0, 1], [0, 1, 1, 2]],
+    ])
+    inputs = {
+        "input_ids": _t([[0, 0, 10, 11], [20, 21, 22, 23]]),
+        "labels": _t([[-100, -100, 10, 11], [20, 21, 22, 23]]),
+        "attention_mask": _t([[0, 0, 1, 1], [1, 1, 1, 1]]),
+        "position_ids": positions,
+        "text_position_ids": torch.arange(4).expand(2, -1),
+        "mm_token_type_ids": _t([[0, 0, 0, 0], [0, 1, 1, 0]]),
+    }
+
+    out = bridge_swift_inputs(inputs, padding_side="left")
+
+    assert out["text_position_ids"].tolist() == [[0, 1, 0, 1, 2, 3]]
+    assert out["cu_seq_lens_q"].tolist() == [0, 2, 6]
+    assert out["labels"].tolist() == [[-100, 11, -100, 21, 22, 23]]
+    expected_mrope = torch.cat([positions[:, :1, 2:], positions[:, 1:]], dim=-1)
+    torch.testing.assert_close(out["position_ids"], expected_mrope)
 
 
 def test_rejects_native_cu_with_different_sample_boundaries():
@@ -121,6 +150,15 @@ def test_rejects_native_cu_with_different_sample_boundaries():
     inputs["cu_seq_lens_q"] = _t([0, 3, 5]).int()
     with pytest.raises(ValueError, match="original Swift sample boundaries"):
         bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
+
+
+def test_packed_sample_starts_are_unsupervised():
+    inputs = _packed_inputs([2, 3])
+    inputs["labels"] = torch.arange(10, 15).unsqueeze(0)
+    out = bridge_packed_inputs(inputs, sequence_lengths=[2, 3])
+    # The trainer counts labels before the backend shift, which never
+    # targets a sample start.
+    assert out["labels"].tolist() == [[-100, 11, -100, 13, 14]]
 
 
 def test_rejects_position_resets_inconsistent_with_samples():
@@ -153,23 +191,26 @@ def test_collator_captures_lengths_before_native_batch_mutation(nested):
 
     out = SwiftInputCollator(native_collator, template)(batch)
     assert out["cu_seq_lens_q"].tolist() == [0, 2, 5]
-    assert out["labels"].tolist() == [[10, -100, 12, 13, 14]]
+    assert out["labels"].tolist() == [[-100, -100, -100, 13, 14]]
     assert "attention_mask" not in out
     assert "loss_scale" not in out
     assert out["cu_seq_lens_q"].device.type == "cpu"
 
 
-def test_nonpacked_collator_preserves_binary_mask():
+def test_nonpacked_collator_flattens_binary_mask_batches():
     inputs = {
         "input_ids": _t([[0, 0, 10, 11]]),
         "position_ids": _t([[0, 0, 0, 1]]),
+        "labels": _t([[-100, -100, 10, 11]]),
         "attention_mask": _t([[0, 0, 1, 1]]),
     }
     template = SimpleNamespace(padding_free=False, padding_side="left", is_training=True)
     out = SwiftInputCollator(lambda batch: inputs, template)([{"input_ids": [10, 11]}])
-    assert out is inputs
-    assert out["attention_mask"].tolist() == [[0, 0, 1, 1]]
-    assert "cu_seq_lens_q" not in out
+    assert out["input_ids"].tolist() == [[10, 11]]
+    # Each row's first token is not predictable: shifted loss keeps -100.
+    assert out["labels"].tolist() == [[-100, 11]]
+    assert out["cu_seq_lens_q"].tolist() == [0, 2]
+    assert "attention_mask" not in out
 
 
 def test_loss_scale_zeros_masked_into_labels():

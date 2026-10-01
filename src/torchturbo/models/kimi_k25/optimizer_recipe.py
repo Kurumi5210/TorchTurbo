@@ -45,9 +45,8 @@ def get_muon_recipe(model: nn.Module) -> MuonRecipe:
     # An identity projector holds no parameters, so it has nothing to exclude.
     if model.config.vision_config.mm_projector_type != "identity":
         parameter_overrides["mm_projector.**"] = ExcludeFromMuon()
-    qk_clip_specs: dict[str, MLAQKClipSpec] = {}
-    if text_config._attn_implementation == "flash_attention_2":
-        qk_clip_specs["language_model.model.layers.*.self_attn"] = MLAQKClipSpec(
+    qk_clip_specs: dict[str, MLAQKClipSpec] = {
+        "language_model.model.layers.*.self_attn": MLAQKClipSpec(
             query_projection=query_projection,
             key_value_projection="kv_b_proj",
             num_heads=int(text_config.num_attention_heads),
@@ -55,6 +54,7 @@ def get_muon_recipe(model: nn.Module) -> MuonRecipe:
             qk_rope_head_dim=int(text_config.qk_rope_head_dim),
             v_head_dim=int(text_config.v_head_dim),
         )
+    }
     return MuonRecipe(
         parameter_overrides=parameter_overrides,
         qk_clip_specs=qk_clip_specs,

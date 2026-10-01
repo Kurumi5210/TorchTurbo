@@ -33,7 +33,7 @@ from .patches import (
     DictFieldPatch,
     LoadModelPatch,
     LogCallbackPatch,
-    PackedFA2CollatorPatch,
+    PackedInputCollatorPatch,
     PretrainProcessorPatch,
     RegisterAutoclassPatch,
     RunExpPatch,
@@ -96,7 +96,7 @@ class LlamaFactoryV0Adapter(BaseAdapter):
         self._register_lf_templates()
 
         # Register patches — inner patches applied by RunExpPatch
-        self.add_patch(PackedFA2CollatorPatch())
+        self.add_patch(PackedInputCollatorPatch())
         self.add_patch(LoadModelPatch(adapter=self))
         self.add_patch(CreateRefModelPatch(adapter=self))
         self.add_patch(AcceleratorPatch())

@@ -6,9 +6,47 @@ import pytest
 import torch
 
 from torchturbo.adapters.llamafactory_v0.trainer import (
+    LlamaFactoryInputCollator,
     TorchTurboTrainerBase,
     make_torchturbo_trainer,
 )
+
+
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+def test_pretraining_wraps_native_language_modeling_collation(padding_side):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import DataCollatorForLanguageModeling, PreTrainedTokenizerFast
+
+    from torchturbo.engine.utils import assert_packed_inputs
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[PAD]": 0, "[UNK]": 1}, unk_token="[UNK]")),
+        pad_token="[PAD]",
+        unk_token="[UNK]",
+        padding_side=padding_side,
+    )
+    native_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    class BaseTrainer:
+        def __init__(self, *, data_collator):
+            self.optimizer = None
+            self.train_dataset = None
+            self.data_collator = data_collator
+
+    trainer_cls = make_torchturbo_trainer(BaseTrainer, engine=object(), stage="pt")
+    trainer = trainer_cls(data_collator=native_collator)
+    assert isinstance(trainer.data_collator, LlamaFactoryInputCollator)
+    result = trainer.data_collator([
+        {"input_ids": [10, 11]},
+        {"input_ids": [20, 21, 22]},
+    ])
+
+    assert_packed_inputs(result)
+    assert result["input_ids"].tolist() == [[10, 11, 20, 21, 22]]
+    assert result["labels"].tolist() == [[-100, 11, -100, 21, 22]]
+    assert result["position_ids"].tolist() == [[0, 1, 0, 1, 2]]
+    assert result["cu_seq_lens_q"].tolist() == [0, 2, 5]
 
 
 class _DiffusionEngine:

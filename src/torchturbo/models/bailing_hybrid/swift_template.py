@@ -150,11 +150,13 @@ def _make_ling_v3_agent_template_cls():
 def _make_ling_v3_template_cls():
     """Ling v3 ``Template`` subclass (``detailed thinking`` system directive)."""
     from swift.template import Template
-    from swift.utils import get_env_args
 
     class LingV3Template(Template):
         """Ling v3 chat template with hybrid thinking + detailed-thinking directive."""
         def init_env_args(self):
+            # Keep the helper out of the closure used by dill fingerprinting.
+            from swift.utils import get_env_args
+
             super().init_env_args()
             self.enable_thinking = get_env_args('enable_thinking', bool, True)
 

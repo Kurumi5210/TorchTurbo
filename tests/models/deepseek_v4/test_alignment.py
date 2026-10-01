@@ -1,8 +1,8 @@
 """Align DeepSeekV4 v3 modeling with the infer-style reference.
 
-The infer reference follows the original v2 test target:
+The infer reference is the original DeepSeek V4 inference model, kept under:
 
-    torch_turbo/models/deepseek_v4/model.py
+    tests/models/deepseek_v4/inference/model.py
 
 The modeling side uses the v3 implementation under:
 
@@ -35,7 +35,7 @@ os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 # __file__ = <repo>/tests/models/deepseek_v4/test_alignment.py
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
-INFER_REFERENCE_DIR = REPO_ROOT / "torch_turbo" / "models" / "deepseek_v4"
+INFER_REFERENCE_DIR = Path(__file__).resolve().parent / "inference"
 for path in (SRC_ROOT, REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))

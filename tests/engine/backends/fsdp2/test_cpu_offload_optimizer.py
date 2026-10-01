@@ -33,6 +33,19 @@ class SyncRuntime(CpuRuntime):
     """Plain CPU runtime for exercising host-side control flow."""
 
 
+# torch mis-dispatches CPU work to the MPS backend on MPS builds without
+# CUDA (Apple silicon laptops): any op on a pin_memory=True CPU tensor and
+# CPU fused AdamW both hit "missing kernel for mps" or crash the process.
+# CUDA/NPU hosts are unaffected.
+CPU_FUSED_ADAMW_BROKEN = (
+    torch.backends.mps.is_built() and not torch.cuda.is_available()
+)
+requires_cpu_fused_adamw = pytest.mark.skipif(
+    CPU_FUSED_ADAMW_BROKEN,
+    reason="pin_memory/fused CPU ops mis-dispatch to the MPS backend on this torch build",
+)
+
+
 def _offload_adamw(param_groups, optimizer_memory_fraction=0.8, **kwargs):
     return AdamWSwap(
         param_groups,
@@ -49,6 +62,7 @@ def _clone_groups(params):
     ]
 
 
+@requires_cpu_fused_adamw
 def test_cpu_offload_adamw_matches_adamw(monkeypatch):
     def _workspace_init(self, _runtime, _fraction):
         self._storage = torch.empty(1024, dtype=torch.uint8)
@@ -113,6 +127,7 @@ def test_cpu_offload_adamw_matches_adamw(monkeypatch):
     ]
 
 
+@requires_cpu_fused_adamw
 def test_host_update_adamw_matches_adamw():
     torch.manual_seed(11)
     reference_params = [
@@ -151,6 +166,7 @@ def test_host_update_adamw_matches_adamw():
     assert set(cpu_update.state) == set(cpu_params)
 
 
+@requires_cpu_fused_adamw
 def test_step_on_device_requires_workspace():
     params = [torch.nn.Parameter(torch.ones(4))]
     optimizer = _offload_adamw(params)
@@ -204,6 +220,7 @@ def test_device_workspace_synchronizes_capacity_across_ranks(monkeypatch):
     assert workspace.capacity_bytes == 32
 
 
+@requires_cpu_fused_adamw
 def test_workspace_capacity_error_includes_param_name():
     params = [torch.nn.Parameter(torch.ones(8))]
     optimizer = _offload_adamw(
@@ -217,6 +234,7 @@ def test_workspace_capacity_error_includes_param_name():
         optimizer._ensure_workspace_capacity([(params[0], {})])
 
 
+@requires_cpu_fused_adamw
 def test_workspace_capacity_failure_is_synchronized(monkeypatch):
     params = [torch.nn.Parameter(torch.ones(4))]
     optimizer = _offload_adamw(
@@ -238,6 +256,7 @@ def test_workspace_capacity_failure_is_synchronized(monkeypatch):
         optimizer._ensure_workspace_capacity([(params[0], {})])
 
 
+@requires_cpu_fused_adamw
 def test_workspace_stages_multiple_batches_when_each_state_pair_fits():
     params = [torch.nn.Parameter(torch.ones(4)) for _ in range(5)]
     optimizer = _offload_adamw(params)
@@ -258,6 +277,7 @@ def test_workspace_stages_multiple_batches_when_each_state_pair_fits():
     assert next_index == 5
 
 
+@requires_cpu_fused_adamw
 def test_workspace_adamw_matches_adamw(monkeypatch):
     def _workspace_init(self, _runtime, _fraction):
         self._storage = torch.empty(512, dtype=torch.uint8)
@@ -320,6 +340,7 @@ def test_prepare_optimizer_rejects_unsupported_optimizer():
         backend.prepare_optimizer(plan)
 
 
+@requires_cpu_fused_adamw
 def test_prepare_optimizer_builds_adamw_swap():
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.fsdp_config = FSDPConfig(

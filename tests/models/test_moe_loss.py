@@ -1,6 +1,7 @@
 import logging
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -180,25 +181,32 @@ def test_aux_loss_tracker_averages_layers(caplog):
     assert {"aux_loss", "aux_loss_scaled"} <= set(logs)
 
 
-def test_aux_loss_tracker_reports_mtp_module_path_in_debug(caplog):
+@pytest.mark.parametrize("log_level", [logging.INFO, logging.DEBUG])
+def test_aux_loss_tracker_aggregates_backbone_and_mtp_at_all_log_levels(caplog, log_level):
     class MetricModule(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.metrics = {"aux_loss": torch.tensor(value)}
+
         def pop_metrics(self):
-            return {"aux_loss": torch.tensor(2.0)}
+            metrics, self.metrics = self.metrics, {}
+            return metrics
 
     model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([MetricModule(6.0)])
     model.mtp = torch.nn.Module()
-    model.mtp.layers = torch.nn.ModuleList([MetricModule()])
+    model.mtp.layers = torch.nn.ModuleList([MetricModule(2.0)])
     tracker = MetricTracker()
 
-    with caplog.at_level(logging.DEBUG, logger="torchturbo"):
+    with caplog.at_level(log_level, logger="torchturbo"):
         tracker.collect(model)
+        tracker.collect(model)
+    assert tracker.counts == {"aux_loss": 2}
     logs = {}
     tracker.report(logs, lambda value: value.reshape(1))
 
-    assert logs == {
-        "aux_loss": 2.0,
-        "aux_loss/mtp.layers.0": 2.0,
-    }
+    assert logs == {"aux_loss": 4.0}
+    assert tracker.counts == {"aux_loss": 0}
 
 
 def test_aux_loss_logging_averages_microbatches():
@@ -418,8 +426,8 @@ def _run_sp_moe_runtime_inputs_test(
         from torchturbo.models.base import TurboModel
 
         model = TurboModel()
-        attention_mask = torch.tensor([[1, 0, 1, 1, 0, 0]])
-        inputs = {"attention_mask": attention_mask}
+        cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+        inputs = {"input_ids": torch.arange(6).unsqueeze(0), "cu_seq_lens_q": cu}
         parallel_context = {
             "sp": {
                 "sp_group": dist.group.WORLD,
@@ -428,10 +436,35 @@ def _run_sp_moe_runtime_inputs_test(
             }
         }
         runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
-        expected = attention_mask.eq(0).chunk(world_size, dim=1)[rank]
+        expected = torch.tensor([[False, False, False, False, True, True]])
 
-        assert inputs["attention_mask"] is attention_mask
-        torch.testing.assert_close(runtime_inputs.padding_mask, expected)
+        assert inputs["cu_seq_lens_q"] is cu
+        torch.testing.assert_close(
+            runtime_inputs.padding_mask, expected.chunk(world_size, dim=1)[rank]
+        )
+
+        from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+
+        backend = FSDP2Backend.__new__(FSDP2Backend)
+        backend.get_sp_info = lambda: parallel_context["sp"]
+        model.config = SimpleNamespace(pad_token_id=0)
+        cu = torch.tensor([0, 2, 3], dtype=torch.int32)
+        packed_inputs = {
+            "input_ids": torch.tensor([[1, 2, 3, 70, 70]]),
+            "position_ids": torch.tensor([[0, 1, 0, 0, 0]]),
+            "cu_seq_lens_q": cu,
+            "cu_seq_lens_k": cu,
+            "max_length_q": 2,
+            "max_length_k": 2,
+        }
+        prepared = backend.prepare_inputs(model, packed_inputs)
+        runtime_inputs = model.get_moe_runtime_inputs(prepared, parallel_context)
+        expected = torch.tensor([[False, False, False, True, True, True]])
+        torch.testing.assert_close(
+            runtime_inputs.padding_mask, expected.chunk(world_size, dim=1)[rank]
+        )
+        assert prepared["input_ids"].shape == (1, 6)
+        assert prepared["cu_seq_lens_q"] is cu
     finally:
         dist.destroy_process_group()
 
@@ -445,20 +478,60 @@ def test_base_moe_runtime_inputs_match_sp_shard(tmp_path):
     )
 
 
-def test_base_moe_runtime_inputs_use_attention_mask():
+def test_base_moe_runtime_inputs_use_packed_boundaries():
     from torchturbo.models.base import TurboModel
 
     model = TurboModel()
-    attention_mask = torch.tensor([[1, 1, 2, 2, 0, 0]])
-    inputs = {"attention_mask": attention_mask}
+    cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    inputs = {"input_ids": torch.arange(6).unsqueeze(0), "cu_seq_lens_q": cu}
     parallel_context = {
         "sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}
     }
 
     runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
 
-    assert inputs["attention_mask"] is attention_mask
-    torch.testing.assert_close(runtime_inputs.padding_mask, attention_mask.eq(0))
+    assert inputs["cu_seq_lens_q"] is cu
+    assert runtime_inputs.padding_mask.tolist() == [[False, False, False, False, True, True]]
+
+
+def test_packed_tail_does_not_change_router_losses_gradients_or_bias_counts():
+    from torchturbo.models.base import TurboModel
+
+    model = TurboModel()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3, 70, 70]]),
+        "cu_seq_lens_q": torch.tensor([0, 2, 3], dtype=torch.int32),
+    }
+    parallel_context = {
+        "sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}
+    }
+    runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
+    logits = torch.tensor(
+        [[2.0, 0.0, -1.0, 0.5],
+         [0.0, 1.0, 2.0, -0.5],
+         [1.0, 3.0, 0.0, 0.0],
+         [100.0, -100.0, 0.0, 0.0],
+         [100.0, -100.0, 0.0, 0.0]],
+    ).unsqueeze(0).requires_grad_()
+    reference_logits = logits[:, :3].detach().clone().requires_grad_()
+    config = _router_config(
+        moe_z_loss_coeff=0.1,
+        moe_router_enable_expert_bias=True,
+    )
+    router = TopKRouter(config)
+    reference_router = TopKRouter(config)
+
+    scores, _ = router.routing(logits, padding_mask=runtime_inputs.padding_mask)
+    reference_scores, _ = reference_router.routing(reference_logits)
+    (scores.sum() * 0).backward()
+    (reference_scores.sum() * 0).backward()
+
+    torch.testing.assert_close(router.pop_metrics(), reference_router.pop_metrics())
+    torch.testing.assert_close(
+        router.local_tokens_per_expert, reference_router.local_tokens_per_expert
+    )
+    torch.testing.assert_close(logits.grad[:, :3], reference_logits.grad)
+    torch.testing.assert_close(logits.grad[:, 3:], torch.zeros_like(logits.grad[:, 3:]))
 
 
 def test_moe_models_inherit_base_runtime_inputs():
@@ -476,18 +549,6 @@ def test_moe_models_inherit_base_runtime_inputs():
         TurboQwen3_5MoeForConditionalGeneration.get_moe_runtime_inputs
         is TurboModel.get_moe_runtime_inputs
     )
-
-
-def test_base_moe_runtime_inputs_ignore_additive_attention_mask():
-    from torchturbo.models.base import TurboModel
-
-    model = TurboModel()
-    inputs = {"attention_mask": torch.zeros(1, 1, 4, 4)}
-    parallel_context = {"sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}}
-
-    runtime_inputs = model.get_moe_runtime_inputs(inputs, parallel_context)
-
-    assert runtime_inputs.padding_mask is None
 
 
 def _run_sp_group_isolation_test(rank: int, world_size: int, init_file: str) -> None:

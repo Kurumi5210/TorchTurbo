@@ -60,22 +60,8 @@ else:
     FusedRMSNormGated = None
     fla_causal_conv1d = None
 
-from torchturbo.utils.flash_attn_utils import get_unpad_data_lf
-from torchturbo.utils.functools import cache
+logger = logging.get_logger(__name__)
 
-from torchturbo.logging import get_logger
-
-logger = get_logger(__name__)
-
-
-@cache
-def _get_cu_seqlens(attention_mask):
-    if attention_mask is not None and torch.max(attention_mask) > 1:
-        _, cu_seqlens, _ = get_unpad_data_lf(attention_mask)
-        if cu_seqlens[-1] != attention_mask.size(1):
-            cu_seqlens = torch.nn.functional.pad(cu_seqlens, (0, 1), value=attention_mask.size(1))
-        return cu_seqlens
-    return None
 
 class Qwen3_5MoeVisionRotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
@@ -289,18 +275,6 @@ class Qwen3_5MoeRMSNormGated(nn.Module):
         hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
         return hidden_states.to(input_dtype)
-
-
-def apply_mask_to_padding_states(hidden_states, attention_mask):
-    """
-    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
-    """
-    # NOTE: attention mask is a 2D boolean tensor
-    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
-        dtype = hidden_states.dtype
-        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-
-    return hidden_states
 
 
 is_fast_path_available = all(
@@ -547,7 +521,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
 
         if not is_fast_path_available:
-            logger.warning_rank0_once(
+            logger.warning_once(
                 "The fast path is not available because one of the required library is not installed. Falling back to "
                 "torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and"
                 " https://github.com/Dao-AILab/causal-conv1d"
@@ -563,11 +537,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Qwen3_5MoeDynamicCache | None = None,
         cache_position: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        cu_seq_lens: torch.Tensor | None = None,
     ):
-        #hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        cu_seqlens = _get_cu_seqlens(attention_mask)
-
         from torchturbo.ops import ops
 
         # Set up dimensions for reshapes later
@@ -616,7 +587,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_seq_lens,
             )
 
         query, key, value = torch.split(
@@ -640,35 +611,31 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        valid_len = cu_seqlens[-1] if cu_seqlens != None else seq_len
         if not use_precomputed_states:
             core_attn_out, last_recurrent_state = ops.gated_delta_rule(
-                q=query[:, :valid_len],
-                k=key[:, :valid_len],
-                v=value[:, :valid_len],
-                g=g[:, :valid_len],
-                beta=beta[:, :valid_len],
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
                 initial_state=None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens = cu_seqlens,
+                cu_seqlens=cu_seq_lens,
             )
 
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
-                q=query[:, :valid_len],
-                k=key[:, :valid_len],
-                v=value[:, :valid_len],
-                g=g[:, :valid_len],
-                beta=beta[:, :valid_len],
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens = cu_seqlens,
+                cu_seqlens=cu_seq_lens,
             )
-        if core_attn_out.shape[1] < seq_len:
-            out = core_attn_out
-            core_attn_out = torch.cat([out, out.new_zeros(out.shape[0], seq_len - out.shape[1], *out.shape[2:])], dim=1)
 
         # Update cache
         if cache_params is not None:
@@ -996,7 +963,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
                 cache_position=cache_position,
-                attention_mask=attention_mask,
+                cu_seq_lens=kwargs.get("cu_seq_lens_q"),
             )
         elif self.layer_type == "full_attention":
             # Self Attention
@@ -1506,6 +1473,7 @@ class Qwen3_5MoeMTPLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             past_key_values=None,
             position_embeddings=position_embeddings,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -1626,24 +1594,20 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
         else:
             text_position_ids = None
 
-        # BUGFIX: Support neat_packing and adapt attention mask/cache_position for DeepSpeed ZeRO-3.
-        if attention_mask is not None and attention_mask.all():
+        # Training carries packed boundaries; generation may still carry a
+        # padding mask that full attention must preserve.
+        causal_mask = attention_mask
+        if causal_mask is not None and causal_mask.all():
             causal_mask = None
-        else:
-            causal_mask = attention_mask
-
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
-
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
-                attention_mask=layer_mask,
+                attention_mask=causal_mask,
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -1657,18 +1621,6 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
-
-    def _update_linear_attn_mask(self, attention_mask, cache_position):
-        """
-        NOTE: Left-padding is used for linear attention mask.
-        No need for zeroing states when
-            1. Cached forward
-            2. Attending to all inputs
-        """
-        linear_attn_mask = attention_mask
-        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
-            linear_attn_mask = None
-        return linear_attn_mask
 
 
 class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
@@ -2436,6 +2388,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                 attention_mask=attention_mask,
                 position_ids=position_ids[0] if position_ids is not None and position_ids.ndim == 3 and position_ids.shape[0] == 4 else position_ids,
                 pad_token_id=int(getattr(self.config.text_config, "pad_token_id", 0) or 0),
+                **kwargs,
             )
             mtp_logits = [self.lm_head(h) for h in mtp_hidden_states]
 

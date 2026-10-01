@@ -34,9 +34,13 @@ def pad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
 
 
 def create_causal_mask(
-    config, input_embeds, attention_mask, cache_position, past_key_values, position_ids
+    config, inputs_embeds, attention_mask, cache_position, past_key_values, position_ids
 ):
-    # do not split attention mask into chunks under ulyssess sequence parallel's condition
+    # Attention mask passthrough for flash-attention style dispatch: the
+    # kernels take causality (and sliding windows) from their own kwargs and
+    # padding/packing from the 2D mask, so no 4D mask is built here. Models
+    # call this with keyword arguments, so the parameter names must match the
+    # upstream factories.
     return attention_mask
 
 

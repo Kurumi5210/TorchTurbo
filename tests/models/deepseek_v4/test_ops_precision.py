@@ -15,15 +15,16 @@ import math
 import os
 import sys
 import types
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 try:
     import torch
     import torch.nn.functional as F
 except ModuleNotFoundError:
     if "pytest" in sys.modules:
-        import pytest
-
         pytest.skip("torch is required for DeepSeekV4 op precision tests", allow_module_level=True)
     raise
 
@@ -31,7 +32,7 @@ os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
-INFER_REFERENCE_DIR = REPO_ROOT / "torch_turbo" / "models" / "deepseek_v4"
+INFER_REFERENCE_DIR = Path(__file__).resolve().parent / "inference"
 for path in (SRC_ROOT, REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -270,6 +271,49 @@ def make_modules(device):
     return modeling_module, reference_module, config, infer_config(reference_module)
 
 
+# The packed op forwards live in TurboDeepseekV4ForCausalLM, which installs
+# them as class-level patches during parallelization. Op precision checks must
+# run against those packed forwards, not the plain modeling defaults, and must
+# restore the originals afterwards so other tests in the same process keep the
+# unpatched modeling behavior.
+_PATCHED_OP_CLASSES = (
+    "DeepseekV4Compressor",
+    "DeepseekV4Indexer",
+    "GetWindowTopkIdxs",
+    "GetCompressTopkIdxs",
+    "LiCompute",
+    "InnerAttentionOps",
+    "PreAttentionOps",
+    "PostAttentionOps",
+    "SparseAttention",
+    "DeepseekV4Attention",
+)
+
+
+@contextmanager
+def packed_attention_ops():
+    from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as modeling_module
+    from torchturbo.models.deepseek_v4.model import TurboDeepseekV4ForCausalLM
+
+    saved_forwards = {
+        name: getattr(modeling_module, name).forward for name in _PATCHED_OP_CLASSES
+    }
+    saved_scaler = modeling_module.DSAIndexerLossAutoScaler
+    TurboDeepseekV4ForCausalLM.patch_deepseek_v4_attention_for_sp(None, 1, 0)
+    try:
+        yield
+    finally:
+        for name, forward in saved_forwards.items():
+            getattr(modeling_module, name).forward = forward
+        modeling_module.DSAIndexerLossAutoScaler = saved_scaler
+
+
+@pytest.fixture(autouse=True)
+def _packed_attention_ops():
+    with packed_attention_ops():
+        yield
+
+
 def copy_compressor_weights(src, dst):
     dst.ape.data.copy_(src.ape.data)
     dst.wkv.weight.data.copy_(src.wkv.weight.data)
@@ -290,7 +334,7 @@ def test_topk_helpers(device="cpu"):
     attention_mask = torch.ones_like(position_ids)
 
     actual_window = modeling_module.GetWindowTopkIdxs()(
-        window_size, bsz, seqlen, torch.device(device), attention_mask=attention_mask
+        window_size, bsz, seqlen, torch.device(device), segment_ids=attention_mask
     )
     expected_window = reference_module.get_window_topk_idxs(window_size, bsz, seqlen, start_pos=0).to(device)
     torch.testing.assert_close(actual_window, expected_window)
@@ -300,7 +344,7 @@ def test_topk_helpers(device="cpu"):
         x,
         offset,
         q_global_positions=position_ids,
-        attention_mask=attention_mask,
+        segment_ids=attention_mask,
     )
     expected_compress = reference_module.get_compress_topk_idxs(
         ratio, bsz, seqlen, start_pos=0, offset=offset
@@ -349,6 +393,9 @@ def test_compressor_prefill(device="cpu"):
         actual_module = modeling_module.DeepseekV4Compressor(
             config, compress_ratio=4, head_dim=config.head_dim, rotate=rotate
         ).to(device).float()
+        # Uninitialized torch.empty weights carry garbage values that can
+        # overflow the softmax to NaN; seed-bounded init keeps the run stable.
+        actual_module.init_weights(0.02)
         expected_module = reference_module.Compressor(
             args, compress_ratio=4, head_dim=args.head_dim, rotate=rotate
         ).to(device).float()
@@ -376,6 +423,7 @@ def test_indexer_prefill_topk(device="cpu"):
     freqs_cis = attn.freqs_cis
 
     actual_indexer = modeling_module.DeepseekV4Indexer(config, compress_ratio=4).to(device).float()
+    actual_indexer.init_weights(0.02)
     expected_indexer = reference_module.Indexer(args, compress_ratio=4).to(device).float()
     copy_indexer_weights(actual_indexer, expected_indexer)
     expected_indexer.freqs_cis = freqs_cis
@@ -390,7 +438,7 @@ def test_indexer_prefill_topk(device="cpu"):
         seqlen,
         offset,
         q_global_positions=position_ids,
-        attention_mask=attention_mask,
+        segment_ids=attention_mask,
     )
     expected_topk = expected_indexer(x, qr, start_pos=0, offset=offset)
     torch.testing.assert_close(actual_topk, expected_topk)
@@ -398,6 +446,8 @@ def test_indexer_prefill_topk(device="cpu"):
 
 
 def test_packed_compress_metadata():
+    from torchturbo.models.deepseek_v4 import packing_utils
+
     attention_mask = torch.tensor(
         [
             [1, 1, 1, 1, 1, 0, 0, 2, 2, 2, 2, 2],
@@ -447,11 +497,12 @@ def main():
     print(f"Repo root: {REPO_ROOT}")
     print(f"Infer reference: {INFER_REFERENCE_DIR / 'model.py'}")
 
-    test_topk_helpers(args.device)
-    test_sparse_attention(args.device)
-    test_packed_compress_metadata()
-    test_compressor_prefill(args.device)
-    test_indexer_prefill_topk(args.device)
+    with packed_attention_ops():
+        test_topk_helpers(args.device)
+        test_sparse_attention(args.device)
+        test_packed_compress_metadata()
+        test_compressor_prefill(args.device)
+        test_indexer_prefill_topk(args.device)
     print("All op precision tests passed")
 
 

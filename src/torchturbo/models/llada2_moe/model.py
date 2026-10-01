@@ -24,6 +24,8 @@ class TurboLLaDA2MoeForCausalLM(TurboModel, LLaDA2MoeModelLM):
 
     def __init__(self, config: LLaDA2MoeConfig) -> None:
         self._pre_init_patches(config)
+        # Block diffusion requires a 4D attention mask that FA2 cannot represent.
+        config._attn_implementation = "sdpa"
         super().__init__(config)
         self._post_init_patches()
 

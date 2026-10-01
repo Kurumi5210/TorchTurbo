@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from torchturbo.models.base import TurboModel
 from torchturbo.models.kimi_k25 import modeling_deepseek
@@ -61,6 +63,46 @@ def test_kimi_custom_fa2_passes_integer_boundaries_to_varlen_kernel(monkeypatch)
     assert not output[:, 5:].any()
 
 
+def test_kimi_native_fa2_consumes_cu_without_segment_mask(monkeypatch):
+    """The native (non-turbo) flash path takes cu directly, not a rebuilt mask."""
+    query = torch.arange(48, dtype=torch.float32).reshape(1, 6, 2, 4)
+    captured = {}
+
+    def fake_flash_attn_varlen_func(query_states, key_states, value_states, **kwargs):
+        captured.update(kwargs)
+        return query_states
+
+    monkeypatch.setattr(
+        modeling_deepseek,
+        "flash_attn_varlen_func",
+        fake_flash_attn_varlen_func,
+        raising=False,
+    )
+    attention = object.__new__(DeepseekV3FlashAttention2)
+    nn.Module.__init__(attention)
+    attention.num_heads = 2
+
+    cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    output = attention._flash_attention_forward(
+        query,
+        query,
+        query,
+        None,
+        query_length=6,
+        is_causal=True,
+        cu_seq_lens_q=cu,
+        cu_seq_lens_k=cu,
+        max_length_q=2,
+        max_length_k=2,
+    )
+
+    assert captured["cu_seqlens_q"].tolist() == [0, 2, 4]
+    assert captured["max_seqlen_q"] == 2
+    # The padded tail (two tokens beyond cu[-1]) comes back as zeros.
+    assert output.shape == query.shape
+    assert not output[:, 4:].any()
+
+
 def test_kimi_sp_slices_embeddings_but_keeps_global_packed_mask(monkeypatch):
     import torch.distributed as dist
 
@@ -88,12 +130,72 @@ def test_kimi_sp_slices_embeddings_but_keeps_global_packed_mask(monkeypatch):
     assert result["attention_mask"] is attention_mask
 
 
-def test_alignment_padding_is_excluded_from_moe_runtime_inputs():
-    attention_mask = torch.tensor([[1, 1, 2, 2, 2, 0, 0, 0]])
+@pytest.mark.parametrize("sequence_length", [4, 6])
+def test_kimi_forwards_cu_boundaries_and_padding_to_language_layers(sequence_length):
+    captured = []
 
+    class DecoderLayer(nn.Module):
+        def forward(self, hidden_states, *, attention_mask, **kwargs):
+            captured.append((attention_mask, kwargs))
+            return (hidden_states,)
+
+    config = SimpleNamespace(
+        output_attentions=False,
+        output_hidden_states=False,
+        use_cache=False,
+        use_return_dict=True,
+    )
+    backbone = object.__new__(modeling_deepseek.DeepseekV3Model)
+    nn.Module.__init__(backbone)
+    backbone.config = config
+    backbone.layers = nn.ModuleList([DecoderLayer()])
+    backbone.norm = nn.Identity()
+    backbone._use_flash_attention_2 = True
+    backbone.gradient_checkpointing = False
+
+    class LanguageModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = backbone
+
+        def forward(self, **kwargs):
+            output = self.model(**kwargs)
+            return CausalLMOutputWithPast(logits=output.last_hidden_state)
+
+    model = object.__new__(TurboKimiK25ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.config = config
+    model.vision_tower = nn.Identity()
+    model.language_model = LanguageModel()
+    cu = torch.tensor([0, 2, 4], dtype=torch.int32)
+    output = model(
+        inputs_embeds=torch.zeros(1, sequence_length, 4),
+        position_ids=torch.tensor([[0, 1, 0, 1] + [0] * (sequence_length - 4)]),
+        cu_seq_lens_q=cu,
+        cu_seq_lens_k=cu,
+        max_length_q=2,
+        max_length_k=2,
+    )
+
+    # No segment mask is rebuilt: boundaries ride with cu to the layers and
+    # the padding tail stays outside every boundary.
+    layer_mask, layer_kwargs = captured[0]
+    assert layer_mask is None
+    assert layer_kwargs["cu_seq_lens_q"] is cu
+    assert layer_kwargs["cu_seq_lens_k"] is cu
+    assert layer_kwargs["max_length_q"] == 2
+    assert layer_kwargs["max_length_k"] == 2
+    assert output.logits.shape == (1, sequence_length, 4)
+    assert cu.tolist() == [0, 2, 4]
+
+
+def test_alignment_padding_is_excluded_from_moe_runtime_inputs():
     runtime_inputs = TurboModel.get_moe_runtime_inputs(
         None,
-        {"attention_mask": attention_mask},
+        {
+            "input_ids": torch.zeros(1, 8, dtype=torch.long),
+            "cu_seq_lens_q": torch.tensor([0, 2, 5], dtype=torch.int32),
+        },
         {"sp": {"sp_size": 1}},
     )
 

@@ -3111,7 +3111,6 @@ def _kimi_recipe_model():
             self.mm_projector = nn.Linear(hidden_size, hidden_size, bias=False)
             self.config = SimpleNamespace(
                 text_config=SimpleNamespace(
-                    _attn_implementation="flash_attention_2",
                     num_attention_heads=num_heads,
                     hidden_size=hidden_size,
                     moe_intermediate_size=ffn_size,
@@ -3238,27 +3237,16 @@ def _get_kimi_recipe(model):
     return _load_kimi_recipe_module().get_muon_recipe(model)
 
 
-@pytest.mark.parametrize("attention_implementation", ["flash_attention_2", "eager"])
-def test_kimi_recipe_only_enables_qk_clipping_for_flash_attention_2(
-    attention_implementation,
-):
+def test_kimi_recipe_declares_qk_projections_without_attention_implementation():
     model = _kimi_recipe_model()
-    supported_recipe = _get_kimi_recipe(model)
-    model.config.text_config._attn_implementation = attention_implementation
     recipe = _get_kimi_recipe(model)
 
-    assert recipe.parameter_overrides == supported_recipe.parameter_overrides
     config = MuonOptimizerConfig(lr=0.1, weight_decay=0.02)
     assert _muon_plan(model, recipe, config).qk_clip_plan is None
 
     config.qk_clip = QKClipConfig()
-    if attention_implementation == "flash_attention_2":
-        plan = _muon_plan(model, recipe, config)
-        assert len(plan.qk_clip_plan.layers) == len(model.language_model.model.layers)
-    else:
-        assert not recipe.qk_clip_specs
-        with pytest.raises(ValueError, match="requires an explicit QK clip recipe"):
-            _muon_plan(model, recipe, config)
+    plan = _muon_plan(model, recipe, config)
+    assert len(plan.qk_clip_plan.layers) == len(model.language_model.model.layers)
 
 
 def test_kimi_recipe_annotates_only_special_parameters():

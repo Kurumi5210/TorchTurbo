@@ -19,11 +19,10 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-from torchturbo.logging import get_logger
 
 from .configuration_deepseek_v4 import DeepseekV4Config
 
-logger = get_logger(__name__)
+logger = logging.get_logger(__name__)
 
 
 
@@ -256,25 +255,25 @@ class DSAIndexerLoss(nn.Module):
 
     def forward(
         self,
-        selected_main_attn_dist,
-        index_score,
-        _topk_indices,
-        loss_scale,
-    ):
-        index_score = F.softmax(index_score, dim=-1, dtype=torch.float32)
+        selected_main_attn_dist: torch.Tensor,
+        index_score: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = topk_indices >= 0
+        index_score = index_score.float().masked_fill(
+            ~valid, torch.finfo(torch.float32).min
+        )
+        index_score = F.softmax(index_score, dim=-1).masked_fill(~valid, 0)
+        selected_main_attn_dist = selected_main_attn_dist.masked_fill(~valid, 0)
         selected_main_attn_dist = F.normalize(selected_main_attn_dist, p=1, dim=-1)
 
-        loss = (
-            F.kl_div(
-                (index_score + 1e-10).log(),
-                selected_main_attn_dist + 1e-10,
-                reduction="none",
-            )
-            .sum(dim=-1)
-            .mean()
-        )
-        loss *= loss_scale
-        return loss
+        loss = F.kl_div(
+            (index_score + 1e-10).log(),
+            selected_main_attn_dist,
+            reduction="none",
+        ).sum()
+        num_queries = valid.any(dim=-1).sum()
+        return loss / num_queries.clamp_min(1)
 
 
 class GetAttnScores(nn.Module):
@@ -285,12 +284,12 @@ class GetAttnScores(nn.Module):
 
     def forward(
         self,
-        query,
-        key,
-        attention_mask,
-        num_attn_head_per_group,
-        attn_scale,
-    ):
+        query: torch.Tensor,
+        key: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        num_attn_head_per_group: int,
+        attn_scale: float,
+    ) -> torch.Tensor:
         if num_attn_head_per_group > 1:
             key = key.repeat_interleave(num_attn_head_per_group, dim=1)
 
@@ -305,9 +304,12 @@ class GetAttnScores(nn.Module):
         attn = (query @ key.transpose(-1, -2)) * attn_scale
 
         if attention_mask is not None:
-            attn.masked_fill_(attention_mask, float("-inf"))
+            attention_mask = attention_mask.unsqueeze(1)
+            attn.masked_fill_(attention_mask, torch.finfo(attn.dtype).min)
 
         attn = F.softmax(attn, dim=-1, dtype=torch.float32)
+        if attention_mask is not None:
+            attn = attn.masked_fill(attention_mask, 0)
         attn = attn.sum(dim=1)
         return attn
 
@@ -315,7 +317,9 @@ class GetAttnScores(nn.Module):
 class LiLoss(nn.Module):
     """Indexer loss computation wrapper."""
 
-    def __init__(self, n_heads, softmax_scale, compress_ratio) -> None:
+    def __init__(
+        self, n_heads: int, softmax_scale: float, compress_ratio: int
+    ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.softmax_scale = softmax_scale
@@ -325,19 +329,27 @@ class LiLoss(nn.Module):
 
     def forward(
         self,
-        q,
-        kv_compress,
-        _q_indexer,
-        _k_indexer,
-        _weights,
-        compress_topk_idxs,
-        index_score,
-        attention_masks,
-        offset,
-    ):
+        q: torch.Tensor,
+        kv_compress: torch.Tensor,
+        q_indexer: torch.Tensor,
+        k_indexer: torch.Tensor,
+        weights: torch.Tensor,
+        compress_topk_idxs: torch.Tensor,
+        index_score: torch.Tensor | None,
+        attention_masks: torch.Tensor | None,
+        offset: int,
+    ) -> torch.Tensor:
         compress_topk_idxs = torch.where(
             compress_topk_idxs == -1, compress_topk_idxs, compress_topk_idxs - offset
         )
+        safe_indices = compress_topk_idxs.clamp_min(0)
+        if attention_masks is None:
+            query_positions = torch.arange(q.size(1), device=q.device)
+            block_ends = (
+                torch.arange(kv_compress.size(1), device=q.device) + 1
+            ) * self.compress_ratio
+            attention_masks = block_ends > (query_positions[:, None] + 1)
+            attention_masks = attention_masks.unsqueeze(0)
 
         main_attn_dist = self.get_attn_scores(
             q.transpose(1, 2).detach(),
@@ -348,14 +360,22 @@ class LiLoss(nn.Module):
         )
 
         selected_main_attn_dist = torch.gather(
-            main_attn_dist, dim=-1, index=compress_topk_idxs
+            main_attn_dist, dim=-1, index=safe_indices
         )
+
+        if index_score is None:
+            # Fused index selection supplies indices without differentiable scores.
+            batch_indices = torch.arange(q.size(0), device=q.device)[:, None, None]
+            selected_keys = k_indexer[batch_indices, safe_indices]
+            index_score = torch.einsum(
+                "bshd,bskd->bshk", q_indexer, selected_keys
+            )
+            index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
         loss = self.compute_dsa_indexer_loss(
             selected_main_attn_dist,
             index_score,
             compress_topk_idxs,
-            self.softmax_scale,
         )
         return loss
 
@@ -374,16 +394,16 @@ class ComputeIndexerLoss(nn.Module):
 
     def forward(
         self,
-        compress_topk_idxs,
-        offset,
-        q,
-        kv_compress,
-        attention_masks,
-        index_score,
-        q_indexer,
-        k_indexer,
-        weights,
-    ):
+        compress_topk_idxs: torch.Tensor,
+        offset: int,
+        q: torch.Tensor,
+        kv_compress: torch.Tensor,
+        attention_masks: torch.Tensor | None,
+        index_score: torch.Tensor | None,
+        q_indexer: torch.Tensor,
+        k_indexer: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
         return self.li_loss(
             q,
             kv_compress,
@@ -789,8 +809,13 @@ class DeepseekV4Attention(nn.Module):
         past_key_value: Optional[Cache] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
-        """Forward pass with pre/inner/post structure."""
+        """Forward pass with pre/inner/post structure.
+
+        ``cu_seq_lens`` carries packed boundaries for the sequence-parallel
+        patch; the base reference path is not packed-aware and ignores it.
+        """
         bsz, seqlen, _ = hidden_states.size()
         freqs_cis = self.freqs_cis.to(hidden_states.device)
         hadamard_mat = self.hadamard_mat if self.hadamard_mat is not None else None
@@ -831,7 +856,7 @@ class DeepseekV4Attention(nn.Module):
             offset,
             q,
             kv_compress,
-            attention_mask,
+            None,  # The reference loss uses the implicit compressed causal mask.
             index_score,
             q_indexer,
             k_indexer,
@@ -1225,6 +1250,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
         input_ids: Optional[torch.LongTensor] = None,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         """Forward pass with training logic."""
         # Attention with HC
@@ -1241,6 +1267,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            cu_seq_lens=cu_seq_lens,
         )
 
         attn_output = attn_outputs[0]
@@ -1249,7 +1276,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             offset,
             q,
             kv_compress,
-            _,  # attention_mask from outputs (same as input)
+            compressed_attention_mask,
             index_score,
             q_indexer,
             k_indexer,
@@ -1257,7 +1284,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         ) = attn_outputs[3:]
 
         # Compute indexer loss for training
-        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        indexer_loss_coeff = self.config.dsa_indexer_loss_coeff
         if self.cal_index_loss is not None and self.training and indexer_loss_coeff > 0.0:
             if compress_topk_idxs is not None:
                 loss = self.cal_index_loss(
@@ -1265,14 +1292,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                     offset,
                     q,
                     kv_compress,
-                    attention_mask,
+                    compressed_attention_mask,
                     index_score,
                     q_indexer,
                     k_indexer,
                     weights,
                 )
                 # Apply loss scaler for proper gradient scaling
-                attn_output = DSAIndexerLossAutoScaler.apply(attn_output, loss)
+                attn_output = DSAIndexerLossAutoScaler.apply(
+                    attn_output, loss * indexer_loss_coeff
+                )
 
         hidden_states = self.hc_post(attn_output, residual, post, comb)
 
@@ -1396,6 +1425,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             module.init_weights(std)
         elif isinstance(module, DeepseekV4Head):
             module.init_weights(std)
+        elif module is self:
+            # hc_head_* are bare parameters on the root module, so apply()
+            # never reaches them through a child module. Without this branch
+            # they stay torch.empty and forward yields NaN logits.
+            self.init_hc_head_weights(std)
         else:
             super()._init_weights(module)
 
@@ -1448,6 +1482,8 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cu_seq_lens_q: Optional[torch.Tensor] = None,
+        **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1520,6 +1556,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                     use_cache,
                     output_attentions,
                     input_ids if idx < self.config.num_hash_layers else None,
+                    cu_seq_lens_q,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1530,6 +1567,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                     input_ids=input_ids if idx < self.config.num_hash_layers else None,
+                    cu_seq_lens=cu_seq_lens_q,
                 )
 
             hidden_states = layer_outputs[0]

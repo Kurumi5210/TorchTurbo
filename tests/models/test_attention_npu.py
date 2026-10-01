@@ -12,6 +12,8 @@ from torchturbo.ops import OpDispatcher, registry
 from torchturbo.ops.providers.npu import attention
 from torchturbo.runtime.npu import NpuRuntime
 
+from .flash_attention_fakes import lazy_flash_attention_kernels
+
 
 @pytest.mark.parametrize("module", [None, SimpleNamespace()])
 def test_npu_attention_availability_requires_kernel_api(monkeypatch, module):
@@ -76,9 +78,7 @@ def kernels(monkeypatch):
     process_kwargs = hf_attention._lazy_define_process_function(varlen)
     monkeypatch.setattr(
         hf_attention, "lazy_import_flash_attention",
-        lambda *args, **kwargs: (
-            (flash, varlen, hf_attention._pad_input, hf_attention._unpad_input), process_kwargs
-        ),
+        lambda *args, **kwargs: (lazy_flash_attention_kernels(flash, varlen), process_kwargs),
     )
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_fusion_attention=native))
     monkeypatch.setattr(

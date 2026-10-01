@@ -61,15 +61,13 @@ from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
-from transformers.utils import is_flash_attn_2_available, is_torch_npu_available
+from transformers.utils import is_flash_attn_2_available, is_torch_npu_available, logging
 from transformers.generation.utils import GenerationMixin
 
 from .configuration_kimi_k25 import KimiK25Config
 from .modeling_deepseek import DeepseekV3ForCausalLM
 
-from torchturbo.logging import get_logger
-
-logger = get_logger(__name__)
+logger = logging.get_logger(__name__)
 
 # Flash attention imports
 if is_flash_attn_2_available():
@@ -78,7 +76,7 @@ if is_flash_attn_2_available():
     # from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 if is_torch_npu_available():
-    logger.info_rank0("Using npu_fusion_attention")
+    logger.info("Using npu_fusion_attention")
     from torchturbo.utils.flash_attn_utils import (
         index_first_axis,
         pad_input,
@@ -1167,6 +1165,7 @@ class KimiK25ForConditionalGeneration(KimiK25PreTrainedModel, GenerationMixin):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        **kwargs,
     ) -> tuple | LlavaCausalLMOutputWithPast:
         r"""
         Args:
@@ -1268,6 +1267,12 @@ class KimiK25ForConditionalGeneration(KimiK25PreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            # Packed boundaries ride with cu straight to the attention
+            # kernels; no segment mask is rebuilt for the legacy stack.
+            cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+            cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
+            max_length_q=kwargs.get("max_length_q"),
+            max_length_k=kwargs.get("max_length_k"),
         )
 
         logits = outputs[0]

@@ -18,15 +18,38 @@ try:
 except ImportError:
     NPU_AVAILABLE = False
 
-from torch_turbo.models.glm_moe_dsa.npu import (
+if not NPU_AVAILABLE:
+    pytest.skip("torch_npu is required for indexer packing tests", allow_module_level=True)
+
+from torchturbo.models.glm_moe_dsa.npu import (
     indexer_forward_torch,
     indexer_forward_npu,
     fix_invalid_topk_indices,
     fix_npu_topk_indices,
     create_index_mask,
 )
-from torch_turbo.utils.flash_attn_utils import packing_mask_to_causal_mask
-from torch_turbo.utils.npu_utils import seed_all
+from torchturbo.utils.flash_attn_utils import packing_mask_to_causal_mask
+
+
+def seed_all(seed: int = 1234) -> None:
+    """Seed every RNG and force deterministic NPU kernels."""
+    import os
+    import random
+
+    import numpy as np
+
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    os.environ["HCCL_DETERMINISTIC"] = str(True)
+    os.environ["LCCL_DETERMINISTIC"] = str(1)
+    os.environ["CLOSE_MATMUL_K_SHIFT"] = str(1)
+    os.environ["ATB_MATMUL_SHUFFLE_K_ENABLE"] = "0"
+    os.environ["ATB_LLM_LCOC_ENABLE"] = "0"
+    torch.use_deterministic_algorithms(True)
+    torch_npu.npu.manual_seed_all(seed)
+    torch_npu.npu.manual_seed(seed)
 
 
 class MockConfig:

@@ -1,4 +1,6 @@
 import pytest
+pytest.importorskip("torch_npu")
+pytest.importorskip("mindspeed")
 import torch
 from torch import nn
 import os

@@ -61,7 +61,13 @@ class CPUOffloadConfig:
     def __post_init__(self) -> None:
         if self.enabled is None:
             return
-        self.enabled = bool(self.enabled)
+        if isinstance(self.enabled, str):
+            # Lazy import: engine.args imports this module.
+            from ...args import string_to_bool
+
+            self.enabled = string_to_bool(self.enabled)
+        else:
+            self.enabled = bool(self.enabled)
         if not self.enabled:
             self.mode = CPUOffloadMode.FULL
             self.optimizer_memory_fraction = 0.8

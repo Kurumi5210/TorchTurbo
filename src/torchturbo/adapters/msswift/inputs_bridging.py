@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from ...engine.utils import assert_packed_inputs
+from ...engine.utils import assert_packed_inputs, get_packed_boundaries
 from ...logging import get_logger
 
 logger = get_logger(__name__)
@@ -73,7 +73,6 @@ def bridge_packed_inputs(
             "loss_scale",
             "position_ids",
             "text_position_ids",
-            "token_type_ids",
             "mm_token_type_ids",
         ):
             if key in inputs:
@@ -102,7 +101,75 @@ def bridge_packed_inputs(
                 raise ValueError("Packed Swift maximum lengths must be normalized on CPU.")
             value = int(value)
         inputs[key] = value
+    if inputs.get("labels") is not None:
+        # Trainer counts supervision before the backend shifts labels. Sample
+        # starts have no preceding prediction within their own sample.
+        inputs["labels"][0, expected_cu[:-1]] = _IGNORE_INDEX
     inputs.pop("attention_mask", None)
+    assert_packed_inputs(inputs)
+    return inputs
+
+
+def bridge_unpacked_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a padded Swift batch into one row with cu/max metadata.
+
+    Swift without ``--packing`` collates padded [batch, seq] rows with a
+    0/1 attention mask; every row is a separate sequence once flattened.
+    """
+    input_ids = inputs["input_ids"]
+    if input_ids.device.type != "cpu":
+        raise ValueError("Swift inputs must be normalized on CPU before device transfer.")
+    attention_mask = inputs.pop("attention_mask")
+    batch_size, seq_len = input_ids.shape
+    if attention_mask.shape != (batch_size, seq_len):
+        raise ValueError("Swift attention_mask must match input_ids.")
+
+    valid_indices, cu_seqlens, max_length = get_packed_boundaries(attention_mask)
+    text_positions = torch.cat([
+        torch.arange(length) for length in cu_seqlens.diff().tolist()
+    ]).unsqueeze(0)
+
+    if "position_ids" in inputs:
+        position_ids = inputs["position_ids"]
+        if position_ids.dim() == 3:
+            inputs["position_ids"] = (
+                position_ids.flatten(1).index_select(1, valid_indices).unsqueeze(1)
+            )
+        else:
+            inputs["position_ids"] = (
+                position_ids.flatten().index_select(0, valid_indices).unsqueeze(0)
+            )
+    elif inputs.get("mm_token_type_ids") is None:
+        # Text positions would be wrong for media tokens, so multimodal
+        # batches must bring the template's RoPE coordinates.
+        inputs["position_ids"] = text_positions
+
+    if inputs.get("text_position_ids") is not None:
+        # Swift's mRoPE collator numbers the padded row from zero; its text
+        # coordinates must instead restart at each row's first valid token.
+        inputs["text_position_ids"] = text_positions
+
+    for key in (
+        "input_ids",
+        "labels",
+        "loss_scale",
+        "mm_token_type_ids",
+    ):
+        value = inputs.get(key)
+        if value is not None:
+            if value.shape[:2] != (batch_size, seq_len):
+                raise ValueError(f"Swift {key} must align with the collated rows.")
+            inputs[key] = value.flatten(0, 1).index_select(0, valid_indices).unsqueeze(0)
+
+    if inputs.get("labels") is not None:
+        # Trainer counts supervision before the backend shifts labels. A
+        # row's first token has no preceding prediction within its row.
+        inputs["labels"][0, cu_seqlens[:-1]] = _IGNORE_INDEX
+
+    inputs["cu_seq_lens_q"] = cu_seqlens
+    inputs["cu_seq_lens_k"] = cu_seqlens
+    inputs["max_length_q"] = max_length
+    inputs["max_length_k"] = max_length
     assert_packed_inputs(inputs)
     return inputs
 
@@ -159,4 +226,6 @@ def bridge_swift_inputs(
             sequence_lengths=sequence_lengths,
             padding_side=padding_side,
         )
+    else:
+        inputs = bridge_unpacked_inputs(inputs)
     return bake_loss_scale_into_labels(inputs)

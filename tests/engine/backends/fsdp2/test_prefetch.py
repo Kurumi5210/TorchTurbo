@@ -540,30 +540,22 @@ def test_fsdpconfig_prefetch_depth_rejects_below_one():
         FSDPConfig(backward_prefetch_depth=0)
 
 
-def test_build_fsdp_config_reads_prefetch_depth():
-    from torchturbo.adapters.llamafactory_v0.utils import _build_fsdp_config
+def test_build_from_args_reads_prefetch_depth():
     from torchturbo.engine.args import TorchTurboArgs
-
-    class FakeArgs:
-        fsdp = []
-        fsdp_config = {}
+    from torchturbo.engine.config import build_from_args
 
     tt = TorchTurboArgs(forward_prefetch_depth=3, backward_prefetch_depth=2)
-    cfg = _build_fsdp_config(FakeArgs(), tt)
+    cfg = build_from_args(tt).backend_config
     assert cfg.forward_prefetch_depth == 3
     assert cfg.backward_prefetch_depth == 2
 
 
-def test_build_fsdp_config_rejects_bad_prefetch_depth():
-    from torchturbo.adapters.llamafactory_v0.utils import _build_fsdp_config
+def test_build_from_args_rejects_bad_prefetch_depth():
     from torchturbo.engine.args import TorchTurboArgs
-
-    class FakeArgs:
-        fsdp = []
-        fsdp_config = {}
+    from torchturbo.engine.config import build_from_args
 
     with pytest.raises(ValueError):
-        _build_fsdp_config(FakeArgs(), TorchTurboArgs(forward_prefetch_depth=0))
+        build_from_args(TorchTurboArgs(forward_prefetch_depth=0))
 
 
 def test_engineconfig_from_dict_coerces_enums():
@@ -596,84 +588,52 @@ def test_forward_only_prefetch_rejects_backward_depth():
         FSDPConfig(prefetch_direction="forward", backward_prefetch_depth=2)
 
 
-def test_build_fsdp_config_ignores_lf_prefetch_fields():
-    from torchturbo.adapters.llamafactory_v0.utils import _build_fsdp_config
+def test_build_from_args_defaults_auto():
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
 
-    class FakeArgs:
-        fsdp = []
-        fsdp_config = {
-            "prefetch_strategy": "expert_lookahead",
-            "prefetch_direction": "forward",
-        }
-
-    cfg = _build_fsdp_config(FakeArgs())
+    cfg = build_from_args(TorchTurboArgs()).backend_config
     assert cfg.prefetch_strategy is FSDPPrefetchStrategy.AUTO
     assert cfg.prefetch_direction is FSDPPrefetchDirection.FORWARD_BACKWARD
 
 
-def test_build_fsdp_config_reads_torchturbo_prefetch_args():
-    from torchturbo.adapters.llamafactory_v0.utils import _build_fsdp_config
-    from torchturbo.engine.args import TorchTurboArgs
-
-    class FakeArgs:
-        fsdp = []
-        fsdp_config = {
-            "prefetch_strategy": "expert_lookahead",
-            "prefetch_direction": "forward_backward",
-        }
-
-    tt = TorchTurboArgs(
-        prefetch_strategy="expert_with_layer", prefetch_direction="forward"
-    )
-    cfg = _build_fsdp_config(FakeArgs(), tt)
-    assert cfg.prefetch_strategy is FSDPPrefetchStrategy.EXPERT_WITH_LAYER
-    assert cfg.prefetch_direction is FSDPPrefetchDirection.FORWARD
-
-
-def test_build_fsdp_config_defaults_auto():
-    from torchturbo.adapters.llamafactory_v0.utils import _build_fsdp_config
-
-    class FakeArgs:
-        fsdp = []
-        fsdp_config = {}
-
-    cfg = _build_fsdp_config(FakeArgs())
-    assert cfg.prefetch_strategy == FSDPPrefetchStrategy.AUTO
-
-
 def test_env_injects_prefetch_strategy(monkeypatch):
-    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
 
     # Use a non-default value so this asserts env injection, not the default.
     monkeypatch.setenv("TORCH_TURBO_PREFETCH_STRATEGY", "expert_with_layer")
-    cfg = EngineConfig.from_dict({"backend": "fsdp2"})
+    cfg = build_from_args(TorchTurboArgs())
     assert cfg.backend_config.prefetch_strategy == FSDPPrefetchStrategy.EXPERT_WITH_LAYER
 
 
 def test_env_injects_prefetch_depth(monkeypatch):
-    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
 
     monkeypatch.setenv("TORCH_TURBO_FORWARD_PREFETCH_DEPTH", "3")
     monkeypatch.setenv("TORCH_TURBO_BACKWARD_PREFETCH_DEPTH", "2")
-    cfg = EngineConfig.from_dict({"backend": "fsdp2"})
+    cfg = build_from_args(TorchTurboArgs())
     assert cfg.backend_config.forward_prefetch_depth == 3
     assert cfg.backend_config.backward_prefetch_depth == 2
 
 
 def test_env_rejects_bad_prefetch_depth(monkeypatch):
-    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
 
     monkeypatch.setenv("TORCH_TURBO_BACKWARD_PREFETCH_DEPTH", "0")
     with pytest.raises(ValueError):
-        EngineConfig.from_dict({"backend": "fsdp2"})
+        build_from_args(TorchTurboArgs())
 
 
 def test_env_rejects_backward_only(monkeypatch):
-    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.args import TorchTurboArgs
+    from torchturbo.engine.config import build_from_args
 
     monkeypatch.setenv("TORCH_TURBO_PREFETCH_DIRECTION", "backward")
     with pytest.raises(ValueError):
-        EngineConfig.from_dict({"backend": "fsdp2"})
+        build_from_args(TorchTurboArgs())
 
 
 def test_engineconfig_nested_backend_config_rejects_backward_only():

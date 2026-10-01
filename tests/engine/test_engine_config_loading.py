@@ -12,6 +12,7 @@ Precedence is: CLI > file > env > TorchTurboArgs.
 
 import json
 import textwrap
+from pathlib import Path
 
 import pytest
 import yaml
@@ -246,14 +247,26 @@ def test_config_without_engineconfig_wrapper_raises(tmp_path):
         _build_from_argv(["--tt_config", path])
 
 
-def test_empty_config_file_is_noop(tmp_path):
+@pytest.mark.parametrize(
+    "content",
+    ["engine_config: {}\n", "engine_config: null\n", "engine_config:\n  # sp_size: 2\n"],
+)
+def test_empty_config_file_is_noop(tmp_path, content):
     cfg = _build_from_argv(
-        ["--tt_config", _write(tmp_path, "empty.yaml", "engine_config: {}\n")]
+        ["--tt_config", _write(tmp_path, "empty.yaml", content)]
     )
 
     assert cfg.parallel_plan.sp_size == 1
     assert cfg.activation_checkpointing.enabled is True
     assert cfg.mixed_precision is MixedPrecisionPolicy.FP32
+
+
+@pytest.mark.parametrize("value", ["false", "0", '""', "[]"])
+def test_non_mapping_engine_config_raises(tmp_path, value):
+    path = _write(tmp_path, "invalid.yaml", f"engine_config: {value}\n")
+
+    with pytest.raises(ValueError, match="engine_config must be a mapping"):
+        _build_from_argv(["--tt_config", path])
 
 
 def test_missing_config_file_raises(tmp_path):
@@ -510,6 +523,45 @@ engine_config:
     assert offload.mode.value == "optimizer"
 
 
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_yaml_cpu_offload_parses_string_enabled(tmp_path, enabled):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            f'backend_config:\n  cpu_offload:\n    enabled: "{enabled}"\n'
+            "    mode: optimizer\n    optimizer_memory_fraction: 0.5\n"
+        ),
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    offload = cfg.backend_config.cpu_offload
+    assert offload.enabled is (enabled == "true")
+    assert offload.mode.value == ("optimizer" if enabled == "true" else "full")
+    assert offload.optimizer_memory_fraction == (0.5 if enabled == "true" else 0.8)
+
+
+@pytest.mark.parametrize("enabled", [None, "true", "false"])
+def test_yaml_cpu_offload_resolves_env_enabled(tmp_path, monkeypatch, enabled):
+    if enabled is None:
+        monkeypatch.delenv("TT_TEST_CPU_OFFLOAD", raising=False)
+    else:
+        monkeypatch.setenv("TT_TEST_CPU_OFFLOAD", enabled)
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config(
+            "backend_config:\n  cpu_offload:\n"
+            "    enabled: ${oc.env:TT_TEST_CPU_OFFLOAD,false}\n"
+        ),
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.backend_config.cpu_offload.enabled is (enabled == "true")
+
+
 def test_yaml_cpu_offload_rejects_legacy_enable_key(tmp_path):
     path = _write(
         tmp_path,
@@ -615,6 +667,28 @@ def test_cli_op_policy_overrides_file(tmp_path):
     cfg = _build_from_argv(["--tt_config", path, "--tt_op_policy", "auto"])
 
     assert cfg.ops.policy is OpPolicy.AUTO
+
+
+def test_file_op_overrides_are_applied(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("ops:\n  overrides:\n    rms_norm: torch_rms_norm\n"),
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.ops.overrides == {"rms_norm": "torch_rms_norm"}
+
+
+def test_config_example_loads():
+    path = Path(__file__).parents[2] / "scripts" / "runs" / "config_example.yaml"
+
+    cfg = _build_from_argv(["--tt_config", str(path)])
+
+    assert cfg.ops.overrides == {"rms_norm": "torch_rms_norm"}
+    assert cfg.backend_config.cpu_offload.enabled is False
+    assert cfg.optimizer.name == "muon"
 
 
 def test_cli_use_deterministic_algorithms_overrides_file(tmp_path):

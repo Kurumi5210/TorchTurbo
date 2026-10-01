@@ -1,5 +1,3 @@
-import functools
-
 import torch
 
 from torchturbo.engine.metrics.flops import BaseModelFlops
@@ -73,8 +71,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
         return Qwen3_5MoeFlops
 
     def __init__(self, config: Qwen3_5MoeConfig) -> None:
-        if hasattr(config, "vision_config"):
-            config.vision_config._attn_implementation = "flash_attention_2"
         super().__init__(config)
         self._post_init_patches()
 
@@ -92,13 +88,13 @@ class TurboQwen3_5MoeForConditionalGeneration(
         # Wrap get_rope_index:
         # 1. auto-fill mm_token_type_ids when not provided (the open-source LF
         #    collator never passes this arg);
-        # 2. support LLaMA-Factory neat packing. The upstream get_rope_index
-        #    collapses the attention_mask with .bool(), which merges packed
-        #    sub-sequences into one contiguous run and never resets positions.
-        #    Under neat packing the mask carries incrementing integers
-        #    (1, 2, 3, ... per packed sub-sequence, 0 = pad), so we detect that
-        #    (max > 1) and run a packing-aware variant here, keeping
-        #    modeling_qwen3_5_moe.py unchanged (upstream-faithful).
+        # 2. run a mask-aware variant whenever a mask is given. Mask values
+        #    label blocks (1, 2, 3, ... per packed sub-sequence, 0 = pad), so
+        #    positions restart at every block, and image placeholders cut by
+        #    truncation keep aligned positions instead of failing the upstream
+        #    shape check. The LlamaFactory collator passes binary masks, so
+        #    its calls take this path too. This keeps modeling_qwen3_5_moe.py
+        #    unchanged (upstream-faithful).
         original_get_rope_index = self.model.get_rope_index
         get_vision_position_ids = self.model.get_vision_position_ids
         spatial_merge_size = self.config.vision_config.spatial_merge_size
@@ -134,10 +130,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
             if mm_token_type_ids is None:
                 mm_token_type_ids = _build_mm_token_type_ids(input_ids)
 
-            # Packing-aware path only when the mask actually carries packing
-            # labels (neat packing): values > 1 distinguish packed sub-sequences.
-            # A plain 0/1 mask (or no mask) falls through to the upstream impl,
-            # so non-packed training and inference are byte-identical to before.
+            # Only mask-less calls keep the upstream implementation.
             if attention_mask is None or attention_mask.numel() == 0:
                 return original_get_rope_index(
                     input_ids,
@@ -254,7 +247,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
-        self.patch_vision_attention_interface()
         if sp_size > 1:
             from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
                 Qwen3_5MoeTextModel,
@@ -264,19 +256,10 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
             patch_forward_for_sp_input_slicing(Qwen3_5MoeTextModel, sp_group, sp_size)
 
-            # Patch full attention for large SP (sp_size > num_attention_heads)
-            text_config = (
-                self.config.text_config
-                if hasattr(self.config, "text_config")
-                else self.config
-            )
-            num_attention_heads = text_config.num_attention_heads
-            if sp_size > num_attention_heads:
-                self._patch_ulysses_fa_for_sp(
-                    num_attention_heads, sp_size
-                )
-
-            self.patch_ulysses_fa(sp_info)
+            # Vision keeps flash_attention_2 on its own subconfig and stays
+            # on the native flash path; only text attention switches to the
+            # registered SP interface.
+            self.register_sp_attention_interface(sp_info)
 
             self.patch_gated_delta_net_for_sp(
                 Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank
@@ -286,124 +269,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 self.patch_mtp_for_sp(
                     Qwen3_5MoeMultiTokenPredictor, sp_group, sp_size, sp_rank
                 )
-
-    @classmethod
-    def patch_vision_attention_interface(cls):
-        from . import modeling_qwen3_5_moe
-        from ..modules.attention.interface import attention_forward
-
-        attn_cls = modeling_qwen3_5_moe.Qwen3_5MoeVisionAttention
-        origin_attr = "_torchturbo_qwen3_5_moe_vision_origin_attention_interface"
-        if getattr(attn_cls, origin_attr, None) is not None:
-            return  # already patched
-        setattr(attn_cls, origin_attr, attn_cls.attention_interface)
-
-        def sp_attention_interface(
-            module,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            *args,
-            **kwargs,
-        ):
-            call_kwargs = kwargs.copy()
-            position_ids = call_kwargs.pop("position_ids", None)
-            dropout = call_kwargs.pop("dropout", 0.0)
-            softmax_scale = call_kwargs.pop("scaling", None)
-            is_causal = call_kwargs.pop("is_causal", False)
-
-            seq_len = query_states.shape[2]
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
-            value_states = value_states.transpose(1, 2)
-
-            # Vision attention does not use the language model's SP collectives.
-            attn_output = attention_forward(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                query_length=seq_len,
-                is_causal=is_causal,
-                dropout=dropout,
-                position_ids=position_ids,
-                softmax_scale=softmax_scale,
-                **call_kwargs,  # cu_seq_lens_q/k, max_length_q/k flow through
-            )
-            return attn_output, None
-
-        attn_cls.attention_interface = staticmethod(sp_attention_interface)
-
-    # ------------------------------------------------------------------
-    # Full Attention: sp_repeat for Q heads
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def _patch_ulysses_fa_for_sp(cls, num_attention_heads, sp_size):
-        """Patch ulysses_flash_attention_forward to handle sp_size > num_attention_heads.
-
-        When sp_size > num_attention_heads (e.g., SP=32 with 16 Q heads),
-        Q heads are fewer than SP groups and cannot be split across ranks.
-        Solution: repeat Q heads by sp_repeat_q before all-to-all, then
-        dedup after all-to-all back.
-
-        Example (35B, SP=32):
-          num_attention_heads=16, sp_repeat_q=sp_size//num_attention_heads=2
-          Q: [B, T/32, 16, D] → repeat → [B, T/32, 32, D]
-          → all-to-all → [B, T, 1, D] → flash attn → [B, T, 1, D]
-          → all-to-all back → [B, T/32, 32, D] → dedup → [B, T/32, 16, D]
-
-        K/V are handled by the existing GQA repeat in ulysses_flash_attention_forward
-        (num_key_value_heads=2, repeat by 16 → 32 heads, divisible by sp_size=32).
-        """
-        from ..modules.attention.ulysses import ulysses as ulysses_module
-        from ..modules.attention import ulysses as ulysses_pkg
-
-        sp_repeat_q = sp_size // num_attention_heads
-        if sp_repeat_q <= 1:
-            return
-
-        _original_ulysses_fa = ulysses_module.ulysses_flash_attention_forward
-
-        @functools.wraps(_original_ulysses_fa)
-        def _ulysses_fa_with_sp_repeat(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            query_length,
-            *args,
-            position_ids=None,
-            sp_group=None,
-            sp_size=1,
-            **kwargs,
-        ):
-            # Repeat Q heads to match sp_size
-            query_states = query_states.repeat_interleave(sp_repeat_q, dim=2)
-
-            # Call original ulysses flash attention
-            attn_output = _original_ulysses_fa(
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                query_length,
-                *args,
-                position_ids=position_ids,
-                sp_group=sp_group,
-                sp_size=sp_size,
-                **kwargs,
-            )
-
-            # Dedup: after all-to-all back, output has sp_repeat_q * num_q_heads heads.
-            # Each group of sp_repeat_q heads are identical copies → take first of each.
-            attn_output = attn_output[:, :, ::sp_repeat_q, :]
-
-            return attn_output
-
-        ulysses_module.ulysses_flash_attention_forward = _ulysses_fa_with_sp_repeat
-        ulysses_pkg.ulysses_flash_attention_forward = _ulysses_fa_with_sp_repeat
 
     # ------------------------------------------------------------------
     # MTP: SP input slicing
@@ -426,7 +291,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
             attention_mask = kwargs.pop("attention_mask", None)
             position_ids = kwargs.pop("position_ids", None)
             pad_token_id = int(kwargs.pop("pad_token_id", 0))
-
             # The backbone is already SP-local. Reconstruct only IDs so MTP
             # rolling sees the next token across an SP boundary.
             local_seq_len = hidden_states.size(1)
@@ -498,7 +362,6 @@ class TurboQwen3_5MoeForConditionalGeneration(
             gather_seq_scatter_heads,
             gather_heads_scatter_seq,
         )
-        from .modeling_qwen3_5_moe import _get_cu_seqlens
         from torchturbo.ops import ops
         import torch.nn.functional as F
 
@@ -516,10 +379,10 @@ class TurboQwen3_5MoeForConditionalGeneration(
             return weight[tuple(slices)]
 
         def sp_forward(self_attn, hidden_states, **kwargs):
-            # Apply mask & extract shapes
-            cu_seqlens = None
-            attention_mask = kwargs.get("attention_mask", None)
-            cu_seqlens = _get_cu_seqlens(attention_mask)
+            # Global packed boundaries ride with the forward kwargs (passed by
+            # the decoder layer as cu_seq_lens); the a2a gathers below rebuild
+            # the full sequence on each rank.
+            cu_seqlens = kwargs.get("cu_seq_lens")
             B, local_T, _ = hidden_states.shape
 
             nk_full, nv_full = self_attn.num_k_heads, self_attn.num_v_heads
@@ -692,7 +555,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens = cu_seqlens,
+                cu_seqlens=cu_seqlens,
             )
 
             # All-to-all #2: gather heads / scatter seq back

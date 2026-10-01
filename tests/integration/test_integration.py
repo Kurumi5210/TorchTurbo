@@ -70,8 +70,6 @@ class TestActivate:
 
         with mock.patch.dict(sys.modules, cleaned, clear=True):
             with mock.patch("importlib.util.find_spec", return_value=None):
-                # Reset activation state
-                torchturbo._activated.clear()
                 result = torchturbo.activate()
                 assert result is None
 

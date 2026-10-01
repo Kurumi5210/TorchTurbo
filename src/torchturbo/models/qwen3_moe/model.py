@@ -61,7 +61,7 @@ class TurboQwen3MoeForCausalLM(TurboModel, Qwen3MoeForCausalLM):
 
     def on_parallelized(self, parallel_context):
         sp_info = parallel_context["sp"]
-        self.patch_ulysses_fa(sp_info)
+        self.register_sp_attention_interface(sp_info)
 
     def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""

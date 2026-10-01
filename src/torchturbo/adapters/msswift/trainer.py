@@ -25,7 +25,6 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from ...engine import CPUOffloadMode
 from ...engine.distributed import assert_finite
@@ -33,30 +32,6 @@ from ...logging import get_logger
 from . import engine_registry
 
 logger = get_logger(__name__)
-
-
-def apply_ulysses_sp_patch(engine: Any) -> bool:
-    """Redirect global flash-attention to the Ulysses SP kernel when ``sp>1``.
-
-    swift runs its own training loop, so the SP attention patch is applied
-    eagerly from the trainer init instead.
-    Idempotent; a no-op when SP is off.  Returns whether the patch was applied.
-    """
-    try:
-        sp_info = engine.get_sp_info()
-    except Exception:
-        return False
-    sp_group = sp_info.get("sp_group")
-    sp_size = sp_info.get("sp_size", 1)
-    if not sp_group or sp_size <= 1:
-        return False
-
-    from torchturbo.models.modules.attention.ulysses import (
-        patch_flash_attention_forward_for_sp,
-    )
-
-    patch_flash_attention_forward_for_sp(sp_info)
-    return True
 
 
 def install_clip_override(trainer, engine) -> None:
@@ -196,7 +171,6 @@ class TurboTrainerMixin:
             )
         )
 
-        apply_ulysses_sp_patch(engine)
         install_clip_override(self, engine)
         install_accelerator_overrides(self, engine)
 
@@ -348,6 +322,7 @@ class TurboTrainerMixin:
         for key in ("compute_loss_func", "loss_scale", "logits_to_keep"):
             inputs.pop(key, None)
 
+        sp_size = engine.get_sp_info()["sp_size"]
         loss, outputs = engine.compute_loss(
             model,
             inputs,
@@ -360,8 +335,8 @@ class TurboTrainerMixin:
 
         # SP gathers loss to full length; scale back when HF gives no
         # num_items_in_batch.
-        if num_items_in_batch is None and engine.get_sp_info().get("sp_size", 1) > 1:
-            loss = loss * engine.get_sp_info()["sp_size"]
+        if num_items_in_batch is None and sp_size > 1:
+            loss = loss * sp_size
 
         return (loss, outputs) if return_outputs else loss
 

@@ -49,10 +49,16 @@ def get_turbo_model(config_dict, device="cpu"):
     from torchturbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
     from torchturbo.models.deepseek_v4 import model as turbo_model_module
     from torchturbo.models.deepseek_v4 import modeling_deepseek_v4 as modeling_module
+    from torchturbo.ops import get_or_create_ops
+    from torchturbo.runtime.cpu import CpuRuntime
     try:
         from .test_alignment import hadamard_transform_impl
     except ImportError:  # pragma: no cover - direct script execution
         from test_alignment import hadamard_transform_impl
+
+    # The Turbo wrapper's RMSNorm goes through the ops dispatcher, so a CPU
+    # dispatcher must exist before the model is constructed.
+    get_or_create_ops(device_runtime=CpuRuntime())
 
     # This is a CPU precision test. In NPU containers torch_npu can be importable
     # even when the test tensors live on CPU, so avoid globally patching RMSNorm

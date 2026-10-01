@@ -91,6 +91,7 @@ class Qwen3_5MoeTextForCausalLM(Qwen3_5MoeForCausalLM):
                 attention_mask=attention_mask,
                 position_ids=position_ids[0],
                 pad_token_id=int(getattr(self.config, "pad_token_id", 0) or 0),
+                **kwargs,
             )
             mtp_logits = [self.lm_head(h) for h in mtp_hidden_states]
 

@@ -8,15 +8,20 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers import modeling_flash_attention_utils as flash_utils
+from transformers.integrations import flash_attention as flash_integration
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.config import LossChunkConfig
+from torchturbo.models.modules.attention.interface import attention_forward
 from torchturbo.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
 from torchturbo.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
+    Qwen3_5DecoderLayer,
     Qwen3_5MLP,
     Qwen3_5ModelOutputWithPast,
+    Qwen3_5MTPLayer,
     Qwen3_5MultiTokenPredictor,
     Qwen3_5TextRotaryEmbedding,
 )
@@ -25,6 +30,8 @@ from torchturbo.models.qwen3_5_moe.model import TurboQwen3_5MoeForConditionalGen
 from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeMultiTokenPredictor
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+
+from ..flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
 
 
 def _config(layers=2):
@@ -209,11 +216,15 @@ def test_sp_shifts_global_ids_before_local_embedding_slice(monkeypatch, local_id
     TurboQwen3_5MoeForConditionalGeneration.patch_mtp_for_sp(Qwen3_5MultiTokenPredictor, None, 2, rank)
     assert Qwen3_5MoeMultiTokenPredictor.forward is moe_original
     predictor = Qwen3_5MultiTokenPredictor(_config())
+    cu = torch.tensor([0, 2, 5], dtype=torch.int32)
     # Isolate the shift/slice contract from cross-rank attention communication.
     class IdentityLayer(nn.Module):
         def forward(self, hidden_states, **kwargs):
             assert kwargs["position_ids"].shape[-1] == 3
             assert kwargs["position_embeddings"][0].shape[1] == 3
+            assert kwargs["cu_seq_lens_q"] is cu
+            assert kwargs["cu_seq_lens_k"] is cu
+            assert kwargs["max_length_q"] == kwargs["max_length_k"] == 3
             return hidden_states
 
     predictor.layers = nn.ModuleList([IdentityLayer(), IdentityLayer()])
@@ -227,6 +238,10 @@ def test_sp_shifts_global_ids_before_local_embedding_slice(monkeypatch, local_id
         lambda ids: ids.unsqueeze(-1).expand(-1, -1, 8).float(),
         position_ids=torch.arange(6).view(1, 6),
         position_embeddings=(torch.ones(1, 6, 4), torch.zeros(1, 6, 4)),
+        cu_seq_lens_q=cu,
+        cu_seq_lens_k=cu,
+        max_length_q=3,
+        max_length_k=3,
     )
     expected = ([[2, 3, 4], [3, 4, 5]] if rank == 0 else [[5, 6, 0], [6, 0, 0]])
     assert [tensor[0, :, 0].tolist() for tensor in seen] == expected
@@ -236,7 +251,7 @@ def test_sp_shifts_global_ids_before_local_embedding_slice(monkeypatch, local_id
 def test_position_rows_and_packed_metadata_reach_mtp(monkeypatch, axes):
     model = _model(1)
     text_positions = torch.tensor([[0, 1, 0, 1, 2]])
-    rope_positions = torch.stack((text_positions, text_positions + 2, text_positions + 4))
+    rope_positions = torch.stack((text_positions + 2, text_positions + 4, text_positions + 6))
     positions = (text_positions if axes == 2 else rope_positions if axes == 3
                  else torch.cat((text_positions.unsqueeze(0), rope_positions)))
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
@@ -249,7 +264,10 @@ def test_position_rows_and_packed_metadata_reach_mtp(monkeypatch, axes):
     monkeypatch.setattr(model.mtp, "forward", capture)
     model(input_ids=_batch()["input_ids"], position_ids=positions,
           cu_seq_lens_q=cu, cu_seq_lens_k=cu, max_length_q=3, max_length_k=3)
-    torch.testing.assert_close(captured["position_ids"], text_positions if axes in (2, 4) else positions)
+    # Three-axis inputs use the temporal row for attention; four-axis inputs
+    # carry a separate text row before the three rotary coordinates.
+    expected_text_positions = rope_positions[0] if axes == 3 else text_positions
+    torch.testing.assert_close(captured["position_ids"], expected_text_positions)
     expected_rope = model.model.language_model.rotary_emb(
         model.model.hidden, text_positions if axes == 2 else rope_positions
     )
@@ -258,3 +276,62 @@ def test_position_rows_and_packed_metadata_reach_mtp(monkeypatch, axes):
     assert captured["cu_seq_lens_q"] is cu
     assert captured["cu_seq_lens_k"] is cu
     assert captured["max_length_q"] == captured["max_length_k"] == 3
+
+
+def test_dense_mtp_matches_backbone_with_position_resets_inside_cu(monkeypatch):
+    torch.manual_seed(13)
+    config = _config(1)
+    config._attn_implementation = "flash_attention_2"
+    backbone_layer = Qwen3_5DecoderLayer(config, layer_idx=0)
+    mtp_layer = Qwen3_5MTPLayer(config, layer_idx=1)
+    mtp_layer.load_state_dict(backbone_layer.state_dict())
+    hidden = torch.randn(1, 6, config.hidden_size)
+    positions = torch.tensor([[0, 1, 0, 1, 0, 1]])
+    cu = torch.tensor([0, 6], dtype=torch.int32)
+    observed_metadata = []
+
+    def varlen_attention(query, key, value, **kwargs):
+        observed_metadata.append(kwargs)
+        query_bounds = kwargs["cu_seqlens_q"].tolist()
+        key_bounds = kwargs["cu_seqlens_k"].tolist()
+        outputs = []
+        for qs, qe, ks, ke in zip(
+            query_bounds[:-1], query_bounds[1:], key_bounds[:-1], key_bounds[1:],
+        ):
+            output = F.scaled_dot_product_attention(
+                query[qs:qe].transpose(0, 1).unsqueeze(0),
+                key[ks:ke].transpose(0, 1).unsqueeze(0),
+                value[ks:ke].transpose(0, 1).unsqueeze(0),
+                is_causal=kwargs["causal"],
+                scale=kwargs["softmax_scale"],
+                enable_gqa=True,
+            )
+            outputs.append(output.squeeze(0).transpose(0, 1))
+        return torch.cat(outputs)
+
+    monkeypatch.setattr(flash_integration, "_flash_attention_forward", attention_forward)
+    monkeypatch.setattr(
+        flash_utils, "lazy_import_flash_attention",
+        lambda *args, **kwargs: (
+            lazy_flash_attention_kernels(None, varlen_attention),
+            process_flash_kwargs,
+        ),
+    )
+    inputs = {
+        "position_embeddings": Qwen3_5TextRotaryEmbedding(config)(hidden, positions),
+        "position_ids": positions,
+        "cu_seq_lens_q": cu,
+        "cu_seq_lens_k": cu,
+        "max_length_q": 6,
+        "max_length_k": 6,
+    }
+
+    expected = backbone_layer(hidden, **inputs)
+    actual = mtp_layer(hidden, **inputs)
+
+    torch.testing.assert_close(actual, expected)
+    assert len(observed_metadata) == 2
+    for metadata in observed_metadata:
+        assert metadata["cu_seqlens_q"] is cu
+        assert metadata["cu_seqlens_k"] is cu
+        assert metadata["max_seqlen_q"] == metadata["max_seqlen_k"] == 6

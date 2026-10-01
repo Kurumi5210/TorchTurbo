@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from ...engine import CPUOffloadConfig, CPUOffloadMode, EngineConfig
 from ...engine.args import TorchTurboArgs, get_arg_specs, string_to_bool
+from ...engine.utils import raise_if_evaluation_enabled
 from ...logging import get_logger
 
 
@@ -50,6 +51,8 @@ def build_config_from_lf_args(
     The configured ``EngineConfig`` and raw args with LlamaFactory gradient
     checkpointing disabled.
     """
+    if training_args is not None:
+        raise_if_evaluation_enabled(training_args)
     _raise_if_unsupported_lf_args(finetuning_args, model_args, torchturbo_args)
 
     config, raw_args = _build_config_from_args(

@@ -22,7 +22,6 @@ class TurboQwen3_5MoeTextForCausalLM(TurboModel, Qwen3_5MoeTextForCausalLM):
     config_class = Qwen3_5MoeTextConfig
     base_model_prefix = "model"
 
-    _patch_ulysses_fa_for_sp = _qwen3_5_moe_vlm._patch_ulysses_fa_for_sp
     patch_gated_delta_net_for_sp = _qwen3_5_moe_vlm.patch_gated_delta_net_for_sp
     patch_mtp_for_sp = _qwen3_5_moe_vlm.patch_mtp_for_sp
 
@@ -56,18 +55,7 @@ class TurboQwen3_5MoeTextForCausalLM(TurboModel, Qwen3_5MoeTextForCausalLM):
 
             patch_forward_for_sp_input_slicing(Qwen3_5MoeTextModel, sp_group, sp_size)
 
-            text_config = (
-                self.config.text_config
-                if hasattr(self.config, "text_config")
-                else self.config
-            )
-            num_attention_heads = text_config.num_attention_heads
-            if sp_size > num_attention_heads:
-                self._patch_ulysses_fa_for_sp(
-                    num_attention_heads, sp_size
-                )
-
-            self.patch_ulysses_fa(sp_info)
+            self.register_sp_attention_interface(sp_info)
 
             self.patch_gated_delta_net_for_sp(
                 Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank

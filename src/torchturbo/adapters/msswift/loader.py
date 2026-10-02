@@ -55,8 +55,16 @@ _DTYPE_MAP = {
 def _resolve_dtype(raw: Any) -> torch.dtype:
     if isinstance(raw, torch.dtype):
         return raw
+    if raw is None:
+        return torch.bfloat16
     if isinstance(raw, str):
-        return _DTYPE_MAP.get(raw.lower(), torch.bfloat16)
+        try:
+            return _DTYPE_MAP[raw.lower()]
+        except KeyError as exc:
+            supported = ", ".join(sorted(_DTYPE_MAP))
+            raise ValueError(
+                f"Unsupported torch dtype {raw!r}; expected one of: {supported}"
+            ) from exc
     return torch.bfloat16
 
 
@@ -75,6 +83,19 @@ class TurboModelMixin:
         engine = engine_registry.get_engine()
         peft_config = getattr(engine, "peft_config", None)
         torch_dtype = _resolve_dtype(getattr(self, "torch_dtype", None))
+
+        if engine_registry.get_loading_role() == "reference":
+            # Build the frozen reference through the same engine.
+            logger.info_rank0(
+                "TurboModelMixin: building reference via turbo engine "
+                "(%s, dtype=%s, native_loader=%s)",
+                model_dir, torch_dtype, type(self).__mro__[1].__name__,
+            )
+            return engine.build_model(
+                model_name_or_path=model_dir,
+                torch_dtype=torch_dtype,
+                init_kwargs={"config": config},
+            )
 
         logger.info_rank0(
             "TurboModelMixin: building via turbo engine (%s, dtype=%s, peft=%s, native_loader=%s)",

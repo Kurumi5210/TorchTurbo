@@ -15,7 +15,7 @@ pip install kiwisolver
 pip install torchvision==0.25.0
 pip install torchaudio==2.10.0
 pip install accelerate==1.11.0
-pip install trl==0.24.0
+pip install trl==0.29.0
 pip install matplotlib
 
 pip install ms_swift==4.4.2

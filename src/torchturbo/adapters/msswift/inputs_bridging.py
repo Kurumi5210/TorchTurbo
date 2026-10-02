@@ -25,6 +25,7 @@ class SwiftInputCollator:
     template: Any
 
     def __call__(self, batch: list) -> dict[str, Any]:
+        is_dpo = getattr(self.template, "mode", None) == "rlhf"
         sequence_lengths = None
         if self.template.padding_free:
             # PackingDataset groups samples into lists; the native collator
@@ -32,11 +33,31 @@ class SwiftInputCollator:
             samples = batch
             if isinstance(batch[0], list):
                 samples = [sample for group in batch for sample in group]
-            sequence_lengths = [len(sample["input_ids"]) for sample in samples]
+            if is_dpo:
+                sequence_lengths = [
+                    len(sample[f"{prefix}input_ids"])
+                    for prefix in ("chosen_", "rejected_")
+                    for sample in samples
+                ]
+            else:
+                sequence_lengths = [len(sample["input_ids"]) for sample in samples]
         padding_side = "left"
         if self.template.is_training:
             padding_side = self.template.padding_side
         inputs = self.collator(batch)
+        if is_dpo:
+            # Like Swift's, the DPO forward ignores loss_scale (Swift's template
+            # already masks zero-scale tokens in the labels), so it is not
+            # folded into the labels here.
+            if sequence_lengths is None:
+                # Swift pads the chosen rows, then the rejected rows; the
+                # flattened segments keep that order.
+                return bridge_unpacked_inputs(inputs)
+            return bridge_packed_inputs(
+                inputs,
+                sequence_lengths=sequence_lengths,
+                padding_side=padding_side,
+            )
         return bridge_swift_inputs(
             inputs,
             sequence_lengths=sequence_lengths,

@@ -175,7 +175,8 @@ scripts/runs/
     ├── install_lf_deps.sh    # LlamaFactory 模型依赖
     ├── install_swift_deps.sh # ms-swift 模型依赖
     ├── lf_text_sft.sh        # LlamaFactory SFT 训练脚本
-    └── swift_mllm_sft.sh     # ms-swift 多模态 SFT 训练脚本
+    ├── swift_mllm_sft.sh     # ms-swift 多模态 SFT 训练脚本
+    └── swift_text_dpo.sh     # ms-swift DPO 训练脚本
 ```
 
 示例：

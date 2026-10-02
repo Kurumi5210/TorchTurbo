@@ -122,6 +122,11 @@ ms-swift adapters reject configurations unless `eval_strategy="no"`,
 `do_eval=False`, `do_predict=False`, `predict_with_generate=False`, and
 `eval_on_start=False`.
 
+For ms-swift DPO, `--router_aux_loss_coef` sets the default for TorchTurbo's
+`moe.aux_loss_coeff`; `--tt_config` and explicit `--tt_moe_aux_loss_coeff` take
+precedence. The engine's routers apply the auxiliary gradients and report
+`aux_loss` / `aux_loss_scaled` separately from the DPO loss.
+
 SFT samples are always isolated, including with LlamaFactory's
 `packing=True, neat_packing=False`. `train_on_prompt=True` enables prompt
 supervision within each sample; predictions never cross sample boundaries.

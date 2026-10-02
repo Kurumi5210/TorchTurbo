@@ -93,9 +93,18 @@ if __name__ == "__main__":
 
 ## 运行方式
 
+### LlamaFactory SFT
+
 ```bash
 sh internal/scripts/runs/deepseek_v4/install_lf_deps.sh
 sh internal/scripts/runs/deepseek_v4/lf_sft.sh
+```
+
+### Swift DPO
+
+```bash
+sh internal/scripts/runs/deepseek_v4/install_swift_deps.sh
+sh internal/scripts/runs/deepseek_v4/swift_dpo.sh
 ```
 
 ## torchturbo v2 对比

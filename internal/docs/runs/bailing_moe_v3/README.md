@@ -82,26 +82,32 @@ if __name__ == "__main__":
 
 ### PT
 ```bash
-sh scripts/runs/bailing_v3/install_lf_deps.sh
+sh internal/scripts/runs/bailing_v3/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/bailing_v3/lf_tiny_pt.sh
+sh internal/scripts/runs/bailing_v3/lf_tiny_pt.sh
 ```
 
 ### SFT
 ```bash
-sh scripts/runs/bailing_v3/install_lf_deps.sh
+sh internal/scripts/runs/bailing_v3/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/bailing_v3/lf_tiny_sft.sh
+sh internal/scripts/runs/bailing_v3/lf_tiny_sft.sh
+
+sh internal/scripts/runs/bailing_v3/install_swift_deps.sh
+sh internal/scripts/runs/bailing_v3/swift_tiny_sft.sh
 ```
 
 ### DPO
 ```bash
-sh scripts/runs/bailing_v3/install_lf_deps.sh
+sh internal/scripts/runs/bailing_v3/install_lf_deps.sh
 # Optional when running the script outside this repo:
 # export TORCHTURBO_SRC_DIR=/path/to/torchturbo/src
-sh scripts/runs/bailing_v3/lf_tiny_dpo.sh
+sh internal/scripts/runs/bailing_v3/lf_tiny_dpo.sh
+
+sh internal/scripts/runs/bailing_v3/install_swift_deps.sh
+sh internal/scripts/runs/bailing_v3/swift_tiny_dpo.sh
 ```
 
 ## 和 DeepSpeed 对比

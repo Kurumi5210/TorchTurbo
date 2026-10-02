@@ -495,6 +495,136 @@ def test_manager_cleanup_clears_targets():
     assert model.layers[1].experts_ref.forward_prefetch_arg == []
 
 
+def test_manager_setup_keeps_other_model_targets():
+    policy = make_model([False, True, True])
+    reference = make_model([False, True, True])
+    cfg = FSDPConfig(
+        prefetch_strategy=FSDPPrefetchStrategy.EXPERT_LOOKAHEAD,
+        prefetch_direction=FSDPPrefetchDirection.FORWARD_BACKWARD,
+    )
+    manager = pf.FSDPPrefetchManager(config=cfg)
+
+    manager.setup(reference)
+    manager.setup(policy)
+
+    assert policy.layers[0].forward_prefetch_arg == [
+        policy.layers[1],
+        policy.layers[1].experts_ref,
+    ]
+    assert policy.layers[1].experts_ref.forward_prefetch_arg == [
+        policy.layers[2].experts_ref
+    ]
+    assert policy.layers[2].backward_prefetch_arg == [policy.layers[1]]
+    assert reference.layers[0].forward_prefetch_arg == [
+        reference.layers[1],
+        reference.layers[1].experts_ref,
+    ]
+    assert reference.layers[1].experts_ref.forward_prefetch_arg == [
+        reference.layers[2].experts_ref
+    ]
+    assert len(manager.chains) == 2
+
+
+def test_suspend_expert_forward_prefetch_can_target_one_model():
+    policy = make_model([False, True, True])
+    reference = make_model([False, True, True])
+    manager = pf.FSDPPrefetchManager(
+        config=FSDPConfig(
+            prefetch_strategy=FSDPPrefetchStrategy.EXPERT_LOOKAHEAD
+        )
+    )
+    manager.setup(reference)
+    manager.setup(policy)
+
+    policy_experts = policy.layers[1].experts_ref
+    reference_experts = reference.layers[1].experts_ref
+
+    with manager.suspend_expert_forward_prefetch(policy):
+        assert policy_experts.forward_prefetch_arg == []
+        assert reference_experts.forward_prefetch_arg == [
+            reference.layers[2].experts_ref
+        ]
+
+    assert policy_experts.forward_prefetch_arg == [
+        policy.layers[2].experts_ref
+    ]
+
+    with manager.suspend_expert_forward_prefetch():
+        assert policy_experts.forward_prefetch_arg == []
+        assert reference_experts.forward_prefetch_arg == []
+
+    assert policy_experts.forward_prefetch_arg == [
+        policy.layers[2].experts_ref
+    ]
+    assert reference_experts.forward_prefetch_arg == [
+        reference.layers[2].experts_ref
+    ]
+
+
+def test_suspend_expert_forward_prefetch_supports_same_model_nesting():
+    model = make_model([False, True, True])
+    manager = pf.FSDPPrefetchManager(
+        config=FSDPConfig(
+            prefetch_strategy=FSDPPrefetchStrategy.EXPERT_LOOKAHEAD
+        )
+    )
+    manager.setup(model)
+    experts = model.layers[1].experts_ref
+    targets = [model.layers[2].experts_ref]
+
+    with manager.suspend_expert_forward_prefetch(model):
+        assert experts.forward_prefetch_arg == []
+        with manager.suspend_expert_forward_prefetch(model):
+            assert experts.forward_prefetch_arg == []
+        assert experts.forward_prefetch_arg == []
+
+    assert experts.forward_prefetch_arg == targets
+
+    with pytest.raises(RuntimeError, match="recompute failed"):
+        with manager.suspend_expert_forward_prefetch(model):
+            with manager.suspend_expert_forward_prefetch(model):
+                raise RuntimeError("recompute failed")
+
+    assert experts.forward_prefetch_arg == targets
+
+
+def test_global_and_targeted_prefetch_suspensions_can_overlap():
+    reference = make_model([False, True, True])
+    policy = make_model([False, True, True])
+    manager = pf.FSDPPrefetchManager(
+        config=FSDPConfig(
+            prefetch_strategy=FSDPPrefetchStrategy.EXPERT_LOOKAHEAD
+        )
+    )
+    manager.setup(reference)
+    manager.setup(policy)
+
+    policy_experts = policy.layers[1].experts_ref
+    policy_targets = [policy.layers[2].experts_ref]
+    reference_experts = reference.layers[1].experts_ref
+    reference_targets = [reference.layers[2].experts_ref]
+
+    with manager.suspend_expert_forward_prefetch(policy):
+        with manager.suspend_expert_forward_prefetch():
+            assert policy_experts.forward_prefetch_arg == []
+            assert reference_experts.forward_prefetch_arg == []
+        assert policy_experts.forward_prefetch_arg == []
+        assert reference_experts.forward_prefetch_arg == reference_targets
+
+    assert policy_experts.forward_prefetch_arg == policy_targets
+    assert reference_experts.forward_prefetch_arg == reference_targets
+
+    with manager.suspend_expert_forward_prefetch():
+        with manager.suspend_expert_forward_prefetch(policy):
+            assert policy_experts.forward_prefetch_arg == []
+            assert reference_experts.forward_prefetch_arg == []
+        assert policy_experts.forward_prefetch_arg == []
+        assert reference_experts.forward_prefetch_arg == []
+
+    assert policy_experts.forward_prefetch_arg == policy_targets
+    assert reference_experts.forward_prefetch_arg == reference_targets
+
+
 def test_manager_setup_clears_previous_targets():
     model = make_model([False, True, True])
     cfg = FSDPConfig(
@@ -510,6 +640,30 @@ def test_manager_setup_clears_previous_targets():
     manager.setup(model)
     assert model.layers[0].forward_prefetch_arg == []
     assert model.layers[2].backward_prefetch_arg == []
+
+
+def test_manager_native_setup_only_clears_selected_model():
+    reference = make_model([False, True, True])
+    policy = make_model([False, True, True])
+    cfg = FSDPConfig(
+        prefetch_strategy=FSDPPrefetchStrategy.EXPERT_LOOKAHEAD,
+        prefetch_direction=FSDPPrefetchDirection.FORWARD_BACKWARD,
+    )
+    manager = pf.FSDPPrefetchManager(config=cfg)
+    manager.setup(reference)
+    manager.setup(policy)
+
+    cfg.prefetch_strategy = FSDPPrefetchStrategy.NATIVE
+    manager.setup(policy)
+
+    assert policy.layers[0].forward_prefetch_arg == []
+    assert policy.layers[2].backward_prefetch_arg == []
+    assert reference.layers[0].forward_prefetch_arg == [
+        reference.layers[1],
+        reference.layers[1].experts_ref,
+    ]
+    assert reference.layers[2].backward_prefetch_arg == [reference.layers[1]]
+    assert len(manager.chains) == 1
 
 
 def test_manager_skips_when_torch_below_2_5(monkeypatch):

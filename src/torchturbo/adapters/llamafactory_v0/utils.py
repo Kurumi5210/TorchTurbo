@@ -52,7 +52,9 @@ def build_config_from_lf_args(
     checkpointing disabled.
     """
     if training_args is not None:
-        raise_if_evaluation_enabled(training_args)
+        raise_if_evaluation_enabled(
+            training_args, predict_with_generate=training_args.predict_with_generate
+        )
     _raise_if_unsupported_lf_args(finetuning_args, model_args, torchturbo_args)
 
     config, raw_args = _build_config_from_args(

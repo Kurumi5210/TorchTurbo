@@ -197,6 +197,189 @@ def test_collator_captures_lengths_before_native_batch_mutation(nested):
     assert out["cu_seq_lens_q"].device.type == "cpu"
 
 
+def test_dpo_collator_captures_chosen_then_rejected_lengths():
+    samples = [
+        {"chosen_input_ids": [10, 11], "rejected_input_ids": [20, 21, 22]},
+        {"chosen_input_ids": [30], "rejected_input_ids": [40, 41]},
+    ]
+    template = SimpleNamespace(
+        mode="rlhf", padding_free=True, padding_side="right", is_training=True
+    )
+    pixel_values = torch.ones(1, 3, 2, 2)
+
+    def native_collator(rows):
+        return {
+            "input_ids": _t([[10, 11, 30, 20, 21, 22, 40, 41]]),
+            "position_ids": _t([[0, 1, 0, 0, 1, 2, 0, 1]]),
+            "labels": _t([[10, 11, 30, 20, 21, 22, 40, 41]]),
+            "loss_scale": _t([[1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]]),
+            "pixel_values": pixel_values,
+        }
+
+    out = SwiftInputCollator(native_collator, template)(samples)
+    assert out["cu_seq_lens_q"].tolist() == [0, 2, 3, 6, 8]
+    assert out["max_length_q"] == out["max_length_k"] == 3
+    # Only sample starts are masked; DPO does not fold loss_scale into labels.
+    assert out["labels"].tolist() == [[-100, 11, -100, -100, 21, 22, -100, 41]]
+    assert "loss_scale" in out
+    assert out["pixel_values"] is pixel_values
+
+
+# (input_ids, labels, mm_token_type_ids) in Swift's DPO collation order: every
+# chosen sample, then every rejected sample.
+_DPO_ROWS = [
+    ([1, 2, 3, 4], [-100, -100, 3, 4], [0, 1, 1, 0]),
+    ([5, 6, 7, 8, 9], [-100, 6, 7, 8, 9], [0, 0, 0, 0, 0]),
+    ([1, 2, 9], [-100, -100, 9], [0, 1, 0]),
+    ([5, 10, 3], [-100, 10, 3], [0, 0, 0]),
+]
+
+
+def _sample_mrope(index, length):
+    # Distinct coordinates per sample; get_rope_index restarts at each sample.
+    positions = torch.arange(length)
+    return torch.stack((positions, positions + 10 * (index + 1), positions + 20 * (index + 1)))
+
+
+@pytest.mark.parametrize("mrope", [False, True])
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+def test_dpo_collator_flattens_padded_rows_like_padding_free_rows(padding_side, mrope):
+    num_pairs = len(_DPO_ROWS) // 2
+    samples = [
+        {"chosen_input_ids": _DPO_ROWS[i][0], "rejected_input_ids": _DPO_ROWS[i + num_pairs][0]}
+        for i in range(num_pairs)
+    ]
+    lengths = [len(ids) for ids, _, _ in _DPO_ROWS]
+    width = max(lengths)
+
+    def pad(row, value):
+        fill = [value] * (width - len(row))
+        return row + fill if padding_side == "right" else fill + row
+
+    # Padding-free collation concatenates the samples into one row.
+    text_positions = torch.cat([torch.arange(length) for length in lengths]).unsqueeze(0)
+    padding_free_batch = {
+        "input_ids": _t([[t for ids, _, _ in _DPO_ROWS for t in ids]]),
+        "labels": _t([[t for _, labels, _ in _DPO_ROWS for t in labels]]),
+        "loss_scale": torch.ones(1, sum(lengths)),
+        "position_ids": text_positions,
+    }
+    # Without padding-free, Swift pads every sample to the longest one.
+    padded_batch = {
+        "input_ids": _t([pad(ids, 0) for ids, _, _ in _DPO_ROWS]),
+        "labels": _t([pad(labels, -100) for _, labels, _ in _DPO_ROWS]),
+        "attention_mask": _t([pad([1] * len(ids), 0) for ids, _, _ in _DPO_ROWS]),
+        "loss_scale": _t([pad([1.0] * len(ids), 0.0) for ids, _, _ in _DPO_ROWS]),
+    }
+    if padding_side == "left":
+        padded_batch["position_ids"] = _t([pad(list(range(n)), 0) for n in lengths])
+    if mrope:
+        coordinates = [_sample_mrope(i, length) for i, length in enumerate(lengths)]
+        padding_free_batch["position_ids"] = torch.cat(coordinates, dim=-1).unsqueeze(1)
+        padding_free_batch["text_position_ids"] = text_positions
+        padding_free_batch["mm_token_type_ids"] = _t(
+            [[t for _, _, mm in _DPO_ROWS for t in mm]]
+        )
+        # get_rope_index fills padding with 1, and Swift numbers the text
+        # positions of each padded row from zero.
+        padded_positions = torch.ones(3, len(lengths), width, dtype=torch.long)
+        for row, (coordinate, length) in enumerate(zip(coordinates, lengths)):
+            start = 0 if padding_side == "right" else width - length
+            padded_positions[:, row, start:start + length] = coordinate
+        padded_batch["position_ids"] = padded_positions
+        padded_batch["text_position_ids"] = torch.arange(width).expand(len(lengths), -1)
+        padded_batch["mm_token_type_ids"] = _t([pad(mm, 0) for _, _, mm in _DPO_ROWS])
+
+    def collate(padding_free, native_batch):
+        template = SimpleNamespace(
+            mode="rlhf", padding_free=padding_free, padding_side=padding_side,
+            is_training=True,
+        )
+        return SwiftInputCollator(lambda rows: native_batch, template)(samples)
+
+    expected = collate(True, padding_free_batch)
+    out = collate(False, padded_batch)
+
+    # The model sees identical inputs, without an attention mask.
+    assert out.keys() == expected.keys()
+    for key, value in expected.items():
+        if torch.is_tensor(value):
+            assert torch.equal(out[key], value), key
+        else:
+            assert out[key] == value, key
+    assert out["cu_seq_lens_q"].tolist() == [0, 4, 9, 12, 15]
+
+
+def _native_chatml_template(padding_free, padding_side):
+    from swift.template import get_template
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    words = [
+        "<|im_start|>", "<|im_end|>", "user", "assistant", "\n", "[UNK]", "[PAD]",
+        "hi", "question", "good", "bad", "answer", "very", "a", "b", "c",
+    ]
+    backend = Tokenizer(WordLevel({word: i for i, word in enumerate(words)}, unk_token="[UNK]"))
+    backend.pre_tokenizer = WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", pad_token="[PAD]", eos_token="<|im_end|>",
+    )
+    # Swift templates read the model metadata its loader attaches to the processor.
+    tokenizer.model_info = SimpleNamespace(config=None, task_type="causal_lm", max_model_len=512)
+    tokenizer.model_meta = SimpleNamespace(is_multimodal=False)
+    template = get_template(
+        tokenizer, template_type="chatml", padding_free=padding_free, padding_side=padding_side,
+    )
+    template.set_mode("rlhf")
+    return template
+
+
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+def test_native_dpo_collator_flattens_padded_rows_like_padding_free(padding_side):
+    pytest.importorskip("swift", minversion="4.0")
+    pairs = [
+        {
+            "messages": [
+                {"role": "user", "content": "hi question"},
+                {"role": "assistant", "content": "good answer a b"},
+            ],
+            "rejected_response": "bad answer",
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "question c"},
+                {"role": "assistant", "content": "very good"},
+            ],
+            "rejected_response": "very bad answer c a",
+        },
+    ]
+
+    def collate(padding_free):
+        template = _native_chatml_template(padding_free, padding_side)
+        encoded = [template.encode(dict(pair)) for pair in pairs]
+        chosen_first_tokens = [
+            token
+            for prefix in ("chosen_", "rejected_")
+            for sample in encoded
+            for token in sample[f"{prefix}input_ids"]
+        ]
+        return chosen_first_tokens, SwiftInputCollator(template.data_collator, template)(encoded)
+
+    _, expected = collate(True)
+    chosen_first_tokens, out = collate(False)
+
+    assert out.keys() == expected.keys()
+    for key, value in expected.items():
+        if torch.is_tensor(value):
+            assert torch.equal(out[key], value), key
+        else:
+            assert out[key] == value, key
+    # The DPO forward reads the first half of the segments as chosen samples.
+    assert out["input_ids"][0].tolist() == chosen_first_tokens
+
+
 def test_nonpacked_collator_flattens_binary_mask_batches():
     inputs = {
         "input_ids": _t([[0, 0, 10, 11]]),

@@ -13,10 +13,11 @@ is mixed ahead of swift's trainer base for any stage:
 * ``get_train_dataloader`` — engine SP-aware sampler for all ``sp_size``.
 
 :func:`make_turbo_seq2seq_trainer` combines it with swift's
-:class:`Seq2SeqTrainer` for the SFT stage. A future RLHF stage would combine it
-with ``DPOTrainer`` etc. and only override the RLHF-specific forward
-(``concatenated_forward`` / reference log-probs). Everything else (logging,
-callbacks, the loop, grad accumulation) stays swift/HF.
+:class:`Seq2SeqTrainer` for the SFT stage. :func:`make_turbo_dpo_trainer`
+combines :class:`TurboDPOTrainerMixin` with swift's ``DPOTrainer`` and
+overrides only the DPO forward (``concatenated_forward``) on flattened
+batches. Everything else (logging, callbacks, the loop, grad accumulation)
+stays swift/HF.
 
 The mixin is module-level and imports swift only lazily inside method bodies,
 so this module stays swift-free until a concrete trainer is actually built.
@@ -25,6 +26,10 @@ so this module stays swift-free until a concrete trainer is actually built.
 from __future__ import annotations
 
 import os
+from functools import partial
+
+import torch
+import torch.nn.functional as F
 
 from ...engine import CPUOffloadMode
 from ...engine.distributed import assert_finite
@@ -258,15 +263,6 @@ class TurboTrainerMixin:
         self.model_wrapped = model
         return model
 
-    def create_optimizer_and_scheduler(self, num_training_steps: int):
-        """Create the engine optimizer and scheduler.
-
-        Compatibility entry point for Transformers versions or external
-        callers that still use the combined optimizer/scheduler hook.
-        """
-        optimizer = self.create_optimizer()
-        self.create_scheduler(num_training_steps, optimizer=optimizer)
-
     def create_optimizer(self, model=None):
         if self.optimizer is not None:
             return self.optimizer
@@ -276,15 +272,7 @@ class TurboTrainerMixin:
             self.optimizer = engine.prepare_optimizer()
             return self.optimizer
 
-        opt_res = self.get_optimizer_cls_and_kwargs(self.args)
-        # transformers' get_optimizer_cls_and_kwargs returns either
-        # (optimizer_cls, optimizer_kwargs) [2-tuple] or
-        # (<optimizer_name>, optimizer_cls, optimizer_kwargs) [3-tuple]
-        # across versions; handle both so the adapter isn't pinned to one.
-        if len(opt_res) == 3:
-            _, optimizer_cls, optimizer_kwargs = opt_res
-        else:
-            optimizer_cls, optimizer_kwargs = opt_res
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
         optimizer_kwargs = dict(optimizer_kwargs)
         optimizer_kwargs["weight_decay"] = self.args.weight_decay
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
@@ -412,3 +400,251 @@ def get_turbo_seq2seq_trainer():
     if _cls is None:
         _cls = make_turbo_seq2seq_trainer()
     return _cls
+
+
+class TurboDPOTrainerMixin(TurboTrainerMixin):
+    """Add Swift DPO wiring while retaining TorchTurbo engine ownership.
+
+    :class:`~.inputs_bridging.SwiftInputCollator` flattens every DPO batch
+    into one row with cu boundaries, packed or not, so one
+    ``concatenated_forward`` serves all sequence-parallel sizes.
+    """
+
+    def __init__(self, model=None, ref_model=None, *_args, **kwargs):
+        super().__init__(model, ref_model=None, *_args, **kwargs)
+        # The engine's routers attach the auxiliary gradients and report their
+        # metrics. Swift must not also read or add the model's HF aux_loss.
+        self.aux_loss_enabled = False
+        if ref_model is not None:
+            self.ref_model = ref_model
+            logger.info_rank0(
+                "TurboDPOTrainer: restored engine-sharded reference model "
+                "(accelerate re-wrap skipped)."
+            )
+
+    def _prepare_inputs(self, inputs):
+        """Use Swift's preference-input preparation, not the SFT override."""
+        return super(TurboTrainerMixin, self)._prepare_inputs(inputs)
+
+    def get_train_dataloader(self, *args, **kwargs):
+        """Use Swift's preference sampler at sp=1 and Turbo's sampler for SP."""
+        engine = engine_registry.get_engine_or_none()
+        if engine is None or engine.get_sp_info().get("sp_size", 1) <= 1:
+            return super(TurboTrainerMixin, self).get_train_dataloader(*args, **kwargs)
+        return super().get_train_dataloader(*args, **kwargs)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Resolve directly to Swift's DPO loss implementation.
+        return super(TurboTrainerMixin, self).compute_loss(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
+
+    def concatenated_forward(self, model, batch, is_ref_model: bool = False):
+        """Compute Swift's DPO forward outputs from one flattened row.
+
+        The row holds ``2 * N`` segments delimited by ``cu_seq_lens_q``: the
+        ``N`` chosen samples, then their rejected counterparts. The model
+        receives the global boundaries. Under sequence parallelism each rank
+        runs its token shard and the per-segment sums are all-reduced over
+        the SP group.
+
+        Returns:
+            The outputs Swift's ``get_batch_loss_metrics`` reads: chosen and
+            rejected log-probs, mean logits and the policy NLL loss. The engine
+            owns router auxiliary gradients and metrics.
+        """
+        from torch.distributed.nn.functional import all_reduce
+
+        from ...models.base import SequenceParallelInputMode
+        from ...models.modules.attention.ulysses import slice_input_tensor
+        from ...utils.flash_attn_utils import cu_seqlens_to_segment_ids
+
+        engine = engine_registry.get_engine()
+        sp_info = engine.get_sp_info()
+        sp_size = sp_info["sp_size"]
+
+        inputs = dict(batch)
+        # Swift's DPO loss reads neither field; keep them out of the model call.
+        for key in ("text_position_ids", "loss_scale"):
+            inputs.pop(key, None)
+        # Pad the token fields, labels included, to a multiple of the SP size.
+        inputs = engine.backend.prepare_inputs(model, inputs)
+        labels = inputs.pop("labels")
+
+        # MFU and MoE runtime statistics read the whole row.
+        if model.training:
+            engine._record_micro(inputs)
+            gradient_accumulation_steps = self.current_gradient_accumulation_steps
+        else:
+            gradient_accumulation_steps = 1
+        engine._prepare_moe_runtime(model, inputs, gradient_accumulation_steps)
+
+        cu_seqlens = inputs["cu_seq_lens_q"]
+        num_segments = cu_seqlens.numel() - 1
+        num_examples = num_segments // 2
+        segment_ids = cu_seqlens_to_segment_ids(cu_seqlens, labels.size(-1))
+        labels = self._shift_packed_labels(labels, segment_ids, self.label_pad_token_id)
+        loss_mask = labels != self.label_pad_token_id
+
+        # Weight each token's log-prob in its segment sum. The weights depend
+        # on whole segments, so compute them before SP sharding.
+        segment_index = (segment_ids - 1).clamp_min(0)
+        token_weights = torch.ones_like(labels, dtype=torch.float32)
+        completion_lengths = self._sum_by_segment(
+            loss_mask.float(), segment_ids, num_segments
+        )
+        loss_types = self.loss_type if isinstance(self.loss_type, list) else [self.loss_type]
+        if "ipo" in loss_types:
+            # IPO averages the log-probs over each completion.
+            token_weights = token_weights / completion_lengths[segment_index].clamp_min(1)
+        ld_alpha = self.args.ld_alpha
+        if ld_alpha is not None and not is_ref_model:
+            # LD-DPO scales the completion tokens past the shorter completion
+            # of each pair by ld_alpha.
+            completion_starts = completion_lengths.cumsum(0) - completion_lengths
+            completion_positions = (
+                loss_mask.cumsum(-1) - 1 - completion_starts[segment_index]
+            )
+            public_lengths = torch.minimum(
+                completion_lengths[:num_examples], completion_lengths[num_examples:]
+            ).repeat(2)
+            is_public = completion_positions < public_lengths[segment_index]
+            token_weights = torch.where(
+                is_public, token_weights, token_weights * ld_alpha
+            )
+
+        if sp_size > 1:
+            shard = partial(
+                slice_input_tensor,
+                dim=-1,
+                group=sp_info["sp_group"],
+                rank=sp_info["sp_rank"],
+                padding=False,
+            )
+            input_mode = model.get_sequence_parallel_input_mode()
+            if input_mode != SequenceParallelInputMode.POST_EMBEDDING:
+                inputs["input_ids"] = shard(inputs["input_ids"])
+                inputs["position_ids"] = shard(inputs["position_ids"])
+            labels = shard(labels)
+            segment_ids = shard(segment_ids)
+            token_weights = shard(token_weights)
+
+        if self.get_use_logits_to_keep():
+            # Project only the positions that predict a target token.
+            keep = labels[0] != self.label_pad_token_id
+            inputs["logits_to_keep"] = keep
+            labels = labels[:, keep]
+            segment_ids = segment_ids[:, keep]
+            token_weights = token_weights[:, keep]
+        outputs = model(**inputs, use_cache=False)
+
+        per_token_logps, mean_logits, loss_mask = self.get_per_token_logps(
+            outputs.logits, labels, label_pad_token_id=self.label_pad_token_id
+        )
+        segment_logps = self._sum_by_segment(
+            per_token_logps * token_weights, segment_ids, num_segments
+        )
+        is_chosen = loss_mask & (segment_ids <= num_examples)
+        is_rejected = loss_mask & (segment_ids > num_examples)
+        # Reduce the segment sums and the metric sums in one collective.
+        stats = torch.cat((
+            segment_logps,
+            torch.stack((
+                (mean_logits * is_chosen).sum(),
+                (mean_logits * is_rejected).sum(),
+                (per_token_logps * is_chosen).sum(),
+                is_chosen.sum().float(),
+                is_rejected.sum().float(),
+            )),
+        ))
+        if sp_size > 1:
+            stats = all_reduce(stats, group=sp_info["sp_group"])
+        (
+            chosen_logits_sum,
+            rejected_logits_sum,
+            chosen_logps_sum,
+            num_chosen_tokens,
+            num_rejected_tokens,
+        ) = stats[num_segments:]
+
+        num_chosen_tokens = num_chosen_tokens.clamp_min(1)
+        output = {
+            "chosen_logps": stats[:num_examples],
+            "rejected_logps": stats[num_examples:num_segments],
+            "mean_chosen_logits": chosen_logits_sum / num_chosen_tokens,
+            "mean_rejected_logits": rejected_logits_sum / num_rejected_tokens.clamp_min(1),
+        }
+        if not is_ref_model:
+            output["nll_loss"] = -chosen_logps_sum / num_chosen_tokens
+        return output
+
+    @staticmethod
+    def _sum_by_segment(
+        values: torch.Tensor, segment_ids: torch.Tensor, num_segments: int
+    ) -> torch.Tensor:
+        """Sum ``[1, seq]`` values per segment, dropping ID 0 (tail padding)."""
+        sums = values.new_zeros(num_segments + 1).index_add(0, segment_ids[0], values[0])
+        return sums[1:]
+
+    @staticmethod
+    def _shift_packed_labels(
+        labels: torch.Tensor, segment_ids: torch.Tensor, pad_token_id: int
+    ) -> torch.Tensor:
+        """Shift labels only inside each packed segment."""
+        next_labels = F.pad(labels, (0, 1), value=pad_token_id)[..., 1:]
+        segment = segment_ids.to(torch.long)
+        same_segment = segment == F.pad(segment, (0, 1), value=0)[..., 1:]
+        valid = segment.ne(0) & same_segment
+        return torch.where(valid, next_labels, torch.full_like(labels, pad_token_id))
+
+    def get_per_token_logps(self, logits, labels, label_pad_token_id=-100, reduction="mean"):
+        # Use LF's full-vocabulary log-softmax while preserving Swift's return contract.
+        if logits.shape[:-1] != labels.shape:
+            raise ValueError(
+                "DPO forward requires logits batch and sequence dimensions to match "
+                f"labels, but got logits {tuple(logits.shape[:-1])} and labels "
+                f"{tuple(labels.shape)}. For multimodal models, templates must expand "
+                "visual placeholder tokens before the model forward."
+            )
+        logits = logits.float()
+        loss_mask = labels != label_pad_token_id
+        safe_labels = labels.masked_fill(~loss_mask, 0)
+        if reduction == "sum":
+            mean_logits = logits.sum(dim=-1)
+        else:
+            mean_logits = logits.mean(dim=-1)
+        per_token_logps = torch.gather(
+            logits.log_softmax(-1),
+            dim=-1,
+            index=safe_labels.unsqueeze(-1),
+        ).squeeze(-1)
+        return (
+            per_token_logps * loss_mask,
+            mean_logits * loss_mask,
+            loss_mask,
+        )
+
+
+_dpo_cls = None
+
+
+def make_turbo_dpo_trainer():
+    """Build the lazy TorchTurbo DPO trainer class."""
+    from swift.rlhf_trainers import DPOTrainer
+
+    return type(
+        "TurboDPOTrainer",
+        (TurboDPOTrainerMixin, DPOTrainer),
+        {"__doc__": "swift DPOTrainer with the turbo engine/backend driving training."},
+    )
+
+
+def get_turbo_dpo_trainer():
+    """Return (and cache) the ``TurboDPOTrainer`` class."""
+    global _dpo_cls
+    if _dpo_cls is None:
+        _dpo_cls = make_turbo_dpo_trainer()
+    return _dpo_cls

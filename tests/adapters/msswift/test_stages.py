@@ -25,6 +25,7 @@ def test_sft_and_pt_stages_registered():
     names = [spec.name for spec in iter_stages()]
     assert "sft" in names
     assert "pt" in names
+    assert "dpo" in names
 
 
 def test_sft_stage_spec_fields():
@@ -40,6 +41,15 @@ def test_pt_stage_spec_fields():
 
     assert PT_STAGE.pipeline_module == "swift.pipelines.train.pretrain"
     assert PT_STAGE.pipeline_attr == "SwiftPretrain"
+
+
+def test_dpo_stage_spec_fields():
+    from torchturbo.adapters.msswift.stages import DPO_STAGE, TURBO_TRAINERS
+
+    assert DPO_STAGE.pipeline_module == "swift.pipelines.train.rlhf"
+    assert DPO_STAGE.pipeline_attr == "SwiftRLHF"
+    # The DPO stage is keyed by swift's rlhf_type, not task_type.
+    assert TURBO_TRAINERS["dpo"].endswith("TurboDPOTrainer")
 
 
 def test_pt_stage_swaps_its_own_pipeline_global():

@@ -78,16 +78,24 @@ def validate_signature(
             )
 
 
-def raise_if_evaluation_enabled(training_args: Any) -> None:
+def raise_if_evaluation_enabled(
+    training_args: Any, *, predict_with_generate: bool
+) -> None:
     """Reject HF evaluation, prediction and generation settings.
 
     TorchTurbo only trains; adapters call this while building the engine
     config from framework training arguments.
+
+    Args:
+        training_args: The HF training arguments the trainer runs with.
+        predict_with_generate: The user's generation setting. Adapters pass it
+            explicitly because trainer argument classes without generation,
+            such as TRL's ``DPOConfig``, drop it.
     """
     if (
         training_args.do_eval
         or training_args.do_predict
-        or training_args.predict_with_generate
+        or predict_with_generate
         or training_args.eval_strategy != "no"
         or training_args.eval_on_start
     ):

@@ -92,10 +92,21 @@ if __name__ == "__main__":
 
 安装依赖
 ```bash
-sh scripts/runs/qwen3_5_moe/install_swift_deps.sh
+sh internal/scripts/runs/qwen3_5_moe/install_swift_deps.sh
 ```
-
+#### SFT
 运行训练
 ```bash
-sh scripts/runs/qwen3_5_moe/swift_mllm_sft.sh
+sh internal/scripts/runs/qwen3_5_moe/swift_mllm_sft.sh
+```
+#### PT
+运行训练
+```bash
+sh internal/scripts/runs/qwen3_5_moe/swift_mllm_pt.sh
+```
+
+#### DPO
+
+```bash
+sh internal/scripts/runs/qwen3_5_moe/swift_text_dpo.sh
 ```

@@ -4,6 +4,17 @@ from __future__ import annotations
 
 import sys
 
+
+def _extract_stage(argv):
+    """Return the selected stage and arguments without its token."""
+    from torchturbo.adapters.msswift.stages import iter_stages
+
+    stage_names = {spec.name for spec in iter_stages()}
+    if argv and argv[0] in stage_names:
+        return argv[0], argv[1:]
+    return "sft", argv
+
+
 if __name__ == '__main__':
     # Match swift's cli worker preamble for device/dist-init parity.
     from swift.cli.utils import try_use_single_device_mode
@@ -11,13 +22,10 @@ if __name__ == '__main__':
 
     # Optional leading positional stage token (swift's subcommand form):
     # ``run_swift.py pt --model ...``. Anything else (a flag) means sft.
-    from torchturbo.adapters.msswift.stages import iter_stages, stage_wiring
+    from torchturbo.adapters.msswift.stages import stage_wiring
 
     argv = sys.argv[1:]
-    stages = {spec.name: spec for spec in iter_stages()}
-    stage = argv[0] if argv and argv[0] in stages else "sft"
-    if argv and argv[0] == stage:
-        argv = argv[1:]
+    stage, argv = _extract_stage(argv)
 
     # Shared tt parser strips all --tt_*; swift sees only its own args.
     from torchturbo.engine.args import parse_torchturbo_args, set_torchturbo_args

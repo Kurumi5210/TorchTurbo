@@ -14,9 +14,8 @@ it up together.
 :class:`TurboSwiftArgsMixin` carries the ``__post_init__`` that turns OFF the
 swift/HF settings the turbo engine takes ownership of (activation
 checkpointing, sequence parallelism, FSDP / DeepSpeed sharding), so the two
-never compete. It is reused by every stage's arguments class — SFT today, a
-future ``TurboRlhfArguments(RLHFArguments, TurboSwiftArgsMixin)`` later — so
-each stage only declares the swift-native fields specific to it.
+never compete. It is reused by every stage's arguments class (SFT, PT and
+DPO), so each stage only declares the swift-native fields specific to it.
 
 These classes are **module-level** on purpose (not built inside a factory
 closure): swift's multiprocess dataset pipelines (``dataset.map`` with
@@ -35,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from swift.arguments import PretrainArguments, SftArguments
+from swift.arguments import PretrainArguments, RLHFArguments, SftArguments
 
 
 class TurboSwiftArgsMixin:
@@ -85,3 +84,7 @@ class TurboPretrainArguments(TurboSwiftArgsMixin, PretrainArguments):  # type: i
     owns them); with the native class they would compete with the engine.
     """
 
+
+@dataclass
+class TurboRLHFArguments(TurboSwiftArgsMixin, RLHFArguments):  # type: ignore[misc]
+    """Swift arguments for the TorchTurbo DPO stage."""

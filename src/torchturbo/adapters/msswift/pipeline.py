@@ -10,9 +10,10 @@ from typing import Any, List, Optional, Union
 
 from swift.pipelines.base import SwiftPipeline
 from swift.pipelines.train.pretrain import SwiftPretrain
+from swift.pipelines.train.rlhf import SwiftRLHF
 from swift.pipelines.train.sft import SwiftSft
 
-from .args import TurboPretrainArguments, TurboSftArguments
+from .args import TurboPretrainArguments, TurboRLHFArguments, TurboSftArguments
 from . import engine_registry
 from .utils import build_config_from_swift_args, build_lora_config_from_swift_args
 from ...logging import LogLevel, get_logger, logging_configure
@@ -85,7 +86,6 @@ class TurboEnginePipelineMixin:
         return datasets if datasets is not None else super()._prepare_dataset()
 
 
-
 class TurboSwiftSft(TurboEnginePipelineMixin, SwiftSft):  # type: ignore[misc]
     """SwiftSft that builds the turbo engine up front (module-level for dill
     by-reference pickling -- see module docstring).
@@ -105,10 +105,23 @@ class TurboSwiftPretrain(TurboEnginePipelineMixin, SwiftPretrain):  # type: igno
     turbo_stage = "pt"
 
     def _get_dataset(self):
-        # PT consumes raw multimodal rows before swift encodes them.
         from .data_check import validate_raw_dataset
 
         train_dataset, val_dataset = super()._get_dataset()
         validate_raw_dataset(train_dataset, "train")
         validate_raw_dataset(val_dataset, "val")
         return train_dataset, val_dataset
+
+
+class TurboSwiftRLHF(TurboEnginePipelineMixin, SwiftRLHF):  # type: ignore[misc]
+    """Swift DPO pipeline backed by TorchTurbo."""
+
+    args_class = TurboRLHFArguments
+    turbo_stage = "dpo"
+
+    def _prepare_single_model(self, key, origin_key, model_type, model_revision):
+        if (origin_key or key) != "ref":
+            return super()._prepare_single_model(key, origin_key, model_type, model_revision)
+
+        with engine_registry.scoped_loading_role("reference"):
+            return super()._prepare_single_model(key, origin_key, model_type, model_revision)

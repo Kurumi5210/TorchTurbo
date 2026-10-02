@@ -847,8 +847,11 @@ def test_activation_checkpointing_patches_plan_targets(monkeypatch):
     )
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
+    suspended_models = []
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda: nullcontext()
+        suspend_expert_forward_prefetch=lambda model: (
+            suspended_models.append(model) or nullcontext()
+        )
     )
 
     model = TaggedModule("root")
@@ -883,6 +886,44 @@ def test_activation_checkpointing_patches_plan_targets(monkeypatch):
     assert x.requires_grad is False
     assert checkpoint_calls[-1]["use_reentrant"] is False
     assert "context_fn" in checkpoint_calls[-1]
+    _, recompute_context = checkpoint_calls[-1]["context_fn"]()
+    with recompute_context:
+        pass
+    assert suspended_models == [model]
+
+
+def test_reentrant_checkpointing_suspends_prefetch_for_its_model(monkeypatch):
+    from torchturbo.engine.config import ActivationCheckpointingConfig
+
+    backend = make_backend()
+    backend.config = types.SimpleNamespace(
+        activation_checkpointing=ActivationCheckpointingConfig(
+            enabled=True, use_reentrant=True
+        )
+    )
+    suspended_models = []
+    backend.prefetch_manager = types.SimpleNamespace(
+        suspend_expert_forward_prefetch=lambda model: (
+            suspended_models.append(model) or nullcontext()
+        )
+    )
+
+    model = TaggedModule("root")
+    model.layers = nn.ModuleList([CheckpointBlock("L0")])
+    plan = FSDPParallelPlan(
+        plan={"layers.*": FSDPPlanSpec(activation_checkpoint=True)}
+    )
+
+    def fake_checkpoint(function, *args, **kwargs):
+        assert kwargs["use_reentrant"] is True
+        return function(*args)
+
+    monkeypatch.setattr("torch.utils.checkpoint.checkpoint", fake_checkpoint)
+
+    backend._apply_activation_checkpointing(model, resolve_plan(model, plan))
+    model.layers[0](torch.ones(1))
+
+    assert suspended_models == [model]
 
 
 def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
@@ -895,7 +936,7 @@ def test_activation_checkpointing_eval_uses_original_forward(monkeypatch):
     backend.rank = 0
     backend.logger = types.SimpleNamespace(info=lambda *args, **kwargs: None)
     backend.prefetch_manager = types.SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda: nullcontext()
+        suspend_expert_forward_prefetch=lambda model: nullcontext()
     )
 
     model = TaggedModule("root")

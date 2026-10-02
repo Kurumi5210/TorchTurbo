@@ -74,10 +74,13 @@ def _base_args(**overrides):
         output_dir="/tmp/out",
         tuner_type="full",
         rlhf_type=None,
+        router_aux_loss_coef=0.0,
+        # Swift's own arguments carry the generation option; DPOConfig, used
+        # as training_args for DPO, does not.
+        predict_with_generate=False,
         training_args=SimpleNamespace(
             do_eval=False,
             do_predict=False,
-            predict_with_generate=False,
             eval_strategy="no",
             eval_on_start=False,
         ),
@@ -110,7 +113,8 @@ def _base_args(**overrides):
 )
 def test_rejects_eval_and_generation_during_config_build(option, value):
     args = _base_args()
-    setattr(args.training_args, option, value)
+    target = args if option == "predict_with_generate" else args.training_args
+    setattr(target, option, value)
     tt = _set_tt()
     with pytest.raises(NotImplementedError, match="does not support evaluation or generation"):
         build_config_from_swift_args(args)
@@ -118,12 +122,8 @@ def test_rejects_eval_and_generation_during_config_build(option, value):
     assert tt.mixed_precision is None
 
 
-@pytest.mark.parametrize("validation_dataset", [False, True])
-def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, validation_dataset):
-    pytest.importorskip("swift", minversion="4.0")
+def _save_tiny_llama(tmp_path):
     from transformers import LlamaConfig
-
-    from torchturbo.adapters.msswift.args import TurboSftArguments
 
     model_dir = tmp_path / "model"
     LlamaConfig(
@@ -131,6 +131,15 @@ def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, 
         intermediate_size=16, num_hidden_layers=1, num_attention_heads=1,
         num_key_value_heads=1,
     ).save_pretrained(model_dir)
+    return model_dir
+
+
+@pytest.mark.parametrize("validation_dataset", [False, True])
+def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, validation_dataset):
+    pytest.importorskip("swift", minversion="4.0")
+    from torchturbo.adapters.msswift.args import TurboSftArguments
+
+    model_dir = _save_tiny_llama(tmp_path)
     args = TurboSftArguments(
         model=str(model_dir), model_type="llama", template="llama", dataset=["training-data"],
         val_dataset=["validation-data"] if validation_dataset else [],
@@ -147,6 +156,109 @@ def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, 
     else:
         config = build_config_from_swift_args(args)
         assert config.checkpoint.hf_model_path == str(model_dir)
+
+
+@pytest.mark.parametrize("padding_free", [False, True])
+def test_native_dpo_args_build_config(tmp_path, padding_free):
+    pytest.importorskip("swift", minversion="4.0")
+    from torchturbo.adapters.msswift.args import TurboRLHFArguments
+
+    model_dir = _save_tiny_llama(tmp_path)
+    args = TurboRLHFArguments(
+        model=str(model_dir), model_type="llama", template="llama",
+        dataset=["training-data"], rlhf_type="dpo", padding_free=padding_free,
+        router_aux_loss_coef=0.02,
+        attn_impl="flash_attn", output_dir=str(tmp_path / "output"),
+        add_version=False, tuner_type="full", report_to=[], use_cpu=True,
+        check_model=False,
+    )
+    # The layout stays the user's choice; the collator flattens either one.
+    assert args.padding_free is padding_free
+    # The engine-owned settings are forced off.
+    assert args.gradient_checkpointing is False
+    _set_tt()
+    config = build_config_from_swift_args(args)
+    assert config.checkpoint.hf_model_path == str(model_dir)
+    assert config.moe.aux_loss_coeff == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("turbo_coefficient", [0.0, 0.03])
+def test_dpo_router_aux_loss_uses_engine_config(turbo_coefficient):
+    _set_tt(moe_aux_loss_coeff=turbo_coefficient)
+    args = _base_args(rlhf_type="dpo", router_aux_loss_coef=0.02)
+
+    config = build_config_from_swift_args(args)
+
+    assert config.moe.aux_loss_coeff == pytest.approx(turbo_coefficient or 0.02)
+    assert args.router_aux_loss_coef == 0.02
+
+
+@pytest.mark.parametrize("cli_coefficient", [None, 0.0, 0.03])
+def test_dpo_router_aux_loss_preserves_config_and_cli_precedence(tmp_path, cli_coefficient):
+    from torchturbo.engine.args import parse_torchturbo_args, set_torchturbo_args
+
+    config_file = tmp_path / "turbo.yaml"
+    config_file.write_text("engine_config:\n  moe:\n    aux_loss_coeff: 0.04\n")
+    argv = ["--tt_config", str(config_file)]
+    if cli_coefficient is not None:
+        argv += ["--tt_moe_aux_loss_coeff", str(cli_coefficient)]
+    tt, _ = parse_torchturbo_args(argv)
+    set_torchturbo_args(tt)
+
+    config = build_config_from_swift_args(
+        _base_args(rlhf_type="dpo", router_aux_loss_coef=0.02)
+    )
+
+    expected = 0.04 if cli_coefficient is None else cli_coefficient
+    assert config.moe.aux_loss_coeff == pytest.approx(expected)
+
+
+def test_sft_router_aux_loss_config_is_unchanged():
+    _set_tt()
+
+    config = build_config_from_swift_args(_base_args(router_aux_loss_coef=0.02))
+
+    assert config.moe.aux_loss_coeff == 0.0
+
+
+def test_native_dpo_args_reject_generation(tmp_path):
+    pytest.importorskip("swift", minversion="4.0")
+    from dataclasses import fields
+
+    from torchturbo.adapters.msswift.args import TurboRLHFArguments
+
+    model_dir = _save_tiny_llama(tmp_path)
+    args = TurboRLHFArguments(
+        model=str(model_dir), model_type="llama", template="llama",
+        dataset=["training-data"], rlhf_type="dpo", predict_with_generate=True,
+        # Otherwise Swift selects the "nlg" metric, which requires jieba.
+        eval_metric="acc",
+        output_dir=str(tmp_path / "output"), add_version=False,
+        tuner_type="full", report_to=[], use_cpu=True, check_model=False,
+    )
+    # DPOConfig drops the option; only Swift's own arguments carry it.
+    assert "predict_with_generate" not in {field.name for field in fields(args.training_args)}
+    assert args.predict_with_generate is True
+    _set_tt()
+    with pytest.raises(NotImplementedError, match="does not support evaluation or generation"):
+        build_config_from_swift_args(args)
+
+
+def test_dpo_argument_mixin_preserves_implicit_logits_to_keep():
+    pytest.importorskip("swift", minversion="4.0")
+    from torchturbo.adapters.msswift.args import TurboSwiftArgsMixin
+
+    class _Base:
+        def __post_init__(self):
+            pass
+
+    class _Args(TurboSwiftArgsMixin, _Base):
+        rlhf_type = "dpo"
+        use_logits_to_keep = None
+
+    args = _Args()
+    args.__post_init__()
+    assert args.use_logits_to_keep is None
 
 
 def test_mixed_precision_from_bf16():
@@ -402,18 +514,66 @@ def test_unsupported_tuner_type_raises():
         build_config_from_swift_args(_base_args(tuner_type="adalora"))
 
 
-def test_dpo_with_mtp_raises():
-    _set_tt(enable_mtp=True)
-    with pytest.raises(NotImplementedError):
-        build_config_from_swift_args(
-            _base_args(rlhf_type="dpo", tuner_type="full")
-        )
-
-
-def test_dpo_with_lora_raises():
+def test_dpo_with_multimodal_architecture_is_accepted_for_text_batches():
     _set_tt()
-    with pytest.raises(NotImplementedError):
+    cfg = build_config_from_swift_args(
+        _base_args(
+            rlhf_type="dpo",
+            model_meta=SimpleNamespace(is_multimodal=True),
+        )
+    )
+    assert cfg.parallel_plan.sp_size == 1
+
+
+def test_dpo_with_implicit_logits_to_keep_is_accepted():
+    _set_tt()
+    cfg = build_config_from_swift_args(
+        _base_args(rlhf_type="dpo", use_logits_to_keep=None)
+    )
+    assert cfg.parallel_plan.sp_size == 1
+
+
+def test_dpo_with_sp_is_accepted():
+    _set_tt(sp_size=2)
+    cfg = build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="full"))
+    assert cfg.parallel_plan.sp_size == 2
+
+
+def test_dpo_rejects_lora():
+    _set_tt()
+    with pytest.raises(NotImplementedError, match="DPO with tuner_type!=full"):
         build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="lora"))
+
+
+def test_dpo_rejects_mtp():
+    _set_tt(enable_mtp=True)
+    with pytest.raises(NotImplementedError, match="DPO with MTP"):
+        build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="full"))
+
+
+def test_dpo_with_yaml_sp_is_accepted(tmp_path):
+    """A resolved YAML sequence-parallel plan is accepted by DPO."""
+    cfg = tmp_path / "tt.yaml"
+    cfg.write_text("engine_config:\n  parallel_plan:\n    sp_size: 2\n")
+    _set_tt(config_path=str(cfg))
+    resolved = build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="full"))
+    assert resolved.parallel_plan.sp_size == 2
+
+
+def test_dpo_v1_baseline_matrix_accepted():
+    """Test the supported full-tune DPO baseline matrix."""
+    _set_tt()
+    build_config_from_swift_args(
+        _base_args(
+            rlhf_type="dpo",
+            tuner_type="full",
+            packing=False,
+            padding_free=False,
+            loss_scale="last_round+ignore_empty_think",
+            ref_adapters=[],
+            adapters=[],
+        )
+    )
 
 
 def test_lora_config_all_linear():

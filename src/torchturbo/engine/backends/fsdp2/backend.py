@@ -913,7 +913,7 @@ class FSDP2Backend(BaseBackend):
             # edges can leak into backward.
             return (
                 nullcontext(),
-                self.prefetch_manager.suspend_expert_forward_prefetch(),
+                self.prefetch_manager.suspend_expert_forward_prefetch(model),
             )
 
         def make_checkpointed_forward(module: nn.Module):
@@ -952,9 +952,10 @@ class FSDP2Backend(BaseBackend):
                     )
 
                 suspend_prefetch = self.prefetch_manager.suspend_expert_forward_prefetch
+
                 def run_fn(*a, **kw):
                     if torch.is_grad_enabled():
-                        with suspend_prefetch():
+                        with suspend_prefetch(model):
                             return base_fn(*a, **kw)
                     return base_fn(*a, **kw)
 

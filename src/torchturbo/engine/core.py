@@ -962,7 +962,7 @@ class TorchTurboEngine:
         inputs: Any,
         gradient_accumulation_steps: int,
     ) -> None:
-        """Set AUX scale and inject the current MoE runtime inputs."""
+        """Inject MoE runtime inputs and update the training aux-loss scale."""
         from ..models.modules.moe.moe_layer import BaseMoELayer
 
         moe_layers = [
@@ -973,10 +973,9 @@ class TorchTurboEngine:
 
         from ..models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 
-        aux_loss_scale = (
-            1.0 / gradient_accumulation_steps if model.training else 1.0
-        )
-        MoEAuxLossAutoScaler.set_loss_scale(aux_loss_scale)
+        if model.training:
+            aux_loss_scale = 1.0 / gradient_accumulation_steps
+            MoEAuxLossAutoScaler.set_loss_scale(aux_loss_scale)
 
         runtime_inputs = model.get_moe_runtime_inputs(
             inputs, self._get_parallel_context()

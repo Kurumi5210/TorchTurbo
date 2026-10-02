@@ -95,19 +95,19 @@ class DummyBackend(BaseBackend):
         return model
 
     def load_model(self, model, model_name_or_path, load_weights=True):
-        raise NotImplementedError
+        return model
 
-    def save_model(self, model, model_name_or_path, output_dir, format, **kwargs):
-        raise NotImplementedError
+    def save_model(self, model, model_name_or_path, output_dir, format="hf", **kwargs):
+        return None
 
-    def load_from_checkpoint(self, model, checkpoint_dir, format, **kwargs):
-        raise NotImplementedError
+    def load_from_checkpoint(self, model, checkpoint_dir, format="hf", **kwargs):
+        return None
 
     def save_optimizer(self, optimizer, model, output_dir, **kwargs):
-        raise NotImplementedError
+        return None
 
     def load_optimizer(self, optimizer, model, checkpoint_dir, **kwargs):
-        raise NotImplementedError
+        return None
 
     def prepare_optimizer(
         self,
@@ -139,6 +139,10 @@ class DummyBackend(BaseBackend):
     def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
         loss = torch.tensor(0.0)
         return (loss, None) if return_outputs else loss
+
+
+class ProfilingBackend(DummyBackend):
+    pass
 
 
 class RecordingProfiler:
@@ -682,7 +686,8 @@ class TestEngineSetup:
 
     @pytest.mark.parametrize(
         ("training", "gradient_accumulation_steps", "expected_scale"),
-        [(True, 4, 0.25), (False, 4, 1.0)],
+        # Eval/reference forwards must preserve the pending policy aux scale.
+        [(True, 4, 0.25), (False, 4, None)],
     )
     def test_compute_loss_sets_moe_aux_loss_scale(
         self,
@@ -713,6 +718,13 @@ class TestEngineSetup:
 
             def get_ep_info(self):
                 return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
+
+            def get_parallel_context(self):
+                return {
+                    "dp": self.get_dp_info(),
+                    "ep": self.get_ep_info(),
+                    "sp": self.get_sp_info(),
+                }
 
         class RuntimeMoELayer(BaseMoELayer):
             def __init__(self):
@@ -747,7 +759,7 @@ class TestEngineSetup:
             gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
-        assert scales == [expected_scale]
+        assert scales == ([] if expected_scale is None else [expected_scale])
 
     def test_compute_loss_skips_moe_setup_for_dense(self, monkeypatch):
         class RuntimeBackend:
@@ -1003,7 +1015,7 @@ def _make_engine_for_ga(sp_size, world_size, gbs=None):
 
 
 def test_resolve_ga_tt_gbs_derives_from_formula():
-    # world=64, gbs=32, sp=4 -> ga = 32*4/64 = 2
+    # world=64, gbs=32, sp=4 -> ga = 32*4/64 = 2 (tt_gbs requires framework ga=1)
     engine, restore = _make_engine_for_ga(sp_size=4, world_size=64, gbs=32)
     try:
         assert engine.resolve_gradient_accumulation_steps(1) == 2

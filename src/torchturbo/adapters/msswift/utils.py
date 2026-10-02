@@ -27,7 +27,10 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     are read back from it by :func:`build_from_args`. Env-var overrides are
     merged inside ``build_from_args``.
     """
-    raise_if_evaluation_enabled(args.training_args)
+    # Swift's arguments keep the user's generation option; DPOConfig drops it.
+    raise_if_evaluation_enabled(
+        args.training_args, predict_with_generate=args.predict_with_generate
+    )
     _raise_if_unsupported(args)
 
     tt = get_torchturbo_args()
@@ -49,6 +52,11 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
         elif getattr(args, "fp16", False):
             mixed_precision_hint = "fp16"
         tt.mixed_precision = mixed_precision_hint
+
+    # DPO uses the engine's router loss and metrics. Explicit Turbo settings
+    # still override this Swift default when build_from_args merges the config.
+    if vars(args).get("rlhf_type") == "dpo" and tt.moe_aux_loss_coeff == 0.0:
+        tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
     # swift-native checkpoint paths.
     tt.model_path = getattr(args, "model", None)

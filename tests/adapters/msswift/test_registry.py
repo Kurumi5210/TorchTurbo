@@ -298,3 +298,191 @@ def test_pt_stage_reuses_causal_lm_trainer():
         )
     finally:
         adapter.deactivate()
+
+
+def test_dpo_pipeline_structure():
+    """Test the DPO pipeline class and reference loading hook."""
+    from swift.arguments import RLHFArguments
+    from swift.pipelines.train.rlhf import SwiftRLHF
+
+    from torchturbo.adapters.msswift.args import (
+        TurboRLHFArguments,
+        TurboSwiftArgsMixin,
+    )
+    from torchturbo.adapters.msswift.pipeline import (
+        TurboEnginePipelineMixin,
+        TurboSwiftRLHF,
+        TurboSwiftSft,
+    )
+
+    assert issubclass(TurboSwiftRLHF, SwiftRLHF)
+    mro = TurboSwiftRLHF.__mro__
+    assert mro.index(TurboEnginePipelineMixin) < mro.index(SwiftRLHF)
+    assert TurboSwiftRLHF.args_class is TurboRLHFArguments
+    assert TurboSwiftRLHF.turbo_stage == "dpo"
+    assert TurboSwiftRLHF.__init__ is TurboEnginePipelineMixin.__init__
+    assert TurboSwiftSft.__init__ is TurboEnginePipelineMixin.__init__
+
+    # Args: force-off mixin must run ahead of RLHFArguments.__post_init__.
+    assert issubclass(TurboRLHFArguments, RLHFArguments)
+    amro = TurboRLHFArguments.__mro__
+    assert amro.index(TurboSwiftArgsMixin) < amro.index(RLHFArguments)
+    assert TurboRLHFArguments.__post_init__ is TurboSwiftArgsMixin.__post_init__
+    turbo_dropout = TurboRLHFArguments.__dataclass_fields__.get("disable_dropout")
+    native_dropout = RLHFArguments.__dataclass_fields__.get("disable_dropout")
+    assert (turbo_dropout.default if turbo_dropout else None) == (
+        native_dropout.default if native_dropout else None
+    )
+
+
+def test_native_plugin_swaps_swift_rlhf():
+    """Test the plugin swap for Swift's RLHF pipeline."""
+    import importlib
+
+    import swift.pipelines.train.rlhf as swift_rlhf_mod
+
+    from torchturbo.adapters.msswift import MSSwiftAdapter
+    from torchturbo.adapters.msswift.pipeline import TurboSwiftRLHF
+    from torchturbo.adapters.msswift.stages import iter_stages, stage_wiring
+
+    MSSwiftAdapter().activate()
+    originals = {}
+    for spec in iter_stages():
+        mod = importlib.import_module(spec.pipeline_module)
+        originals[(spec.pipeline_module, spec.pipeline_attr)] = getattr(
+            mod, spec.pipeline_attr
+        )
+        setattr(mod, spec.pipeline_attr, stage_wiring(spec.name)[0])
+    try:
+        assert swift_rlhf_mod.SwiftRLHF is TurboSwiftRLHF
+        assert callable(swift_rlhf_mod.rlhf_main)
+        assert stage_wiring("dpo")[1] is swift_rlhf_mod.rlhf_main
+    finally:
+        for (module_name, attr), original in originals.items():
+            mod = importlib.import_module(module_name)
+            setattr(mod, attr, original)
+
+
+def test_dpo_stage_maps_rlhf_trainer_key():
+    """Test the DPO trainer registry mapping."""
+    from swift.trainers import TrainerFactory
+
+    from torchturbo.adapters.msswift import MSSwiftAdapter
+
+    adapter = MSSwiftAdapter()
+    adapter.activate()
+    try:
+        assert TrainerFactory.TRAINER_MAPPING["dpo"].endswith("TurboDPOTrainer")
+    finally:
+        adapter.deactivate()
+
+
+def test_dpo_trainer_mro_and_loss_routing():
+    """Test DPO trainer MRO and loss routing."""
+    from swift.rlhf_trainers import DPOTrainer as SwiftDPOTrainer
+
+    from torchturbo.adapters.msswift.trainer import (
+        TurboDPOTrainerMixin,
+        TurboTrainerMixin,
+        get_turbo_dpo_trainer,
+    )
+
+    turbo_cls = get_turbo_dpo_trainer()
+    assert issubclass(turbo_cls, SwiftDPOTrainer)
+    mro = turbo_cls.__mro__
+    assert (
+        mro.index(TurboDPOTrainerMixin)
+        < mro.index(TurboTrainerMixin)
+        < mro.index(SwiftDPOTrainer)
+    )
+
+    # compute_loss is the DPO mixin's, and the next implementation down the
+    # MRO (skipping TurboTrainerMixin's engine CE) is swift's DPO loss.
+    assert turbo_cls.compute_loss is TurboDPOTrainerMixin.compute_loss
+    for klass in mro[mro.index(TurboTrainerMixin) + 1:]:
+        if "compute_loss" in klass.__dict__:
+            assert klass is SwiftDPOTrainer
+            break
+
+    # concatenated_forward is the DPO mixin's packed forward.
+    assert turbo_cls.concatenated_forward is TurboDPOTrainerMixin.concatenated_forward
+
+
+def test_dpo_ref_model_stash():
+    """Test that the trainer restores the engine-built reference model."""
+    from torchturbo.adapters.msswift.trainer import TurboDPOTrainerMixin
+
+    seen = {}
+
+    class _Base:
+        def __init__(self, model=None, ref_model=None, *_args, **_kwargs):
+            seen["ref_at_super"] = ref_model
+
+    class _Fake(TurboDPOTrainerMixin, _Base):
+        pass
+
+    ref = object()
+    trainer = object.__new__(_Fake)
+    _Fake.__init__(trainer, model=None, ref_model=ref)
+    assert seen["ref_at_super"] is None
+    assert trainer.ref_model is ref
+
+
+def test_reference_loading_role_and_loader_routing():
+    """DPO references build through engine.build_model; policy uses prepare_model."""
+    from torchturbo.adapters.msswift import engine_registry
+    from torchturbo.adapters.msswift.loader import TurboModelMixin
+
+    calls = {"prepare": 0, "build": 0}
+
+    class _FakeEngine:
+        peft_config = None
+
+        def prepare_model(self, **_kwargs):
+            calls["prepare"] += 1
+            return "policy"
+
+        def build_model(self, **_kwargs):
+            calls["build"] += 1
+            return "reference"
+
+    engine_registry.set_engine(_FakeEngine())
+    loader = object.__new__(TurboModelMixin)
+    try:
+        assert loader.get_model("/m", "cfg", None, {}) == "policy"
+        with engine_registry.scoped_loading_role("reference"):
+            assert loader.get_model("/m", "cfg", None, {}) == "reference"
+            assert engine_registry.get_loading_role() == "reference"
+        # Scope exit restores the (outer) policy role.
+        assert engine_registry.get_loading_role() is None
+        assert loader.get_model("/m", "cfg", None, {}) == "policy"
+        assert calls == {"prepare": 2, "build": 1}
+    finally:
+        engine_registry.clear()
+
+
+def test_rlhf_pipeline_marks_reference_loads(monkeypatch):
+    """DPO wraps only its frozen reference load in the secondary role."""
+    from swift.pipelines.train.rlhf import SwiftRLHF
+
+    from torchturbo.adapters.msswift import engine_registry
+    from torchturbo.adapters.msswift.pipeline import TurboSwiftRLHF
+
+    calls = []
+
+    def _fake_super(self, key, origin_key, model_type, model_revision):
+        calls.append((key, origin_key, engine_registry.get_loading_role()))
+        return ("model", None)
+
+    monkeypatch.setattr(SwiftRLHF, "_prepare_single_model", _fake_super)
+
+    pipeline = object.__new__(TurboSwiftRLHF)
+    pipeline._prepare_single_model("ref", "ref", None, None)
+    pipeline._prepare_single_model("reward", None, None, None)
+    pipeline._prepare_single_model("value", "value", None, None)
+    assert calls == [
+        ("ref", "ref", "reference"),
+        ("reward", None, None),
+        ("value", "value", None),
+    ]
+    assert engine_registry.get_loading_role() is None

@@ -593,6 +593,8 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
             cu_seq_lens: torch.Tensor = None,
         ):
             bsz, seqlen, _ = hidden_states.size()
+            if position_ids is not None and position_ids.size(0) == 1 and bsz > 1:
+                position_ids = position_ids.expand(bsz, -1)
             # Segment ids drive every packed operator (compression blocks,
             # window/compress top-k, sparse attention). Packed batches carry
             # global cu boundaries; attention_mask is never set (the engine

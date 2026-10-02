@@ -39,14 +39,20 @@ def iter_stages() -> Tuple[SwiftStageSpec, ...]:
 
 def stage_wiring(stage: str) -> tuple:
     """Return (turbo pipeline class, native swift main) for the stage."""
-    from swift.pipelines.train import pretrain, sft
-
     from . import pipeline
 
     if stage == "sft":
-        return pipeline.TurboSwiftSft, sft.sft_main
+        from swift.pipelines.train.sft import sft_main
+
+        return pipeline.TurboSwiftSft, sft_main
     if stage == "pt":
-        return pipeline.TurboSwiftPretrain, pretrain.pretrain_main
+        from swift.pipelines.train.pretrain import pretrain_main
+
+        return pipeline.TurboSwiftPretrain, pretrain_main
+    if stage == "dpo":
+        from swift.pipelines.train.rlhf import rlhf_main
+
+        return pipeline.TurboSwiftRLHF, rlhf_main
     raise KeyError(stage)
 
 
@@ -55,6 +61,7 @@ def stage_wiring(stage: str) -> tuple:
 # "dpo"/"kto"/... here).
 TURBO_TRAINERS: Dict[str, str] = {
     "causal_lm": "torchturbo.adapters.msswift.trainer_factory.TurboSeq2SeqTrainer",
+    "dpo": "torchturbo.adapters.msswift.trainer_factory.TurboDPOTrainer",
 }
 
 SFT_STAGE = SwiftStageSpec(
@@ -71,5 +78,13 @@ PT_STAGE = SwiftStageSpec(
     pipeline_attr="SwiftPretrain",
 )
 
+# DPO uses Swift's RLHF pipeline and dpo trainer mapping.
+DPO_STAGE = SwiftStageSpec(
+    name="dpo",
+    pipeline_module="swift.pipelines.train.rlhf",
+    pipeline_attr="SwiftRLHF",
+)
+
 register_stage(SFT_STAGE)
 register_stage(PT_STAGE)
+register_stage(DPO_STAGE)

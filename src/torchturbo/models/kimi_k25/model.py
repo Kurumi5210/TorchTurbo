@@ -12,6 +12,7 @@ from .configuration_kimi_k25 import KimiK25Config
 from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..base import TurboVLMModel
+from ..modules.attention.ulysses import SequenceParallelInputSlicingSpec
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
 from transformers import AutoModelForCausalLM
@@ -111,14 +112,12 @@ class TurboKimiK25ForConditionalGeneration(
     def _post_init_patches(self):
         pass
 
-    def on_parallelized(self, parallel_context):
-        from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing
-
-        sp_info = parallel_context["sp"]
-        sp_group = sp_info["sp_group"]
-        sp_size = sp_info["sp_size"]
+    def get_sequence_parallel_input_slicing_spec(self) -> SequenceParallelInputSlicingSpec:
         cls = type(self.language_model)
-        patch_forward_for_sp_input_slicing(cls, sp_group, sp_size)
+        return SequenceParallelInputSlicingSpec(
+            self.language_model,
+            cls.forward,
+        )
 
     def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""

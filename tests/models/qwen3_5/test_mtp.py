@@ -205,7 +205,7 @@ def test_sp_shifts_global_ids_before_local_embedding_slice(monkeypatch, local_id
     moe_original = Qwen3_5MoeMultiTokenPredictor.forward
     monkeypatch.setattr(Qwen3_5MultiTokenPredictor, "forward", original)
     monkeypatch.setattr(ulysses, "slice_input_tensor",
-                        lambda tensor, dim, group, rank, padding: tensor.chunk(2, dim=dim)[rank])
+                        lambda tensor, dim, group, rank: tensor.chunk(2, dim=dim)[rank])
     global_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
 
     def gather(outputs, inputs, group):

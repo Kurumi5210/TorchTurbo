@@ -1,15 +1,76 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from torchturbo.adapters.llamafactory_v0.trainer import (
     LlamaFactoryInputCollator,
+    TorchTurboDPOTrainer,
     TorchTurboTrainerBase,
     make_torchturbo_trainer,
 )
+
+
+@pytest.mark.parametrize("sp_rank", [0, 1])
+@pytest.mark.parametrize("explicit_positions", [False, True])
+def test_dpo_leaves_padded_inputs_global_for_model_slicing(
+    monkeypatch, sp_rank, explicit_positions
+):
+    from torchturbo.models.base import TurboModel
+    from torchturbo.models.modules.attention.ulysses import patch_forward_for_sp_input_slicing
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", lambda value, **kwargs: value
+    )
+    sp_info = {"sp_size": 2, "sp_group": object(), "sp_rank": sp_rank}
+
+    class Model(TurboModel, torch.nn.Module):
+        def forward(self, input_ids, **kwargs):
+            return input_ids
+
+    model = Model()
+    ref_model = Model()
+    patch_forward_for_sp_input_slicing(
+        model.get_sequence_parallel_input_slicing_spec(), **sp_info
+    )
+    patch_forward_for_sp_input_slicing(
+        ref_model.get_sequence_parallel_input_slicing_spec(), **sp_info
+    )
+    trainer = object.__new__(TorchTurboDPOTrainer)
+    trainer.engine = SimpleNamespace(get_sp_info=lambda: sp_info)
+    trainer.label_pad_token_id = -100
+    trainer.ftx_gamma = 0.0
+    trainer.loss_type = "sigmoid"
+    trainer.finetuning_args = SimpleNamespace(use_ref_model=True)
+    trainer.ref_model = ref_model
+    seen_models = []
+
+    def forward(model, batch, is_ref_model=False):
+        seen_models.append(model)
+        assert batch["input_ids"].tolist() == [[1, 2, 3, 4, 5, 0]] * 2
+        assert batch["labels"].tolist() == [[1, 2, 3, 4, 5, -100]] * 2
+        num_position_rows = 2 if explicit_positions else 1
+        assert batch["position_ids"].tolist() == [[0, 1, 2, 3, 4, 0]] * num_position_rows
+        expected = [[1, 2, 3]] if sp_rank == 0 else [[4, 5, 0]]
+        assert model(**batch).tolist() == expected * 2
+        return (torch.ones(1),) * 5
+
+    trainer.concatenated_forward = forward
+    trainer.compute_preference_loss = lambda *args: (torch.ones(1),) * 3
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5]] * 2),
+        "labels": torch.tensor([[1, 2, 3, 4, 5]] * 2),
+    }
+    if explicit_positions:
+        batch["position_ids"] = torch.arange(5).expand(2, -1)
+    trainer.get_batch_loss_metrics(model, batch)
+
+    assert seen_models == [model, ref_model]
+    assert batch["input_ids"].shape == batch["labels"].shape == (2, 5)
 
 
 @pytest.mark.parametrize("padding_side", ["left", "right"])
@@ -155,6 +216,93 @@ def test_muon_optimizer_bypasses_framework_optimizer_resolution():
     trainer.optimizer = None
 
     assert trainer.create_optimizer() is optimizer
+
+
+@pytest.mark.parametrize("pass_optimizer", [False, True])
+def test_muon_scheduler_is_created_by_engine_after_llamafactory_defaults(
+    monkeypatch, pass_optimizer
+):
+    trainer_optimizer = object()
+    passed_optimizer = object()
+    scheduler = object()
+    calls = []
+
+    def create_custom_scheduler(training_args, num_training_steps):
+        # LlamaFactory fills the WSD phase lengths before a scheduler is built.
+        calls.append(("defaults", num_training_steps))
+        training_args.lr_scheduler_kwargs = {
+            "num_stable_steps": 2,
+            "num_decay_steps": 6,
+        }
+
+    class Engine:
+        config = SimpleNamespace(optimizer=SimpleNamespace(name="muon"))
+
+        def prepare_lr_scheduler(self, *args, **kwargs):
+            calls.append(("engine", args, kwargs))
+            return scheduler
+
+    trainer_utils = ModuleType("llamafactory.train.trainer_utils")
+    trainer_utils.create_custom_scheduler = create_custom_scheduler
+    monkeypatch.setitem(sys.modules, "llamafactory.train.trainer_utils", trainer_utils)
+    trainer = object.__new__(TorchTurboTrainerBase)
+    trainer.engine = Engine()
+    trainer.optimizer = trainer_optimizer
+    trainer.lr_scheduler = None
+    trainer.args = SimpleNamespace(
+        lr_scheduler_type="warmup_stable_decay",
+        lr_scheduler_kwargs={},
+        get_warmup_steps=lambda num_training_steps: 2,
+    )
+    if pass_optimizer:
+        create_kwargs = {"optimizer": passed_optimizer}
+        scheduler_optimizer = passed_optimizer
+    else:
+        create_kwargs = {}
+        scheduler_optimizer = trainer_optimizer
+
+    assert trainer.create_scheduler(10, **create_kwargs) is scheduler
+    # A second call keeps the scheduler that the training loop already steps.
+    assert trainer.create_scheduler(10, **create_kwargs) is scheduler
+    assert trainer._created_lr_scheduler is True
+    assert calls == [
+        ("defaults", 10),
+        (
+            "engine",
+            ("warmup_stable_decay",),
+            {
+                "optimizer": scheduler_optimizer,
+                "num_warmup_steps": 2,
+                "num_training_steps": 10,
+                "scheduler_specific_kwargs": {
+                    "num_stable_steps": 2,
+                    "num_decay_steps": 6,
+                },
+            },
+        ),
+    ]
+
+
+def test_framework_scheduler_is_kept_without_engine_optimizer():
+    scheduler = object()
+    calls = []
+
+    class BaseTrainer:
+        def create_scheduler(self, num_training_steps, optimizer=None):
+            calls.append((num_training_steps, optimizer))
+            return scheduler
+
+    trainer_cls = make_torchturbo_trainer(
+        BaseTrainer,
+        engine=SimpleNamespace(
+            config=SimpleNamespace(optimizer=SimpleNamespace(name=None)),
+        ),
+        stage="sft",
+    )
+    trainer = object.__new__(trainer_cls)
+
+    assert trainer.create_scheduler(10) is scheduler
+    assert calls == [(10, None)]
 
 
 def test_external_optimizer_is_rejected():

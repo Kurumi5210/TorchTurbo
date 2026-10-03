@@ -425,7 +425,11 @@ def _run_sp_moe_runtime_inputs_test(
     try:
         from torchturbo.models.base import TurboModel
 
-        model = TurboModel()
+        class Model(TurboModel, torch.nn.Module):
+            def forward(self, **kwargs):
+                return kwargs
+
+        model = Model()
         cu = torch.tensor([0, 2, 4], dtype=torch.int32)
         inputs = {"input_ids": torch.arange(6).unsqueeze(0), "cu_seq_lens_q": cu}
         parallel_context = {

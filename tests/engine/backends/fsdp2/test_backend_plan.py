@@ -810,15 +810,26 @@ def test_chunked_loss_keeps_output_embedding_separate_from_tail_norm(
     assert (["norm", "lm_head"], False) not in calls
 
 
-def test_prepare_model_applies_activation_checkpointing_before_sharding():
+@pytest.mark.parametrize("sp_size", [1, 2])
+def test_prepare_model_applies_input_slicing_before_checkpointing_and_sharding(sp_size):
+    from torchturbo.models.modules.attention.ulysses import SequenceParallelInputSlicingSpec
+
     order = []
     model = TaggedModule("root")
+    sp_info = {"sp_size": sp_size, "sp_group": None, "sp_rank": 0}
+
+    def get_input_slicing_spec():
+        order.append("input_slicing")
+        return SequenceParallelInputSlicingSpec(model, TaggedModule.forward)
+
+    model.get_sequence_parallel_input_slicing_spec = get_input_slicing_spec
 
     backend = make_backend()
     backend.prefetch_manager = types.SimpleNamespace(
         setup=lambda model: order.append("prefetch")
     )
     backend.get_ep_info = lambda: {"ep_size": 1}
+    backend.get_sp_info = lambda: sp_info
     backend._init_mesh = lambda plan: order.append("init_mesh")
     backend._replace_modules = lambda model, plan: order.append("replace") or model
     backend._apply_activation_checkpointing = (
@@ -831,6 +842,7 @@ def test_prepare_model_applies_activation_checkpointing_before_sharding():
     assert order == [
         "init_mesh",
         "replace",
+        *(["input_slicing"] if sp_size > 1 else []),
         "activation_checkpointing",
         "shard",
         "prefetch",

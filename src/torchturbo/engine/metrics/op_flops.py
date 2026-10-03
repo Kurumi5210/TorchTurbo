@@ -358,6 +358,8 @@ def embedding_flops(batch_size: int, seq_length: int, vocab_size: int, hidden_si
 def vision_encoder_flops(
     grid_thw_list,
     vision_config,
+    *,
+    include_merger: bool = True,
 ) -> tuple[int, int]:
     """Forward FLOPs of a Qwen-VL vision tower over a list of images/videos.
 
@@ -372,6 +374,10 @@ def vision_encoder_flops(
         The model's ``vision_config`` ``PretrainedConfig`` (depth / hidden_size /
         intermediate_size / in_channels / patch_size / temporal_patch_size /
         spatial_merge_size / out_hidden_size / num_heads), accessed by attribute.
+    include_merger:
+        Count the PatchMerger's fc1/fc2 projections. Checkpoints with
+        ``disable_merger_proj=True`` keep only the merger's norm, so those
+        recipes pass False.
 
     Returns
     ``(total_forward_flops, num_merged_tokens)`` where ``num_merged_tokens`` is
@@ -409,7 +415,10 @@ def vision_encoder_flops(
         mlp = plain_mlp_flops(1, P, hidden, intermediate) if intermediate > 0 else 0
         # 3) PatchMerger: P patches -> P/sm^2 tokens; fc1 then fc2.
         out_t = P // (sm * sm) if sm > 0 else P
-        merger = linear_flops(out_t, merge_in, merge_in) + linear_flops(out_t, merge_in, out_hidden)
+        merger = (
+            linear_flops(out_t, merge_in, merge_in) + linear_flops(out_t, merge_in, out_hidden)
+            if include_merger else 0
+        )
         total_flops += conv + depth * (attn + mlp) + merger
         merged_tokens += out_t
     return total_flops, merged_tokens

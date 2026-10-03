@@ -696,43 +696,30 @@ def preprocess_multimodal_pretrain(
     if not texts:
         return {"input_ids": [], "attention_mask": [], "labels": []}
 
-    # Expand <image> → <|vision_start|>{image_pad * seqlen}<|vision_end|>
-    # Each image's seqlen depends on its resolution after processing.
-    # We must compute it by running the image through the processor.
+    # Derive image token counts from the same media path used by the collator.
     vision_bos = "<|vision_start|>"
     vision_eos = "<|vision_end|>"
     image_token = getattr(template.mm_plugin, "image_token", None) or "<|image_pad|>"
 
-    image_processor = getattr(mm_processor, "image_processor", None)
-    merge_size = getattr(image_processor, "merge_size", 2) if image_processor else 2
-    merge_length = merge_size ** 2
-    image_max_pixels = getattr(mm_processor, "image_max_pixels", 768 * 768) if mm_processor else 768 * 768
-    image_min_pixels = getattr(mm_processor, "image_min_pixels", 32 * 32) if mm_processor else 32 * 32
     plugin = template.mm_plugin
 
     expanded = []
     for txt, img_paths in zip(texts, images):
         result_txt = txt
         for path in img_paths:
-            if image_processor is not None:
-                from PIL import Image as PILImage
-                try:
-                    img = PILImage.open(path.strip())
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    # Use plugin's _preprocess_image for identical resize behavior
-                    img = plugin._preprocess_image(
-                        img,
-                        image_max_pixels=image_max_pixels,
-                        image_min_pixels=image_min_pixels,
-                    )
-                    processed = image_processor([img], return_tensors="pt")
-                    grid_thw = processed["image_grid_thw"][0]
-                    seqlen = int(grid_thw.prod().item()) // merge_length
-                except Exception:
-                    seqlen = 1
-            else:
-                seqlen = 1
+            media_inputs = plugin.get_mm_inputs(
+                images=[path.strip()],
+                videos=[],
+                audios=[],
+                imglens=[1],
+                vidlens=[0],
+                audlens=[0],
+                batch_ids=[[]],
+                processor=mm_processor,
+            )
+            grid_thw = media_inputs["image_grid_thw"][0]
+            merge_length = mm_processor.image_processor.merge_size ** 2
+            seqlen = int(grid_thw.prod().item()) // merge_length
             replacement = f"{vision_bos}{image_token * seqlen}{vision_eos}"
             result_txt = result_txt.replace(IMAGE_PLACEHOLDER, replacement, 1)
         expanded.append(result_txt)

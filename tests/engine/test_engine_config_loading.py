@@ -222,6 +222,47 @@ def test_optimizer_config_file_paths_follow_dataclass_schema():
     _validate_config_file({"optimizer": {"name": None, "muon": muon}})
 
 
+def test_build_muon_per_step_coefficients_and_adamw_lr_from_yaml(tmp_path):
+    from torch import nn
+
+    from torchturbo.engine.optimizers import MuonPlan, MuonRecipe
+
+    coefficients = [
+        [4.0848, -6.8946, 2.9270],
+        [3.9505, -6.3029, 2.6377],
+        [3.7418, -5.5913, 2.3037],
+        [2.8769, -3.1427, 1.2046],
+        [2.8366, -3.0525, 1.2012],
+    ]
+    content = {
+        "engine_config": {
+            "optimizer": {
+                "name": "muon",
+                "muon": {
+                    "lr": 2.5e-5,
+                    "weight_decay": 0.01,
+                    "ns_steps": 5,
+                    "ns_coefficients": coefficients,
+                    "adamw_lr": 1.0e-5,
+                },
+            }
+        }
+    }
+    path = _write(tmp_path, "muon.yaml", yaml.safe_dump(content))
+
+    cfg = _build_from_argv(["--tt_config", path])
+    plan = MuonPlan(
+        nn.Linear(2, 2), recipe=MuonRecipe({}), config=cfg.optimizer.muon
+    )
+
+    assert plan.muon_kwargs["ns_coefficients"] == tuple(map(tuple, coefficients))
+    assert plan.muon_kwargs["ns_steps"] == 5
+    assert plan.muon_kwargs["lr"] == 2.5e-5
+    assert plan.adamw_kwargs["lr"] == 1.0e-5
+    assert plan.muon_fqns == ("weight",)
+    assert plan.adamw_no_decay_fqns == ("bias",)
+
+
 def test_unknown_optimizer_config_file_field_raises(tmp_path):
     path = _write(
         tmp_path,

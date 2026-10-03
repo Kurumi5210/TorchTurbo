@@ -5,11 +5,38 @@ import pytest
 import torch
 
 import torchturbo.ops as turbo_ops
+from torchturbo.models.modules.attention.ulysses import ulysses_pad_inputs
 from torchturbo.models.qwen3_5 import modeling_qwen3_5 as dense
 from torchturbo.models.qwen3_5.model import TurboQwen3_5ForConditionalGeneration
+from torchturbo.models.qwen3_5.swift_template import _post_process_inputs
 from torchturbo.models.qwen3_5_moe import modeling_qwen3_5_moe as moe
 from torchturbo.models.qwen3_5_moe.model import TurboQwen3_5MoeForConditionalGeneration
 from torchturbo.ops.dispatcher import OpDispatcher
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [TurboQwen3_5ForConditionalGeneration, TurboQwen3_5MoeForConditionalGeneration],
+)
+def test_sp_padding_keeps_swift_text_positions_aligned(model_cls):
+    model = SimpleNamespace(model=SimpleNamespace(language_model=torch.nn.Module()))
+    spec = model_cls.get_sequence_parallel_input_slicing_spec(model)
+    batch = ulysses_pad_inputs(
+        {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14]]),
+            "position_ids": torch.tensor([[[0, 1, 0, 1, 2]]] * 3),
+            "text_position_ids": torch.tensor([[0, 1, 0, 1, 2]]),
+            "mm_token_type_ids": torch.zeros(1, 5, dtype=torch.long),
+        },
+        spec,
+        sp_size=2,
+    )
+
+    # Swift's pre-forward hook merges both position layouts at model call time.
+    position_ids = _post_process_inputs(batch)["position_ids"]
+
+    assert position_ids.shape == (4, 1, 6)
+    assert position_ids[0].tolist() == [[0, 1, 0, 1, 2, 0]]
 
 
 @pytest.mark.parametrize("text_model", [dense.Qwen3_5TextModel, moe.Qwen3_5MoeTextModel])

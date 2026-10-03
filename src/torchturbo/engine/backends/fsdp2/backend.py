@@ -19,10 +19,10 @@ except ImportError:  # pragma: no cover - torch<2.9 compatibility
         _get_total_norm as get_total_norm,
     )
 
-from torchturbo.models.base import SequenceParallelInputMode
 from torchturbo.models.modules.attention.ulysses import (
+    patch_forward_for_sp_input_slicing,
     slice_input_tensor,
-    ulysses_pad,
+    ulysses_pad_inputs,
 )
 from torchturbo.models.modules.comm import all_gather_tensor
 from torchturbo.models.modules.loss import chunk_loss, logits_loss
@@ -434,6 +434,17 @@ class FSDP2Backend(BaseBackend):
 
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
+
+        # Models slice inputs at their declared boundary. Install slicing
+        # first so activation checkpointing wraps it and remains effective.
+        sp_info = self.get_sp_info()
+        if sp_info["sp_size"] > 1:
+            patch_forward_for_sp_input_slicing(
+                model.get_sequence_parallel_input_slicing_spec(),
+                sp_info["sp_group"],
+                sp_info["sp_size"],
+                sp_info["sp_rank"],
+            )
 
         # Freeze model-authored patterns into exact targets before later
         # transformations can add wrappers or replace parameter objects.
@@ -1669,8 +1680,8 @@ class FSDP2Backend(BaseBackend):
 
         return total_norm
 
-    def prepare_inputs(self, model, inputs):
-        """Pad inputs for Ulysses sequence parallelism.
+    def prepare_inputs(self, model: nn.Module, inputs: Any) -> Any:
+        """Pad the global batch with the model's SP padding rules.
 
         ``cu_seq_lens_q/k`` keep describing the valid prefix, so attention and
         MoE statistics exclude the dummy media and SP alignment tails.
@@ -1679,62 +1690,11 @@ class FSDP2Backend(BaseBackend):
             return inputs
 
         sp_size = self.get_sp_info()["sp_size"]
-        input_ids = inputs.get("input_ids")
-        if sp_size <= 1 or not torch.is_tensor(input_ids) or input_ids.dim() != 2:
+        if sp_size <= 1:
             return inputs
-
-        seq_len = input_ids.size(-1)
-        pad_size = (-seq_len) % sp_size
-        if pad_size == 0:
-            return inputs
-
-        inputs = dict(inputs)
-        position_ids = inputs.get("position_ids")
-        labels = inputs.get("labels")
-        pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", 0)
-        if pad_token_id is None:
-            pad_token_id = 0
-        (
-            inputs["input_ids"],
-            inputs["position_ids"],
-            inputs["labels"],
-            _,
-        ) = ulysses_pad(
-            input_ids,
-            position_ids_rmpad=position_ids,
-            labels=labels,
-            sp_size=sp_size,
-            pad_value=pad_token_id,
+        return ulysses_pad_inputs(
+            inputs, model.get_sequence_parallel_input_slicing_spec(), sp_size
         )
-
-        mm_token_type_ids = inputs.get("mm_token_type_ids")
-        if (
-            torch.is_tensor(mm_token_type_ids)
-            and mm_token_type_ids.size(-1) == seq_len
-        ):
-            inputs["mm_token_type_ids"] = nn.functional.pad(
-                mm_token_type_ids, (0, pad_size), value=0
-            )
-
-        text_position_ids = inputs.get("text_position_ids")
-        if (
-            torch.is_tensor(text_position_ids)
-            and text_position_ids.size(-1) == seq_len
-        ):
-            pad_positions = torch.arange(
-                pad_size,
-                device=text_position_ids.device,
-                dtype=text_position_ids.dtype,
-            ).reshape((1,) * (text_position_ids.dim() - 1) + (pad_size,))
-            inputs["text_position_ids"] = torch.cat(
-                (
-                    text_position_ids,
-                    pad_positions.expand(*text_position_ids.shape[:-1], pad_size),
-                ),
-                dim=-1,
-            )
-
-        return inputs
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         if (
@@ -1762,23 +1722,6 @@ class FSDP2Backend(BaseBackend):
 
         # # Repeated calculation in SP group
         # num_items_in_batch = num_items_in_batch // sp_size
-
-        input_mode = model.get_sequence_parallel_input_mode()
-        if input_mode != SequenceParallelInputMode.POST_EMBEDDING:
-            inputs["input_ids"] = slice_input_tensor(
-                inputs["input_ids"],
-                dim=1,
-                group=sp_group,
-                rank=sp_rank,
-                padding=False,
-            )
-            inputs["position_ids"] = slice_input_tensor(
-                inputs["position_ids"],
-                dim=-1,
-                group=sp_group,
-                rank=sp_rank,
-                padding=False,
-            )
 
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
         mtp_loss_scale = self.config.mtp.loss_scaling_factor
@@ -1911,8 +1854,6 @@ class FSDP2Backend(BaseBackend):
                     dim=1,
                     group=sp_group,
                     rank=sp_rank,
-                    padding=False,
-                    sp_mode="ulysses",
                 )
             shifted_labels.append(labels_i.to(prediction.device))
             normalizers.append(
@@ -2030,7 +1971,7 @@ class FSDP2Backend(BaseBackend):
                 "chunked LM loss does not support diffusion training"
             )
 
-        inputs = dict(inputs)
+        inputs = dict(self.prepare_inputs(model, inputs))
         inputs["use_cache"] = False
         labels = inputs.pop("labels")  # [1, 2T], clean half = -100
 
@@ -2047,16 +1988,14 @@ class FSDP2Backend(BaseBackend):
         block_mask = inputs["attention_mask"]
 
         if sp_size > 1 and sp_group is not None:
-            # SP: slice the 2T sequence to the local shard; block mask stays full.
+            # The model slices its inputs; loss labels use the same local shard.
             n_valid = int((labels != ignore_index).sum().item())
-            full_local = slice_input_tensor(inputs["input_ids"], dim=1, group=sp_group, rank=sp_rank)
-            pos_local = slice_input_tensor(inputs["position_ids"], dim=1, group=sp_group, rank=sp_rank)
             labels_local = slice_input_tensor(labels, dim=1, group=sp_group, rank=sp_rank)
 
             outputs = model(
-                input_ids=full_local,
+                input_ids=inputs["input_ids"],
                 attention_mask=block_mask,
-                position_ids=pos_local,
+                position_ids=inputs["position_ids"],
                 use_cache=False,
             )
             loss_local = nn.functional.cross_entropy(

@@ -78,6 +78,9 @@ class GroupedMLP(torch.nn.Module):
                     x,
                     activation_func=self.config.activation_func,
                     limit=self.swiglu_limit,
+                    clamp_gate_after_activation=(
+                        self.config.moe_swiglu_clamp_gate_after_activation
+                    ),
                 )
 
             self.activation_func = glu

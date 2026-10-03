@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional
 
 import torch
@@ -16,18 +15,13 @@ logger = get_logger(__name__)
 if TYPE_CHECKING:
     from ..engine.metrics.flops import BaseModelFlops
     from ..engine.optimizers import OptimizerRecipe
+    from .modules.attention.ulysses import SequenceParallelInputSlicingSpec
     from .modules.moe.moe_layer import MoERuntimeInputs
-
-
-class SequenceParallelInputMode(str, Enum):
-    PRE_EMBEDDING = "pre_embedding"
-    POST_EMBEDDING = "post_embedding"
 
 
 class TurboModel:
     """Base contract between TorchTurboEngine and TorchTurbo models."""
 
-    sequence_parallel_input_mode = SequenceParallelInputMode.PRE_EMBEDDING
     is_diffusion_model = False  # Set to True for subclasses to indicate a diffusion model (uses block-diffusion loss).
 
     def get_norm(self) -> Optional[nn.Module]:
@@ -163,12 +157,23 @@ class TurboModel:
                 dim=1,
                 group=sp_info["sp_group"],
                 rank=sp_info["sp_rank"],
-                padding=False,
             )
         return MoERuntimeInputs(padding_mask=padding_mask)
 
-    def get_sequence_parallel_input_mode(self) -> SequenceParallelInputMode:
-        return self.sequence_parallel_input_mode
+    def get_sequence_parallel_input_slicing_spec(self) -> SequenceParallelInputSlicingSpec:
+        """Declare the batch fields to pad and the inputs to slice for SP.
+
+        The backend pads the global batch with the spec's padded fields and
+        installs slicing before checkpointing and sharding. The default slices
+        token IDs and positions at the model entry.
+        """
+        from .modules.attention.ulysses import SequenceParallelInputSlicingSpec
+
+        return SequenceParallelInputSlicingSpec(
+            self,
+            type(self).forward,
+            sliced_inputs=(("input_ids", 1), ("position_ids", -1)),
+        )
 
     def get_parameter_groups(
         self,
@@ -233,7 +238,6 @@ class TurboModel:
 class TurboVLMModel(TurboModel):
     """Base class for multimodal Turbo models."""
 
-    sequence_parallel_input_mode = SequenceParallelInputMode.POST_EMBEDDING
     nested_config_names = ("text_config", "vision_config")
     vision_tower_module_names = ("vision_tower",)
     multi_modal_projector_module_names = ("multi_modal_projector", "mm_projector")
@@ -241,6 +245,13 @@ class TurboVLMModel(TurboModel):
 
     def get_sp_attention_config(self) -> Any:
         return self.config.text_config
+
+    def get_sequence_parallel_input_slicing_spec(self) -> SequenceParallelInputSlicingSpec:
+        """VLMs slice after media fusion, so each model declares its boundary."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must declare its media-fusion boundary in "
+            "get_sequence_parallel_input_slicing_spec()"
+        )
 
     @classmethod
     @contextmanager

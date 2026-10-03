@@ -53,6 +53,7 @@ except ImportError:
         return hasattr(torch, "fx")
 from .configuration_bailing_moe_v3 import BailingMoeV3Config
 from transformers.generation.utils import GenerationMixin
+from transformers import modeling_flash_attention_utils as flash_utils
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
 from transformers.processing_utils import Unpack
@@ -212,18 +213,6 @@ def pad_input(
 ) -> torch.Tensor:
     output = index_put_first_axis(hidden_states, indices, batch_size * seq_len)
     return _unflatten_batch_seq(output, batch_size, seq_len)
-
-
-def _get_unpad_data(attention_mask):
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
-    return (
-        indices,
-        cu_seqlens,
-        max_seqlen_in_batch,
-    )
 
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
@@ -897,7 +886,7 @@ class BailingMoeV3KimiDeltaAttention(nn.Module):
         cu_seqlens = kwargs.get('cu_seqlens')
         indices = None
         if attention_mask is not None:
-            indices, cu_seqlens, _ = _get_unpad_data(attention_mask[:, -q_len:])
+            indices, cu_seqlens, _ = flash_utils._get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(_flatten_batch_seq(hidden_states), indices).unsqueeze(0)
 
         conv_state_q, conv_state_k, conv_state_v = None, None, None

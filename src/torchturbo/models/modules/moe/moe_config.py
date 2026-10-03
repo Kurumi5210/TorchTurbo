@@ -69,6 +69,9 @@ class MoEConfig:
     moe_apply_probs_on_input: bool = False
     """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""
     moe_swiglu_limit: Optional[List[float]] = None
+    """Cap the activated gate, min(act(gate), limit), instead of the gate
+    pre-activation when applying moe_swiglu_limit."""
+    moe_swiglu_clamp_gate_after_activation: bool = False
     """Number of layers using token-id hash routing."""
     num_hash_layers: int = 0
     """Vocabulary size for token-id hash routing table."""

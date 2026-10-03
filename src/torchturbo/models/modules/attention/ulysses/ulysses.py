@@ -1,6 +1,9 @@
-import inspect
 import math
-from functools import partial
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from enum import Enum
+from functools import partial, wraps
+from types import MethodType
 from typing import Any, Optional, Tuple
 
 import torch
@@ -478,286 +481,135 @@ def register_turbo_ulysses_attention(
     )
 
 
-def _forward_arg_index(forward, names: tuple[str, ...], skip_first: int):
-    try:
-        parameters = list(inspect.signature(forward).parameters.values())
-    except (TypeError, ValueError):
-        return None
+class SequencePadding(Enum):
+    """Values written into the SP alignment tail of a batch field."""
 
-    positional_kinds = {
-        inspect.Parameter.POSITIONAL_ONLY,
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-    }
-    positional_index = 0
-    for parameter in parameters:
-        if parameter.kind in positional_kinds:
-            if parameter.name in names:
-                arg_index = positional_index - skip_first
-                return arg_index if arg_index >= 0 else None
-            positional_index += 1
-    return None
+    ZERO = "zero"
+    IGNORE_INDEX = "ignore_index"
+    POSITION = "position"
 
 
-def patch_kda_attention_forward_for_sp(
-    attn_cls: type,
-    sp_group: ProcessGroup,
+@dataclass(frozen=True)
+class SequenceParallelInputSlicingSpec:
+    """SP input contract declared by a model.
+
+    ``ulysses_pad_inputs`` right-pads ``padded_inputs`` in the global batch
+    before the model call. The patched boundary then slices ``sliced_inputs``
+    to the local shard. Packed metadata and media tensors stay global.
+
+    Attributes:
+        module: Module whose method receives the global inputs.
+        original_forward: Original unbound method to wrap.
+        forward_name: Name of the method receiving the sliced inputs.
+        sliced_inputs: Boundary argument names and sequence dimensions. Each
+            tensor of a tuple argument is sliced.
+        padded_inputs: Batch field names and their tail values. The sequence
+            is the last dimension of every batch field.
+    """
+
+    module: torch.nn.Module
+    original_forward: Callable[..., Any]
+    forward_name: str = "forward"
+    sliced_inputs: tuple[tuple[str, int], ...] = (
+        ("inputs_embeds", 1),
+        ("position_ids", -1),
+    )
+    padded_inputs: tuple[tuple[str, SequencePadding], ...] = (
+        ("input_ids", SequencePadding.ZERO),
+        ("mm_token_type_ids", SequencePadding.ZERO),
+        ("labels", SequencePadding.IGNORE_INDEX),
+        ("position_ids", SequencePadding.POSITION),
+        ("text_position_ids", SequencePadding.POSITION),
+    )
+
+
+def _pad_sequence(tensor: Tensor, pad_size: int, padding: SequencePadding) -> Tensor:
+    if padding == SequencePadding.POSITION:
+        tail = torch.arange(pad_size, device=tensor.device, dtype=tensor.dtype)
+        tail = tail.expand(*tensor.shape[:-1], pad_size)
+        return torch.cat((tensor, tail), dim=-1)
+    value = -100 if padding == SequencePadding.IGNORE_INDEX else 0
+    return torch.nn.functional.pad(tensor, (0, pad_size), value=value)
+
+
+def ulysses_pad_inputs(
+    inputs: Mapping[str, Any],
+    spec: SequenceParallelInputSlicingSpec,
     sp_size: int,
-    sp_rank: int,
-):
-    """Patch KDA/DSA-style sequence-state attention for correctness under SP.
+) -> dict[str, Any]:
+    """Right-pad the spec's batch fields to a multiple of ``sp_size``.
 
-    These layers carry state along the sequence dimension, so local shard-only
-    execution would break causality. This wrapper gathers the full sequence,
-    runs the original forward, then scatters the output sequence back.
+    Every declared field receives the tail length that aligns ``input_ids``.
+    Packed boundaries keep describing the valid prefix, so attention, MoE
+    statistics, and losses ignore the tail; the tail token ID only needs to
+    be a valid non-media ID. Other fields pass through.
+
+    Args:
+        inputs: Global batch with ``input_ids``.
+        spec: Model SP input contract.
+        sp_size: Sequence parallel size.
+
+    Returns:
+        A new batch. The input mapping and tensors are not modified.
     """
-
-    if sp_size <= 1 or sp_group is None:
-        return
-
-    origin_attr = "_torchturbo_origin_forward"
-    origin_forward = getattr(attn_cls, origin_attr, None)
-    if origin_forward is None:
-        origin_forward = attn_cls.forward
-        setattr(attn_cls, origin_attr, origin_forward)
-
-    cache_arg_index = _forward_arg_index(
-        origin_forward, ("past_key_values", "past_key_value"), skip_first=2
-    )
-
-    def sp_forward(self, hidden_states, *args, **kwargs):
-        return kda_attention_sp_forward(
-            self,
-            origin_forward,
-            hidden_states,
-            args,
-            kwargs,
-            cache_arg_index,
-            sp_group,
-            sp_size,
-            sp_rank,
-        )
-
-    attn_cls.forward = sp_forward
-
-
-def kda_attention_sp_forward(
-    module,
-    origin_forward,
-    hidden_states: Tensor,
-    args,
-    kwargs,
-    cache_arg_index: Optional[int],
-    sp_group: ProcessGroup,
-    sp_size: int,
-    sp_rank: int,
-):
-    past = kwargs.get("past_key_values", kwargs.get("past_key_value", None))
-    if past is None and cache_arg_index is not None and len(args) > cache_arg_index:
-        past = args[cache_arg_index]
-    if past is not None:
-        raise NotImplementedError(
-            "Sequence-parallel KDA/DSA attention does not support KV cache."
-        )
-
-    local_seq_len = hidden_states.size(1)
-    full_hidden_states = all_gather_sp_with_grad_reduce(
-        hidden_states, dim=1, sp_group=sp_group, sp_size=sp_size
-    )
-    result = origin_forward(module, full_hidden_states, *args, **kwargs)
-    is_tuple = isinstance(result, (tuple, list))
-    if is_tuple:
-        output, *rest = result
-    else:
-        output = result
-    output = slice_input_tensor(
-        output,
-        dim=1,
-        group=sp_group,
-        rank=sp_rank,
-        padding=False,
-    )
-    if output.size(1) != local_seq_len:
-        output = output[:, :local_seq_len].contiguous()
-    if is_tuple:
-        return (output, *rest)
-    return output
-
-
-# copied from verl
-def patch_vlm_for_ulysses_input_slicing(model_class: type):
-    """
-    Applies a monkey patch to the forward method of a given model class
-    to enable Ulysses sequence parallelism input slicing.
-    """
-
-    def _create_ulysses_wrapped_decoder_forward(original_forward):
-        def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
-            inputs_embeds = kwargs.get("inputs_embeds")
-            position_ids = kwargs.get("position_ids")
-            visual_pos_masks = kwargs.get("visual_pos_masks")
-            deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
-            call_kwargs = kwargs.copy()
-
-            current_ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
-
-            slice_now = (
-                inputs_embeds is not None
-                and current_ulysses_sp_size > 1
-                and getattr(self, "_needs_initial_slice", True)
-            )
-            if slice_now:
-                call_kwargs["inputs_embeds"] = slice_input_tensor(
-                    inputs_embeds, dim=1, padding=False
-                )
-                call_kwargs["position_ids"] = slice_input_tensor(
-                    position_ids, dim=-1, padding=False
-                )
-                # Also slice visual_pos_masks and deepstack_visual_embeds for Qwen3 VL models
-                if visual_pos_masks is not None:
-                    original_visual_mask = visual_pos_masks
-                    sliced_visual_mask = slice_input_tensor(
-                        visual_pos_masks, dim=1, padding=False
-                    )
-                    call_kwargs["visual_pos_masks"] = sliced_visual_mask
-
-                    if deepstack_visual_embeds is not None:
-                        sliced_embeds = []
-
-                        num_visual_before = original_visual_mask.sum().item()
-                        num_visual_in_shard = sliced_visual_mask.sum().item()
-
-                        if num_visual_in_shard > 0 and num_visual_before > 0:
-                            # Calculate which visual embeddings belong to this shard
-                            # We need to find the offset of visual tokens in this shard
-                            rank = get_ulysses_sequence_parallel_rank()
-                            seq_len = original_visual_mask.shape[1]
-                            local_seq_len = seq_len // current_ulysses_sp_size
-                            start_idx = rank * local_seq_len
-                            end_idx = start_idx + local_seq_len
-
-                            # Get total visual tokens before and up to the end of the shard's sequence slice
-                            # This correctly handles batches by summing across all samples
-                            visual_start = (
-                                original_visual_mask[:, :start_idx].sum().item()
-                                if start_idx > 0
-                                else 0
-                            )
-                            visual_end = original_visual_mask[:, :end_idx].sum().item()
-
-                            # Slice each tensor in deepstack_visual_embeds
-                            for embed in deepstack_visual_embeds:
-                                sliced_embeds.append(embed[visual_start:visual_end])
-                        else:
-                            # No visual tokens in this shard, create empty tensors to maintain gradient flow
-                            for embed in deepstack_visual_embeds:
-                                sliced_embeds.append(embed[:0])
-                        call_kwargs["deepstack_visual_embeds"] = sliced_embeds
-
-                self._needs_initial_slice = False
-            try:
-                return original_forward(self, *args, **call_kwargs)
-            finally:
-                if slice_now:
-                    self._needs_initial_slice = True
-
-        return ulysses_wrapped_decoder_forward
-
-    original_forward = model_class.forward
-    wrapped_forward = _create_ulysses_wrapped_decoder_forward(original_forward)
-    model_class.forward = wrapped_forward
-    logger.info_rank0("Monkey patch %s.forward for Ulysses SP input slicing.", model_class.__name__)
+    padded = dict(inputs)
+    pad_size = (-inputs["input_ids"].size(-1)) % sp_size
+    if pad_size == 0:
+        return padded
+    for name, padding in spec.padded_inputs:
+        tensor = inputs.get(name)
+        if tensor is not None:
+            padded[name] = _pad_sequence(tensor, pad_size, padding)
+    return padded
 
 
 def patch_forward_for_sp_input_slicing(
-    model_class: type, sp_group: dist.ProcessGroup, sp_size: int
-):
+    spec: SequenceParallelInputSlicingSpec,
+    sp_group: dist.ProcessGroup,
+    sp_size: int,
+    sp_rank: int,
+) -> None:
+    """Patch a module method to slice its sequence-aligned inputs.
+
+    Inputs to slice must be passed as keyword arguments and already aligned
+    by ``ulysses_pad_inputs``. Every non-None declared input is sliced; masks
+    and packed metadata stay global. Install this wrapper before other
+    instance-level forward wrappers.
+
+    Args:
+        spec: Model-owned boundary and input dimensions. Repeated installation
+            must use the original unbound method in the spec.
+        sp_group: Sequence parallel process group.
+        sp_size: Number of sequence parallel ranks.
+        sp_rank: Rank within the sequence parallel group.
+    """
+
     if sp_size <= 1:
         return
 
-    original_forward = model_class.forward
-    sp_rank = dist.get_rank(sp_group)
-
-    def _create_ulysses_wrapped_decoder_forward(original_forward):
-        def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
-            inputs_embeds = kwargs.get("inputs_embeds")
-            position_ids = kwargs.get("position_ids")
-            visual_pos_masks = kwargs.get("visual_pos_masks")
-            deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
-            call_kwargs = kwargs.copy()
-
-            current_ulysses_sp_size = sp_size
-
-            slice_now = (
-                inputs_embeds is not None
-                and current_ulysses_sp_size > 1
-                and getattr(self, "_needs_initial_slice", True)
-            )
-            if slice_now:
-                call_kwargs["inputs_embeds"] = slice_input_tensor(
-                    inputs_embeds, dim=1, group=sp_group, rank=sp_rank, padding=False
+    @wraps(spec.original_forward)
+    def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
+        call_kwargs = kwargs.copy()
+        for input_name, dim in spec.sliced_inputs:
+            value = call_kwargs.get(input_name)
+            if value is None:
+                continue
+            if isinstance(value, tuple):
+                call_kwargs[input_name] = tuple(
+                    slice_input_tensor(tensor, dim=dim, group=sp_group, rank=sp_rank)
+                    for tensor in value
                 )
-                # VLM batches without explicit positions (the model derives
-                # mrope coordinates) stay None instead of crashing the slice.
-                if position_ids is not None:
-                    call_kwargs["position_ids"] = slice_input_tensor(
-                        position_ids, dim=-1, group=sp_group, rank=sp_rank, padding=False
-                    )
-                # Also slice visual_pos_masks and deepstack_visual_embeds for Qwen3 VL models
-                if visual_pos_masks is not None:
-                    original_visual_mask = visual_pos_masks
-                    sliced_visual_mask = slice_input_tensor(
-                        visual_pos_masks,
-                        dim=1,
-                        group=sp_group,
-                        rank=sp_rank,
-                        padding=False,
-                    )
-                    call_kwargs["visual_pos_masks"] = sliced_visual_mask
+            else:
+                call_kwargs[input_name] = slice_input_tensor(
+                    value, dim=dim, group=sp_group, rank=sp_rank
+                )
+        return spec.original_forward(self, *args, **call_kwargs)
 
-                    if deepstack_visual_embeds is not None:
-                        sliced_embeds = []
-
-                        num_visual_before = original_visual_mask.sum().item()
-                        num_visual_in_shard = sliced_visual_mask.sum().item()
-
-                        if num_visual_in_shard > 0 and num_visual_before > 0:
-                            # Calculate which visual embeddings belong to this shard
-                            # We need to find the offset of visual tokens in this shard
-                            rank = sp_rank
-                            seq_len = original_visual_mask.shape[1]
-                            local_seq_len = seq_len // current_ulysses_sp_size
-                            start_idx = rank * local_seq_len
-                            end_idx = start_idx + local_seq_len
-
-                            # Get total visual tokens before and up to the end of the shard's sequence slice
-                            # This correctly handles batches by summing across all samples
-                            visual_start = (
-                                original_visual_mask[:, :start_idx].sum().item()
-                                if start_idx > 0
-                                else 0
-                            )
-                            visual_end = original_visual_mask[:, :end_idx].sum().item()
-
-                            # Slice each tensor in deepstack_visual_embeds
-                            for embed in deepstack_visual_embeds:
-                                sliced_embeds.append(embed[visual_start:visual_end])
-                        else:
-                            # No visual tokens in this shard, create empty tensors to maintain gradient flow
-                            for embed in deepstack_visual_embeds:
-                                sliced_embeds.append(embed[:0])
-                        call_kwargs["deepstack_visual_embeds"] = sliced_embeds
-
-                self._needs_initial_slice = False
-            try:
-                return original_forward(self, *args, **call_kwargs)
-            finally:
-                if slice_now:
-                    self._needs_initial_slice = True
-
-        return ulysses_wrapped_decoder_forward
-
-    wrapped_forward = _create_ulysses_wrapped_decoder_forward(original_forward)
-    model_class.forward = wrapped_forward
+    setattr(
+        spec.module,
+        spec.forward_name,
+        MethodType(ulysses_wrapped_decoder_forward, spec.module),
+    )
 
 
 def all_gather_sp_with_grad_reduce(

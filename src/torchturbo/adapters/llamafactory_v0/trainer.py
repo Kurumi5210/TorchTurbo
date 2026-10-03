@@ -204,6 +204,33 @@ class TorchTurboTrainerBase:
         )
         return self.optimizer
 
+    def create_scheduler(
+        self,
+        num_training_steps: int,
+        optimizer: torch.optim.Optimizer | None = None,
+    ) -> torch.optim.lr_scheduler.LRScheduler:
+        engine = self._engine()
+        if engine.config.optimizer.name is not None:
+            # Engine-managed optimizers take their LRs from engine config, so
+            # the engine also builds their LR schedule.
+            if self.lr_scheduler is None:
+                from llamafactory.train.trainer_utils import create_custom_scheduler
+
+                # Preserve LlamaFactory's scheduler argument defaults.
+                create_custom_scheduler(self.args, num_training_steps)
+                if optimizer is None:
+                    optimizer = self.optimizer
+                self.lr_scheduler = engine.prepare_lr_scheduler(
+                    self.args.lr_scheduler_type,
+                    optimizer=optimizer,
+                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                    num_training_steps=num_training_steps,
+                    scheduler_specific_kwargs=self.args.lr_scheduler_kwargs,
+                )
+                self._created_lr_scheduler = True
+            return self.lr_scheduler
+        return super().create_scheduler(num_training_steps, optimizer)
+
     def save_model(self, output_dir=None, _internal_call=False):
         engine = self._engine()
         if output_dir is None:
@@ -558,8 +585,6 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                 dim=1,
                 group=sp_group,
                 rank=sp_rank,
-                padding=False,
-                sp_mode="ulysses",
             )
 
         all_logps, valid_length = self.get_batch_logps_with_sp(
@@ -607,16 +632,12 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
 
     def get_batch_loss_metrics(self, model, inputs, train_eval: str = "train"):
         from torch.distributed.nn.functional import all_reduce
-        from torchturbo.models.modules.attention.ulysses import (
-            ulysses_pad,
-            ulysses_pad_and_slice_inputs,
-        )
+        from torchturbo.models.modules.attention.ulysses import ulysses_pad_inputs
 
         inputs = dict(inputs)
         sp_info = self._engine().get_sp_info()
         sp_size = sp_info["sp_size"]
         sp_group = sp_info["sp_group"]
-        sp_rank = sp_info["sp_rank"]
 
         if inputs.get("position_ids", None) is None:
             inputs["position_ids"] = torch.arange(
@@ -624,39 +645,10 @@ class TorchTurboDPOTrainer(TorchTurboTrainerBase):
                 device=inputs["input_ids"].device,
             ).unsqueeze(0)
 
-        from ...models.base import SequenceParallelInputMode
-
-        if model.get_sequence_parallel_input_mode() == SequenceParallelInputMode.POST_EMBEDDING:
-            (
-                inputs["input_ids"],
-                inputs["position_ids"],
-                _,
-                pad_size,
-            ) = ulysses_pad(
-                inputs["input_ids"],
-                position_ids_rmpad=inputs["position_ids"],
-                sp_size=sp_size,
-            )
-        else:
-            (
-                inputs["input_ids"],
-                inputs["position_ids"],
-                _,
-                pad_size,
-            ) = ulysses_pad_and_slice_inputs(
-                inputs["input_ids"],
-                position_ids_rmpad=inputs["position_ids"],
-                sp_size=sp_size,
-                sp_group=sp_group,
-                sp_rank=sp_rank,
-            )
         inputs["attention_mask"] = None
-        if pad_size:
-            inputs["labels"] = nn.functional.pad(
-                inputs["labels"],
-                (0, pad_size),
-                value=self.label_pad_token_id,
-            )
+        inputs = ulysses_pad_inputs(
+            inputs, model.get_sequence_parallel_input_slicing_spec(), sp_size
+        )
 
         metrics = {}
         (

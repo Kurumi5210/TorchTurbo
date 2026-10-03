@@ -353,14 +353,17 @@ def naive_kda_lowerbound_gate(
     g: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor | None = None,
-    lower_bound: float = -5.0,
+    lower_bound: float | None = -5.0,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     H, _ = g.shape[-2:]
     g = g.float()
     if dt_bias is not None:
         g = g + dt_bias.view(H, -1)
-    g = lower_bound * F.sigmoid(A_log.view(H, 1).exp() * g)
+    if lower_bound is None:
+        g = -A_log.view(H, 1).exp() * F.softplus(g)
+    else:
+        g = lower_bound * F.sigmoid(A_log.view(H, 1).exp() * g)
     return g.to(output_dtype)
 
 

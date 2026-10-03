@@ -278,8 +278,6 @@ class MuonOptimizerConfig:
             raise ValueError("Muon weight_decay must be non-negative")
         if self.momentum < 0:
             raise ValueError("Muon momentum must be non-negative")
-        if len(self.ns_coefficients) != 3:
-            raise ValueError("Muon ns_coefficients must contain three values")
         if not 0 <= self.ns_steps < 100:
             raise ValueError("Muon ns_steps must be in [0, 100)")
         if len(self.adamw_betas) != 2 or not all(

@@ -106,20 +106,22 @@ def test_kimi_native_fa2_consumes_cu_without_segment_mask(monkeypatch):
 def test_kimi_sp_slices_embeddings_but_keeps_global_packed_mask(monkeypatch):
     import torch.distributed as dist
 
-    monkeypatch.setattr(dist, "get_rank", lambda _group: 0)
     monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
 
-    class FakeLanguageModel:
+    class FakeLanguageModel(nn.Module):
         def forward(self, **kwargs):
             return kwargs
 
+    model = FakeLanguageModel()
+    wrapper = SimpleNamespace(language_model=model)
     patch_forward_for_sp_input_slicing(
-        FakeLanguageModel,
+        TurboKimiK25ForConditionalGeneration.get_sequence_parallel_input_slicing_spec(wrapper),
         sp_group=object(),
         sp_size=2,
+        sp_rank=0,
     )
     attention_mask = torch.tensor([[1, 1, 2, 2, 2, 0, 0, 0]])
-    result = FakeLanguageModel().forward(
+    result = model.forward(
         inputs_embeds=torch.zeros(1, 8, 4),
         position_ids=torch.tensor([[0, 1, 0, 1, 2, 0, 1, 2]]),
         attention_mask=attention_mask,

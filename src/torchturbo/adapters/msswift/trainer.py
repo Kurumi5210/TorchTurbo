@@ -6,7 +6,7 @@ is mixed ahead of swift's trainer base for any stage:
 * ``_wrap_model``  — the model is already FSDP2-sharded; don't let accelerate
   re-wrap it.
 * ``create_optimizer`` — build via the engine (FSDP2-aware); ``create_scheduler``
-  keeps HF's default around the engine optimizer.
+  uses the engine for engine-managed optimizers and HF's default otherwise.
 * ``compute_loss``  — ``engine.compute_loss`` (with SP loss re-scale).
 * ``_get_data_collator`` - normalize Swift packing on CPU before device transfer.
 * ``save_model`` — engine writes DCP weights; swift still records metadata.
@@ -30,6 +30,9 @@ from functools import partial
 
 import torch
 import torch.nn.functional as F
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 
 from ...engine import CPUOffloadMode
 from ...engine.distributed import assert_finite
@@ -278,11 +281,28 @@ class TurboTrainerMixin:
         self.optimizer = engine.prepare_optimizer(optimizer_cls, **optimizer_kwargs)
         return self.optimizer
 
-    def create_scheduler(self, num_training_steps: int, optimizer=None):
+    def create_scheduler(
+        self, num_training_steps: int, optimizer: Optimizer | None = None
+    ) -> LRScheduler:
         from swift.trainers.mixin import SwiftMixin
 
         if optimizer is None:
             optimizer = self.optimizer
+        engine = engine_registry.get_engine()
+        if engine.config.optimizer.name is not None:
+            # Engine-managed optimizers take their LRs from engine config, so
+            # the engine also builds their LR schedule.
+            if self.lr_scheduler is None:
+                self.lr_scheduler = engine.prepare_lr_scheduler(
+                    self.args.lr_scheduler_type,
+                    optimizer=optimizer,
+                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                    num_training_steps=num_training_steps,
+                    scheduler_specific_kwargs=self.args.lr_scheduler_kwargs,
+                )
+                self._created_lr_scheduler = True
+            return self.lr_scheduler
+
         # Skip swift's OptimizerCallback scheduler; use HF's default.
         self.lr_scheduler = super(SwiftMixin, self).create_scheduler(num_training_steps, optimizer)
         return self.lr_scheduler

@@ -40,20 +40,15 @@ class TurboQwen3_5MoeTextForCausalLM(TurboModel, Qwen3_5MoeTextForCausalLM):
         return Qwen3_5MoeFlops
 
     def on_parallelized(self, parallel_context):
-        from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing
-
         sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
         if sp_size > 1:
             from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-                Qwen3_5MoeTextModel,
                 Qwen3_5MoeGatedDeltaNet,
                 Qwen3_5MoeMultiTokenPredictor,
             )
-
-            patch_forward_for_sp_input_slicing(Qwen3_5MoeTextModel, sp_group, sp_size)
 
             self.register_sp_attention_interface(sp_info)
 

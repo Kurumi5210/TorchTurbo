@@ -14,7 +14,7 @@ from transformers.utils import ModelOutput
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.config import LossChunkConfig
-from torchturbo.models.base import SequenceParallelInputMode, TurboModel
+from torchturbo.models.base import TurboModel
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
 
@@ -83,9 +83,6 @@ class _ContractModel(TurboModel, nn.Module):
         self.with_mtp = mtp
         self.upcast_logits = upcast_logits
         self.forward_calls = []
-
-    def get_sequence_parallel_input_mode(self):
-        return SequenceParallelInputMode.POST_EMBEDDING
 
     def get_lm_head(self):
         return self.lm_head

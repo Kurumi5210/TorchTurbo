@@ -62,6 +62,16 @@ Each model directory is responsible for three tasks:
 - Implementing the `TurboModel` or `TurboVLMModel` contract and model-specific hooks
 - Providing the model's default strategy through `get_default_parallel_plan()`
 
+Models declare their sequence parallel input contract through
+`get_sequence_parallel_input_slicing_spec()`. Before the model call, the spec's
+padded fields in the global batch are right-padded to a multiple of the SP size;
+packed sequence metadata keeps describing the valid prefix, so attention, MoE
+statistics, and losses ignore the tail. The backend installs slicing at the spec's
+boundary before activation checkpointing and sharding. The default spec slices
+token IDs and positions at the model entry; VLMs slice at their media-fusion
+boundary. Loss targets use the same shards, while media tensors and packed
+sequence metadata stay global.
+
 Typical structure:
 
 ```text

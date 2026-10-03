@@ -176,7 +176,10 @@ def test_fsdp_muon_direction_matches_pytorch_muon_for_one_matrix():
             "ns_coefficients": coefficients,
             "ns_steps": 5,
             "eps": 1e-7,
-        }
+        },
+    )
+    optimizer._ns_step_coefficients = (
+        FSDPDistributedMuon._ns_step_coefficients.__get__(optimizer)
     )
     item = SimpleNamespace(resolved_compute_view=None)
 
@@ -223,7 +226,10 @@ def test_batched_muon_consumes_independent_logical_matrices(
             "ns_coefficients": coefficients,
             "ns_steps": 5,
             "eps": 1e-7,
-        }
+        },
+    )
+    optimizer._ns_step_coefficients = (
+        FSDPDistributedMuon._ns_step_coefficients.__get__(optimizer)
     )
     item = SimpleNamespace(resolved_compute_view=view)
     actual = torch.stack(

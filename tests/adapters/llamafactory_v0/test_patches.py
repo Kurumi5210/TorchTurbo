@@ -300,6 +300,41 @@ def test_lf095_path_preserves_native_mrope_and_compacts_packed_tokens(monkeypatc
     assert sft_cls.__call__ is original_sft_call
 
 
+def test_qwen_dummy_patch_leaves_bailing_media_tokens_enabled(monkeypatch):
+    _, parent_cls, _ = _install_fake_llamafactory(monkeypatch)
+    original_call = parent_cls.__call__
+    patch = Qwen35DummyMediaPatch()
+    patch.patch()
+
+    plugin = SimpleNamespace(image_token="<image>", audio_token=None)
+    collator = parent_cls()
+    collator.model = SimpleNamespace(
+        config=SimpleNamespace(model_type="bailing_moe_v3_vl")
+    )
+    collator.tokenizer = _tokenizer()
+    collator.template = SimpleNamespace(mm_plugin=plugin)
+    collator.get_rope_func = None
+    collator.parent_batch = {"input_ids": torch.tensor([[1, 2, 3]])}
+
+    try:
+        collator(
+            [
+                {
+                    "input_ids": [1, 2, 3],
+                    "images": None,
+                    "videos": None,
+                    "audios": None,
+                }
+            ]
+        )
+        assert collator.plugin_tokens_seen_by_lf == ("<image>", None)
+        assert plugin.image_token == "<image>"
+    finally:
+        patch.revert()
+
+    assert parent_cls.__call__ is original_call
+
+
 def test_lf095_kimi_packed_fa2_uses_cu_metadata(monkeypatch):
     _, _, sft_cls = _install_fake_llamafactory(monkeypatch)
     patch = PackedInputCollatorPatch()

@@ -22,6 +22,7 @@ from .backends.base import BaseBackend
 from .config import EngineConfig, FreezePolicy
 from .metrics import MetricTracker
 from .optimizers import MuonPlan, OptimizerClassPlan, OptimizersContainer
+from .optimizers.lr_scheduler import create_lr_scheduler
 from .utils import has_meta_tensor
 from torchturbo.adapters.rl.packed import (
     gather_logprobs_entropy,
@@ -644,12 +645,19 @@ class TorchTurboEngine:
 
     def prepare_lr_scheduler(
         self,
-        scheduler_cls: type,
+        scheduler_cls: type | str,
+        *,
+        optimizer: torch.optim.Optimizer | None = None,
         **kwargs: Any,
     ) -> Any:
         """Create an LR scheduler for the optimizer.
 
         Must be called **after** ``prepare_optimizer()``.
+
+        A scheduler name uses the engine's named scheduler factory. A scheduler
+        class is constructed directly. The scheduler binds to ``optimizer``
+        when supplied, or to the engine's optimizer otherwise. Base learning
+        rates come from the bound optimizer's parameter groups.
 
         Example::
 
@@ -669,7 +677,12 @@ class TorchTurboEngine:
                 "No optimizer created. Call engine.prepare_optimizer() first."
             )
 
-        self.lr_scheduler = scheduler_cls(self.optimizer, **kwargs)
+        if optimizer is None:
+            optimizer = self.optimizer
+        if isinstance(scheduler_cls, str):
+            self.lr_scheduler = create_lr_scheduler(scheduler_cls, optimizer, **kwargs)
+        else:
+            self.lr_scheduler = scheduler_cls(optimizer, **kwargs)
         logger.info_rank0("Created LR scheduler: %s", type(self.lr_scheduler).__name__)
         return self.lr_scheduler
 
@@ -1123,9 +1136,8 @@ class TorchTurboEngine:
     ) -> dict[str, Any]:
         """Create padded model inputs from a packed micro-batch.
 
-        This is the packed-token counterpart of the SFT ``compute_loss`` input
-        preparation.  The engine owns SP state and uses Ulysses helpers when
-        sequence parallelism is active.
+        Model inputs use the same backend padding as SFT. Rolled token IDs
+        are aligned to that layout and sliced for the local RL loss.
         """
 
         input_ids = mb["input_ids"]
@@ -1139,42 +1151,10 @@ class TorchTurboEngine:
                 seq_len, device=input_ids.device
             )
 
-        padded_input_ids = input_ids.unsqueeze(0)
-        padded_position_ids = position_ids.unsqueeze(0)
-        attention_mask = mb.get("attention_mask", None)
-        sp_info = self.get_sp_info()
-        sp_size = int(sp_info.get("sp_size", 1))
-
-        sp_pad_size = 0
-        input_ids_rolled = None
-        if sp_size > 1:
-            from torchturbo.adapters.rl.sp import pad_and_slice_packed_inputs
-            from torchturbo.models.base import SequenceParallelInputMode
-
-            # POST_EMBEDDING (e.g. VLM wrappers）:
-            # defer SP slicing to the model's patch_forward_for_sp_input_slicing
-            # (which slices post-embedding inputs_embeds)
-            input_mode = self.model.get_sequence_parallel_input_mode()
-            do_slice = input_mode != SequenceParallelInputMode.POST_EMBEDDING
-
-            (
-                padded_input_ids,
-                padded_position_ids,
-                attention_mask,
-                sp_pad_size,
-                input_ids_rolled,
-            ) = pad_and_slice_packed_inputs(
-                padded_input_ids,
-                padded_position_ids,
-                attention_mask,
-                sp_info,
-                do_slice=do_slice,
-            )
-
         max_seqlen = max(seqlens) if seqlens else total_len
         result = {
-            "input_ids": padded_input_ids,
-            "position_ids": padded_position_ids,
+            "input_ids": input_ids.unsqueeze(0),
+            "position_ids": position_ids.unsqueeze(0),
             "use_cache": False,
             "cu_seqlens": cu_seqlens,
             "cu_seq_lens_q": cu_seqlens,
@@ -1182,12 +1162,25 @@ class TorchTurboEngine:
             "max_length_q": max_seqlen,
             "max_length_k": max_seqlen,
             "max_seqlen": max_seqlen,
-            "attention_mask": attention_mask,
             "_pad_length": 0,
-            "_sp_pad_size": sp_pad_size,
         }
-        if input_ids_rolled is not None:
-            result["_input_ids_rolled"] = input_ids_rolled.squeeze(0)
+        result = self.backend.prepare_inputs(self.model, result)
+        result["_sp_pad_size"] = result["input_ids"].size(-1) - total_len
+
+        sp_info = self.get_sp_info()
+        if sp_info["sp_size"] > 1:
+            from torchturbo.models.modules.attention.ulysses import slice_input_tensor
+
+            # Roll the original sequence before adding the ignored tail. The
+            # padded loss targets must remain valid vocabulary indices.
+            input_ids_rolled = torch.zeros_like(result["input_ids"])
+            input_ids_rolled[:, :total_len] = torch.roll(input_ids, shifts=-1, dims=0)
+            result["_input_ids_rolled"] = slice_input_tensor(
+                input_ids_rolled,
+                dim=1,
+                group=sp_info["sp_group"],
+                rank=sp_info["sp_rank"],
+            ).squeeze(0)
         return result
 
     def forward_backward_batch(

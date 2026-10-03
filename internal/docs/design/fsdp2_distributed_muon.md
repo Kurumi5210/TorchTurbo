@@ -731,6 +731,35 @@ FQN，并保存对应的分片状态。恢复时：
 
 scheduler 始终绑定最终 optimizer；是否使用 container 不改变训练侧的调用方式。
 
+配置了 `optimizer.name` 时，ms-swift 和 LlamaFactory 负责将调度类型、warmup、
+总步数和调度参数转交给 `engine.prepare_lr_scheduler()`。未配置
+`optimizer.name` 时，调度器仍由训练框架构造。
+
+Engine 通过 `engine/optimizers/lr_scheduler.py` 构造并保存调度器。调度器默认
+绑定 engine 的 optimizer；调用方显式传入 `optimizer` 时则绑定该对象，以其
+参数组中的初始学习率为基准。Engine 管理的 optimizer 的参数组峰值学习率
+由 engine 配置决定。
+
+Engine 的 `cosine_with_min_lr` 和 `cosine_warmup_with_min_lr` 将绝对 `min_lr`
+分别应用到每个参数组。例如 Muon 的峰值为 `2.5e-5`、AdamW 为 `1e-5`，配置
+`min_lr=1e-7` 时，两组都衰减到 `1e-7`。`cosine_with_min_lr` 在默认
+`num_cycles=0.5` 且 warmup 步数小于总训练步数时，各组在 warmup 后从各自的
+峰值按半余弦曲线衰减，在计划训练步数结束时达到 `min_lr`；
+在相同默认条件下，`cosine_warmup_with_min_lr` 沿用 HF 的步数偏移，在最后一个
+训练步使用 `min_lr`。实现复用 HF 的 warmup 和余弦函数，通过 PyTorch `LambdaLR` 为各组
+设置独立的最低比例。显式设置 `min_lr_rate` 时仍沿用 HF 的共同倍率；其他命名
+scheduler 复用 HF 的构造函数。LlamaFactory 在转交参数前保留自己的调度参数
+默认值处理。
+
+`OptimizersContainer.defaults` 只保留各 child 一致的选项。各组 LR 不同时，
+需要单一 `defaults["lr"]` 的 HF scheduler（如 `polynomial`）会在构造时报错，
+不会按某一组的 LR 换算其他组。
+
+Checkpoint 沿用 HF/PyTorch `LambdaLR` 的恢复约定：恢复 `base_lrs` 和步数，
+调度函数参数则由当前配置重建。因此，恢复训练应沿用原来的峰值学习率、
+warmup、总步数及调度参数；修改这些配置后再加载旧 checkpoint，不能保证曲线
+连续或保持原定绝对下限。
+
 owner 表、routes 和缓冲区不进入 checkpoint。动量按原参数分片保存，所以恢复后
 即使换了 owner，也不需要改变动量的存储方式。
 

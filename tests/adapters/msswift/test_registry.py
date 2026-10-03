@@ -23,6 +23,18 @@ if "grouped_gemm" not in sys.modules:  # pragma: no cover - env shim
 swift = pytest.importorskip("swift")
 
 
+@pytest.fixture(autouse=True)
+def restore_pipeline_globals(monkeypatch):
+    """Keep persistent adapter registrations from leaking between tests."""
+    from importlib import import_module
+
+    from torchturbo.adapters.msswift.stages import iter_stages
+
+    for stage in iter_stages():
+        module = import_module(stage.pipeline_module)
+        monkeypatch.setattr(module, stage.pipeline_attr, vars(module)[stage.pipeline_attr])
+
+
 def test_adapter_detection():
     from torchturbo.adapters.msswift import MSSwiftAdapter
     from torchturbo.adapters.msswift.compat import get_swift_version, is_swift_supported
@@ -199,7 +211,8 @@ def test_native_plugin_swaps_swift_sft():
 
     # Activate (registers models/trainers) then swap the pipeline class exactly
     # as the plugin module does on import.
-    MSSwiftAdapter().activate()
+    adapter = MSSwiftAdapter()
+    adapter.activate()
     swift_sft_mod.SwiftSft = TurboSwiftSft
     try:
         assert swift_sft_mod.SwiftSft is TurboSwiftSft
@@ -208,6 +221,7 @@ def test_native_plugin_swaps_swift_sft():
         assert callable(swift_sft_mod.sft_main)
     finally:
         swift_sft_mod.SwiftSft = original
+        adapter.deactivate()
 
 
 def test_pt_pipeline_structure():
@@ -259,22 +273,24 @@ def test_native_plugin_swaps_swift_pretrain():
     from torchturbo.adapters.msswift.pipeline import TurboSwiftPretrain
     from torchturbo.adapters.msswift.stages import iter_stages, stage_wiring
 
-    MSSwiftAdapter().activate()
+    adapter = MSSwiftAdapter()
+    adapter.activate()
     # Replay the plugin's swap loop; snapshot/restore the touched globals.
     originals = {}
-    for spec in iter_stages():
-        mod = importlib.import_module(spec.pipeline_module)
-        originals[(spec.pipeline_module, spec.pipeline_attr)] = getattr(
-            mod, spec.pipeline_attr
-        )
-        setattr(mod, spec.pipeline_attr, stage_wiring(spec.name)[0])
     try:
+        for spec in iter_stages():
+            mod = importlib.import_module(spec.pipeline_module)
+            originals[(spec.pipeline_module, spec.pipeline_attr)] = getattr(
+                mod, spec.pipeline_attr
+            )
+            setattr(mod, spec.pipeline_attr, stage_wiring(spec.name)[0])
         assert swift_pt_mod.SwiftPretrain is TurboSwiftPretrain
         assert callable(swift_pt_mod.pretrain_main)
     finally:
         for (module_name, attr), original in originals.items():
             mod = importlib.import_module(module_name)
             setattr(mod, attr, original)
+        adapter.deactivate()
 
 
 def test_pt_stage_reuses_causal_lm_trainer():

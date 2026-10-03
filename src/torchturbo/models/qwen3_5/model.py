@@ -11,6 +11,7 @@ from torchturbo.runtime import get_device_runtime
 
 from ...engine.config import ParameterGroup
 from ..base import TurboVLMModel
+from ..modules.attention.ulysses import SequenceParallelInputSlicingSpec
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
 
@@ -89,21 +90,24 @@ class TurboQwen3_5ForConditionalGeneration(
     def _post_init_patches(self):
         pass
 
-    def on_parallelized(self, parallel_context):
-        from ..modules.attention.ulysses import patch_forward_for_sp_input_slicing
+    def get_sequence_parallel_input_slicing_spec(self) -> SequenceParallelInputSlicingSpec:
+        from .modeling_qwen3_5 import Qwen3_5TextModel
 
+        return SequenceParallelInputSlicingSpec(
+            self.model.language_model,
+            Qwen3_5TextModel.forward,
+        )
+
+    def on_parallelized(self, parallel_context):
         sp_info = parallel_context["sp"]
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
         if sp_size > 1:
             from torchturbo.models.qwen3_5.modeling_qwen3_5 import (
-                Qwen3_5TextModel,
                 Qwen3_5GatedDeltaNet,
                 Qwen3_5MultiTokenPredictor,
             )
-
-            patch_forward_for_sp_input_slicing(Qwen3_5TextModel, sp_group, sp_size)
 
             # Vision keeps flash_attention_2 on its own subconfig and stays
             # on the native flash path; only text attention switches to the
@@ -158,7 +162,7 @@ class TurboQwen3_5ForConditionalGeneration(
                 if tensor is None or tensor.size(dim) == local_seq_len:
                     return tensor
                 return slice_input_tensor(
-                    tensor, dim=dim, group=sp_group, rank=sp_rank, padding=False
+                    tensor, dim=dim, group=sp_group, rank=sp_rank
                 )
 
             position_ids = localize(position_ids, -1)

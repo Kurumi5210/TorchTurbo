@@ -349,6 +349,7 @@ class OpDispatcher:
         *,
         activation_func,
         limit: float = 0.0,
+        clamp_gate_after_activation: bool = False,
         impl: str | None = None,
     ):
         return self._dispatch(
@@ -356,6 +357,7 @@ class OpDispatcher:
             x,
             activation_func=activation_func,
             limit=limit,
+            clamp_gate_after_activation=clamp_gate_after_activation,
             impl=impl,
         )
 

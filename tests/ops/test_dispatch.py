@@ -175,6 +175,24 @@ def test_gated_activation_reference_supports_limit(activation_func):
     assert torch.allclose(actual, expected)
 
 
+@pytest.mark.parametrize("activation_func", [F.silu, F.gelu])
+def test_gated_activation_reference_can_clamp_gate_after_activation(activation_func):
+    x = torch.randn(2, 8, dtype=torch.float32) * 4
+    actual = get_ops().gated_activation(
+        x,
+        activation_func=activation_func,
+        limit=0.5,
+        clamp_gate_after_activation=True,
+    )
+
+    gate, up = torch.chunk(x, 2, dim=-1)
+    expected = torch.clamp(activation_func(gate), max=0.5) * torch.clamp(
+        up, min=-0.5, max=0.5
+    )
+
+    assert torch.allclose(actual, expected)
+
+
 def test_swiglu_custom_policy_errors_when_no_cpu_custom_impl_exists():
     x = torch.randn(2, 8, dtype=torch.float32)
 

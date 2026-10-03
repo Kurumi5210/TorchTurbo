@@ -9,6 +9,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchturbo.engine.core import TorchTurboEngine
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+from torchturbo.models.base import TurboModel
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 
@@ -34,11 +35,7 @@ def test_compute_loss_passes_cu_through_backend_and_model(
     calls = []
     padded_length = physical_length + (-physical_length) % sp_size
 
-    class Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.config = SimpleNamespace(pad_token_id=99)
-
+    class Model(TurboModel, torch.nn.Module):
         def forward(self, input_ids, position_ids, labels, cu_seq_lens_q, cu_seq_lens_k,
                     max_length_q, max_length_k):
             calls.append("model")
@@ -120,16 +117,11 @@ def test_text_batch_without_positions_gets_contiguous_default():
     backend._compute_lm_loss_with_sp = (
         lambda **kw: (torch.tensor(0.0), (torch.tensor(0.0),))
     )
-    backend.get_sequence_parallel_input_mode = lambda: "pre_embedding"
-
     class Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.config = SimpleNamespace(pad_token_id=0)
             self.training = False
-
-        def get_sequence_parallel_input_mode(self):
-            return "post_embedding"
 
     inputs = {
         "input_ids": torch.arange(4).unsqueeze(0),
@@ -171,9 +163,6 @@ def test_multimodal_batch_without_positions_keeps_none_for_mrope():
             self.config = SimpleNamespace(pad_token_id=0)
             self.training = False
 
-        def get_sequence_parallel_input_mode(self):
-            return "post_embedding"
-
     inputs = {
         "input_ids": torch.arange(4).unsqueeze(0),
         "labels": torch.full((1, 4), -100),
@@ -196,24 +185,86 @@ def test_sp_input_slicing_skips_absent_position_ids(monkeypatch):
     import torch.distributed as dist
 
     from torchturbo.models.modules.attention.ulysses import (
+        SequenceParallelInputSlicingSpec,
         patch_forward_for_sp_input_slicing,
     )
 
-    monkeypatch.setattr(dist, "get_rank", lambda _group: 0)
     monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
 
-    class FakeLanguageModel:
+    class FakeLanguageModel(torch.nn.Module):
         def forward(self, **kwargs):
             return kwargs
 
+    model = FakeLanguageModel()
+    unpatched_model = FakeLanguageModel()
     patch_forward_for_sp_input_slicing(
-        FakeLanguageModel, sp_group=object(), sp_size=2
+        SequenceParallelInputSlicingSpec(model, FakeLanguageModel.forward),
+        sp_group=object(),
+        sp_size=2,
+        sp_rank=0,
     )
     embeds = torch.zeros(1, 4, 2)
-    result = FakeLanguageModel().forward(
+    result = model.forward(
         inputs_embeds=embeds,
         position_ids=None,
     )
 
     assert result["inputs_embeds"].shape == (1, 2, 2)
     assert result["position_ids"] is None
+    assert unpatched_model.forward(inputs_embeds=embeds)["inputs_embeds"].shape == (
+        1,
+        4,
+        2,
+    )
+
+
+@pytest.mark.parametrize("num_patches", [1, 2])
+def test_sp_input_slicing_uses_model_input_contract(monkeypatch, num_patches):
+    """Models can declare additional tensor and tensor-tuple inputs."""
+    import torch.distributed as dist
+
+    from torchturbo.models.modules.attention.ulysses import (
+        SequenceParallelInputSlicingSpec,
+        patch_forward_for_sp_input_slicing,
+    )
+
+    monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
+
+    class FakeLanguageModel(torch.nn.Module):
+        def forward(self, **kwargs):
+            return kwargs
+
+    model = FakeLanguageModel()
+    sp_group = object()
+    spec = SequenceParallelInputSlicingSpec(
+        model,
+        FakeLanguageModel.forward,
+        sliced_inputs=(
+            ("inputs_embeds", 1),
+            ("position_ids", -1),
+            ("text_position_ids", -1),
+            ("mtp_shifted_input_ids", 1),
+        ),
+    )
+    for _ in range(num_patches):
+        patch_forward_for_sp_input_slicing(
+            spec,
+            sp_group=sp_group,
+            sp_size=2,
+            sp_rank=1,
+        )
+    result = model.forward(
+        inputs_embeds=torch.arange(8).reshape(1, 4, 2),
+        position_ids=torch.arange(12).reshape(3, 1, 4),
+        text_position_ids=torch.arange(4).reshape(1, 4),
+        mtp_shifted_input_ids=(
+            torch.tensor([[1, 2, 3, 4]]),
+            torch.tensor([[2, 3, 4, 0]]),
+        ),
+    )
+
+    assert result["inputs_embeds"].shape == (1, 2, 2)
+    assert result["position_ids"].shape == (3, 1, 2)
+    assert result["text_position_ids"].tolist() == [[2, 3]]
+    assert result["mtp_shifted_input_ids"][0].tolist() == [[3, 4]]
+    assert result["mtp_shifted_input_ids"][1].tolist() == [[4, 0]]

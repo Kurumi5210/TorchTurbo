@@ -453,6 +453,99 @@ def test_muon_optimizer_bypasses_swift_optimizer_resolution(monkeypatch):
     assert trainer.create_optimizer() is optimizer
 
 
+def _install_swift_mixin(monkeypatch):
+    """Install the ``SwiftMixin`` whose scheduler hook the adapter bypasses."""
+
+    class SwiftMixin:
+        def create_scheduler(self, *args, **kwargs):
+            raise AssertionError("swift's OptimizerCallback scheduler must be bypassed")
+
+    swift_mixin_module = types.ModuleType("swift.trainers.mixin")
+    swift_mixin_module.SwiftMixin = SwiftMixin
+    monkeypatch.setitem(sys.modules, "swift.trainers.mixin", swift_mixin_module)
+    return SwiftMixin
+
+
+@pytest.mark.parametrize("pass_optimizer", [False, True])
+def test_muon_scheduler_is_created_by_engine(monkeypatch, pass_optimizer):
+    from torchturbo.adapters.msswift import engine_registry
+    from torchturbo.adapters.msswift.trainer import TurboTrainerMixin
+
+    _install_swift_mixin(monkeypatch)
+    trainer_optimizer = object()
+    passed_optimizer = object()
+    scheduler = object()
+    calls = []
+
+    class Engine:
+        config = SimpleNamespace(optimizer=SimpleNamespace(name="muon"))
+
+        def prepare_lr_scheduler(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return scheduler
+
+    monkeypatch.setattr(engine_registry, "get_engine", lambda: Engine())
+    trainer = object.__new__(TurboTrainerMixin)
+    trainer.optimizer = trainer_optimizer
+    trainer.lr_scheduler = None
+    trainer.args = SimpleNamespace(
+        lr_scheduler_type="cosine_with_min_lr",
+        lr_scheduler_kwargs={"min_lr": 1e-7},
+        get_warmup_steps=lambda num_training_steps: 2,
+    )
+    if pass_optimizer:
+        create_kwargs = {"optimizer": passed_optimizer}
+        scheduler_optimizer = passed_optimizer
+    else:
+        create_kwargs = {}
+        scheduler_optimizer = trainer_optimizer
+
+    assert trainer.create_scheduler(10, **create_kwargs) is scheduler
+    # A second call keeps the scheduler that the training loop already steps.
+    assert trainer.create_scheduler(10, **create_kwargs) is scheduler
+    assert trainer._created_lr_scheduler is True
+    assert calls == [
+        (
+            ("cosine_with_min_lr",),
+            {
+                "optimizer": scheduler_optimizer,
+                "num_warmup_steps": 2,
+                "num_training_steps": 10,
+                "scheduler_specific_kwargs": {"min_lr": 1e-7},
+            },
+        )
+    ]
+
+
+def test_framework_scheduler_is_kept_without_engine_optimizer(monkeypatch):
+    from torchturbo.adapters.msswift import engine_registry
+    from torchturbo.adapters.msswift.trainer import TurboTrainerMixin
+
+    swift_mixin = _install_swift_mixin(monkeypatch)
+    optimizer = object()
+    scheduler = object()
+    calls = []
+
+    class HfTrainer:
+        def create_scheduler(self, num_training_steps, optimizer=None):
+            calls.append((num_training_steps, optimizer))
+            return scheduler
+
+    class SwiftTrainer(TurboTrainerMixin, swift_mixin, HfTrainer):
+        pass
+
+    engine = SimpleNamespace(
+        config=SimpleNamespace(optimizer=SimpleNamespace(name=None)),
+    )
+    monkeypatch.setattr(engine_registry, "get_engine", lambda: engine)
+    trainer = object.__new__(SwiftTrainer)
+    trainer.optimizer = optimizer
+
+    assert trainer.create_scheduler(10) is scheduler
+    assert trainer.lr_scheduler is scheduler
+    assert calls == [(10, optimizer)]
+
+
 def test_accelerator_keeps_engine_optimizer_state_placement():
     from torchturbo.adapters.msswift.trainer import install_accelerator_overrides
 

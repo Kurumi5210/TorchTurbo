@@ -175,6 +175,28 @@ class TurboModel:
             sliced_inputs=(("input_ids", 1), ("position_ids", -1)),
         )
 
+    def on_prepare_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Validate and transform packed training inputs before SP padding.
+
+        The engine calls this before SP padding on every loss path; the
+        default enforces the packed-batch contract (boundaries ride with
+        ``cu_seq_lens_q/k``, ``attention_mask`` batches are rejected) and
+        returns the inputs unchanged. Media grids are only readable on the
+        complete, unpadded packed row, so gridded transforms belong here.
+        """
+        if inputs.get("attention_mask") is not None:
+            raise ValueError(
+                "Training batches must express sequence boundaries with "
+                "cu_seq_lens_q/k, not attention_mask. Normalize the batch "
+                "on the adapter side before it reaches the engine."
+            )
+        if inputs.get("cu_seq_lens_q") is None:
+            raise ValueError(
+                "Training batches must be flattened packed inputs carrying "
+                "cu_seq_lens_q/k and max_length_q/k metadata."
+            )
+        return inputs
+
     def get_parameter_groups(
         self,
     ) -> dict[ParameterGroup, Iterable[tuple[str, nn.Parameter]]]:

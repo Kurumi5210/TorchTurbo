@@ -83,6 +83,9 @@ def test_compute_loss_passes_cu_through_backend_and_model(
 
 
 def test_nonpacked_mask_is_rejected():
+    class ContractModel(TurboModel):
+        pass
+
     batch = {
         "attention_mask": torch.tensor([[1, 1, 0]]),
         "cu_seq_lens_q": torch.tensor([0, 2], dtype=torch.int32),
@@ -95,7 +98,7 @@ def test_nonpacked_mask_is_rejected():
     engine._prepare_moe_runtime = lambda *args: None
 
     with pytest.raises(ValueError, match="not attention_mask"):
-        engine.compute_loss(torch.nn.Identity().eval(), batch)
+        engine.compute_loss(ContractModel(), batch)
 
 
 def test_text_batch_without_positions_gets_contiguous_default():

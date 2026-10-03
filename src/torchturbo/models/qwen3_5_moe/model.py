@@ -2,6 +2,7 @@ import torch
 
 from torchturbo.engine.metrics.flops import BaseModelFlops
 from transformers import AutoModelForImageTextToText
+from typing import Any
 from typing_extensions import override
 
 from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
@@ -248,6 +249,40 @@ class TurboQwen3_5MoeForConditionalGeneration(
             self.model.language_model,
             Qwen3_5MoeTextModel.forward,
         )
+
+    def on_prepare_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Build M-RoPE position ids on packed row."""
+        inputs = super().on_prepare_inputs(inputs)
+        if inputs["position_ids"].ndim == 3:
+            return inputs
+        config = self.config
+        row_input_ids = inputs["input_ids"][0]
+        image_grid_thw = inputs.get("image_grid_thw")
+        video_grid_thw = inputs.get("video_grid_thw")
+        has_media_tokens = (
+            row_input_ids == config.image_token_id
+        ).any().item() or (row_input_ids == config.video_token_id).any().item()
+        if image_grid_thw is None and video_grid_thw is None and not has_media_tokens:
+            return inputs
+
+        boundaries = inputs["cu_seqlens"].tolist()
+        mm_position_ids = []
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+            mm, _ = self.model.get_rope_index(
+                input_ids=row_input_ids[start:end].unsqueeze(0),
+                image_grid_thw=(
+                    None if image_grid_thw is None else image_grid_thw[index]
+                ),
+                video_grid_thw=(
+                    None if video_grid_thw is None else video_grid_thw[index]
+                ),
+            )
+            mm_position_ids.append(mm)
+        inputs["position_ids"] = torch.cat(
+            (inputs["position_ids"].unsqueeze(0), torch.cat(mm_position_ids, dim=-1)),
+            dim=0,
+        )
+        return inputs
 
     def on_parallelized(self, parallel_context):
         sp_info = parallel_context["sp"]

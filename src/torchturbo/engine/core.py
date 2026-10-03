@@ -1011,17 +1011,7 @@ class TorchTurboEngine:
         Sequence boundaries reach the models only as ``cu_seq_lens_q/k``;
         batches carrying ``attention_mask`` are rejected.
         """
-        if inputs.get("attention_mask") is not None:
-            raise ValueError(
-                "Training batches must express sequence boundaries with "
-                "cu_seq_lens_q/k, not attention_mask. Normalize the batch "
-                "on the adapter side before it reaches the engine."
-            )
-        if inputs.get("cu_seq_lens_q") is None:
-            raise ValueError(
-                "Training batches must be flattened packed inputs carrying "
-                "cu_seq_lens_q/k and max_length_q/k metadata."
-            )
+        inputs = model.on_prepare_inputs(inputs)
         inputs = self.backend.prepare_inputs(model, inputs)
         if model.training:
             self._record_micro(inputs)
@@ -1125,10 +1115,6 @@ class TorchTurboEngine:
 
         self.metric_tracker.record(metrics)
 
-    # ------------------------------------------------------------------
-    # forward / backward API for RL
-    # ------------------------------------------------------------------
-
     def prepare_packed_micro_batch(
         self,
         mb: dict[str, Any],
@@ -1164,6 +1150,7 @@ class TorchTurboEngine:
             "max_seqlen": max_seqlen,
             "_pad_length": 0,
         }
+        result = self.model.on_prepare_inputs(result)
         result = self.backend.prepare_inputs(self.model, result)
         result["_sp_pad_size"] = result["input_ids"].size(-1) - total_len
 

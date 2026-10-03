@@ -31,9 +31,10 @@ def test_native_image_training_keeps_mrope(tmp_path, padding_side, packing):
 
     from torchturbo.adapters.llamafactory_v0.patches import PackedInputCollatorPatch
     from torchturbo.adapters.llamafactory_v0.trainer import make_torchturbo_trainer
+    from torchturbo.models.base import TurboModel
     from torchturbo.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 
-    class Model(torch.nn.Module):
+    class Model(TurboModel, torch.nn.Module):
         main_input_name = "input_ids"
         is_diffusion_model = False
         get_rope_index = Qwen3_5Model.get_rope_index

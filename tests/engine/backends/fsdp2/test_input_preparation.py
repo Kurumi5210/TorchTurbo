@@ -264,8 +264,6 @@ def test_rl_packed_inputs_are_sliced_once_by_the_model(
     runtime_inputs = model.get_moe_runtime_inputs(batch, {"sp": sp_info})
     expected_padding = [False] * num_tokens + [True] * pad_size
     assert runtime_inputs.padding_mask.tolist() == [expected_padding[shard]]
-
-
 @pytest.mark.parametrize("sp_rank", [0, 1])
 def test_diffusion_model_inputs_and_loss_labels_share_one_slice(monkeypatch, sp_rank):
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)

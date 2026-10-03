@@ -75,6 +75,17 @@ def test_turbo_model_requires_an_explicit_optimizer_recipe():
             TurboModel().get_optimizer_recipe(optimizer_name)
 
 
+class PackedLossModel(TurboModel, nn.Module):
+    """TinyModel plus the TurboModel contract for engine.compute_loss."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 1, bias=False)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 class TinyLogitsModel(nn.Module):
     """Small logits-producing model for the packed RL engine API tests."""
 
@@ -231,7 +242,7 @@ class TestPackedInputContract:
 
         with pytest.raises(ValueError, match="not attention_mask"):
             engine.compute_loss(
-                TinyModel(), _minimal_packed_inputs(attention_mask=torch.ones(1, 2))
+                PackedLossModel(), _minimal_packed_inputs(attention_mask=torch.ones(1, 2))
             )
 
     def test_compute_loss_requires_cu_metadata(self):
@@ -244,7 +255,7 @@ class TestPackedInputContract:
         engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
 
         with pytest.raises(ValueError, match="cu_seq_lens_q/k"):
-            engine.compute_loss(TinyModel(), {"input_ids": torch.ones(1, 4)})
+            engine.compute_loss(PackedLossModel(), {"input_ids": torch.ones(1, 4)})
 
 
 class TestEngineSetup:
@@ -596,7 +607,7 @@ class TestEngineSetup:
         self, dummy_engine
     ):
         engine = dummy_engine
-        model = TinyModel().eval()
+        model = PackedLossModel().eval()
         model.pop_metrics = lambda: {"test_metric": torch.tensor(2.0)}
 
         engine.compute_loss(model, _minimal_packed_inputs())
@@ -613,7 +624,7 @@ class TestEngineSetup:
         self, dummy_engine
     ):
         engine = dummy_engine
-        model = TinyModel()
+        model = PackedLossModel()
         model.pop_metrics = lambda: {"test_metric": torch.tensor(2.0)}
 
         engine.compute_loss(model, _minimal_packed_inputs())
@@ -733,7 +744,7 @@ class TestEngineSetup:
             def forward(self, hidden_states, input_ids=None):
                 return hidden_states
 
-        class RuntimeModel(nn.Module):
+        class RuntimeModel(TurboModel, nn.Module):
             def __init__(self):
                 super().__init__()
                 self.moe = RuntimeMoELayer()
@@ -780,7 +791,7 @@ class TestEngineSetup:
         engine.metric_tracker = engine_core.MetricTracker()
         engine.config = SimpleNamespace(mfu=SimpleNamespace(enabled=False))
 
-        engine.compute_loss(TinyModel(), _minimal_packed_inputs())
+        engine.compute_loss(PackedLossModel(), _minimal_packed_inputs())
 
         assert scales == []
 

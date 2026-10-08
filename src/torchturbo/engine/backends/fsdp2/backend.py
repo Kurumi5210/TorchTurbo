@@ -1730,6 +1730,7 @@ class FSDP2Backend(BaseBackend):
             inputs,
             use_chunked_loss=use_chunked_loss,
         )
+        dspark_loss_fn = getattr(outputs, "dspark_loss_fn", None)
 
         total_loss, component_losses = self._compute_lm_loss_with_sp(
             model=model,
@@ -1743,6 +1744,30 @@ class FSDP2Backend(BaseBackend):
             num_items_in_batch=num_items_in_batch,
             mtp_loss_scale=mtp_loss_scale,
         )
+        if dspark_loss_fn is not None:
+            outputs.dspark_loss_fn = None
+            dspark_loss = dspark_loss_fn(labels)
+            # DSpark returns a global anchor mean. Match the LM loss's
+            # microbatch normalization before adapters apply their SP scale.
+            if num_items_in_batch is None:
+                dspark_loss = dspark_loss / sp_size
+            else:
+                shifted_labels, normalizers = self._prepare_loss_labels(
+                    [labels],
+                    labels,
+                    sp_size=sp_size,
+                    sp_group=sp_group,
+                    sp_rank=sp_rank,
+                    num_items_in_batch=num_items_in_batch,
+                    cu_seq_lens=inputs.get("cu_seq_lens_q"),
+                )
+                num_tokens = (shifted_labels[0] != -100).sum()
+                if sp_size > 1:
+                    dist.all_reduce(num_tokens, group=sp_group)
+                dspark_loss = dspark_loss * num_tokens / normalizers[0]
+            total_loss = (
+                total_loss + dspark_loss * self.config.dspark.loss_scaling_factor
+            )
         mtp_losses = component_losses[1:]
 
         if self.config.mtp.log_loss:

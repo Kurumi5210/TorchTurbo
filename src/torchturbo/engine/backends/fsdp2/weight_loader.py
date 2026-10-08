@@ -17,20 +17,36 @@ logger = get_logger(__name__)
 
 
 class _PendingTask:
-    """Holds state for an async broadcast that needs to be awaited and processed.
+    """Holds a broadcast before and after it is submitted to the backend.
 
-    After handle.wait(), the full_tensor contains valid data and can be
-    distributed into the model state dict via distribute_tensor + assign.
+    Before issue, ``handle`` is ``None`` and ``source``/``group`` describe the
+    collective to create. After issue, ``handle`` is waited on and the full
+    tensor is distributed into the model state dict.
     """
-    __slots__ = ('handle', 'full_tensor', 'param', 'mesh', 'key', 'target_dtype')
+    __slots__ = (
+        'handle', 'full_tensor', 'param', 'mesh', 'key', 'target_dtype',
+        'group', 'source',
+    )
 
-    def __init__(self, handle, full_tensor, param, mesh, key, target_dtype=None):
+    def __init__(
+        self,
+        handle,
+        full_tensor,
+        param,
+        mesh,
+        key,
+        target_dtype,
+        group,
+        source,
+    ):
         self.handle = handle
         self.full_tensor = full_tensor
         self.param = param
         self.mesh = mesh
         self.key = key
         self.target_dtype = target_dtype
+        self.group = group
+        self.source = source
 
 
 class DistParamLoader:
@@ -335,13 +351,13 @@ class DistParamLoader:
 
     # ── Async Broadcast Helpers ────────────────────────────────────
 
-    def _async_broadcast_tensor(self, name, shape=None, broadcast_dtype=None, group=None):
-        """Issue an async broadcast and return (handle, tensor).
+    def _prepare_tensor(self, name, shape=None, broadcast_dtype=None, group=None):
+        """Prepare a broadcast tensor and return (tensor, mesh, group, source).
 
         Broadcasts in broadcast_dtype (defaults to checkpoint dtype). Owner
         keeps the loaded dtype without conversion; non-owners allocate in
         broadcast_dtype. group=None means the world group. Dtype conversion
-        to param.dtype is deferred to _flush_pending_tasks.
+        to param.dtype is deferred to the pending-task flush.
         """
         owner = self.param_to_rank[name]
         if self.rank == owner:
@@ -349,16 +365,15 @@ class DistParamLoader:
             tensor = self.local_sd[name].to(self.device)
         else:
             tensor = torch.empty(shape, device=self.device, dtype=broadcast_dtype)
-        handle = dist.broadcast(tensor, src=owner, group=group, async_op=True)
-        return handle, tensor
+        return tensor, self.world_mesh, group, owner
 
-    def _async_broadcast_expert_weight(self, name, param):
-        """Async broadcast of expert weight1 or weight2 within EDP group.
+    def _prepare_expert_weight(self, name, param):
+        """Prepare expert weight1 or weight2 for an EDP-group broadcast.
 
         The converter handles format-specific assembly (per-expert vs fused)
         and weight1 vs weight2 dispatch. Owner rank assembles the tensor;
-        non-owners allocate empty. Broadcasts in checkpoint dtype, returns
-        (handle, tensor). Dtype conversion deferred to _flush_pending_tasks.
+        non-owners allocate empty. Dtype conversion is deferred to the
+        pending-task flush.
         """
         hf_key = self.param_converter.get_expert_broadcast_key(name)
         owner = self.param_to_rank[hf_key]
@@ -371,13 +386,12 @@ class DistParamLoader:
                 tensor, self.local_sd, name
             )
 
-        handle = dist.broadcast(tensor, src=owner, group=self.edp_group, async_op=True)
-        return handle, tensor
+        return tensor, self.mesh["edp"], self.edp_group, owner
 
-    def _async_init_and_broadcast_lora(self, clean_name, param):
-        """Issue async broadcast for a LoRA adapter param.
+    def _prepare_lora(self, clean_name, param):
+        """Prepare a LoRA adapter tensor for broadcast.
 
-        Returns (handle, tensor, mesh).
+        Returns (tensor, mesh, group, source).
         """
         is_a = (".lora_A." in clean_name
                 or ".lora_A2." in clean_name
@@ -402,8 +416,7 @@ class DistParamLoader:
             else:
                 full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
 
-            handle = dist.broadcast(full, src=edp_src_global, group=edp_group, async_op=True)
-            return handle, full, edp_mesh
+            return full, edp_mesh, edp_group, edp_src_global
         else:
             if self.rank == 0:
                 full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
@@ -411,8 +424,7 @@ class DistParamLoader:
             else:
                 full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
 
-            handle = dist.broadcast(full, src=0, async_op=True)
-            return handle, full, self.world_mesh
+            return full, self.world_mesh, None, 0
 
     # ── Memory Budget Sync ─────────────────────────────────────────
 
@@ -440,22 +452,40 @@ class DistParamLoader:
     # ── Flush Pending Tasks ────────────────────────────────────────
 
     def _flush_pending_tasks(self, tasks, sharded_sd):
-        """Wait for async broadcasts, convert dtype, distribute and store in state dict.
+        """Issue async broadcasts in a stable order, then store their tensors.
 
         For DTensor (FSDP-managed) params: ``distribute_tensor`` the broadcast
         full tensor, ``to_local()`` the local shard, then rebuild a standalone
         DTensor with ``from_local()``. ``to_local()`` is a view into the
         just-broadcast full buffer, so the shard is materialised as an
         independent tensor (``clone`` on device, ``.to("cpu")`` under offload)
-        before ``from_local`` — that releases ``task.full_tensor`` every
-        iteration instead of pinning each full buffer in ``sharded_sd``. Memory
-        stays flat as the state dict accumulates (no OOM) without a
-        ``to_empty``/``copy_`` fast path.
+        before ``from_local``. That releases ``task.full_tensor`` every
+        iteration instead of pinning each full buffer in ``sharded_sd``, so
+        memory stays flat as the state dict accumulates.
 
         Plain (no_shard / replicated) params are not FSDP-managed: the broadcast
         tensor is stored directly and stays on the compute device even under
         offload.
         """
+        # torch_npu/HCCL can stop advancing a large varied-size async-broadcast
+        # window when its source changes repeatedly. Keep EDP work first and
+        # sort world work by source while retaining the original preparation
+        # order (and therefore LoRA initialization order) within each source.
+        tasks.sort(
+            key=lambda task: (
+                0 if task.group is not None else 1,
+                task.source,
+            )
+        )
+
+        for task in tasks:
+            task.handle = dist.broadcast(
+                task.full_tensor,
+                src=task.source,
+                group=task.group,
+                async_op=True,
+            )
+
         for task in tasks:
             task.handle.wait()
 
@@ -561,10 +591,9 @@ class DistParamLoader:
             target_dtype = param.dtype
 
             if is_peft_adapter_param(clean_name):
-                handle, full, mesh = self._async_init_and_broadcast_lora(clean_name, param)
+                full, mesh, group, source = self._prepare_lora(clean_name, param)
             elif self.param_converter.is_expert_weight(clean_name):
-                handle, full = self._async_broadcast_expert_weight(clean_name, param)
-                mesh = self.mesh['edp']
+                full, mesh, group, source = self._prepare_expert_weight(clean_name, param)
             else:
                 hf_name = self.param_converter.to_hf_name(clean_name)
                 if hf_name not in self.param_to_filename:
@@ -581,8 +610,9 @@ class DistParamLoader:
                     continue
                 # Broadcast in checkpoint dtype; dtype conversion deferred to flush
                 hf_dtype = self.param_converter.get_default_hf_dtype(hf_name)
-                handle, full = self._async_broadcast_tensor(hf_name, param.shape, hf_dtype, group=None)
-                mesh = self.world_mesh
+                full, mesh, group, source = self._prepare_tensor(
+                    hf_name, param.shape, hf_dtype, group=None
+                )
 
             tensor_bytes = full.numel() * full.element_size()
 
@@ -595,7 +625,11 @@ class DistParamLoader:
                     "[load] broadcast flushed %d/%d params", processed, num_params
                 )
 
-            pending.append(_PendingTask(handle, full, param, mesh, name, target_dtype))
+            pending.append(
+                _PendingTask(
+                    None, full, param, mesh, name, target_dtype, group, source
+                )
+            )
             pending_bytes += tensor_bytes
             processed += 1
 

@@ -382,6 +382,59 @@ class MTPConfig:
 
 
 @dataclass
+class DSparkTrainingConfig:
+    """DeepSeek-V4 DSpark training recipe.
+
+    Defaults follow the official DeepSpec DSpark configs for Qwen3 and Gemma4:
+    https://github.com/deepseek-ai/DeepSpec
+
+    ``enabled`` independently controls the DSpark training branch.  MTP layers
+    are still gated by ``mtp.enabled``, while the DSpark architecture is
+    determined by the model config's ``dspark_block_size``.
+
+    These values are set onto the model config during ``init_context``; the
+    model config itself is not expected to provide them.
+    """
+
+    enabled: bool = True
+    loss_scaling_factor: float = 0.1
+    num_anchors: int = 512
+    loss_decay_gamma: float = 4.0
+    ce_loss_alpha: float = 0.1
+    l1_loss_alpha: float = 0.9
+    confidence_loss_alpha: float = 1.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.enabled, str):
+            self.enabled = string_to_bool(self.enabled)
+        else:
+            self.enabled = bool(self.enabled)
+        self.loss_scaling_factor = float(self.loss_scaling_factor)
+        if self.loss_scaling_factor < 0:
+            raise ValueError(
+                "dspark loss_scaling_factor must be non-negative, got "
+                f"{self.loss_scaling_factor}"
+            )
+        if self.num_anchors <= 0:
+            raise ValueError(
+                f"dspark num_anchors must be positive, got {self.num_anchors}"
+            )
+        if self.loss_decay_gamma < 0:
+            raise ValueError(
+                f"dspark loss_decay_gamma must be non-negative, "
+                f"got {self.loss_decay_gamma}"
+            )
+        loss_alphas = {
+            "ce_loss_alpha": self.ce_loss_alpha,
+            "l1_loss_alpha": self.l1_loss_alpha,
+            "confidence_loss_alpha": self.confidence_loss_alpha,
+        }
+        for name, value in loss_alphas.items():
+            if value < 0:
+                raise ValueError(f"dspark {name} must be non-negative, got {value}")
+
+
+@dataclass
 class LossChunkConfig:
     """Compute ``lm_head`` + cross-entropy in token chunks, avoiding the full
     ``[tokens, vocab]`` logits tensor.
@@ -561,6 +614,9 @@ class EngineConfig:
     mtp: MTPConfig = field(default_factory=MTPConfig)
     """Multi-Token-Prediction settings."""
 
+    dspark: DSparkTrainingConfig = field(default_factory=DSparkTrainingConfig)
+    """DeepSeek-V4 DSpark training overrides."""
+
     moe: MoEConfig = field(default_factory=MoEConfig)
     """MoE training settings."""
 
@@ -602,6 +658,10 @@ class EngineConfig:
             self.ops = OpsConfig()
         if self.loss_chunk is None:
             self.loss_chunk = LossChunkConfig()
+        if self.dspark is None:
+            self.dspark = DSparkTrainingConfig()
+        elif isinstance(self.dspark, dict):
+            self.dspark = DSparkTrainingConfig(**self.dspark)
         if self.optimizer is None:
             self.optimizer = OptimizerConfig()
         elif isinstance(self.optimizer, dict):
@@ -716,6 +776,9 @@ class EngineConfig:
         # MTP
         mtp_config = cls._parse_mtp_config(d)
 
+        # DeepSeek-V4 DSpark
+        dspark_config = cls._parse_dspark_training_config(d.get("dspark", {}))
+
         # MoE
         moe_config = cls._parse_moe_config(d.get("moe", {}))
 
@@ -760,6 +823,7 @@ class EngineConfig:
             "hf_model_path",
             "default_save_format",
             "mtp",
+            "dspark",
             "moe",
             "enable_mtp",
             "mtp_loss_scaling_factor",
@@ -785,6 +849,7 @@ class EngineConfig:
             optimizer=optimizer,
             checkpoint=ckpt,
             mtp=mtp_config,
+            dspark=dspark_config,
             moe=moe_config,
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
@@ -830,6 +895,16 @@ class EngineConfig:
         if mtp_d.get("loss_scaling_factor") is None:
             mtp_d["loss_scaling_factor"] = 0.1
         return MTPConfig(**mtp_d)
+
+    @staticmethod
+    def _parse_dspark_training_config(value: Any) -> DSparkTrainingConfig:
+        if isinstance(value, DSparkTrainingConfig):
+            return value
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise TypeError("dspark must be a dict or DSparkTrainingConfig.")
+        return DSparkTrainingConfig(**value)
 
     @staticmethod
     def _parse_moe_config(value: Any) -> MoEConfig:
@@ -1035,6 +1110,7 @@ def build_from_args(
         optimizer=_build_optimizer_config(fields),
         checkpoint=_build_checkpoint_config(fields),
         mtp=_build_mtp_config(fields),
+        dspark=_build_dspark_training_config(fields),
         moe=_build_moe_config(fields),
         loss_chunk=_build_loss_chunk_config(fields),
         freeze_policy=_build_freeze_policy(fields),
@@ -1178,6 +1254,12 @@ def _build_mtp_config(fields: Mapping[str, Any]) -> MTPConfig:
         ),
         log_loss=string_to_bool(mtp_d.get("log_loss", False)),
     )
+
+
+def _build_dspark_training_config(fields: Mapping[str, Any]) -> DSparkTrainingConfig:
+    """DSparkTrainingConfig from the merged config dict."""
+    dspark_d = fields.get("dspark") or {}
+    return DSparkTrainingConfig(**dspark_d)
 
 
 def _build_loss_chunk_config(fields: Mapping[str, Any]) -> LossChunkConfig:

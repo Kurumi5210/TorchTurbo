@@ -161,7 +161,9 @@ class TopKRouter(Router):
             dist.all_reduce(
                 tokens_per_expert, op=dist.ReduceOp.SUM, group=self.sp_group
             )
-        total_num_tokens = tokens_per_expert.sum() / self.topk
+        # A fully padded batch routes no tokens. The floor keeps its aux loss
+        # and gradient at zero instead of 0 / 0, as in the z-loss path.
+        total_num_tokens = (tokens_per_expert.sum() / self.topk).clamp_min(1)
 
         raw_aux_loss = self._token_aux_loss(
             scores_for_aux_loss,

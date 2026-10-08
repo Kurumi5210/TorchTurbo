@@ -272,10 +272,15 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 | Memory | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
 | Prefetching | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |
 | MTP / MoE loss | `--tt_enable_mtp` / `--tt_mtp_loss_scaling_factor` / `--tt_mtp_log_loss` / `--tt_moe_aux_loss_coeff` / `--tt_moe_z_loss_coeff` / `--tt_enable_chunk_loss` / `--tt_loss_chunk_size` |
+| DeepSeek-V4 DSpark (needs MTP and a DSpark checkpoint) | `--tt_enable_dspark` / `--tt_dspark_loss_scaling_factor` / `--tt_dspark_num_anchors` / `--tt_dspark_loss_decay_gamma` / `--tt_dspark_ce_loss_alpha` / `--tt_dspark_l1_loss_alpha` / `--tt_dspark_confidence_loss_alpha` |
 | VLM freezing | `--tt_freeze_vision_tower` / `--tt_freeze_multi_modal_projector` / `--tt_freeze_language_model` |
 | Diffusion models (LLaDA2) | `--tt_cap_lambda` / `--tt_bd_mask_low` / `--tt_bd_mask_high` / `--tt_bd_block_size` |
 | Checkpointing | `--tt_default_save_format` |
 | Profiling, metrics, and logging | `--tt_profiling` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+
+DeepSeek-V4 MTP and DSpark jointly train the backbone and draft modules, including
+the shared embedding and output head. DSpark stops gradients through its reference
+distributions while allowing gradients through the backbone context features.
 
 ## Adding a New Model
 

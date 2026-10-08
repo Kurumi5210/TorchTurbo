@@ -241,10 +241,14 @@ docs/runs/
 | 显存 | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
 | 预取 | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |
 | MTP / MoE loss | `--tt_enable_mtp` / `--tt_mtp_loss_scaling_factor` / `--tt_mtp_log_loss` / `--tt_moe_aux_loss_coeff` / `--tt_moe_z_loss_coeff` / `--tt_enable_chunk_loss` / `--tt_loss_chunk_size` |
+| DeepSeek-V4 DSpark（需开启 MTP 且使用 DSpark checkpoint） | `--tt_enable_dspark` / `--tt_dspark_loss_scaling_factor` / `--tt_dspark_num_anchors` / `--tt_dspark_loss_decay_gamma` / `--tt_dspark_ce_loss_alpha` / `--tt_dspark_l1_loss_alpha` / `--tt_dspark_confidence_loss_alpha` |
 | VLM 冻结 | `--tt_freeze_vision_tower` / `--tt_freeze_multi_modal_projector` / `--tt_freeze_language_model` |
 | 扩散模型（LLaDA2） | `--tt_cap_lambda` / `--tt_bd_mask_low` / `--tt_bd_mask_high` / `--tt_bd_block_size` |
 | Checkpoint | `--tt_default_save_format` |
 | 性能分析、指标与日志 | `--tt_profiling` / `--tt_memory_snapshot_steps` / `--tt_log_mfu` / `--tt_card_name` / `--tt_log_level` |
+
+DeepSeek-V4 MTP 和 DSpark 联合训练主干与 draft 模块，包括共享 embedding 和输出 head。
+DSpark 的参考分布保持停止梯度，主干上下文特征允许梯度回传。
 
 
 ## 添加新模型

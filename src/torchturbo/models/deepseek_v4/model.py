@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager
 from functools import wraps
 from types import MethodType
 from typing import Optional
@@ -19,6 +20,7 @@ from ..base import TurboModel
 from ..registry import register_model
 from ..weight_converter import BaseWeightConverter
 from .configuration_deepseek_v4 import DeepseekV4Config
+from .mtp import DeepseekV4MTPForwarder, DeepseekV4MultiTokenPredictor
 from .modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
 
@@ -63,11 +65,31 @@ class DeepseekV4WeightConverter(BaseWeightConverter):
 class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
     config_class = DeepseekV4Config
     base_model_prefix = ""
+    _forward_mtp = DeepseekV4MTPForwarder()
 
     def __init__(self, config: DeepseekV4Config):
         self._pre_init_patches(config)
         super().__init__(config)
+        self.mtp = (
+            DeepseekV4MultiTokenPredictor(config)
+            if config.num_nextn_predict_layers > 0
+            else None
+        )
         self._post_init_patches()
+
+    @classmethod
+    @contextmanager
+    def init_context(cls, config: DeepseekV4Config, engine_config):
+        dspark = engine_config.dspark
+        config.dspark_enabled = dspark.enabled
+        config.dspark_num_anchors = dspark.num_anchors
+        config.dspark_loss_decay_gamma = dspark.loss_decay_gamma
+        config.dspark_ce_loss_alpha = dspark.ce_loss_alpha
+        config.dspark_l1_loss_alpha = dspark.l1_loss_alpha
+        config.dspark_confidence_loss_alpha = dspark.confidence_loss_alpha
+
+        with super().init_context(config, engine_config):
+            yield
 
     @classmethod
     def get_default_parallel_plan(cls, **kwargs):
@@ -86,7 +108,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
         lm_head = self._modules["head"]
         noop_lm_head = self.head
         if noop_lm_head is lm_head:
-            return super().forward(*args, **kwargs)
+            return self._forward_mtp.forward(self, *args, **kwargs)
 
         def head_forward(hidden_states, hc_fn, hc_scale, hc_base, norm):
             hidden_states = lm_head._hc_head(
@@ -99,7 +121,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
 
         object.__setattr__(self, "head", head_forward)
         try:
-            return super().forward(*args, **kwargs)
+            return self._forward_mtp.forward(self, *args, **kwargs)
         finally:
             object.__setattr__(self, "head", noop_lm_head)
 
@@ -133,7 +155,7 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
         """Rebuild runtime buffers cleared by FSDP2 meta-device loading."""
         from . import modeling_deepseek_v4 as dsv4
 
-        for layer in self.layers:
+        for layer in (*self.layers, *(self.mtp or [])):
             attn = layer.attn
             if attn.compress_ratio > 1:
                 original_seq_len = attn.config.original_max_position_embeddings
@@ -194,6 +216,11 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
                 loss_fn = layer.cal_index_loss.li_loss.compute_dsa_indexer_loss
                 loss_fn.forward = MethodType(indexer_loss_forward, loss_fn)
         self.patch_deepseek_v4_attention_for_sp(sp_group, sp_size, sp_rank)
+        self._forward_mtp = DeepseekV4MTPForwarder(
+            sp_group=sp_group,
+            sp_size=sp_size,
+            sp_rank=sp_rank,
+        )
 
     @classmethod
     def patch_deepseek_v4_attention_for_sp(cls, sp_group, sp_size, sp_rank):

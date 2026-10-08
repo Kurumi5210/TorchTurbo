@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-裁剪 DeepSeek V4 模型到前 N 层，并保存新的权重。
+"""Prune a DeepSeek V4 model to its first N layers and save new weights.
 
-用法:
+Usage:
     python create_small_dsv4.py --input_dir /path/to/deepseek-v4 --output_dir /path/to/output --num_layers 4
 """
 
@@ -17,7 +16,7 @@ from safetensors.torch import save_file
 
 
 def extract_layer_index(key):
-    """从 key 中提取 layer 索引，支持两种格式:
+    """Extract a layer index from a weight-map key. Supported formats:
     - model.layers.0.xxx -> 0
     - layers.0.xxx -> 0
     """
@@ -39,7 +38,7 @@ def extract_layer_index(key):
 
 
 def load_index_json(input_dir):
-    """加载 model.safetensors.index.json，返回 weight_map 和 metadata"""
+    """Load the safetensors index and return its weight map and metadata."""
     index_path = os.path.join(input_dir, "model.safetensors.index.json")
     if not os.path.exists(index_path):
         return None, None
@@ -51,24 +50,34 @@ def load_index_json(input_dir):
 
 
 def is_mtp_key(key):
-    """检查是否是 mtp 层的权重"""
+    """Return whether a key belongs to an MTP layer."""
     return key.startswith("mtp.") or ".mtp." in key
 
 
-def select_needed_files(weight_map, num_layers):
-    """根据 weight_map 和所需层数，选择需要读取的文件"""
+def count_mtp_stages(weight_map):
+    """Count MTP stages represented by a checkpoint weight map."""
+    stages = set()
+    for key in weight_map:
+        if is_mtp_key(key):
+            stages.add(int(key.split("mtp.")[1].split(".", 1)[0]))
+    return max(stages) + 1 if stages else 0
+
+
+def select_needed_files(weight_map, num_layers, keep_mtp):
+    """Select checkpoint files needed for the requested layers."""
     needed_files = set()
     all_layers = set()
 
     for key, filename in weight_map.items():
-        # 跳过 mtp 层
         if is_mtp_key(key):
+            if keep_mtp:
+                needed_files.add(filename)
             continue
 
         layer_idx = extract_layer_index(key)
 
         if layer_idx is None:
-            # 非 layer 相关权重 (embed, norm, lm_head 等)，需要读取
+            # Read non-layer weights such as embeddings, norms, and the head.
             needed_files.add(filename)
         elif layer_idx < num_layers:
             needed_files.add(filename)
@@ -78,7 +87,7 @@ def select_needed_files(weight_map, num_layers):
 
 
 def load_weights_from_files(input_dir, weight_map, needed_files):
-    """只从需要的文件中加载权重"""
+    """Load weights only from the selected checkpoint files."""
     all_weights = {}
 
     for filename in needed_files:
@@ -95,7 +104,7 @@ def load_weights_from_files(input_dir, weight_map, needed_files):
 
 
 def load_all_safetensors(input_dir):
-    """回退方案：加载所有 safetensors 文件"""
+    """Fallback path: load every safetensors file."""
     weight_files = sorted([f for f in os.listdir(input_dir) if f.endswith(".safetensors")])
 
     all_weights = {}
@@ -108,13 +117,14 @@ def load_all_safetensors(input_dir):
     return all_weights
 
 
-def filter_layers(weights, num_layers):
-    """只保留前 num_layers 层的权重，排除 mtp 层"""
+def filter_layers(weights, num_layers, keep_mtp):
+    """Keep the first num_layers layers and optionally keep MTP weights."""
     filtered = OrderedDict()
 
     for key, tensor in weights.items():
-        # 跳过 mtp 层
         if is_mtp_key(key):
+            if keep_mtp:
+                filtered[key] = tensor
             continue
 
         layer_idx = extract_layer_index(key)
@@ -129,7 +139,7 @@ def filter_layers(weights, num_layers):
 
 
 def save_in_shards(weights, output_dir, shard_size="5GB"):
-    """将权重保存为 safetensors 分片文件"""
+    """Save weights as sharded safetensors files."""
     os.makedirs(output_dir, exist_ok=True)
 
     if shard_size.endswith("GB"):
@@ -169,7 +179,7 @@ def save_in_shards(weights, output_dir, shard_size="5GB"):
         print(f"  Saved {shard_filename} ({len(current_shard)} tensors, {current_size / 1e9:.2f} GB)")
         shard_idx += 1
 
-    # 重命名更新总数
+    # Rename shards after the final shard count is known.
     weight_map = {}
     for i, old_name in enumerate(shard_files):
         new_name = f"model-{i:05d}-of-{shard_idx:05d}.safetensors"
@@ -178,7 +188,7 @@ def save_in_shards(weights, output_dir, shard_size="5GB"):
         if old_name != new_name:
             os.rename(old_path, new_path)
 
-        # 记录新 weight_map
+        # Record the new weight map.
         with safe_open(new_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 weight_map[key] = new_name
@@ -187,7 +197,7 @@ def save_in_shards(weights, output_dir, shard_size="5GB"):
 
 
 def save_index_json(output_dir, weight_map, num_layers, total_size=0):
-    """保存新的 model.safetensors.index.json"""
+    """Save a new model.safetensors.index.json file."""
     index_data = {
         "metadata": {
             "format": "pt",
@@ -203,8 +213,8 @@ def save_index_json(output_dir, weight_map, num_layers, total_size=0):
     print(f"Saved model.safetensors.index.json")
 
 
-def copy_config_files(input_dir, output_dir, num_layers):
-    """复制并修改配置文件"""
+def copy_config_files(input_dir, output_dir, num_layers, keep_mtp, dspark, mtp_stages):
+    """Copy and update model configuration files."""
     config_path = os.path.join(input_dir, "config.json")
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
@@ -214,15 +224,38 @@ def copy_config_files(input_dir, output_dir, num_layers):
         config["num_hidden_layers"] = num_layers
         print(f"  Updated num_hidden_layers: {original_layers} -> {num_layers}")
 
+        if keep_mtp:
+            config["num_nextn_predict_layers"] = mtp_stages
+            if config.get("compress_ratios"):
+                tail = (
+                    [0] * mtp_stages
+                    if dspark
+                    else [config["compress_ratios"][-1]] * mtp_stages
+                )
+                config["compress_ratios"] = config["compress_ratios"][:num_layers] + tail
+            if dspark:
+                # main_proj consumes one hidden state per target layer, so keep
+                # the target count and move the targets into the kept layers.
+                num_target_layers = len(config["dspark_target_layer_ids"])
+                config["dspark_target_layer_ids"] = list(
+                    range(num_layers - num_target_layers, num_layers)
+                )
+                print(
+                    "  Updated DSpark target layers: "
+                    f"{config['dspark_target_layer_ids']}"
+                )
+            print(f"  Updated MTP layers: {config['num_nextn_predict_layers']}")
+
         output_config_path = os.path.join(output_dir, "config.json")
         with open(output_config_path, "w") as f:
             json.dump(config, f, indent=2)
         print(f"  Saved config.json")
 
-    # 复制其他文件
+    # Copy auxiliary tokenizer and generation files.
     for filename in [
         "tokenizer_config.json",
         "tokenizer.json",
+        "generation_config.json",
         "vocab.json",
         "merges.txt",
         "special_tokens_map.json",
@@ -235,31 +268,50 @@ def copy_config_files(input_dir, output_dir, num_layers):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="裁剪 DeepSeek V4 模型到前 N 层")
+    parser = argparse.ArgumentParser(description="Prune DeepSeek V4 to its first N layers")
     parser.add_argument(
-        "--input_dir", type=str, required=True, help="输入模型权重目录 (Hugging Face 格式)"
+        "--input_dir", type=str, required=True, help="Input Hugging Face checkpoint directory"
     )
-    parser.add_argument("--output_dir", type=str, required=True, help="输出目录")
-    parser.add_argument("--num_layers", type=int, required=True, help="保留的层数")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--num_layers", type=int, required=True, help="Number of layers to keep")
     parser.add_argument(
-        "--shard_size", type=str, default="5GB", help="每个分片的大小 (默认: 5GB)"
+        "--shard_size", type=str, default="5GB", help="Maximum shard size (default: 5GB)"
+    )
+    parser.add_argument("--keep_mtp", action="store_true", help="Keep mtp.* weights")
+    parser.add_argument(
+        "--dspark",
+        action="store_true",
+        help="Input is a DSpark checkpoint; remap its target layers into the kept layers",
     )
 
     args = parser.parse_args()
+    if args.dspark and not args.keep_mtp:
+        parser.error("--dspark requires --keep_mtp")
 
     print(f"Loading index from {args.input_dir}...")
     weight_map, _ = load_index_json(args.input_dir)
+    mtp_stages = count_mtp_stages(weight_map) if weight_map else 0
+    if args.dspark and mtp_stages == 0:
+        parser.error("no mtp.* stages found in the checkpoint index")
+    if args.dspark:
+        with open(os.path.join(args.input_dir, "config.json"), "r") as f:
+            num_target_layers = len(json.load(f)["dspark_target_layer_ids"])
+        if args.num_layers < num_target_layers:
+            parser.error(
+                f"--num_layers must be at least {num_target_layers} to keep "
+                "every DSpark target layer"
+            )
 
     if weight_map:
         print(f"  Found index.json with {len(weight_map)} tensors")
 
-        # 计算需要的文件
-        needed_files, all_layers = select_needed_files(weight_map, args.num_layers)
+        # Determine which shard files must be read.
+        needed_files, all_layers = select_needed_files(weight_map, args.num_layers, args.keep_mtp)
         print(f"  Total layers in model: {max(all_layers) + 1 if all_layers else 0}")
         print(f"  Target layers: 0-{args.num_layers - 1}")
         print(f"  Need to read {len(needed_files)} files out of {len(set(weight_map.values()))}")
 
-        # 只加载需要的文件
+        # Load only the required shard files.
         print(f"\nLoading weights from selected files...")
         weights = load_weights_from_files(args.input_dir, weight_map, needed_files)
     else:
@@ -268,7 +320,7 @@ def main():
 
     print(f"  Loaded {len(weights)} tensors")
 
-    # 统计原始层数 (排除 mtp 层)
+    # Count original backbone layers, excluding MTP.
     layer_indices = {
         extract_layer_index(k)
         for k in weights.keys()
@@ -284,10 +336,10 @@ def main():
         args.num_layers = original_num_layers
 
     print(f"\nFiltering to first {args.num_layers} layers...")
-    filtered_weights = filter_layers(weights, args.num_layers)
+    filtered_weights = filter_layers(weights, args.num_layers, args.keep_mtp)
     print(f"  Kept {len(filtered_weights)} tensors")
 
-    # 清理内存
+    # Release the unfiltered tensors.
     del weights
 
     print(f"\nSaving to {args.output_dir}...")
@@ -295,13 +347,20 @@ def main():
 
     new_weight_map = save_in_shards(filtered_weights, args.output_dir, args.shard_size)
 
-    # 计算总大小
+    # Compute the final checkpoint size.
     total_size = sum(t.numel() * t.element_size() for t in filtered_weights.values())
 
     save_index_json(args.output_dir, new_weight_map, args.num_layers, total_size)
 
     print("\nCopying config files...")
-    copy_config_files(args.input_dir, args.output_dir, args.num_layers)
+    copy_config_files(
+        args.input_dir,
+        args.output_dir,
+        args.num_layers,
+        args.keep_mtp,
+        args.dspark,
+        mtp_stages,
+    )
 
     print("\n" + "=" * 50)
     print("Done!")

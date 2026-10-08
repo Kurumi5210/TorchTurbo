@@ -52,7 +52,10 @@ def _replace_moe_only(
     ep_size = ep_info["ep_size"]
 
     swiglu_limit = getattr(hf_config, "swiglu_limit", 0.0)
-    num_layers = getattr(hf_config, "num_hidden_layers", 0)
+    num_layers = (
+        getattr(hf_config, "num_hidden_layers", 0)
+        + getattr(hf_config, "num_nextn_predict_layers", 0)
+    )
     moe_swiglu_limit = [swiglu_limit] * num_layers if swiglu_limit else None
     dsv4_config_kwargs = get_base_moe_config(
         hf_config=hf_config,
@@ -96,6 +99,16 @@ def get_parallel_plan() -> FSDPParallelPlan:
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
             ),
             "layers.*.ffn": FSDPPlanSpec(
+                replace_module=_replace_moe_only,
+                module_kwargs={"moe_submodules": moe_submodules},
+            ),
+            "mtp.*": FSDPPlanSpec(
+                activation_checkpoint=True,
+            ),
+            "mtp.*.ffn.experts": FSDPPlanSpec(
+                placement=FSDPPlacementSpec(Shard(0), "edp"),
+            ),
+            "mtp.*.ffn": FSDPPlanSpec(
                 replace_module=_replace_moe_only,
                 module_kwargs={"moe_submodules": moe_submodules},
             ),

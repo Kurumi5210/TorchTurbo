@@ -118,6 +118,26 @@ class TorchTurboArgs:
         from gradients.
     mtp_log_loss:
         Log each raw MTP loss at info level. Defaults to ``False``.
+    enable_dspark:
+        Whether to run the DeepSeek-V4 DSpark training branch. Requires MTP
+        layers to be enabled and a DSpark model configuration.
+    dspark_loss_scaling_factor:
+        Weight applied to the DSpark loss before adding it to the main loss.
+        Set ``0`` to keep the DSpark forward but exclude it from gradients.
+    dspark_num_anchors:
+        DeepSeek-V4 DSpark maximum anchor-block count.
+    dspark_loss_decay_gamma:
+        DeepSeek-V4 DSpark position-decay gamma. ``None`` leaves the
+        official DeepSpec default unchanged.
+    dspark_ce_loss_alpha:
+        DeepSeek-V4 DSpark cross-entropy loss coefficient. ``None`` leaves the
+        official DeepSpec default unchanged.
+    dspark_l1_loss_alpha:
+        DeepSeek-V4 DSpark distribution-match L1 coefficient. ``None`` leaves
+        the official DeepSpec default unchanged.
+    dspark_confidence_loss_alpha:
+        DeepSeek-V4 DSpark confidence-head BCE coefficient. ``None`` leaves the
+        official DeepSpec default unchanged.
     bd_mask_low:
         LLaDA2 block-diffusion per-sample noise ratio (sigma) lower bound.
         Defaults to ``0.3``.
@@ -153,6 +173,13 @@ class TorchTurboArgs:
     moe_aux_loss_coeff: float = 0.0
     moe_z_loss_coeff: float = 0.0
     mtp_log_loss: bool = False
+    enable_dspark: bool = True
+    dspark_loss_scaling_factor: float = 0.1
+    dspark_num_anchors: int | None = None
+    dspark_loss_decay_gamma: float | None = None
+    dspark_ce_loss_alpha: float | None = None
+    dspark_l1_loss_alpha: float | None = None
+    dspark_confidence_loss_alpha: float | None = None
     enable_chunk_loss: bool = False
     loss_chunk_size: int | None = None
     freeze_vision_tower: bool = False
@@ -421,6 +448,75 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         type=float,
         metavar="FLOAT",
         help="MTP loss weight. Ignored when MTP is off.",
+    ),
+    TurboArgSpec(
+        name="enable_dspark",
+        args_name="enable_dspark",
+        cli_name="--tt_enable_dspark",
+        config_path="dspark.enabled",
+        type=string_to_bool,
+        metavar="BOOL",
+        help="Enable the DeepSeek-V4 DSpark training branch. "
+        "Off skips its loss without stripping MTP modules.",
+    ),
+    TurboArgSpec(
+        name="dspark_loss_scaling_factor",
+        args_name="dspark_loss_scaling_factor",
+        cli_name="--tt_dspark_loss_scaling_factor",
+        config_path="dspark.loss_scaling_factor",
+        type=float,
+        metavar="FLOAT",
+        help="DeepSeek-V4 DSpark loss weight.",
+    ),
+    TurboArgSpec(
+        name="dspark_num_anchors",
+        args_name="dspark_num_anchors",
+        cli_name="--tt_dspark_num_anchors",
+        config_path="dspark.num_anchors",
+        type=int,
+        metavar="N",
+        help="DeepSeek-V4 DSpark maximum anchor-block count. "
+        "Unset keeps the official DeepSpec default.",
+    ),
+    TurboArgSpec(
+        name="dspark_loss_decay_gamma",
+        args_name="dspark_loss_decay_gamma",
+        cli_name="--tt_dspark_loss_decay_gamma",
+        config_path="dspark.loss_decay_gamma",
+        type=float,
+        metavar="FLOAT",
+        help="DeepSeek-V4 DSpark position-decay gamma. "
+        "Unset keeps the official DeepSpec default.",
+    ),
+    TurboArgSpec(
+        name="dspark_ce_loss_alpha",
+        args_name="dspark_ce_loss_alpha",
+        cli_name="--tt_dspark_ce_loss_alpha",
+        config_path="dspark.ce_loss_alpha",
+        type=float,
+        metavar="FLOAT",
+        help="DeepSeek-V4 DSpark cross-entropy loss coefficient. "
+        "Unset keeps the official DeepSpec default.",
+    ),
+    TurboArgSpec(
+        name="dspark_l1_loss_alpha",
+        args_name="dspark_l1_loss_alpha",
+        cli_name="--tt_dspark_l1_loss_alpha",
+        config_path="dspark.l1_loss_alpha",
+        type=float,
+        metavar="FLOAT",
+        help="DeepSeek-V4 DSpark distribution-match L1 coefficient. "
+        "Unset keeps the official DeepSpec default.",
+    ),
+    TurboArgSpec(
+        name="dspark_confidence_loss_alpha",
+        args_name="dspark_confidence_loss_alpha",
+        cli_name="--tt_dspark_confidence_loss_alpha",
+        config_path="dspark.confidence_loss_alpha",
+        type=float,
+        metavar="FLOAT",
+        help="DeepSeek-V4 DSpark confidence-head BCE coefficient. "
+        "Unset keeps the official DeepSpec default.",
     ),
     TurboArgSpec(
         name="moe_aux_loss_coeff",
@@ -734,6 +830,13 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.moe_aux_loss_coeff,
             args.moe_z_loss_coeff,
             args.mtp_log_loss,
+            args.enable_dspark,
+            args.dspark_loss_scaling_factor,
+            args.dspark_num_anchors,
+            args.dspark_loss_decay_gamma,
+            args.dspark_ce_loss_alpha,
+            args.dspark_l1_loss_alpha,
+            args.dspark_confidence_loss_alpha,
             args.enable_chunk_loss,
             args.loss_chunk_size,
         ]

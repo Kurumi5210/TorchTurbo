@@ -163,6 +163,18 @@ def test_token_aux_loss_ignores_padding_tokens():
     )
 
 
+def test_token_aux_loss_is_zero_when_every_token_is_padding():
+    router = TopKRouter(_router_config(hidden_size=4))
+    torch.nn.init.normal_(router.weight)
+    hidden_states = torch.randn(3, 1, 4)
+
+    probs, _, _ = router(hidden_states, padding_mask=torch.ones(1, 3, dtype=torch.bool))
+    probs.sum().backward()
+
+    assert router._metrics["aux_loss"] == 0
+    assert torch.isfinite(router.weight.grad).all()
+
+
 def test_aux_loss_tracker_averages_layers(caplog):
     tracker = MetricTracker()
     model = torch.nn.ModuleList([TopKRouter(_router_config()) for _ in range(2)])

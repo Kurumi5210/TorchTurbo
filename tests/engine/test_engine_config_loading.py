@@ -23,6 +23,7 @@ from torchturbo.engine.args import (
     parse_torchturbo_args,
 )
 from torchturbo.engine.config import (
+    DSparkTrainingConfig,
     EngineConfig,
     MixedPrecisionPolicy,
     ParameterGroup,
@@ -700,6 +701,42 @@ def test_cli_mtp_overrides_file(tmp_path):
     cfg = _build_from_argv(["--tt_config", path, "--tt_enable_mtp", "false"])
 
     assert cfg.mtp.enabled is False
+
+
+def test_cli_dspark_overrides_file_and_keeps_unset_defaults(tmp_path):
+    path = _write(
+        tmp_path,
+        "cfg.yaml",
+        _engine_config("dspark:\n  enabled: false\n  num_anchors: 256\n"),
+    )
+
+    cfg = _build_from_argv(["--tt_config", path, "--tt_dspark_num_anchors", "128"])
+
+    assert cfg.dspark == DSparkTrainingConfig(enabled=False, num_anchors=128)
+
+
+def test_cli_dspark_flags_map_to_config_fields():
+    cfg = _build_from_argv(
+        [
+            "--tt_enable_dspark", "false",
+            "--tt_dspark_loss_scaling_factor", "0.3",
+            "--tt_dspark_num_anchors", "64",
+            "--tt_dspark_loss_decay_gamma", "2.0",
+            "--tt_dspark_ce_loss_alpha", "0.2",
+            "--tt_dspark_l1_loss_alpha", "0.7",
+            "--tt_dspark_confidence_loss_alpha", "0.5",
+        ]
+    )
+
+    assert cfg.dspark == DSparkTrainingConfig(
+        enabled=False,
+        loss_scaling_factor=0.3,
+        num_anchors=64,
+        loss_decay_gamma=2.0,
+        ce_loss_alpha=0.2,
+        l1_loss_alpha=0.7,
+        confidence_loss_alpha=0.5,
+    )
 
 
 def test_cli_op_policy_overrides_file(tmp_path):

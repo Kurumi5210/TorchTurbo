@@ -98,6 +98,15 @@ class DeepseekV4Config(PretrainedConfig):
             Clamping limit for SwiGLU.
         num_hash_layers (`int`, *optional*, defaults to 0):
             Number of layers using hash-based routing.
+        dspark_block_size (`int`, *optional*, defaults to 0):
+            Number of positions produced by one DSpark draft block. Zero disables
+            DSpark and selects the standard MTP implementation.
+        dspark_noise_token_id (`int`, *optional*, defaults to 0):
+            Token ID used for non-anchor positions in a DSpark draft block.
+        dspark_target_layer_ids (`list[int]`, *optional*):
+            Backbone layers whose mean hidden states form the DSpark context.
+        dspark_markov_rank (`int`, *optional*, defaults to 256):
+            Rank of the low-rank DSpark Markov transition head.
         num_mtp_layers (`int`, *optional*, defaults to 0):
             Number of Multi-Token Prediction layers.
         rms_norm_eps (`float`, *optional*, defaults to 1e-6):
@@ -165,6 +174,10 @@ class DeepseekV4Config(PretrainedConfig):
         swiglu_limit=0.0,
         num_hash_layers=0,
         num_nextn_predict_layers=0,
+        dspark_block_size=0,
+        dspark_noise_token_id=0,
+        dspark_target_layer_ids=(),
+        dspark_markov_rank=256,
         rms_norm_eps=1e-6,
         use_cache=True,
         tie_word_embeddings=False,
@@ -217,6 +230,10 @@ class DeepseekV4Config(PretrainedConfig):
         self.swiglu_limit = swiglu_limit
         self.num_hash_layers = num_hash_layers
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.dspark_block_size = dspark_block_size
+        self.dspark_noise_token_id = dspark_noise_token_id
+        self.dspark_target_layer_ids = dspark_target_layer_ids
+        self.dspark_markov_rank = dspark_markov_rank
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.attention_dropout = attention_dropout

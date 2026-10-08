@@ -486,7 +486,6 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
         """
         from torch.distributed.nn.functional import all_reduce
 
-        from ...models.base import SequenceParallelInputMode
         from ...models.modules.attention.ulysses import slice_input_tensor
         from ...utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
@@ -498,6 +497,7 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
         # Swift's DPO loss reads neither field; keep them out of the model call.
         for key in ("text_position_ids", "loss_scale"):
             inputs.pop(key, None)
+        inputs = model.on_prepare_inputs(inputs)
         # Pad the token fields, labels included, to a multiple of the SP size.
         inputs = engine.backend.prepare_inputs(model, inputs)
         labels = inputs.pop("labels")
@@ -545,17 +545,14 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
             )
 
         if sp_size > 1:
+            # The model slices its own inputs at its SP boundary, so only the
+            # loss-side tensors are sharded here to the same local tokens.
             shard = partial(
                 slice_input_tensor,
                 dim=-1,
                 group=sp_info["sp_group"],
                 rank=sp_info["sp_rank"],
-                padding=False,
             )
-            input_mode = model.get_sequence_parallel_input_mode()
-            if input_mode != SequenceParallelInputMode.POST_EMBEDDING:
-                inputs["input_ids"] = shard(inputs["input_ids"])
-                inputs["position_ids"] = shard(inputs["position_ids"])
             labels = shard(labels)
             segment_ids = shard(segment_ids)
             token_weights = shard(token_weights)

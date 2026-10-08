@@ -1122,8 +1122,11 @@ class TorchTurboEngine:
     ) -> dict[str, Any]:
         """Create padded model inputs from a packed micro-batch.
 
-        Model inputs use the same backend padding as SFT. Rolled token IDs
-        are aligned to that layout and sliced for the local RL loss.
+        Model inputs use the same backend padding as SFT. The micro-batch
+        ``cu_seqlens`` reach the model as ``cu_seq_lens_q/k``, the same
+        boundary metadata as SFT. Rolled token IDs are aligned to that layout
+        and sliced for the local RL loss. Media tensors and grids stay global
+        and reach the model's input hook before padding.
         """
 
         input_ids = mb["input_ids"]
@@ -1142,15 +1145,13 @@ class TorchTurboEngine:
             "input_ids": input_ids.unsqueeze(0),
             "position_ids": position_ids.unsqueeze(0),
             "use_cache": False,
-            "cu_seqlens": cu_seqlens,
             "cu_seq_lens_q": cu_seqlens,
             "cu_seq_lens_k": cu_seqlens,
             "max_length_q": max_seqlen,
             "max_length_k": max_seqlen,
-            "max_seqlen": max_seqlen,
             "_pad_length": 0,
         }
-        result = self.model.on_prepare_inputs(result)
+        result = self.model.on_prepare_inputs(result, source_inputs=mb)
         result = self.backend.prepare_inputs(self.model, result)
         result["_sp_pad_size"] = result["input_ids"].size(-1) - total_len
 

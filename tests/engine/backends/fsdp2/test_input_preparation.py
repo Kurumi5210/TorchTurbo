@@ -11,7 +11,7 @@ from torch import nn
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.config import ActivationCheckpointingConfig, EngineConfig
 from torchturbo.engine.core import TorchTurboEngine
-from torchturbo.models.base import TurboModel
+from torchturbo.models.base import TurboModel, TurboVLMModel
 from torchturbo.models.modules.attention.ulysses import (
     SequenceParallelInputSlicingSpec,
     patch_forward_for_sp_input_slicing,
@@ -141,7 +141,7 @@ class _PreEmbeddingModel(TurboModel, nn.Module):
         )
 
 
-class _PostEmbeddingModel(_PreEmbeddingModel):
+class _PostEmbeddingModel(TurboVLMModel, _PreEmbeddingModel):
     def get_sequence_parallel_input_slicing_spec(self):
         return SequenceParallelInputSlicingSpec(
             self.language_model,
@@ -217,12 +217,17 @@ def test_backend_installs_slicing_with_checkpoint_recomputation(
     assert batch["input_ids"].shape[1] == global_length
 
 
-@pytest.mark.parametrize("model_cls", [_PreEmbeddingModel, _PostEmbeddingModel])
+@pytest.mark.parametrize("model_cls, media_keys", [
+    (_PreEmbeddingModel, ()),
+    (_PostEmbeddingModel, ()),
+    (_PostEmbeddingModel, ("pixel_values", "image_grid_thw")),
+    (_PostEmbeddingModel, ("pixel_values_videos", "video_grid_thw")),
+])
 @pytest.mark.parametrize("num_tokens, sp_size, sp_rank", [
     (5, 1, 0), (5, 2, 0), (5, 2, 1), (6, 2, 1), (2, 4, 3),
 ])
 def test_rl_packed_inputs_are_sliced_once_by_the_model(
-    monkeypatch, model_cls, num_tokens, sp_size, sp_rank
+    monkeypatch, model_cls, num_tokens, sp_size, sp_rank, media_keys
 ):
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: sp_size)
     sp_info = {"sp_size": sp_size, "sp_group": object(), "sp_rank": sp_rank}
@@ -237,8 +242,14 @@ def test_rl_packed_inputs_are_sliced_once_by_the_model(
     split = min(2, num_tokens - 1)
     cu = torch.tensor([0, split, num_tokens], dtype=torch.int32)
     ids = list(range(1, num_tokens + 1))
+    media = {key: torch.ones(3, 4) for key in media_keys}
     batch = engine.prepare_packed_micro_batch(
-        {"input_ids": torch.tensor(ids), "cu_seqlens": cu},
+        {
+            "input_ids": torch.tensor(ids),
+            "cu_seqlens": cu,
+            "ppo_loss_mask": torch.ones(num_tokens),
+            **media,
+        },
         [split, num_tokens - split],
     )
 
@@ -251,7 +262,9 @@ def test_rl_packed_inputs_are_sliced_once_by_the_model(
     assert batch["input_ids"].tolist() == [ids + [0] * pad_size]
     assert batch["_sp_pad_size"] == pad_size
     assert "attention_mask" not in batch
+    assert "cu_seqlens" not in batch
     assert "labels" not in batch
+    assert "ppo_loss_mask" not in batch
     if sp_size > 1:
         expected_rolled_ids = ids[1:] + ids[:1] + [0] * pad_size
         assert batch["_input_ids_rolled"].tolist() == expected_rolled_ids[shard]
@@ -261,6 +274,8 @@ def test_rl_packed_inputs_are_sliced_once_by_the_model(
     _, positions, kwargs = model.language_model.calls[-1]
     assert positions.tolist() == [expected_positions[shard]]
     assert kwargs["cu_seq_lens_q"] is cu
+    for key, value in media.items():
+        assert kwargs[key] is value
     runtime_inputs = model.get_moe_runtime_inputs(batch, {"sp": sp_info})
     expected_padding = [False] * num_tokens + [True] * pad_size
     assert runtime_inputs.padding_mask.tolist() == [expected_padding[shard]]

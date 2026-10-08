@@ -1866,11 +1866,6 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 **kwargs,
             )
         else:
-            # RL supplies cu_seqlens alongside the common cu_seq_lens_q metadata.
-            # Consume the KDA argument before forwarding the remaining kwargs.
-            kda_cu = kwargs.pop("cu_seqlens", None)
-            if kda_cu is None:
-                kda_cu = kwargs.get("cu_seq_lens_q")
             hidden_states, self_attn_weights, present_key_value = self.attention(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -1878,7 +1873,7 @@ class BailingMoeV3DecoderLayer(nn.Module):
                 position_ids=position_ids,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                cu_seqlens=kda_cu,
+                cu_seqlens=kwargs.get("cu_seq_lens_q"),
                 **kwargs,
             )
 

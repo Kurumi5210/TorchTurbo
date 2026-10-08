@@ -175,7 +175,12 @@ class TurboModel:
             sliced_inputs=(("input_ids", 1), ("position_ids", -1)),
         )
 
-    def on_prepare_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+    def on_prepare_inputs(
+        self,
+        inputs: dict[str, Any],
+        *,
+        source_inputs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Validate and transform packed training inputs before SP padding.
 
         The engine calls this before SP padding on every loss path; the
@@ -183,6 +188,14 @@ class TurboModel:
         ``cu_seq_lens_q/k``, ``attention_mask`` batches are rejected) and
         returns the inputs unchanged. Media grids are only readable on the
         complete, unpadded packed row, so gridded transforms belong here.
+
+        Args:
+            inputs: Normalized packed model inputs.
+            source_inputs: Original batch from which model-specific fields
+                can be copied when the engine reconstructs the inputs.
+
+        Returns:
+            Prepared model inputs.
         """
         if inputs.get("attention_mask") is not None:
             raise ValueError(
@@ -264,6 +277,30 @@ class TurboVLMModel(TurboModel):
     vision_tower_module_names = ("vision_tower",)
     multi_modal_projector_module_names = ("multi_modal_projector", "mm_projector")
     language_model_module_names = ("language_model",)
+    multimodal_input_keys: tuple[str, ...] = (
+        "pixel_values",
+        "image_grid_thw",
+        "pixel_values_videos",
+        "video_grid_thw",
+    )
+
+    def on_prepare_inputs(
+        self,
+        inputs: dict[str, Any],
+        *,
+        source_inputs: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Preserve the model's media fields before packed input transforms.
+
+        Models with different media arguments override multimodal_input_keys.
+        Media tensors and grids remain global through SP padding and slicing.
+        """
+        inputs = super().on_prepare_inputs(inputs, source_inputs=source_inputs)
+        if source_inputs is not None:
+            for key in self.multimodal_input_keys:
+                if key in source_inputs:
+                    inputs[key] = source_inputs[key]
+        return inputs
 
     def get_sp_attention_config(self) -> Any:
         return self.config.text_config

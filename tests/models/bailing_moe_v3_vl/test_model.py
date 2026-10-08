@@ -267,6 +267,49 @@ def test_packed_images_match_independent_samples(
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("sp_size", [1, 4])
+def test_prepared_swift_packed_batch_matches_independent_samples(hybrid, sp_size):
+    """Swift packs text positions; the forward derives per-sample mRoPE."""
+    from torchturbo.models.modules.attention.ulysses import ulysses_pad_inputs
+
+    model = make_model(hybrid=hybrid)
+    text = torch.tensor([[2, 3, 4]])
+    image = torch.tensor([[4, 62, 60, 60, 63, 5]])
+    pixels = torch.randn(8, 24)
+    grids = torch.tensor([[1, 2, 4]])
+    separate = torch.cat(
+        (
+            model(input_ids=text).logits,
+            model(input_ids=image, pixel_values=pixels, image_grid_thw=grids).logits,
+        ),
+        dim=1,
+    )
+    cu = torch.tensor([0, 3, 9], dtype=torch.int32)
+    inputs = model.on_prepare_inputs(
+        {
+            "input_ids": torch.cat((text, image), dim=1),
+            "position_ids": torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4, 5]]),
+            "cu_seq_lens_q": cu,
+            "cu_seq_lens_k": cu,
+            "max_length_q": 6,
+            "max_length_k": 6,
+            "pixel_values": pixels,
+            "image_grid_thw": grids,
+        }
+    )
+    # The SP alignment tail stays outside every packed sample.
+    inputs = ulysses_pad_inputs(
+        inputs, model.get_sequence_parallel_input_slicing_spec(), sp_size
+    )
+
+    result = model(**inputs)
+
+    torch.testing.assert_close(
+        result.logits[:, : separate.size(1)], separate, atol=2e-6, rtol=2e-5
+    )
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
 def test_batched_images_and_broadcast_positions(hybrid):
     model = make_model(hybrid=hybrid)
     ids = torch.tensor([[2, 62, 60, 63, 3, 0], [4, 62, 60, 60, 63, 5]])
@@ -761,7 +804,7 @@ def test_rl_packed_micro_batch_preserves_kda_boundaries(monkeypatch):
     packed = model(**inputs)
 
     torch.testing.assert_close(packed.logits, separate, atol=2e-6, rtol=2e-5)
-    assert inputs["cu_seqlens"] is cu
+    assert inputs["cu_seq_lens_q"] is cu
     packed.logits.sum().backward()
     assert torch.isfinite(model.model.layers[0].attention.q_proj.weight.grad).all()
 

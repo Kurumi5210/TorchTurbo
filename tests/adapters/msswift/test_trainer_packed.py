@@ -14,6 +14,11 @@ from torchturbo.adapters.msswift.inputs_bridging import (  # noqa: E402
     bridge_packed_inputs,
 )
 from torchturbo.adapters.msswift.trainer import TurboDPOTrainerMixin  # noqa: E402
+from torchturbo.models.base import TurboModel  # noqa: E402
+from torchturbo.models.modules.attention.ulysses import (  # noqa: E402
+    patch_forward_for_sp_input_slicing,
+    ulysses_pad_inputs,
+)
 
 # (prompt, chosen response, rejected response) for each preference pair.
 _PAIRS = [
@@ -35,7 +40,7 @@ def _logits(table, input_ids, position_ids):
     return table[input_ids] + 0.1 * position_ids.unsqueeze(-1)
 
 
-class _TokenModel(torch.nn.Module):
+class _TokenModel(TurboModel, torch.nn.Module):
     def __init__(self, vocab_size=11):
         super().__init__()
         generator = torch.Generator().manual_seed(0)
@@ -63,11 +68,12 @@ class _ExpandedTokenModel(_TokenModel):
 class _Engine:
     def __init__(self):
         self.backend = SimpleNamespace(prepare_inputs=lambda model, inputs: inputs)
+        self.sp_info = {"sp_size": 1, "sp_group": None, "sp_rank": 0}
         self.recorded = []
         self.moe_steps = []
 
     def get_sp_info(self):
-        return {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+        return self.sp_info
 
     def _record_micro(self, inputs):
         self.recorded.append(tuple(inputs["input_ids"].shape))
@@ -195,6 +201,45 @@ def test_dpo_forward_applies_ld_alpha_to_the_policy_only(monkeypatch):
     assert engine.moe_steps == [4, 1]
 
 
+@pytest.mark.parametrize("use_logits_to_keep", [False, True])
+def test_sp_dpo_forward_matches_per_sample_reference(monkeypatch, use_logits_to_keep):
+    """Every SP rank feeds the global row to a model that slices its inputs."""
+    # The 14-token row pads to 16, so the last shard also holds the SP tail.
+    sp_size = 4
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: sp_size)
+    trainer, engine = _trainer(
+        monkeypatch, loss_type="ipo", ld_alpha=0.5, use_logits_to_keep=use_logits_to_keep
+    )
+    model = _TokenModel()
+    spec = model.get_sequence_parallel_input_slicing_spec()
+    engine.backend.prepare_inputs = lambda model, inputs: ulysses_pad_inputs(
+        inputs, spec, sp_size
+    )
+
+    def forward_on_every_rank(all_reduce):
+        monkeypatch.setattr("torch.distributed.nn.functional.all_reduce", all_reduce)
+        outputs = []
+        for sp_rank in range(sp_size):
+            engine.sp_info = {"sp_size": sp_size, "sp_group": None, "sp_rank": sp_rank}
+            patch_forward_for_sp_input_slicing(spec, None, sp_size, sp_rank)
+            outputs.append(trainer.concatenated_forward(model, _packed_batch()))
+        return outputs
+
+    # Collect each rank's partial sums, then replay every rank with their
+    # total as the all-reduce result.
+    partial_stats = []
+
+    def record_partial_stats(stats, group):
+        partial_stats.append(stats)
+        return stats
+
+    forward_on_every_rank(record_partial_stats)
+    total_stats = torch.stack(partial_stats).sum(0)
+    expected = _reference(model, "ipo", ld_alpha=0.5)
+    for output in forward_on_every_rank(lambda stats, group: total_stats):
+        _assert_outputs_close(output, expected)
+
+
 @pytest.mark.parametrize(
     ("use_logits_to_keep", "expected_shapes"),
     [
@@ -213,6 +258,16 @@ def test_dpo_forward_rejects_model_expanded_sequence(
     ) as exc_info:
         trainer.concatenated_forward(_ExpandedTokenModel(), _packed_batch())
     assert expected_shapes in str(exc_info.value)
+
+
+def test_dpo_forward_applies_the_model_input_hook(monkeypatch):
+    trainer, _ = _trainer(monkeypatch)
+    batch = _packed_batch()
+    # The base hook rejects mask-delimited batches before SP padding.
+    batch["attention_mask"] = torch.ones_like(batch["input_ids"])
+
+    with pytest.raises(ValueError, match="not attention_mask"):
+        trainer.concatenated_forward(_TokenModel(), batch)
 
 
 @pytest.mark.parametrize("use_logits_to_keep", [False, True])

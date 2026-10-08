@@ -47,6 +47,7 @@ class KimiK25WeightConverter(BaseWeightConverter):
 class TurboKimiK25ForConditionalGeneration(
     TurboVLMModel, KimiK25ForConditionalGeneration
 ):
+    multimodal_input_keys: tuple[str, ...] = ("pixel_values", "grid_thws")
 
     def get_weight_converter(self, parallel_context, model_path):
         return KimiK25WeightConverter(self, parallel_context, model_path)

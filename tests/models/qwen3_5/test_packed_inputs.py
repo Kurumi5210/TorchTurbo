@@ -141,17 +141,153 @@ def test_gated_delta_ops_cover_padding_and_share_metadata(monkeypatch, family, s
     assert cu.tolist() == [0, 2, 5]
 
 
-def _rope_index_model():
+def _rope_index_model(
+    model_cls=TurboQwen3_5MoeForConditionalGeneration, spatial_merge_size=1
+):
     config = SimpleNamespace(
-        vision_config=SimpleNamespace(spatial_merge_size=1),
+        vision_config=SimpleNamespace(spatial_merge_size=spatial_merge_size),
         image_token_id=99,
         video_token_id=98,
+        vision_start_token_id=97,
     )
     model = SimpleNamespace(config=config)
+    if model_cls is TurboQwen3_5ForConditionalGeneration:
+        model.get_rope_index = lambda *args, **kwargs: dense.Qwen3_5Model.get_rope_index(model, *args, **kwargs)
+        return model
     model.get_vision_position_ids = lambda *args, **kwargs: moe.Qwen3_5MoeModel.get_vision_position_ids(model, *args, **kwargs)
     model.get_rope_index = lambda *args, **kwargs: moe.Qwen3_5MoeModel.get_rope_index(model, *args, **kwargs)
     TurboQwen3_5MoeForConditionalGeneration._post_init_patches(SimpleNamespace(model=model, config=config))
     return model
+
+
+def _input_hook_model(model_cls):
+    # Exercise the actual input hook and RoPE code without model weights.
+    model = object.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.model = _rope_index_model(model_cls, spatial_merge_size=2)
+    model.config = model.model.config
+    return model
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [TurboQwen3_5ForConditionalGeneration, TurboQwen3_5MoeForConditionalGeneration],
+)
+@pytest.mark.parametrize("tail_padding", [0, 2])
+@pytest.mark.parametrize("via_engine", [False, True])
+def test_input_hook_matches_independent_multimodal_samples(
+    model_cls, tail_padding, via_engine
+):
+    model = _input_hook_model(model_cls)
+    # Text-only samples, multiple images, and interleaved image/video entries
+    # make sample indices differ from both image and video grid indices.
+    samples = [
+        ([10, 11], None, None),
+        ([10, 97, 99, 99, 96, 11, 97, 99, 99, 99, 99, 96, 12],
+         [[1, 2, 4], [1, 4, 4]], None),
+        ([12, 13, 14], None, None),
+        ([10, 97, 98, 98, 96, 11, 97, 99, 99, 96, 12, 97, 98, 98, 98, 98, 96, 13],
+         [[1, 4, 2]], [[1, 2, 4], [1, 4, 4]]),
+        ([10, 97, 99, 99, 96, 11, 97, 98, 98, 96, 12],
+         [[1, 2, 4]], [[1, 4, 2]]),
+    ]
+    _assert_prepared_positions_match_samples(model, samples, tail_padding, via_engine)
+
+
+def test_input_hook_keeps_multiframe_video_grids_with_their_sample():
+    model = _input_hook_model(TurboQwen3_5ForConditionalGeneration)
+    samples = [
+        ([10, 11], None, None),
+        ([10, 97, 98, 98, 96, 11, 97, 98, 98, 96, 12],
+         None, [[2, 2, 4]]),
+        ([13, 97, 98, 98, 98, 98, 96, 14], None, [[1, 4, 4]]),
+    ]
+    _assert_prepared_positions_match_samples(model, samples, tail_padding=0)
+
+
+def _assert_prepared_positions_match_samples(
+    model, samples, tail_padding, via_engine=False
+):
+    input_ids, text_positions, expected_positions = [], [], []
+    media_grids = {"image_grid_thw": [], "video_grid_thw": []}
+    boundaries = [0]
+    for ids, images, videos in samples:
+        ids = torch.tensor([ids])
+        sample_grids = {}
+        for key, grids in zip(media_grids, (images, videos)):
+            if grids is not None:
+                sample_grids[key] = torch.tensor(grids)
+                media_grids[key].append(sample_grids[key])
+        positions, _ = model.model.get_rope_index(input_ids=ids, **sample_grids)
+        input_ids.append(ids)
+        text_positions.append(torch.arange(ids.size(-1)).unsqueeze(0))
+        expected_positions.append(positions)
+        boundaries.append(boundaries[-1] + ids.size(-1))
+
+    text_positions = torch.nn.functional.pad(
+        torch.cat(text_positions, dim=-1), (0, tail_padding)
+    )
+    cu = torch.tensor(boundaries, dtype=torch.int32)
+    inputs = {
+        "input_ids": torch.nn.functional.pad(
+            torch.cat(input_ids, dim=-1), (0, tail_padding)
+        ),
+        "position_ids": text_positions,
+        "cu_seq_lens_q": cu,
+        "cu_seq_lens_k": cu,
+        "max_length_q": max(len(ids) for ids, _, _ in samples),
+        "max_length_k": max(len(ids) for ids, _, _ in samples),
+        **{key: torch.cat(grids) for key, grids in media_grids.items() if grids},
+    }
+    original_grids = {key: inputs[key].clone() for key in media_grids if key in inputs}
+
+    if via_engine:
+        from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+        from torchturbo.engine.core import TorchTurboEngine
+
+        engine = TorchTurboEngine.__new__(TorchTurboEngine)
+        engine.model = model
+        engine.backend = FSDP2Backend.__new__(FSDP2Backend)
+        engine.backend.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_sp_info = lambda: {"sp_size": 1}
+        prepared = engine.prepare_packed_micro_batch(
+            {
+                "input_ids": inputs["input_ids"].squeeze(0),
+                "cu_seqlens": cu,
+                **{key: inputs[key] for key in original_grids},
+            },
+            cu.diff().tolist(),
+        )
+    else:
+        prepared = model.on_prepare_inputs(inputs)
+
+    expected = torch.cat(
+        (text_positions.unsqueeze(0), torch.nn.functional.pad(
+            torch.cat(expected_positions, dim=-1), (0, tail_padding)
+        )), dim=0,
+    )
+    torch.testing.assert_close(prepared["position_ids"], expected)
+    for key, grids in original_grids.items():
+        torch.testing.assert_close(prepared[key], grids)
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [TurboQwen3_5ForConditionalGeneration, TurboQwen3_5MoeForConditionalGeneration],
+)
+@pytest.mark.parametrize("position_rows", [1, 3, 4])
+def test_input_hook_preserves_text_and_precomputed_positions(model_cls, position_rows):
+    model = _input_hook_model(model_cls)
+    positions = torch.tensor([[0, 1, 0, 1, 2]])
+    if position_rows > 1:
+        positions = positions.unsqueeze(0).expand(position_rows, -1, -1)
+    inputs = {
+        "input_ids": torch.tensor([[10, 11, 12, 13, 14]]),
+        "position_ids": positions,
+        "cu_seq_lens_q": torch.tensor([0, 2, 5], dtype=torch.int32),
+    }
+
+    assert model.on_prepare_inputs(inputs)["position_ids"] is positions
 
 
 def test_moe_rope_index_restarts_positions_per_mask_block():

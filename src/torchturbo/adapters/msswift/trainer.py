@@ -8,7 +8,8 @@ is mixed ahead of swift's trainer base for any stage:
 * ``create_optimizer`` — build via the engine (FSDP2-aware); ``create_scheduler``
   uses the engine for engine-managed optimizers and HF's default otherwise.
 * ``compute_loss``  — ``engine.compute_loss`` (with SP loss re-scale).
-* ``_get_data_collator`` - normalize Swift packing on CPU before device transfer.
+* ``_get_data_collator`` - the taken-over plugin's collator, else
+  ``SwiftInputCollator`` over swift's template collator.
 * ``save_model`` — engine writes DCP weights; swift still records metadata.
 * ``get_train_dataloader`` — engine SP-aware sampler for all ``sp_size``.
 
@@ -165,6 +166,9 @@ class TurboTrainerMixin:
             )
 
     def __init__(self, *args, **kwargs):
+        # Routed plugin collator handed over by the pipeline; pop before super so
+        # the swift/HF base never sees it.
+        self._plugin_collator = kwargs.pop('plugin_collator', None)
         super().__init__(*args, **kwargs)
         engine = engine_registry.get_engine_or_none()
         if engine is None:
@@ -308,6 +312,10 @@ class TurboTrainerMixin:
         return self.lr_scheduler
 
     def _get_data_collator(self, args, template):
+        """Serve the routed plugin's collator (handed over at construction); else
+        wrap swift's template collator with ``SwiftInputCollator``."""
+        if self._plugin_collator is not None:
+            return self._plugin_collator
         from .inputs_bridging import SwiftInputCollator
 
         return SwiftInputCollator(super()._get_data_collator(args, template), template)

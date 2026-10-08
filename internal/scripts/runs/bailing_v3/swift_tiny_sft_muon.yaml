@@ -2,6 +2,7 @@ engine_config:
   parallel_plan:
     sp_size: 8
     ep_size: 8
+  gbs: 128
 
   activation_checkpointing:
     enabled: true

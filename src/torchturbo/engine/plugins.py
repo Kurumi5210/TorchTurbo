@@ -127,7 +127,14 @@ class DatasetPrepareContext:
 
 
 class DatasetPlugin(Plugin):
-    """Supplies a training dataset per name: build the complete dataset, or supply raw rows"""
+    """Supplies a training dataset per name: build the complete dataset, or supply
+    raw rows. Provided datasets are pack-grouped (default collator) or one packed
+    row per item; the latter override :meth:`get_collate_fn`."""
+
+    def get_collate_fn(self) -> Callable[[list], dict] | None:
+        """Batch collator for the provided dataset; ``None`` keeps the framework
+        collator. Override for one-packed-row-per-item plugins."""
+        return None
 
     def dataset_names(self) -> list[str]:
         raise NotImplementedError

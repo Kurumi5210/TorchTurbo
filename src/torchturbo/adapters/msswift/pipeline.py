@@ -58,8 +58,8 @@ class TurboEnginePipelineMixin:
 
         from .plugins import SwiftPluginHost
 
-        # Plugin host consumes the plugins carried by --tt_plugin and routes each
-        # DatasetPlugin to its bridge; reused by _prepare_dataset below.
+        # Plugin host for --tt_plugin plugins; reused by _prepare_dataset and
+        # handed to the trainer via _get_trainer_kwargs.
         self._plugin_host = SwiftPluginHost()
         self._plugin_host.install_plugins(engine.plugin_manager)
         if getattr(self.args, "tuner_type", "full") == "lora":
@@ -76,14 +76,23 @@ class TurboEnginePipelineMixin:
         return model if model is not None else self.model
 
     def _prepare_dataset(self):
-        """A plugin-provided ``--dataset`` takes over preparation via ``try_takeover``;
-        else swift's native path."""
+        """A plugin-provided dataset takes over via ``try_takeover``; else swift's
+        native path."""
         datasets = self._plugin_host.dataset_bridge.try_takeover(
             args=self.args,
             template=self.template,
             show_dataset=getattr(self, "_show_dataset", None),
         )
         return datasets if datasets is not None else super()._prepare_dataset()
+
+    def _get_trainer_kwargs(self):
+        """Hand the routed plugin's collator to the trainer through swift's kwargs seam.
+         swift's pipelines pass trainer constructor kwargs the same way (``SwiftRLHF`` 
+         ships ``ref_model`` and friends through this hook)."""
+        return {
+            **super()._get_trainer_kwargs(),
+            'plugin_collator': self._plugin_host.dataset_bridge.collator_for(self.args),
+        }
 
 
 class TurboSwiftSft(TurboEnginePipelineMixin, SwiftSft):  # type: ignore[misc]

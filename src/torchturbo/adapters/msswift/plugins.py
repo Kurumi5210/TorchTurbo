@@ -45,15 +45,15 @@ class DatasetPluginBridge:
     }
 
     def __init__(self) -> None:
-        # plugins owning dataset preparation for at least one of their dataset_names
-        self._prepare_plugins: list = []
+        # name -> plugin for every provided dataset
+        self._provided: dict[str, object] = {}
 
     def add(self, plugin) -> None:
         names = plugin.dataset_names()
         provides = [n for n in names if plugin.provides_dataset(n)]
         raws = [n for n in names if n not in provides]
-        if provides and plugin not in self._prepare_plugins:
-            self._prepare_plugins.append(plugin)
+        for name in provides:
+            self._provided[name] = plugin
         if raws:
             self._register_swift_dataset(plugin, raws)
         get_logger(__name__).info_rank0(
@@ -118,27 +118,45 @@ class DatasetPluginBridge:
         )
         return [train_dataset, val_dataset]
 
+    def collator_for(self, args) -> Optional[Callable]:
+        """The collator of the route ``args`` resolves to (the same routing
+        ``try_takeover`` applies); ``None`` without a route or when the plugin
+        emits pack-grouped rows for the default collator."""
+        route = self.resolve_dataset(args)
+        if route is None:
+            return None
+        return route[1].get_collate_fn()
+
     def resolve_dataset(self, args) -> Optional[tuple[str, object]]:
-        """Return ``(name, plugin)`` when ``args.dataset`` (str or List[str]) names a
-        dataset provided by some installed plugin; else ``None``."""
+        """Return ``(name, plugin)`` for the dataset to take over; ``None`` keeps the
+        native path. ``args.dataset`` naming a provided dataset wins; with no dataset
+        or val_dataset named, a lone provided dataset takes over; several are
+        ambiguous and raise."""
+        requested = self._requested_names(args)
+        for name in requested:
+            plugin = self._provided.get(name)
+            if plugin is not None:
+                return name, plugin
+        # Implicit fallback: only when nothing at all was named.
+        if requested or getattr(args, "val_dataset", None):
+            return None
+        if not self._provided:
+            return None
+        if len(self._provided) > 1:
+            raise ValueError(
+                f"several plugin-provided datasets and no --dataset to select one: "
+                f"{sorted(self._provided)}")
+        return next(iter(self._provided.items()))
+
+    @staticmethod
+    def _requested_names(args) -> list:
+        """The dataset names ``args.dataset`` asks for (str is comma-separated)."""
         raw = getattr(args, "dataset", None)
         if raw is None:
-            return None
+            return []
         if isinstance(raw, str):
-            names = [n.strip() for n in raw.split(",") if n.strip()]
-        else:
-            names = [str(n).strip() for n in raw if str(n).strip()]
-        if not names:
-            return None
-        for plugin in self._prepare_plugins:
-            try:
-                dataset_names = plugin.dataset_names()
-            except Exception:
-                continue
-            for name in names:
-                if name in dataset_names and plugin.provides_dataset(name):
-                    return name, plugin
-        return None
+            return [n.strip() for n in raw.split(",") if n.strip()]
+        return [str(n).strip() for n in raw if str(n).strip()]
 
     def make_ctx(self, entry: dict, args, template, *, cache_path: str | None = None,
                  show_dataset=None) -> DatasetPrepareContext:

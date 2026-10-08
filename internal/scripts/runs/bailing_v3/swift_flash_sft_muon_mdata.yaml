@@ -1,0 +1,30 @@
+engine_config:
+  parallel_plan:
+    sp_size: 8
+    ep_size: 8
+  gbs: 128
+
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: true
+
+  loss_chunk:
+    enabled: true
+
+  mtp:
+    enabled: true
+    loss_scaling_factor: 0.1
+
+  moe:
+    z_loss_coeff: 1.67e-6
+
+  mfu:
+    enabled: true
+
+  optimizer:
+    name: muon
+    muon:
+      lr: 5.5e-5
+      weight_decay: 0.1
+      adamw_betas: [0.9, 0.95]
+      adamw_eps: 1.0e-8

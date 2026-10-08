@@ -643,6 +643,34 @@ class TorchTurboEngine:
         )
         return self.optimizer
 
+    def offload_optimizer(self) -> None:
+        """Synchronously release optimizer device state before inference.
+
+        Call on every training worker after zero_grad(set_to_none=True), with
+        no backward, optimizer step, or checkpoint in progress. Model weights
+        and inference resources are managed separately by the caller. The
+        engine-managed Muon optimizer requires FSDP parameters to keep their
+        storage: moving the model, for example with ``module.to()``, makes its
+        next step fail, so keep parameters in place or use full CPU offload.
+        """
+        if self.optimizer is None:
+            raise RuntimeError(
+                "No optimizer created. Call engine.prepare_optimizer() first."
+            )
+        self.backend.offload_optimizer()
+
+    def restore_optimizer(self) -> None:
+        """Synchronously restore the optimizer's original training policy.
+
+        Release inference allocations first. States configured to reside on CPU
+        remain there; execution workspaces are allocated by the next step.
+        """
+        if self.optimizer is None:
+            raise RuntimeError(
+                "No optimizer created. Call engine.prepare_optimizer() first."
+            )
+        self.backend.restore_optimizer()
+
     def prepare_lr_scheduler(
         self,
         scheduler_cls: type | str,

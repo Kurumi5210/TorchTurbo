@@ -11,7 +11,7 @@ from torch import Tensor, nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
-from ....models.modules.attention.qk_clip import QKClipState, get_qk_clip_state
+from ....models.modules.attention.qk_clip import QKClipState
 from ...optimizers.qk_clip import MLAQKClipSpec
 
 if TYPE_CHECKING:
@@ -62,6 +62,7 @@ class QKClipController:
         plan: QKClipPlan,
         *,
         sp_size: int = 1,
+        device: torch.device | None = None,
     ) -> None:
         if not plan.layers:
             raise ValueError("QK clipping requires at least one attention layer")
@@ -103,11 +104,15 @@ class QKClipController:
             raise ValueError(
                 "QK clipping with SP requires weights on the dense world mesh"
             )
-        device = weights[0][0].parameter.device
+        parameter_device = weights[0][0].parameter.device
         if any(
-            weight.parameter.device != device for pair in weights for weight in pair
+            weight.parameter.device != parameter_device
+            for pair in weights
+            for weight in pair
         ):
             raise ValueError("QK clipping requires all MLA weights on the same device")
+        if device is None:
+            device = parameter_device
         if mesh is not None:
             self._reduction_group = mesh.get_group()
             self._reduction_size = mesh.size()
@@ -133,6 +138,11 @@ class QKClipController:
             layer.module.qk_clip_state = state
             bound_layers.append(_BoundLayer(state, query, key_value))
         self._layers = tuple(bound_layers)
+
+    def set_collection(self, enabled: bool) -> None:
+        """Pause or resume statistics collection, keeping observed maxima."""
+        for layer in self._layers:
+            layer.state.enabled = enabled
 
     @staticmethod
     def _bind_weight(
@@ -197,8 +207,8 @@ class QKClipController:
         for layer, head_scales in zip(
             self._layers, scales.split(self._num_heads), strict=True
         ):
-            layer.query.scale(head_scales)
-            layer.key_value.scale(head_scales)
+            layer.query.scale(head_scales.to(layer.query.parameter.device))
+            layer.key_value.scale(head_scales.to(layer.key_value.parameter.device))
         self.reset()
 
     def _step_post_hook(
@@ -215,6 +225,12 @@ class QKClipController:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> None:
+        # Collection pauses while the optimizer is offloaded; report that state
+        # instead of the missing statistics it causes.
+        if any(not layer.state.enabled for layer in self._layers):
+            raise RuntimeError(
+                "optimizer is offloaded; call engine.restore_optimizer()"
+            )
         if (len(args) > 1 and args[1] is not None) or kwargs.get("closure") is not None:
             raise ValueError("QK clipping does not support optimizer closures")
         if any(not layer.state.observed for layer in self._layers):
@@ -229,6 +245,7 @@ def install_qk_clip(
     optimizer: torch.optim.Optimizer,
     *,
     sp_size: int = 1,
+    device: torch.device | None = None,
 ) -> QKClipController:
     """Bind attention statistics and clip after the complete optimizer update."""
     optimizer_parameters = {
@@ -237,7 +254,7 @@ def install_qk_clip(
         for parameter in group["params"]
     }
     for layer in plan.layers:
-        if get_qk_clip_state(layer.module) is not None:
+        if vars(layer.module).get("qk_clip_state") is not None:
             raise ValueError("QK clipping is already installed on an attention layer")
         if any(
             id(parameter) not in optimizer_parameters
@@ -249,6 +266,7 @@ def install_qk_clip(
     controller = QKClipController(
         plan,
         sp_size=sp_size,
+        device=device,
     )
     optimizer.register_step_pre_hook(controller._step_pre_hook)
     optimizer.register_step_post_hook(controller._step_post_hook)

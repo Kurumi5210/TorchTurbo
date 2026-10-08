@@ -85,6 +85,18 @@ class DeviceRuntime(ABC):
     def memory_info(self) -> tuple[int, int]:
         ...
 
+    def memory_reserved(self) -> int:
+        """Return bytes the caching allocator holds on the current device."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement memory_reserved()."
+        )
+
+    def memory_allocated(self) -> int:
+        """Return bytes occupied by live tensors on the current device."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement memory_allocated()."
+        )
+
     @abstractmethod
     def stream(self, stream=None):
         ...

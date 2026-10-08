@@ -115,6 +115,25 @@ SFT 样本始终相互隔离，包括 LlamaFactory 的 `packing=True, neat_packi
 
 `src/torchturbo/adapters/rl/` 提供强化学习框架可复用的 packed-sequence / SP 工具；它是工具包，不是已注册的 adapter。
 
+RL 调用方可以在两个训练窗口之间挂起已准备的 FSDP2 优化器：
+
+```python
+optimizer.zero_grad(set_to_none=True)
+engine.offload_optimizer()
+# 执行推理，并在恢复训练状态前释放推理占用的显存。
+engine.restore_optimizer()
+```
+
+这两个接口是同步、幂等的，需要在每个训练 worker 的空闲训练边界调用。它们释放
+AdamW、AdamWSwap、Muon 和 child optimizer 占用的设备显存，并暂停 QK clip 的统计
+收集，同时保持参数与 scheduler 绑定不变。模型权重和推理资源仍由调用方管理。使用
+Muon 时需保持 FSDP 参数原位：用 `module.to()` 移动参数会替换其 storage，导致下一次
+step 失败；如果权重必须离开设备，请使用 `full` CPU offload。
+
+Muon 支持 `full` 和 `optimizer` 两种 CPU offload，`optimizer_memory_fraction=0`
+选择 CPU Newton-Schulz 和 CPU 交换。这些路径在 CUDA/NPU 硬件上验证前属于实验性功能，
+详见[设计文档](internal/docs/design/fsdp2_distributed_muon.md)。
+
 模型如需注册 LlamaFactory template，可在模型目录提供 `lf_template.py`。  
 Adapter 激活时会扫描已注册模型并自动调用对应 `register()`。
 

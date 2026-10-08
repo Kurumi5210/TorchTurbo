@@ -1,21 +1,67 @@
-"""AdamW optimizer-state CPU offload for FSDP2."""
+"""AdamW construction and optimizer-state CPU offload for FSDP2."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from itertools import chain, groupby
-from typing import Mapping, Union
+from typing import Any, Union
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
+from torch.optim import Optimizer
 
 from .....logging import get_logger
 from .....runtime import DeviceRuntime, TurboDevice
+from ....optimizers.plan import ParamGroup
+from ..config import CPUOffloadConfig, CPUOffloadMode
+from .state import wrap_cpu_state
 
+__all__ = [
+    "AdamWSwap",
+    "prepare_fsdp_adamw_optimizer",
+]
 
 logger = get_logger(__name__)
+
+
+def prepare_fsdp_adamw_optimizer(
+    groups: Sequence[ParamGroup],
+    optimizer_kwargs: Mapping[str, Any],
+    *,
+    device_runtime: DeviceRuntime,
+    cpu_offload: CPUOffloadConfig,
+    split_param_groups: Callable[
+        [Sequence[Mapping[str, Any]]],
+        list[dict[str, Any]],
+    ],
+) -> Optimizer:
+    """Build native AdamW, or AdamWSwap under optimizer-state offload.
+
+    Native AdamW plans and the Muon fallback both use this function, so they
+    apply the same offload policy and FSDP topology split.
+    """
+    param_groups = split_param_groups(
+        tuple(group.get_optimizer_param_group() for group in groups)
+    )
+    options = dict(optimizer_kwargs)
+    if cpu_offload.enabled and cpu_offload.mode is CPUOffloadMode.OPTIMIZER:
+        # AdamWSwap always runs the fused kernel and has no fused option.
+        options.pop("fused", None)
+        return AdamWSwap(
+            param_groups,
+            **options,
+            device_runtime=device_runtime,
+            optimizer_memory_fraction=cpu_offload.optimizer_memory_fraction,
+            param_names={
+                param: name
+                for group in groups
+                for name, param in group.params_by_fqn.items()
+            },
+        )
+    return torch.optim.AdamW(param_groups, **options)
 
 
 class DeviceWorkspace:
@@ -123,7 +169,7 @@ class AdamWSwapMixin:
 
     def _acquire_workspace(self) -> DeviceWorkspace | None:
         """Allocate the per-step workspace for AdamW state staging."""
-        self._release_workspace()
+        self.release_workspace()
         self.device_runtime.synchronize()
         workspace = DeviceWorkspace(
             self.device_runtime,
@@ -132,7 +178,7 @@ class AdamWSwapMixin:
         self.workspace = workspace if workspace.is_available else None
         return self.workspace
 
-    def _release_workspace(self) -> None:
+    def release_workspace(self) -> None:
         """Synchronize and release the workspace."""
         if self.workspace is None:
             return
@@ -260,32 +306,10 @@ class AdamWSwapMixin:
     def _parameter_name(self, param: torch.Tensor) -> str:
         return self.param_to_name_map.get(param, "<unnamed parameter>")
 
-    def _checkpoint_mesh(self, source_mesh: DeviceMesh) -> DeviceMesh:
-        checkpoint_mesh = self._checkpoint_meshes.get(source_mesh)
-        if checkpoint_mesh is None:
-            checkpoint_mesh = DeviceMesh(
-                "cpu",
-                source_mesh.mesh,
-                mesh_dim_names=source_mesh.mesh_dim_names,
-                _init_backend=False,
-            )
-            self._checkpoint_meshes[source_mesh] = checkpoint_mesh
-        return checkpoint_mesh
-
     def _wrap_checkpoint_tensor(
         self, tensor: torch.Tensor, param: torch.Tensor
     ) -> torch.Tensor:
-        if not isinstance(param, DTensor) or tensor.ndim == 0:
-            return tensor
-
-        return DTensor.from_local(
-            tensor,
-            self._checkpoint_mesh(param.device_mesh),
-            param.placements,
-            run_check=False,
-            shape=param.shape,
-            stride=param.stride(),
-        )
+        return wrap_cpu_state(tensor, param, self._checkpoint_meshes)
 
     def _workspace_state_fits(self, state: dict[str, torch.Tensor]) -> bool:
         assert self.workspace is not None
@@ -496,6 +520,11 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
         Unlike the base implementation, the loaded tensors are copied into the
         existing buffers instead of being adopted.
         """
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            replacement = hook(self, state_dict)
+            if replacement is not None:
+                state_dict = replacement
         saved_groups = state_dict["param_groups"]
         groups = self.param_groups
         if len(groups) != len(saved_groups):
@@ -547,6 +576,8 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
                     cpu_state[key].copy_(value)
                 # Other keys (e.g. amsgrad ``max_exp_avg_sq``) have no swap
                 # counterpart and are ignored.
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     def _validate_state_shape(
         self,
@@ -580,11 +611,11 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
             else:
                 self._step_on_device(params_with_groups)
         finally:
-            self._release_workspace()
+            self.release_workspace()
         return loss
 
     @torch.no_grad()
     def zero_grad(self, set_to_none: bool = True):
         """Release a stale workspace when AMP skips the optimizer update."""
-        self._release_workspace()
+        self.release_workspace()
         return super().zero_grad(set_to_none=set_to_none)

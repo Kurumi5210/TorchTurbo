@@ -20,7 +20,7 @@ from torchturbo.engine.backends.fsdp2.config import (
     FSDPConfig,
 )
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
-from torchturbo.engine.backends.fsdp2.optimizers.adamw_swap import (
+from torchturbo.engine.backends.fsdp2.optimizers.adamw import (
     AdamWSwap,
     DeviceWorkspace,
 )

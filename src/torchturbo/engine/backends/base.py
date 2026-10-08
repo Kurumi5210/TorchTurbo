@@ -143,6 +143,18 @@ class BaseBackend(ABC):
     ) -> Optimizer:
         """Return a validated optimizer with all plan-defined step hooks installed."""
 
+    def offload_optimizer(self) -> None:
+        """Release prepared optimizer device resources at a cleared-gradient boundary."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support optimizer offload"
+        )
+
+    def restore_optimizer(self) -> None:
+        """Restore the prepared optimizer's configured training state locations."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support optimizer restore"
+        )
+
     @abstractmethod
     def get_dp_info(self) -> dict[str, Any]:
         """Compute data-parallel rank and size.

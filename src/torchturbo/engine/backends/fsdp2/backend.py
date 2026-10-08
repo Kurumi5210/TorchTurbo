@@ -48,8 +48,9 @@ from ...distributed import assert_finite, init_process_group_if_needed
 from ....logging import get_logger
 from ..base import BaseBackend
 from .config import CPUOffloadMode, FSDPConfig
-from .optimizers.adamw_swap import AdamWSwap
 from .dcp import DcpCheckpoint
+from .optimizers.adamw import prepare_fsdp_adamw_optimizer
+from .optimizers.memory import OptimizerMemoryController
 from .prefetch import FSDPPrefetchManager
 from .weight_saver import has_hf_weights, hf_model_dir, hf_weights_dir_exists
 
@@ -126,9 +127,17 @@ class FSDP2Backend(BaseBackend):
     def __init__(self, config: EngineConfig, device_runtime: DeviceRuntime) -> None:
         super().__init__(config, device_runtime)
         self.fsdp_config: FSDPConfig = config.backend_config
+        # Manages the optimizer returned by prepare_optimizer().
+        self._optimizer_memory: OptimizerMemoryController | None = None
 
         offload = self.fsdp_config.cpu_offload
-        if offload.enabled and offload.mode is CPUOffloadMode.FULL:
+        if offload.enabled and (
+            offload.mode is CPUOffloadMode.FULL
+            or (
+                config.optimizer.name == MuonPlan.name
+                and offload.optimizer_memory_fraction == 0
+            )
+        ):
             init_process_group_if_needed(enable_cpu_backend=True)
 
         fsdp_config = self.fsdp_config
@@ -632,6 +641,7 @@ class FSDP2Backend(BaseBackend):
         output_dir: str,
         **kwargs: Any,
     ) -> None:
+        self._optimizer_memory.require_active()
         dcp = DcpCheckpoint(self.rank, self.weight_converter)
         dcp.save_optimizer(
             optimizer, model, output_dir, self.get_parallel_context(), **kwargs
@@ -644,6 +654,7 @@ class FSDP2Backend(BaseBackend):
         checkpoint_dir: str,
         **kwargs: Any,
     ) -> None:
+        self._optimizer_memory.require_active()
         dcp = DcpCheckpoint(self.rank, self.weight_converter)
         if dcp.has_optimizer(checkpoint_dir):
             dcp.load_optimizer(
@@ -1396,36 +1407,28 @@ class FSDP2Backend(BaseBackend):
                     f"expected {expected_names!r}, "
                     f"got {tuple(groups_by_optimizer_name)!r}"
                 )
-            optimizer_params = self._split_optimizer_groups_by_topology(
-                tuple(
-                    group.get_optimizer_param_group()
-                    for group in groups_by_optimizer_name[plan.optimizer_name]
-                )
-            )
-            optimizer_cls = plan.optimizer_cls
-            optimizer_kwargs = dict(plan.optimizer_kwargs)
+            groups = groups_by_optimizer_name[plan.optimizer_name]
             offload = self.fsdp_config.cpu_offload
-            if offload.enabled and offload.mode is CPUOffloadMode.OPTIMIZER:
-                if optimizer_cls is not torch.optim.AdamW:
+            if plan.optimizer_cls is torch.optim.AdamW:
+                optimizer = prepare_fsdp_adamw_optimizer(
+                    groups,
+                    plan.optimizer_kwargs,
+                    device_runtime=self.device_runtime,
+                    cpu_offload=offload,
+                    split_param_groups=self._split_optimizer_groups_by_topology,
+                )
+            else:
+                if offload.enabled and offload.mode is CPUOffloadMode.OPTIMIZER:
                     raise ValueError(
                         "swap-optimizer mode currently only supports AdamW; "
-                        f"got {optimizer_cls.__module__}.{optimizer_cls.__name__}"
+                        f"got {plan.optimizer_cls.__module__}.{plan.optimizer_cls.__name__}"
                     )
-                optimizer_cls = AdamWSwap
-                param_names = {
-                    param: name
-                    for group in plan.get_param_groups()
-                    for name, param in group.params_by_fqn.items()
-                }
-                optimizer_kwargs.pop("fused", None)
-                optimizer_kwargs.update(
-                    device_runtime=self.device_runtime,
-                    optimizer_memory_fraction=offload.optimizer_memory_fraction,
-                    param_names=param_names,
+                optimizer = plan.optimizer_cls(
+                    self._split_optimizer_groups_by_topology(
+                        tuple(group.get_optimizer_param_group() for group in groups)
+                    ),
+                    **plan.optimizer_kwargs,
                 )
-            # Keep the plan's optimizer name as the key so the container's
-            # validation stays aligned even when the class is swapped.
-            optimizer = optimizer_cls(optimizer_params, **optimizer_kwargs)
             optimizers_by_name = {plan.optimizer_name: optimizer}
 
         elif isinstance(plan, MuonPlan):
@@ -1435,7 +1438,7 @@ class FSDP2Backend(BaseBackend):
             optimizers_by_name = prepare_fsdp_muon_optimizers(
                 plan,
                 device_runtime=self.device_runtime,
-                cpu_offload=bool(offload.enabled),
+                cpu_offload=offload,
                 split_param_groups=self._split_optimizer_groups_by_topology,
             )
 
@@ -1451,6 +1454,7 @@ class FSDP2Backend(BaseBackend):
             optimizer = container.optimizers[0]
         else:
             optimizer = container
+        qk_clip_controller = None
         if (
             isinstance(plan, MuonPlan)
             and plan.qk_clip_plan is not None
@@ -1458,12 +1462,26 @@ class FSDP2Backend(BaseBackend):
         ):
             from .qk_clip import install_qk_clip
 
-            install_qk_clip(
+            qk_clip_controller = install_qk_clip(
                 plan.qk_clip_plan,
                 optimizer,
                 sp_size=self._sp_size,
+                device=self.device,
             )
+        self._optimizer_memory = OptimizerMemoryController(
+            optimizer,
+            self.device_runtime,
+            qk_clip_controller,
+        )
         return optimizer
+
+    def offload_optimizer(self) -> None:
+        """Park all prepared optimizer resources for an inference window."""
+        self._optimizer_memory.offload()
+
+    def restore_optimizer(self) -> None:
+        """Resume the prepared optimizer without replacing framework bindings."""
+        self._optimizer_memory.restore()
 
     def _split_optimizer_groups_by_topology(
         self,

@@ -106,6 +106,12 @@ class CudaRuntime(DeviceRuntime):
     def memory_info(self) -> tuple[int, int]:
         return torch.cuda.mem_get_info()
 
+    def memory_reserved(self) -> int:
+        return torch.cuda.memory_reserved()
+
+    def memory_allocated(self) -> int:
+        return torch.cuda.memory_allocated()
+
     def stream(self, stream=None):
         if stream is None:
             return nullcontext()

@@ -15,10 +15,7 @@ if "grouped_gemm" not in sys.modules:  # pragma: no cover - env shim
 import pytest
 import torch
 
-from torchturbo.engine.backends.fsdp2.optimizers import (
-    adamw_swap as adamw_swap_module,
-)
-from torchturbo.engine.backends.fsdp2.optimizers.adamw_swap import AdamWSwap
+from torchturbo.engine.backends.fsdp2.optimizers.adamw import AdamWSwap
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -217,8 +214,10 @@ def test_checkpoint_wrapper_preserves_local_storage_and_metadata(monkeypatch):
         def stride():
             return (6, 1)
 
-    monkeypatch.setattr(adamw_swap_module, "DTensor", FakeDTensor)
-    optimizer._checkpoint_mesh = lambda mesh: cpu_mesh if mesh is source_mesh else None
+    from torchturbo.engine.backends.fsdp2.optimizers import state as state_module
+
+    monkeypatch.setattr(state_module, "DTensor", FakeDTensor)
+    optimizer._checkpoint_meshes[source_mesh] = cpu_mesh
 
     result = optimizer._wrap_checkpoint_tensor(local_tensor, FakeParam())
 

@@ -8,7 +8,9 @@ from __future__ import annotations
 import hashlib
 import heapq
 import math
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, cast, overload
@@ -16,11 +18,13 @@ from typing import Any, cast, overload
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torch.optim import Optimizer
 
 from .....logging import get_logger
 from .....runtime import DeviceRuntime
+from .....runtime.cpu import CpuRuntime
 from .....utils.torch_utils import torch_version
 from ....optimizers.muon import (
     MuonPlan,
@@ -28,13 +32,15 @@ from ....optimizers.muon import (
     ResolvedBatchedMatrixView,
 )
 from ....optimizers.plan import ParamGroup
+from ..config import CPUOffloadConfig, CPUOffloadMode
+from .adamw import prepare_fsdp_adamw_optimizer
 from .muon_layout import (
     _MatrixRoute,
     _MuonLayoutPlanner,
     _MuonParameterLayout,
     _StorageToComputePlan,
 )
-
+from .state import wrap_cpu_state
 
 __all__ = [
     "FSDPDistributedMuon",
@@ -51,30 +57,28 @@ def prepare_fsdp_muon_optimizers(
     plan: MuonPlan,
     *,
     device_runtime: DeviceRuntime,
-    cpu_offload: bool,
+    cpu_offload: CPUOffloadConfig,
     split_param_groups: Callable[
         [Sequence[Mapping[str, Any]]],
         list[dict[str, Any]],
     ],
 ) -> dict[str, Optimizer]:
     """Build the FSDP Muon and AdamW optimizer instances."""
-    if cpu_offload:
-        raise RuntimeError("FSDPDistributedMuon does not yet support FSDP CPU offload")
-
     optimizers_by_name: dict[str, Optimizer] = {}
     for optimizer_name, groups in plan.get_param_groups_by_optimizer_name().items():
         if optimizer_name == "Muon":
             optimizers_by_name[optimizer_name] = FSDPDistributedMuon(
                 plan,
                 device_runtime=device_runtime,
+                cpu_offload=cpu_offload,
             )
         elif optimizer_name == "AdamW":
-            param_groups = tuple(
-                group.get_optimizer_param_group() for group in groups
-            )
-            optimizers_by_name[optimizer_name] = torch.optim.AdamW(
-                split_param_groups(param_groups),
-                **plan.adamw_kwargs,
+            optimizers_by_name[optimizer_name] = prepare_fsdp_adamw_optimizer(
+                groups,
+                plan.adamw_kwargs,
+                device_runtime=device_runtime,
+                cpu_offload=cpu_offload,
+                split_param_groups=split_param_groups,
             )
         else:
             raise ValueError(f"FSDP2 optimizer {optimizer_name!r} is not registered")
@@ -188,9 +192,14 @@ class _MuonCommGroup:
     mesh_indices_in_group_order: tuple[int, ...]
     current_group_rank: int
 
-    def __init__(self, item: _BoundMuonParameter) -> None:
+    def __init__(
+        self,
+        item: _BoundMuonParameter,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         mesh = item.param.device_mesh
-        process_group = mesh.get_group()
+        if process_group is None:
+            process_group = mesh.get_group()
         group_size = dist.get_world_size(process_group)
         global_ranks_in_group_order = tuple(
             dist.get_global_rank(process_group, group_rank)
@@ -322,7 +331,8 @@ class _CompiledMuonBucket:
     forward: _PackedTransferSchedule | None
     reverse: _PackedTransferSchedule | None
     dtype: torch.dtype | None
-    device: torch.device | None
+    # Where this bucket's Muon arithmetic and buffers live.
+    device: torch.device
 
     @property
     def has_redistribution(self) -> bool:
@@ -336,6 +346,7 @@ class _CompiledMuonBucket:
         items: tuple[_BoundMuonParameter, ...],
         parameter_plans: tuple[_StorageToComputePlan, ...],
         parameter_groups: tuple[_MuonCommGroup, ...],
+        execution_device: torch.device | None = None,
     ) -> _CompiledMuonBucket:
         """Build this rank's execution metadata for one Muon bucket."""
         if not (len(items) == len(parameter_plans) == len(parameter_groups)):
@@ -365,6 +376,12 @@ class _CompiledMuonBucket:
             plan.compute_partition(parameter_group.current_group_rank).tensor_shape
             for _item, plan, parameter_group in local_entries
         )
+        # Without an explicit execution device, Muon runs where shards live.
+        device = (
+            items[0].storage_layout.device
+            if execution_device is None
+            else execution_device
+        )
 
         if not redistributed_entries:
             return cls(
@@ -378,7 +395,7 @@ class _CompiledMuonBucket:
                 forward=None,
                 reverse=None,
                 dtype=None,
-                device=None,
+                device=device,
             )
         redistributed_items = tuple(
             item for item, _plan, _group in redistributed_entries
@@ -404,10 +421,10 @@ class _CompiledMuonBucket:
                 )
 
         dtype = redistributed_items[0].storage_layout.dtype
-        device = redistributed_items[0].storage_layout.device
+        storage_device = redistributed_items[0].storage_layout.device
         if any(
             item.storage_layout.dtype != dtype
-            or item.storage_layout.device != device
+            or item.storage_layout.device != storage_device
             for item in redistributed_items[1:]
         ):
             raise ValueError(
@@ -680,7 +697,7 @@ class _MuonBuffers:
     def exchange_buffers(self, bucket: _CompiledMuonBucket) -> tuple[Tensor, Tensor]:
         """Return the active storage- and compute-side slices for one bucket."""
         assert bucket.forward is not None
-        assert bucket.dtype is not None and bucket.device is not None
+        assert bucket.dtype is not None
         key = (bucket.device, bucket.dtype)
         storage = self.storage_exchange[key][: bucket.forward.input_numel]
         compute = self.compute_exchange[key][: bucket.forward.output_numel]
@@ -771,6 +788,13 @@ class _MuonWorkspace:
         self.local_buffers = _MuonBuffers()
         # One entry per compiled bucket; None denotes a local-only bucket.
         self.slot_index_by_bucket: tuple[int | None, ...] = ()
+        # Whether buffers cover the buckets last passed to configure().
+        self.configured = False
+
+    @property
+    def num_slots(self) -> int:
+        """Return the pipeline slots used by redistributed buckets."""
+        return 2 if self.async_enabled and self.overlap_comm_compute else 1
 
     @staticmethod
     def _include_bucket_capacities(
@@ -782,7 +806,7 @@ class _MuonWorkspace:
             bucket.local_item_compute_shapes,
             strict=True,
         ):
-            key = (item.storage_layout.device, item.storage_layout.dtype)
+            key = (bucket.device, item.storage_layout.dtype)
             required = capacities.setdefault(key, {})
             required["compute_scratch_numel"] = max(
                 required.get("compute_scratch_numel", 0),
@@ -794,7 +818,7 @@ class _MuonWorkspace:
 
         assert bucket.group is not None
         assert bucket.forward is not None
-        assert bucket.device is not None and bucket.dtype is not None
+        assert bucket.dtype is not None
         rank = bucket.group.current_group_rank
         required = capacities.setdefault((bucket.device, bucket.dtype), {})
         sizes = {
@@ -811,6 +835,43 @@ class _MuonWorkspace:
         }
         for name, numel in sizes.items():
             required[name] = max(required.get(name, 0), numel)
+
+    @staticmethod
+    def _plan_capacities(
+        buckets: Sequence[_CompiledMuonBucket],
+        num_slots: int,
+    ) -> tuple[
+        dict[_BufferKey, dict[str, int]],
+        tuple[dict[_BufferKey, dict[str, int]], ...],
+        tuple[int | None, ...],
+    ]:
+        """Return local and per-slot buffer capacities and each bucket's slot.
+
+        Capacities are aggregated before allocating: a pool grows once per
+        device and dtype, even when many differently sized buckets share its
+        slot. Only redistributed buckets rotate through the slots; local-only
+        buckets neither use a slot nor advance the rotation.
+        """
+        local_capacities: dict[_BufferKey, dict[str, int]] = {}
+        slot_capacities: tuple[dict[_BufferKey, dict[str, int]], ...] = tuple(
+            {} for _ in range(num_slots)
+        )
+        slot_indices: list[int | None] = []
+        redistributed_bucket_index = 0
+        for bucket in buckets:
+            if not bucket.has_redistribution:
+                slot_indices.append(None)
+                _MuonWorkspace._include_bucket_capacities(bucket, local_capacities)
+                continue
+
+            slot_index = redistributed_bucket_index % num_slots
+            slot_indices.append(slot_index)
+            redistributed_bucket_index += 1
+            _MuonWorkspace._include_bucket_capacities(
+                bucket,
+                slot_capacities[slot_index],
+            )
+        return local_capacities, slot_capacities, tuple(slot_indices)
 
     def configure(self, buckets: Sequence[_CompiledMuonBucket]) -> None:
         """Prepare reusable runtime resources for the compiled buckets.
@@ -854,35 +915,14 @@ class _MuonWorkspace:
                         compute_done=self.device_runtime.new_event(),
                         finished=self.device_runtime.new_event(),
                     )
-                    for _ in range(2 if self.overlap_comm_compute else 1)
+                    for _ in range(self.num_slots)
                 )
             else:
                 self.slots = (_MuonSlot(buffers=_MuonBuffers()),)
 
-        # Aggregate capacities before allocating: a pool grows once per device
-        # and dtype, even when many differently sized buckets share its slot.
-        local_capacities: dict[_BufferKey, dict[str, int]] = {}
-        slot_capacities: tuple[dict[_BufferKey, dict[str, int]], ...] = tuple(
-            {} for _ in self.slots
+        local_capacities, slot_capacities, slot_indices = self._plan_capacities(
+            buckets, len(self.slots)
         )
-        # Only redistributed buckets rotate through the slots; local-only
-        # buckets neither use a slot nor advance the rotation.
-        slot_indices: list[int | None] = []
-        redistributed_bucket_index = 0
-        for bucket in buckets:
-            if not bucket.has_redistribution:
-                slot_indices.append(None)
-                self._include_bucket_capacities(bucket, local_capacities)
-                continue
-
-            slot_index = redistributed_bucket_index % len(self.slots)
-            slot_indices.append(slot_index)
-            redistributed_bucket_index += 1
-            self._include_bucket_capacities(
-                bucket,
-                slot_capacities[slot_index],
-            )
-
         for (device, dtype), required in local_capacities.items():
             self.local_buffers.reserve(
                 device=device,
@@ -902,7 +942,7 @@ class _MuonWorkspace:
                     **required,
                 )
 
-        self.slot_index_by_bucket = tuple(slot_indices)
+        self.slot_index_by_bucket = slot_indices
         self._compute_stream = compute_stream
         if self.async_enabled and self.slots:
             assert self.transfer_stream is not None
@@ -911,6 +951,7 @@ class _MuonWorkspace:
                 slot.input_ready.record(self.transfer_stream)
                 slot.compute_done.record(compute_stream)
                 slot.finished.record(self.transfer_stream)
+        self.configured = True
 
     def record_compute_stream(self, stream: Any) -> None:
         """Register all workspace buffers with the current compute stream.
@@ -942,6 +983,54 @@ class _MuonWorkspace:
         if slot_index is None:
             raise RuntimeError("local Muon bucket does not have a pipeline slot")
         return self.slots[slot_index]
+
+    def release(self) -> None:
+        """Wait for all users before releasing buffers and their stream records."""
+        self.device_runtime.synchronize()
+        self.local_buffers = _MuonBuffers()
+        self.slots = ()
+        self.slot_index_by_bucket = ()
+        self.transfer_stream = None
+        self._compute_stream = None
+        self.configured = False
+
+    def required_bytes(self, buckets: Sequence[_CompiledMuonBucket]) -> int:
+        """Estimate buffers plus concurrently live staging and matrix temporaries."""
+        local_capacities, slot_capacities, _ = self._plan_capacities(
+            buckets, self.num_slots
+        )
+        buffers = sum(
+            sum(sizes.values()) * dtype.itemsize
+            for capacities in (local_capacities, *slot_capacities)
+            for (_device, dtype), sizes in capacities.items()
+        )
+        max_staging = 0
+        max_compute = 0
+        for bucket in buckets:
+            shapes = list(bucket.local_item_compute_shapes)
+            if bucket.group is not None:
+                shapes.extend(
+                    plan.compute_partition(bucket.group.current_group_rank).tensor_shape
+                    for plan in bucket.redistributed_plans
+                )
+            for shape in shapes:
+                rows, columns = shape[-2:]
+                matrices = math.prod(shape[:-2])
+                # BF16 iterates and Gram matrices can coexist across addmm calls.
+                required = (
+                    6 * matrices * (rows * columns + min(rows, columns) ** 2)
+                    + 4 * matrices
+                )
+                max_compute = max(max_compute, required)
+            for item in bucket.items:
+                max_staging = max(
+                    max_staging,
+                    2
+                    * math.prod(item.storage_layout.local_shape)
+                    * item.param.element_size(),
+                )
+        # The transfer stream may stage while the caller runs a local item.
+        return buffers + max_compute + self.num_slots * max_staging
 
 
 def _global_ranks_in_mesh_order(tensor: DTensor) -> tuple[int, ...]:
@@ -1088,6 +1177,7 @@ class FSDPDistributedMuon(Optimizer):
         plan: MuonPlan,
         *,
         device_runtime: DeviceRuntime,
+        cpu_offload: CPUOffloadConfig | None = None,
     ) -> None:
         # PyTorch 2.9 may replace an FSDP parameter's local storage when
         # reset_sharded_param() re-pads an uneven shard. This optimizer caches
@@ -1114,21 +1204,48 @@ class FSDPDistributedMuon(Optimizer):
 
         self._bucket_definitions = tuple(plan.buckets)
         self._parameter_specs = dict(plan.parameter_specs)
+        self._offload = cpu_offload or CPUOffloadConfig(enabled=False)
+        self._device_runtime = device_runtime
+        self._checkpoint_meshes: dict[DeviceMesh, DeviceMesh] = {}
         self._bound_parameters = self._bind_parameters(muon_groups)
         parameter_device = self._bound_parameters[0].storage_layout.device
-        if parameter_device.type != device_runtime.device.type:
+        full_offload = (
+            self._offload.enabled and self._offload.mode is CPUOffloadMode.FULL
+        )
+        expected_device = "cpu" if full_offload else device_runtime.device.type
+        if parameter_device.type != expected_device:
             raise ValueError(
-                f"tensor device type {parameter_device.type!r} does not match "
-                f"{type(device_runtime).__name__} device type "
-                f"{device_runtime.device.type!r}"
+                f"Muon requires parameter storage on {expected_device!r} for "
+                f"the configured offload policy, got {parameter_device.type!r}"
             )
+        cpu_execution = (
+            self._offload.enabled and self._offload.optimizer_memory_fraction == 0
+        )
+        execution_runtime = CpuRuntime() if cpu_execution else device_runtime
+        # Muon runs on the shards' own device when its type matches; full
+        # offload instead stages CPU shards on the training device.
+        self._execution_device = (
+            parameter_device
+            if parameter_device.type == execution_runtime.device.type
+            else execution_runtime.device
+        )
+        # Offloaded device execution holds its buffers only inside step();
+        # every other policy keeps them allocated across steps.
+        self._step_scoped_workspace = (
+            self._offload.enabled and self._execution_device.type != "cpu"
+        )
+        self._cpu_groups = self._prepare_cpu_groups() if cpu_execution else {}
         self._compiled_buckets = self._compile_buckets(self._bound_parameters)
         self._validate_compiled_buckets_across_ranks(self._compiled_buckets)
         self._workspace = _MuonWorkspace(
-            device_runtime,
+            execution_runtime,
             overlap_comm_compute=plan.overlap_comm_compute,
         )
-        self._workspace.configure(self._compiled_buckets)
+        if not self._step_scoped_workspace:
+            self._workspace.configure(self._compiled_buckets)
+        # Like AdamWSwap, materialize state up front so DCP finds it initialized
+        # and never runs a zero-gradient step to create it.
+        self._initialize_state()
         # Keep the registered callback unbound; it forwards to the instance
         # method without creating a self -> hook -> bound-self reference cycle.
         self.register_load_state_dict_post_hook(
@@ -1154,6 +1271,7 @@ class FSDPDistributedMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
         self._preflight_step()
+        self._acquire_workspace()
         try:
             if self._workspace.async_enabled and any(
                 bucket.has_redistribution for bucket in self._compiled_buckets
@@ -1166,7 +1284,92 @@ class FSDPDistributedMuon(Optimizer):
             # safely resume this step, even if queued streams have been joined.
             self._failed = True
             raise
+        finally:
+            if self._step_scoped_workspace:
+                self.release_workspace()
         return loss
+
+    def release_workspace(self) -> None:
+        """Release execution buffers; the next step acquires them again."""
+        self._workspace.release()
+
+    def _acquire_workspace(self) -> None:
+        """Allocate missing execution buffers with one decision across ranks.
+
+        When any rank lacks budget or memory, every rank fails before changing
+        momentum or parameters, so no rank enters Muon collectives alone.
+        """
+        if self._workspace.configured:
+            return
+        # Allocate the status first so it exists even when the workspace
+        # allocation itself runs out of memory.
+        status = torch.ones((), dtype=torch.int32, device=self._device_runtime.device)
+        error = None
+        if self._step_scoped_workspace:
+            error = self._workspace_budget_error()
+        if error is None:
+            try:
+                self._workspace.configure(self._compiled_buckets)
+            except RuntimeError as allocation_error:
+                # Its frames would keep the partially allocated buffers alive.
+                error = allocation_error.with_traceback(None)
+        if error is not None:
+            status.zero_()
+        dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        if not status.item():
+            self.release_workspace()
+            raise RuntimeError(
+                "Muon workspace acquisition failed on a training rank before any "
+                "update; release device memory, reduce Muon bucket size or "
+                "overlap, or select CPU execution"
+            ) from error
+
+    def _workspace_budget_error(self) -> RuntimeError | None:
+        """Compare the planned workspace with this rank's offload budget.
+
+        Freed activations usually stay cached by the device allocator after
+        backward and can serve the workspace, so the budget counts them in
+        addition to free driver memory.
+        """
+        runtime = self._device_runtime
+        free, _ = runtime.memory_info()
+        cached = runtime.memory_reserved() - runtime.memory_allocated()
+        fraction = self._offload.optimizer_memory_fraction
+        budget = int((free + cached) * fraction)
+        required = self._workspace.required_bytes(self._compiled_buckets)
+        if required <= budget:
+            return None
+        largest = max(
+            self._bound_parameters,
+            key=lambda item: math.prod(item.global_compute_shape),
+        )
+        return RuntimeError(
+            f"Muon workspace requires {required} bytes, but "
+            f"optimizer_memory_fraction={fraction} allows {budget} bytes; "
+            f"largest parameter={largest.fqn!r}"
+        )
+
+    def _prepare_cpu_groups(self) -> dict[tuple[int, ...], dist.ProcessGroup]:
+        """Reuse CPU-capable groups or create matching Gloo groups collectively."""
+        groups = {}
+        missing = set()
+        for item in self._bound_parameters:
+            group = item.param.device_mesh.get_group()
+            ranks = tuple(sorted(item.storage_layout.global_ranks_in_mesh_order))
+            if "cpu:" in dist.get_backend_config(group):
+                groups[ranks] = group
+            else:
+                missing.add(ranks)
+        requested: list[Any] = [None] * dist.get_world_size()
+        dist.all_gather_object(requested, sorted(missing))
+        all_missing = sorted({ranks for entries in requested for ranks in entries})
+        if all_missing and not dist.is_gloo_available():
+            raise RuntimeError("CPU Muon execution requires a Gloo backend")
+        for ranks in all_missing:
+            group = dist.new_group(list(ranks), backend="gloo")
+            if dist.get_rank() in ranks:
+                groups[ranks] = group
+        return groups
 
     def add_param_group(self, param_group: dict[str, Any]) -> None:
         if self._param_groups_frozen:
@@ -1182,7 +1385,10 @@ class FSDPDistributedMuon(Optimizer):
         self._validate_groups()
         self._compiled_buckets = self._compile_buckets(self._bound_parameters)
         self._validate_compiled_buckets_across_ranks(self._compiled_buckets)
-        self._workspace.configure(self._compiled_buckets)
+        if self._step_scoped_workspace:
+            self.release_workspace()
+        else:
+            self._workspace.configure(self._compiled_buckets)
         self._first_step_validated = False
 
     def _validate_ns_coefficients(self, coefficients: Any, ns_steps: int) -> bool:
@@ -1422,7 +1628,15 @@ class FSDPDistributedMuon(Optimizer):
         compiled_buckets = []
         for bucket in self._bucket_definitions:
             items = tuple(by_fqn[fqn] for fqn in bucket.parameter_fqns)
-            parameter_groups = tuple(_MuonCommGroup(item) for item in items)
+            parameter_groups = tuple(
+                _MuonCommGroup(
+                    item,
+                    self._cpu_groups.get(
+                        tuple(sorted(item.storage_layout.global_ranks_in_mesh_order))
+                    ),
+                )
+                for item in items
+            )
             planners = tuple(
                 _MuonLayoutPlanner(
                     parameter_group.mesh_indices_in_group_order,
@@ -1458,6 +1672,7 @@ class FSDPDistributedMuon(Optimizer):
                     items=items,
                     parameter_plans=parameter_plans,
                     parameter_groups=parameter_groups,
+                    execution_device=self._execution_device,
                 )
             )
         for group_ranks, summary in summaries_by_group.items():
@@ -1502,7 +1717,6 @@ class FSDPDistributedMuon(Optimizer):
             buckets = buckets_by_group[group_ranks]
             first_bucket = buckets[0]
             assert first_bucket.group is not None
-            assert first_bucket.device is not None
             group = first_bucket.group
             descriptions = []
             for bucket in buckets:
@@ -1598,7 +1812,6 @@ class FSDPDistributedMuon(Optimizer):
         missing_gradients = []
         changed_parameter = None
         changed_gradient = None
-        gradients = [] if initialize_state else None
         for item in self._bound_parameters:
             local_parameter = item.param.to_local()
             if (
@@ -1618,8 +1831,6 @@ class FSDPDistributedMuon(Optimizer):
             elif initialize_state and not item.storage_layout.matches(grad):
                 if changed_gradient is None:
                     changed_gradient = item.fqn
-            elif gradients is not None:
-                gradients.append((item, grad))
 
         if missing_gradients:
             raise RuntimeError(
@@ -1629,51 +1840,165 @@ class FSDPDistributedMuon(Optimizer):
         if changed_parameter is not None:
             raise RuntimeError(
                 f"parameter local storage changed for {changed_parameter!r}; "
-                "rebuild FSDPDistributedMuon"
+                "moving FSDP parameters, for example with module.to(), replaces "
+                "their storage, so keep them in place or rebuild FSDPDistributedMuon"
             )
         if changed_gradient is not None:
             raise RuntimeError(
                 f"gradient storage layout changed for {changed_gradient!r}"
             )
 
-        # Validate all restored state before creating any missing momentum, so
-        # an invalid input cannot leave only part of the optimizer initialized.
-        if gradients is not None:
-            for item, _grad in gradients:
-                self._validate_momentum(item)
-            for item, grad in gradients:
-                self._momentum(item, grad)
+        if initialize_state:
+            self._initialize_state()
             self._first_step_validated = True
 
     def _validate_momentum(self, item: _BoundMuonParameter) -> None:
         momentum = self.state.get(item.param, {}).get("momentum_buffer")
         if momentum is None:
             return
-        if not isinstance(momentum, DTensor) or not item.storage_layout.matches(momentum):
+        if self._offload.enabled:
+            valid = (
+                not isinstance(momentum, DTensor)
+                and momentum.device.type == "cpu"
+                and momentum.shape == item.storage_layout.local_shape
+                and momentum.dtype == item.storage_layout.dtype
+                and momentum.is_contiguous()
+            )
+        else:
+            valid = isinstance(momentum, DTensor) and item.storage_layout.matches(
+                momentum
+            )
+        if not valid:
             raise RuntimeError(f"momentum storage layout changed for {item.fqn!r}")
 
-    def _momentum(self, item: _BoundMuonParameter, grad: DTensor) -> DTensor:
-        state = self.state[item.param]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros_like(
-                grad,
-                memory_format=torch.preserve_format,
-            )
-        return state["momentum_buffer"]
+    def _initialize_state(self) -> None:
+        """Validate existing momentum, then create zero momentum where missing.
+
+        Validating every entry first keeps invalid restored state from leaving
+        the optimizer partially initialized.
+        """
+        for item in self._bound_parameters:
+            self._validate_momentum(item)
+        for item in self._bound_parameters:
+            state = self.state[item.param]
+            if "momentum_buffer" in state:
+                continue
+            if self._offload.enabled:
+                state["momentum_buffer"] = self._empty_cpu_momentum(item).zero_()
+            else:
+                state["momentum_buffer"] = torch.zeros_like(
+                    item.param,
+                    memory_format=torch.preserve_format,
+                )
+
+    def _empty_cpu_momentum(self, item: _BoundMuonParameter) -> Tensor:
+        """Allocate an offloaded momentum shard, pinned when a device stages it."""
+        return torch.empty_like(
+            item.param.to_local(),
+            device="cpu",
+            pin_memory=self._execution_device.type != "cpu",
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        """Export CPU momentum with the parameter's distributed shard metadata."""
+        result = super().state_dict()
+        if not self._offload.enabled:
+            return result
+        for group, saved_group in zip(
+            self.param_groups, result["param_groups"], strict=True
+        ):
+            for param, param_id in zip(
+                group["params"], saved_group["params"], strict=True
+            ):
+                if param_id in result["state"]:
+                    entry = dict(result["state"][param_id])
+                    entry["momentum_buffer"] = wrap_cpu_state(
+                        entry["momentum_buffer"],
+                        param,
+                        self._checkpoint_meshes,
+                    )
+                    result["state"][param_id] = entry
+        return result
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Load offloaded momentum without the default parameter-device casting.
+
+        Existing CPU buffers are reused: DCP restores into the live buffers
+        exposed by ``state_dict()``, and reuse avoids a second pinned copy.
+        """
+        if not self._offload.enabled:
+            super().load_state_dict(state_dict)
+            return
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            replacement = hook(self, state_dict)
+            if replacement is not None:
+                state_dict = replacement
+        saved_groups = deepcopy(state_dict["param_groups"])
+        if len(saved_groups) != len(self.param_groups) or any(
+            len(saved["params"]) != len(current["params"])
+            for saved, current in zip(saved_groups, self.param_groups)
+        ):
+            raise ValueError("loaded Muon state has different parameter groups")
+        items_by_param = {item.param: item for item in self._bound_parameters}
+        by_id = {
+            saved_id: items_by_param[param]
+            for saved, current in zip(saved_groups, self.param_groups)
+            for saved_id, param in zip(saved["params"], current["params"])
+        }
+        # Validate every entry and create every missing destination before
+        # copying, so a rejected checkpoint leaves the reused buffers intact.
+        pending = []
+        for saved_id, entry in state_dict["state"].items():
+            if saved_id not in by_id or set(entry) != {"momentum_buffer"}:
+                raise ValueError(
+                    "loaded Muon state has an unknown parameter or state key"
+                )
+            item = by_id[saved_id]
+            value = entry["momentum_buffer"]
+            if isinstance(value, DTensor):
+                if (
+                    value.shape != item.storage_layout.global_shape
+                    or value.placements != item.storage_layout.placements
+                    or _global_ranks_in_mesh_order(value)
+                    != item.storage_layout.global_ranks_in_mesh_order
+                ):
+                    raise ValueError(f"momentum layout mismatch for {item.fqn!r}")
+                value = value.to_local()
+            if (
+                value.shape != item.storage_layout.local_shape
+                or value.dtype != item.storage_layout.dtype
+            ):
+                raise ValueError(f"momentum shape or dtype mismatch for {item.fqn!r}")
+            target = self.state.get(item.param, {}).get("momentum_buffer")
+            if target is None:
+                target = self._empty_cpu_momentum(item)
+            pending.append((item, target, value))
+        restored = defaultdict(dict)
+        for item, target, value in pending:
+            target.copy_(value)
+            restored[item.param]["momentum_buffer"] = target
+        for current, saved in zip(self.param_groups, saved_groups, strict=True):
+            saved["params"] = current["params"]
+        self.state = restored
+        self.param_groups = saved_groups
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     def _local_gradient_and_momentum(
         self,
         item: _BoundMuonParameter,
         reference: Tensor,
-    ) -> tuple[Tensor, Tensor, DTensor, dict[str, Any]]:
+    ) -> tuple[Tensor, Tensor, Tensor, dict[str, Any]]:
         """Return local gradient/state views and this item's parameter group."""
         grad = cast(DTensor, item.param.grad)
-        momentum_state = cast(
-            DTensor,
-            self.state[item.param]["momentum_buffer"],
-        )
+        momentum_state = self.state[item.param]["momentum_buffer"]
         local_grad = grad.to_local().view_as(reference)
-        local_momentum = momentum_state.to_local().view_as(reference)
+        local_momentum = (
+            momentum_state.to_local()
+            if isinstance(momentum_state, DTensor)
+            else momentum_state
+        ).view_as(reference)
         return local_grad, local_momentum, momentum_state, self._group(item)
 
     def _prepare_local(self, item: _BoundMuonParameter, prepared: Tensor) -> None:
@@ -1681,6 +2006,9 @@ class FSDPDistributedMuon(Optimizer):
         gradient, momentum_buffer, momentum_state, group = (
             self._local_gradient_and_momentum(item, prepared)
         )
+        stored_momentum = momentum_buffer
+        gradient = gradient.to(prepared.device)
+        momentum_buffer = momentum_buffer.to(prepared.device)
         momentum_coefficient = group["momentum"]
         momentum_buffer.lerp_(gradient, 1 - momentum_coefficient)
         if group["nesterov"]:
@@ -1692,8 +2020,11 @@ class FSDPDistributedMuon(Optimizer):
             )
         else:
             prepared.copy_(momentum_buffer)
-        torch.autograd.graph.increment_version(momentum_state)
-    
+        if stored_momentum.device != momentum_buffer.device:
+            stored_momentum.copy_(momentum_buffer)
+        if isinstance(momentum_state, DTensor):
+            torch.autograd.graph.increment_version(momentum_state)
+
     def _ns_step_coefficients(
         self,
         coefficients: Sequence[float] | Sequence[Sequence[float]],
@@ -1745,6 +2076,8 @@ class FSDPDistributedMuon(Optimizer):
         """Apply weight decay and a computed direction to local parameter data."""
         group = self._group(item)
         local_param = item.param.to_local().view_as(direction)
+        stored_param = local_param
+        local_param = local_param.to(direction.device)
         if item.resolved_compute_view is not None:
             matrix_shape = item.resolved_compute_view.matrix_shape
         else:
@@ -1766,6 +2099,8 @@ class FSDPDistributedMuon(Optimizer):
 
         local_param.mul_(1 - group["lr"] * group["weight_decay"])
         local_param.add_(direction, alpha=-adjusted_lr)
+        if stored_param.device != local_param.device:
+            stored_param.copy_(local_param)
         torch.autograd.graph.increment_version(item.param)
 
     def _compute_local_items(
@@ -1782,7 +2117,7 @@ class FSDPDistributedMuon(Optimizer):
             prepared = buffers.compute_tensor(
                 shape,
                 dtype=item.storage_layout.dtype,
-                device=item.storage_layout.device,
+                device=bucket.device,
             )
             self._prepare_local(item, prepared)
             if math.prod(shape):
@@ -1796,7 +2131,7 @@ class FSDPDistributedMuon(Optimizer):
     ) -> None:
         """Prepare local storage partitions and pack transfer input."""
         assert bucket.group is not None and bucket.forward is not None
-        assert bucket.dtype is not None and bucket.device is not None
+        assert bucket.dtype is not None
         storage_buffer, _compute_buffer = buffers.exchange_buffers(bucket)
         rank = bucket.group.current_group_rank
         for index, (item, plan) in enumerate(
@@ -1825,7 +2160,7 @@ class FSDPDistributedMuon(Optimizer):
         """Rebuild, compute, and repack this rank's compute partitions."""
         assert bucket.group is not None
         assert bucket.forward is not None and bucket.reverse is not None
-        assert bucket.dtype is not None and bucket.device is not None
+        assert bucket.dtype is not None
         _storage_buffer, compute_buffer = buffers.exchange_buffers(bucket)
         rank = bucket.group.current_group_rank
         for index, (item, plan) in enumerate(
@@ -1860,7 +2195,7 @@ class FSDPDistributedMuon(Optimizer):
     ) -> None:
         """Unpack returned directions and update local parameter storage."""
         assert bucket.group is not None and bucket.reverse is not None
-        assert bucket.dtype is not None and bucket.device is not None
+        assert bucket.dtype is not None
         storage_buffer, _compute_buffer = buffers.exchange_buffers(bucket)
         rank = bucket.group.current_group_rank
         for index, (item, plan) in enumerate(

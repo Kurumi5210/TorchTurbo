@@ -143,6 +143,28 @@ supervision within each sample; predictions never cross sample boundaries.
 
 The `src/torchturbo/adapters/rl/` package provides reusable packed-sequence and SP helpers for reinforcement learning frameworks; it is a utilities package rather than a registered adapter.
 
+RL callers can suspend the prepared FSDP2 optimizer between training windows:
+
+```python
+optimizer.zero_grad(set_to_none=True)
+engine.offload_optimizer()
+# Run inference, then release its allocations before restoring training state.
+engine.restore_optimizer()
+```
+
+Call these synchronous, idempotent APIs on every training worker at an idle
+training boundary. They release AdamW, AdamWSwap, Muon, and child optimizer
+device state and pause QK clipping statistics, while preserving parameter and
+scheduler bindings. Model weights and inference resources remain
+caller-managed. With Muon, keep FSDP parameters in place: moving them with
+`module.to()` replaces their storage and makes the next step fail, so use
+`full` CPU offload when weights must leave the device.
+
+Muon supports `full` and `optimizer` CPU offload, and
+`optimizer_memory_fraction=0` selects CPU Newton-Schulz and CPU exchange. These
+paths are experimental until they are validated on CUDA/NPU hardware; see the
+[design](internal/docs/design/fsdp2_distributed_muon.md).
+
 To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.
 
 ## Quick Start

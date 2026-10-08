@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from torchturbo.models.base import TurboModel, TurboVLMModel
+from torchturbo.models.modules.attention.qk_clip import QKClipState
 from torchturbo.models.modules.attention.ulysses import (
     TURBO_ULYSSES_ATTENTION,
     register_turbo_ulysses_attention,
@@ -316,9 +317,10 @@ class TestUlyssesAttentionInterface:
         assert calls["query_shape"] == (batch, seq, heads * 2, head_dim)
         assert out.shape == (batch, seq, heads, head_dim)
 
+    @pytest.mark.parametrize("enabled", [True, False])
     @pytest.mark.parametrize("training", [True, False])
-    def test_qk_clip_state_is_forwarded_only_in_training(
-        self, monkeypatch, training
+    def test_qk_clip_state_is_forwarded_only_while_collecting(
+        self, monkeypatch, training, enabled
     ):
         calls = {}
 
@@ -332,7 +334,9 @@ class TestUlyssesAttentionInterface:
 
         module = _ModuleStub()
         module.training = training
-        state = object()
+        state = QKClipState(torch.full((2,), -torch.inf))
+        # An offloaded optimizer suspends collection without removing the state.
+        state.enabled = enabled
         module.qk_clip_state = state
         q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
 
@@ -340,7 +344,7 @@ class TestUlyssesAttentionInterface:
             module, q, q, q, None, sp_group=None, sp_size=1
         )
 
-        assert calls["qk_clip_state"] is (state if training else None)
+        assert calls["qk_clip_state"] is (state if training and enabled else None)
 
 
 class TestSpAttentionConfig:

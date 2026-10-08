@@ -54,9 +54,10 @@ engine_config:
     cpu_offload:
       # if "enabled" is "false", CPU offload is disabled
       enabled: false
-      # "mode: optimizer" for swap-optimzier, or "full" for full-offload
+      # "optimizer" keeps parameters on device; "full" also offloads FSDP parameters
       mode: optimizer
-      # "optimizer_memory_fraction" controls workspace size on swap-optimzier mode
+      # Fraction of free device memory for AdamWSwap/Muon workspaces
+      # Zero selects CPU updates, including CPU Newton-Schulz and exchange for Muon
       optimizer_memory_fraction: 0.8
 
   checkpoint:

@@ -14,6 +14,9 @@ from torch import Tensor, nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
+from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
+from torchturbo.engine.backends.fsdp2.dcp import DcpCheckpoint
+from torchturbo.engine.backends.fsdp2.optimizers.memory import OptimizerMemoryController
 from torchturbo.engine.backends.fsdp2.optimizers.muon import FSDPDistributedMuon
 from torchturbo.engine.config import MuonOptimizerConfig
 from torchturbo.engine.optimizers import (
@@ -24,9 +27,9 @@ from torchturbo.engine.optimizers import (
     MuonRecipe,
     Owned,
 )
+from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
-
 
 _HAS_GLOO = dist.is_available() and dist.is_gloo_available()
 _HAS_FSDP_MUON = torch_version() >= (2, 10, 0)
@@ -85,6 +88,7 @@ def _make_optimizer(
     *,
     bucket_strategy: str,
     execution: str,
+    offload_mode: str | None = None,
 ) -> FSDPDistributedMuon:
     specs = {}
     for name, layout in matrix_layouts.items():
@@ -118,7 +122,15 @@ def _make_optimizer(
         ),
     )
     runtime = CpuRuntime() if execution == "sync" else _StubStreamCpuRuntime()
-    return FSDPDistributedMuon(plan, device_runtime=runtime)
+    return FSDPDistributedMuon(
+        plan,
+        device_runtime=runtime,
+        cpu_offload=CPUOffloadConfig(
+            enabled=offload_mode is not None,
+            mode=offload_mode or "full",
+            optimizer_memory_fraction=0,
+        ),
+    )
 
 
 def _matrix_views(
@@ -150,6 +162,8 @@ def _run_distributed_muon_test(
     bucket_strategy: str,
     execution: str,
     init_file: str,
+    offload_mode: str | None = None,
+    resumed_mode: str | None = None,
 ) -> None:
     os.environ.setdefault(
         "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
@@ -222,10 +236,53 @@ def _run_distributed_muon_test(
                 matrix_layouts,
                 bucket_strategy=bucket_strategy,
                 execution=execution,
+                offload_mode=offload_mode,
             )
             return model, optimizer
 
         model, optimizer = make_model_and_optimizer(values)
+        checkpoint_io = DcpCheckpoint(
+            rank, BaseWeightConverter.__new__(BaseWeightConverter)
+        )
+        parallel_context = {"ep": {"ep_rank": 0}}
+        use_dcp = offload_mode is not None or resumed_mode is not None
+        checkpoint_dir = init_file + "-checkpoint"
+        if use_dcp:
+            # A fresh optimizer already holds zero momentum, so saving it needs
+            # no dummy step that could apply weight decay to the model.
+            with patch.object(
+                optimizer, "step", side_effect=AssertionError("dummy step")
+            ):
+                checkpoint_io.save_optimizer(
+                    optimizer, model, checkpoint_dir, parallel_context
+                )
+            for state in optimizer.state.values():
+                momentum = state["momentum_buffer"]
+                local = (
+                    momentum.to_local() if isinstance(momentum, DTensor) else momentum
+                )
+                assert torch.count_nonzero(local) == 0
+
+        # A workspace released for inference is acquired again by the next
+        # step. An allocation failure on one rank must stop every rank.
+        optimizer.release_workspace()
+        configure = optimizer._workspace.configure
+
+        def fail_on_one_rank(buckets):
+            configure(buckets)
+            if rank == 0:
+                raise RuntimeError("injected workspace allocation failure")
+
+        with (
+            patch.object(
+                optimizer._workspace, "configure", side_effect=fail_on_one_rank
+            ),
+            pytest.raises(RuntimeError, match="before any update"),
+        ):
+            optimizer._acquire_workspace()
+        assert not optimizer._workspace.configured
+        assert not optimizer._workspace.slots
+
         workspace = optimizer._workspace
         assert workspace.async_enabled == (execution != "sync")
         assert workspace.overlap_comm_compute == (execution == "async-overlap")
@@ -351,6 +408,8 @@ def _run_distributed_muon_test(
                 optimizer.step()
             assert execution_path.call_count == 1
             assert exchange.call_count == expected_exchanges
+            # Only offloaded device execution releases buffers after a step.
+            assert optimizer._workspace.configured != optimizer._step_scoped_workspace
             reference.step()
 
             for name, parameter in model.named_parameters():
@@ -378,11 +437,17 @@ def _run_distributed_muon_test(
                 state = optimizer.state[parameter]
                 assert set(state) == {"momentum_buffer"}
                 momentum = state["momentum_buffer"]
-                assert isinstance(momentum, DTensor)
-                assert momentum.placements == (Shard(0),)
-                assert momentum.to_local().shape == parameter.to_local().shape
+                if optimizer._offload.enabled:
+                    assert not isinstance(momentum, DTensor)
+                    assert momentum.device.type == "cpu"
+                    local_momentum = momentum
+                else:
+                    assert isinstance(momentum, DTensor)
+                    assert momentum.placements == (Shard(0),)
+                    local_momentum = momentum.to_local()
+                assert local_momentum.shape == parameter.to_local().shape
                 torch.testing.assert_close(
-                    momentum.to_local(),
+                    local_momentum,
                     reference_momentum[shard],
                     rtol=0,
                     atol=0,
@@ -391,14 +456,55 @@ def _run_distributed_muon_test(
         step_and_check()
         step_and_check()
 
+        optimizer.zero_grad(set_to_none=True)
+        storage = [param.to_local().data_ptr() for param in model.parameters()]
+        controller = OptimizerMemoryController(optimizer, CpuRuntime())
+        for _ in range(2):
+            controller.offload()
+            controller.offload()
+            assert not optimizer._workspace.slots
+            assert not optimizer._workspace.local_buffers.compute_scratch
+            with pytest.raises(RuntimeError, match="optimizer is offloaded"):
+                optimizer.step()
+            controller.restore()
+            controller.restore()
+        assert storage == [param.to_local().data_ptr() for param in model.parameters()]
+        step_and_check()
+
         checkpoint = copy.deepcopy(optimizer.state_dict())
+        if use_dcp:
+            checkpoint_io.save_optimizer(
+                optimizer, model, checkpoint_dir, parallel_context
+            )
         resumed_values = {
             name: parameter.full_tensor().detach()
             for name, parameter in model.named_parameters()
         }
+        offload_mode = resumed_mode
         model, optimizer = make_model_and_optimizer(resumed_values)
         buckets_before_load = optimizer._compiled_buckets
         optimizer.load_state_dict(checkpoint)
+        if use_dcp:
+            # Load into a second fresh optimizer, whose state already exists, so
+            # DCP fills the target mode's destinations without a dummy step.
+            model, optimizer = make_model_and_optimizer(resumed_values)
+            initial_buffers = {
+                parameter: state["momentum_buffer"]
+                for parameter, state in optimizer.state.items()
+            }
+            assert len(initial_buffers) == len(shapes)
+            with patch.object(
+                optimizer, "step", side_effect=AssertionError("dummy step")
+            ):
+                checkpoint_io.load_optimizer(
+                    optimizer, model, checkpoint_dir, parallel_context
+                )
+            if optimizer._offload.enabled:
+                # DCP fills the live CPU buffers, and loading keeps them.
+                assert all(
+                    optimizer.state[parameter]["momentum_buffer"] is buffer
+                    for parameter, buffer in initial_buffers.items()
+                )
         assert optimizer._compiled_buckets is not buckets_before_load
         for resumed_bucket, bucket in zip(
             optimizer._compiled_buckets, buckets, strict=True
@@ -450,5 +556,28 @@ def test_distributed_muon_matches_plain_muon_and_reloads_state(
         _run_distributed_muon_test,
         args=(world_size, scenario, bucket_strategy, execution, str(tmp_path / "muon")),
         nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(
+    not _HAS_GLOO or not _HAS_FSDP_MUON, reason="requires Gloo and PyTorch 2.10"
+)
+@pytest.mark.parametrize(
+    "mode,resumed_mode",
+    [
+        ("full", "optimizer"),
+        ("optimizer", "full"),
+        (None, "optimizer"),
+        ("full", None),
+    ],
+)
+def test_distributed_muon_cpu_offload_and_cross_mode_resume(
+    tmp_path, mode, resumed_mode
+):
+    mp.spawn(
+        _run_distributed_muon_test,
+        args=(3, "mixed", "single", "sync", str(tmp_path / "muon"), mode, resumed_mode),
+        nprocs=3,
         join=True,
     )

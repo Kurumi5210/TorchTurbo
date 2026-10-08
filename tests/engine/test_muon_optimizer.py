@@ -2095,6 +2095,8 @@ def test_muon_failed_update_rejects_retry_before_closure(async_enabled):
 
     optimizer = SimpleNamespace(
         _failed=False,
+        _step_scoped_workspace=False,
+        _acquire_workspace=lambda: None,
         _workspace=SimpleNamespace(async_enabled=async_enabled),
         _compiled_buckets=(SimpleNamespace(has_redistribution=True),),
         _preflight_step=lambda: calls.append("preflight"),
@@ -2123,6 +2125,8 @@ def test_muon_preflight_failure_can_be_corrected_before_retry():
 
     optimizer = SimpleNamespace(
         _failed=False,
+        _step_scoped_workspace=False,
+        _acquire_workspace=lambda: None,
         _workspace=SimpleNamespace(async_enabled=False),
         _preflight_step=fail_preflight,
         _run_synchronous=lambda: calls.append("update"),
@@ -3540,6 +3544,7 @@ def test_fsdp2_builds_optimizer_class_plan_and_preserves_parameters():
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = object.__new__(FSDP2Backend)
+    backend._device_runtime = SimpleNamespace(device=torch.device("cpu"))
     backend.fsdp_config = SimpleNamespace(cpu_offload=CPUOffloadConfig())
     backend._mesh = {"edp": object()}
     model = nn.Linear(2, 2, bias=True)
@@ -3563,7 +3568,7 @@ def test_fsdp2_builds_optimizer_class_plan_and_preserves_parameters():
 def test_fsdp2_optimizer_class_plan_swaps_in_adamw_swap_for_optimizer_offload(
     monkeypatch,
 ):
-    import torchturbo.engine.backends.fsdp2.backend as backend_module
+    import torchturbo.engine.backends.fsdp2.optimizers.adamw as adamw_module
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
     from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 
@@ -3580,7 +3585,7 @@ def test_fsdp2_optimizer_class_plan_swaps_in_adamw_swap_for_optimizer_offload(
                 weight_decay=kwargs["weight_decay"],
             )
 
-    monkeypatch.setattr(backend_module, "AdamWSwap", RecordingAdamWSwap)
+    monkeypatch.setattr(adamw_module, "AdamWSwap", RecordingAdamWSwap)
 
     device_runtime = SimpleNamespace(device=torch.device("cpu"))
     backend = object.__new__(FSDP2Backend)
@@ -4026,3 +4031,102 @@ def test_muon_workspace_configure_async_creates_and_reuses_streams_slots_and_buf
     for index, (slot, tensor) in enumerate(zip(slots, tensors, strict=True)):
         assert slot.buffers.storage_exchange[key] is tensor
         torch.testing.assert_close(tensor, torch.full_like(tensor, index + 1))
+
+
+def test_muon_workspace_required_bytes_counts_buffers_and_temporaries():
+    from torchturbo.engine.backends.fsdp2.optimizers.muon import _MuonWorkspace
+    from torchturbo.runtime.cpu import CpuRuntime
+
+    workspace = _MuonWorkspace(CpuRuntime(), overlap_comm_compute=False)
+    buckets = _workspace_test_buckets()
+    required = workspace.required_bytes(buckets)
+
+    workspace.configure(buckets)
+    allocated = sum(
+        tensor.numel() * tensor.element_size()
+        for buffers in (
+            workspace.local_buffers,
+            *(slot.buffers for slot in workspace.slots),
+        )
+        for pool in (
+            buffers.storage_exchange,
+            buffers.compute_exchange,
+            buffers.storage_scratch,
+            buffers.compute_scratch,
+        )
+        for tensor in pool.values()
+    )
+    # The FP64 (1, 5, 7) local matrix dominates both temporaries: three BF16
+    # copies of its values and Gram matrix plus an FP32 norm, and staging of
+    # its gradient and momentum shards.
+    newton_schulz_bytes = 6 * (5 * 7 + 5 * 5) + 4
+    staging_bytes = 2 * 5 * 7 * 8
+    assert required == allocated + newton_schulz_bytes + staging_bytes
+
+
+def test_muon_offloaded_workspace_budget_counts_allocator_cache(monkeypatch):
+    from torchturbo.engine.backends.fsdp2.optimizers.muon import (
+        FSDPDistributedMuon,
+        _MuonWorkspace,
+    )
+    from torchturbo.runtime.cpu import CpuRuntime
+
+    class MemoryStatsRuntime(CpuRuntime):
+        free = 0
+        cached = 0
+
+        def memory_info(self):
+            return self.free, self.free + self.cached
+
+        def memory_reserved(self):
+            return self.cached
+
+        def memory_allocated(self):
+            return 0
+
+    peer_ok = True
+
+    def all_reduce(status, op):
+        assert op == dist.ReduceOp.MIN
+        if not peer_ok:
+            status.zero_()
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    runtime = MemoryStatsRuntime()
+    buckets = _workspace_test_buckets()
+    optimizer = object.__new__(FSDPDistributedMuon)
+    optimizer._offload = CPUOffloadConfig(
+        enabled=True, mode="optimizer", optimizer_memory_fraction=0.5
+    )
+    optimizer._device_runtime = runtime
+    optimizer._workspace = _MuonWorkspace(CpuRuntime(), overlap_comm_compute=False)
+    optimizer._compiled_buckets = buckets
+    optimizer._bound_parameters = tuple(
+        item for bucket in buckets for item in bucket.items
+    )
+    optimizer._step_scoped_workspace = True
+    required = optimizer._workspace.required_bytes(buckets)
+
+    # Freed activations stay cached by the allocator after backward and can
+    # serve the workspace even when the driver reports no free memory.
+    runtime.free, runtime.cached = 0, 2 * required
+    optimizer._acquire_workspace()
+    assert optimizer._workspace.configured
+    assert optimizer._workspace.slots
+    optimizer.release_workspace()
+
+    runtime.free, runtime.cached = required, 0
+    with pytest.raises(RuntimeError, match="before any update") as failure:
+        optimizer._acquire_workspace()
+    assert "optimizer_memory_fraction=0.5" in str(failure.value.__cause__)
+    assert not optimizer._workspace.configured
+    assert not optimizer._workspace.slots
+
+    # A failure on another rank stops this rank after its own allocation.
+    runtime.free, runtime.cached = 2 * required, 0
+    peer_ok = False
+    with pytest.raises(RuntimeError, match="before any update") as failure:
+        optimizer._acquire_workspace()
+    assert failure.value.__cause__ is None
+    assert not optimizer._workspace.configured
+    assert not optimizer._workspace.slots

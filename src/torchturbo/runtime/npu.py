@@ -166,6 +166,12 @@ class NpuRuntime(DeviceRuntime):
             )
         return self._npu.mem_get_info()
 
+    def memory_reserved(self) -> int:
+        return self._npu.memory_reserved()
+
+    def memory_allocated(self) -> int:
+        return self._npu.memory_allocated()
+
     def stream(self, stream=None):
         if stream is None:
             return nullcontext()

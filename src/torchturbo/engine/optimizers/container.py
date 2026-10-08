@@ -224,6 +224,11 @@ class OptimizersContainer(Optimizer):
         """Load versioned state into each named child optimizer."""
         if not isinstance(state_dict, dict):
             raise TypeError("state_dict must be a dict")
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            replacement = hook(self, state_dict)
+            if replacement is not None:
+                state_dict = replacement
 
         expected_keys = {"format_version", "optimizers"}
         if set(state_dict) != expected_keys:
@@ -255,6 +260,8 @@ class OptimizersContainer(Optimizer):
         finally:
             # Optimizer.load_state_dict replaces parameter-group dictionaries.
             self.refresh_param_groups()
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
 
 __all__ = [

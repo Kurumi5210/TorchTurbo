@@ -9,17 +9,20 @@ class QKClipState:
 
     The optimizer-step controller reduces these buffers across workers and
     resets them after clipping. Forward recomputation is safe because maximum
-    accumulation is idempotent.
+    accumulation is idempotent. While the optimizer is offloaded, ``enabled``
+    is false and ``get_qk_clip_state`` hides the state from attention.
     """
 
     max_logits: Tensor
     observed: bool
+    enabled: bool
 
     def __init__(self, max_logits: Tensor) -> None:
         if max_logits.ndim != 1 or max_logits.dtype != torch.float32:
             raise ValueError("QK clipping requires a 1D FP32 statistics tensor.")
         self.max_logits = max_logits
         self.observed = False
+        self.enabled = True
 
     @torch.no_grad()
     def record(self, max_logits: Tensor, head_offset: int = 0) -> None:
@@ -46,5 +49,6 @@ class QKClipState:
 
 
 def get_qk_clip_state(module: nn.Module) -> QKClipState | None:
-    """Return this module's optional statistics without wrapper attribute forwarding."""
-    return vars(module).get("qk_clip_state")
+    """Return active statistics without wrapper attribute forwarding."""
+    state = vars(module).get("qk_clip_state")
+    return state if state is not None and state.enabled else None

@@ -770,18 +770,253 @@ QK clip 校正后的权重随模型参数保存，统计和 controller 属于临
 不进入 checkpoint。恢复训练时按 recipe 和配置重新建立；在完整 optimizer step
 边界恢复后，从新的 forward 开始收集统计，不需要恢复上一窗口的最大值。
 
-## 8. 版本与当前限制
+## 8. CPU offload 与优化器生命周期
 
-### 8.1 PyTorch 版本
+Muon CPU offload 复用前述 matrix view、owner 分配、routes、Newton-Schulz 和参数
+更新公式，只改变参数、梯度、优化器状态的长期存储位置以及 Muon 的执行位置。
+它还为 RL 训练提供显式生命周期接口，在 rollout 前释放 TorchTurbo 管理的优化器
+设备资源，在恢复训练前重建这些资源。训练 offload 策略和 RL 生命周期是两个独立
+维度。
+
+### 8.1 配置与执行策略
+
+CPU offload 复用 FSDP2 Backend 的已有配置，不增加 Muon 专属开关：
+
+```yaml
+engine_config:
+  optimizer:
+    name: muon
+    muon:
+      lr: 0.001
+      weight_decay: 0.01
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: optimizer
+      optimizer_memory_fraction: 0.8
+```
+
+`mode=optimizer` 只将 optimizer state 长期存放在 CPU；`mode=full` 同时使用
+FSDP2 `CPUOffloadPolicy` 管理参数和梯度。`optimizer_memory_fraction` 为正值时，
+Muon 在设备上暂存并执行；为零时，Muon 在 CPU 上同步执行 Newton-Schulz，并使用
+CPU/Gloo 完成分片交换。
+
+下表描述完整 backward 结束后的长期存储，以及 optimizer step 的执行位置。
+full 模式下，FSDP2 在 forward/backward 期间仍会按需在设备上物化参数。
+
+| offload 配置 | 参数/梯度长期存储 | 动量长期存储 | Muon 数值更新 | Muon 分片交换 |
+| --- | --- | --- | --- | --- |
+| disabled | 设备 | 设备 | 设备 | 设备后端 |
+| optimizer，fraction > 0 | 设备 | CPU | 设备暂存 | 设备后端 |
+| full，fraction > 0 | CPU | CPU | 设备暂存 | 设备后端 |
+| optimizer，fraction = 0 | 设备 | CPU | CPU 暂存参数/梯度 | CPU/Gloo |
+| full，fraction = 0 | CPU | CPU | CPU | CPU/Gloo |
+
+full 只影响 FSDP 管理的参数；ignored 或 `no_shard` 参数仍遵循已有行为。
+`fraction=0` 也只表示 Muon 更新与交换在 CPU 上执行，forward/backward、梯度裁剪和
+QK clip 仍遵循各自的设备契约。系统不会根据空闲显存动态改变策略或 owner；配置
+所需的 CPU backend 或 kernel 不可用时，在更新前明确报错，不隐式回退到设备或
+改变计算 dtype。
+
+实现中需要区分三个位置：
+
+- storage device：参数 local shard 的长期位置，由 FSDP2 决定；
+- state device：持久动量的位置，由 offload 策略决定；
+- execution device：momentum、Newton-Schulz 和参数更新的执行位置。
+
+offload 动量以原 FSDP local shard 的形式常驻 CPU，不保存 owner 的完整矩阵；
+设备执行只暂存当前参数和有限数量的 pipeline slots。参数的 shape、stride、
+DTensor placement 和 local storage identity 仍按原 Muon 契约校验。所有回写均在
+原 storage 上执行 `copy_`，不能替换 `Parameter`、重新绑定 `.data` 或改变 FSDP
+mesh。
+
+### 8.2 设备执行与工作区
+
+optimizer 模式下，参数和梯度保留在设备，Muon 将当前参数的 CPU 动量暂存到
+设备，完成 momentum/Nesterov、原有 owner 交换和 Newton-Schulz，再把新动量原地
+写回 CPU buffer，并在设备参数 shard 上应用更新。
+
+full 模式下，参数、梯度和动量长期位于 CPU。Muon 在 step 中暂存当前参数的梯度
+和动量；direction 返回本 rank 后再暂存参数 shard，在设备上完成更新并原地写回
+CPU 参数。step 返回前必须保证动量与参数回写完成，使下一次 FSDP forward 能看到
+最新权重。
+
+设备工作区的峰值包含 state/gradient/parameter staging、storage/compute exchange、
+scratch、活跃的 Newton-Schulz 矩阵和 Gram 中间量。设驱动报告的空闲内存为 `F`，
+allocator 已缓存但未使用的内存为
+`C = memory_reserved - memory_allocated`，fraction 为 `f`，则预算为：
+
+```text
+B = f * (F + C)
+```
+
+预算按各阶段资源的实际生命周期计算，不把不会同时存活的缓冲区简单相加。
+每个 rank 先校验并尝试分配自己的工作区，再由全部训练 ranks 协调结果；任一 rank
+失败时，所有 ranks 都在更新任何参数或有效动量前退出。系统不会把一个完整逻辑
+矩阵拆成多个近似 Muon 更新，也不会在失败后自动迁移 owner 或切换到 CPU。
+
+训练 offload 的设备暂存按 step 获取和释放；静态布局计划继续保留。RL offload
+会释放 Muon 和 AdamWSwap 工作区，restore 后在下一次 step 按需重新获取，不在
+restore 时提前占据训练峰值。当前跨设备暂存使用同步 copy；CPU/设备通信计算
+overlap 和专用 DMA pipeline 不属于本版目标。
+
+### 8.3 同步 CPU 执行
+
+CPU 路径复用相同的 Muon 数值实现和矩阵布局，但将 Newton-Schulz 与分片交换放在
+CPU 上：
+
+- `full + CPU`：CPU 参数、梯度和动量直接完成 momentum、Gloo 交换、
+  Newton-Schulz 和原地参数更新；
+- `optimizer + CPU`：将设备梯度分批复制到 CPU，在 CPU 完成 Muon；direction
+  返回后暂存对应参数 shard，更新后再原地复制回设备。
+
+CPU 执行不包含 forward/backward，也不会隐式切换 dtype。它避免 Muon 设备工作区，
+但会增加 CPU 主存、矩阵计算和网络压力；性能取决于 CPU BF16 kernel、NUMA、内存
+带宽和 Gloo，不能仅凭搬运量推断吞吐。
+
+CPU collective 必须使用实际 dp/edp ranks 建立的可执行通信组，并保留真实
+global-rank 顺序。默认组没有 CPU backend 时，应在 optimizer 准备阶段按一致顺序
+创建并复用配套组；checkpoint 使用的 `_init_backend=False` CPU mesh 只有布局
+元数据，不能作为通信组。
+
+### 8.4 AdamW、container 与资源所有权
+
+Muon fallback 和普通 `OptimizerClassPlan` 共用
+`prepare_fsdp_adamw_optimizer()`。optimizer offload 使用 AdamWSwap；full 模式保留
+原生 AdamW 的既有行为。Muon 没有选中任何矩阵时可退化为纯 AdamW，不应被 Muon
+工作区或 CPU 通信的前置条件拦截。
+
+`OptimizerMemoryController` 显式管理受支持的 optimizer 和附加资源，不递归扫描
+对象属性。其范围包括：
+
+- Muon momentum、workspace、pipeline slots 和 scratch；
+- 原生 AdamW 的 moments、step tensor，以及 AdamWSwap 的 state maps 和 workspace；
+- `OptimizersContainer` 的 children；
+- QK clip 的统计收集状态。
+
+优化器保存的正常模型 `Parameter` 引用不视为状态副本。外部 master weights、
+scheduler 自有设备 tensor、FSDP/通信库资源、模型权重和推理 KV cache 也不属于该
+controller。首版只支持原生 AdamW、AdamWSwap、FSDPDistributedMuon 及其 container
+组合；不支持任意自定义 optimizer subclass、device tensor hyperparameters、
+capturable/differentiable optimizer 或依赖固定地址的 graph capture。
+
+生命周期转换保留 tensor 的 dtype、shape、stride、分片元数据和已知 alias 关系，
+但恢复描述不能继续引用旧设备 tensor。CPU tensor 超参数保持原引用；转换过程不
+替换 param-group 字典，也不改写 scheduler 等外部对象。
+
+### 8.5 RL 生命周期接口
+
+`TorchTurboEngine` 提供两个同步接口：
+
+```python
+engine.offload_optimizer()
+engine.restore_optimizer()
+```
+
+状态机为：
+
+```text
+ACTIVE -- offload_optimizer() --> OFFLOADED
+ACTIVE <-- restore_optimizer() -- OFFLOADED
+```
+
+两个接口幂等，必须由所有训练 worker 在完整训练窗口的空闲边界调用。调用
+`offload_optimizer()` 前，optimizer 参数的梯度必须为 `None`；接口不靠这一条件
+推断所有外部调度工作都已结束，也不增加无条件 `WORLD` barrier。
+`OFFLOADED` 时，无论调用 root optimizer 还是受管理 child 的 `step()`，都必须在
+任何更新前报错，不能隐式 restore。
+
+一次典型的 RL 切换顺序为：
+
+```python
+optimizer.step()
+scheduler.step()
+optimizer.zero_grad(set_to_none=True)
+
+engine.offload_optimizer()
+run_rollout()
+release_rollout_resources()
+engine.restore_optimizer()
+
+run_training()
+```
+
+offload 会等待已提交的计算和搬运完成，将仍在设备上的 optimizer state 迁移到
+CPU，提交新引用，释放工作区，暂停 QK clip 统计，最后调用
+`DeviceRuntime.empty_cache()`。restore 按原训练策略恢复必要状态和统计收集，
+工作区仍延迟到下一次 step 创建。
+
+状态迁移采用 prepare/commit 两阶段：全部 children 的目标资源准备成功后才统一
+提交。CPU 分配失败时保留原有效状态；设备恢复分配失败时清理未提交资源，保持
+`OFFLOADED`，允许之后重试。Muon step 已部分修改状态后的 fatal 语义不变，不能
+借助生命周期回滚重试。
+
+生命周期接口不调用 `model.eval()` / `model.train()`，不同步训练与推理权重，不
+管理 KV cache 或生成引擎，也不改变 Parameter、param-group、scheduler、step、LR
+和 hooks 的绑定。如果外部框架替换模型参数或重新分片，需要重新准备 optimizer。
+特别是用 `module.to()` 移动 Muon 管理的 FSDP 参数会替换 local storage；需要释放
+参数显存时应使用 full offload，而不是在生命周期外移动参数。
+
+### 8.6 QK clip
+
+full offload 下，forward 产生的 QK clip 统计和跨 rank 归约仍在训练设备执行。
+权重位于 CPU 时，只将很小的 per-head scale 复制到 CPU，并按本地行索引缩放参数
+shard，不搬运完整权重。clip 仍作为最终 optimizer 的 post-hook，在全部 Muon 和
+AdamW 更新及必要回写结束后执行一次。
+
+optimizer 挂起期间关闭统计收集，避免 rollout forward 污染下一训练窗口；已有
+统计 tensor 和行索引保留在设备，restore 后恢复收集。一次 offload 不清空尚有效的
+统计，因此 AMP 跳过 step 时保留统计的既有语义不变。
+
+### 8.7 Checkpoint 兼容性
+
+offload 不改变第 7 节定义的 checkpoint 外层格式和状态键：Muon 仍保存原 FSDP
+local shard 的 `momentum_buffer`，AdamW 保存 moments 和 `step`，container 使用
+named-child 格式。CPU state 导出时保留 global shape、stride、placements 和 rank
+顺序，并继续使用已有 EP expert FQN stamping。
+
+加载目标由当前运行配置决定，不能让 checkpoint 中的物理设备标签覆盖 state 和
+execution device 策略。loader 先校验并准备所有目标，再统一提交；已有 CPU 动量
+buffer 可直接复用，避免第二份 pinned memory。Muon 和 AdamWSwap 在构造时已有完整
+状态，DCP 不为它们执行用于初始化状态的 dummy optimizer step。
+
+owner、routes、workspace、streams/events 和生命周期 phase 都不进入 checkpoint。
+Engine checkpoint 只允许在 `ACTIVE` 状态执行；`OFFLOADED` 时在 I/O 和状态分配前
+明确拒绝，不自动 restore。disabled、optimizer、full 及 CPU/设备执行之间的恢复
+必须以参数、optimizer state 和后续更新为准验证兼容性。
+
+### 8.8 性能和验证边界
+
+若本 rank Muon 参数、梯度和动量大小分别为 `P`、`G`、`M`，不计原有 FSDP 通信
+和 Muon rank 间交换时，各路径每步新增搬运量的理想化参考为：
+
+| 路径 | Muon 每步新增主机/设备搬运量参考 |
+| --- | --- |
+| optimizer + 设备执行 | 约 `2M`，动量往返 |
+| full + 设备执行 | 约 `G + 2M + 2P`，梯度、动量和参数暂存/回写 |
+| optimizer + CPU 执行 | 约 `G + 2P`，动量和矩阵计算留在 CPU |
+| full + CPU 执行 | 无 Muon 参数/梯度/动量的设备往返 |
+
+这些是分析量，不是性能承诺。验证需覆盖各 offload 模式的数值与布局、跨模式
+checkpoint、生命周期幂等与失败回滚、root/child step 保护、QK 统计保持，以及
+设备 allocated/reserved、CPU RSS 和 pinned memory。真实 CUDA/NPU 环境还需验证
+设备通信与 Gloo 混用、完整显存峰值和吞吐。同步 CPU 执行已属于功能范围；专用
+CPU kernel、CPU/设备通信计算 overlap、动态 owner 迁移和自动执行策略切换不属于
+本版目标。
+
+## 9. 版本与当前限制
+
+### 9.1 PyTorch 版本
 
 `FSDPDistributedMuon` 要求 PyTorch 2.10 或更高版本。PyTorch 2.9 的
 `reset_sharded_param()` 在重新 padding uneven shard 时可能替换 local storage；本
 optimizer 捕获 local backing storage identity，因此要求 2.10 中 idempotent 的 reset
 行为。空 logical shard 的 identity 使用 backing storage pointer 和 storage offset。
 
-### 8.2 Muon 当前限制
+### 9.2 Muon 当前限制
 
-- 不支持 FSDP CPU offload；启用时 Backend 明确报错；
+- 支持 `full` / `optimizer` CPU offload，fraction 为零时执行同步 CPU
+  Newton-Schulz 和分片交换；具体配置、生命周期接口和验证边界见第 8 节；
 - 只支持一维 `dp`/`edp` mesh、精确 `Shard(0)` placement 和连续二维 storage；
 - 全局参数 shape 必须非空，但允许空 local storage 和空 compute partition；
 - 不支持一个 Muon parameter 在 step 中没有 gradient；

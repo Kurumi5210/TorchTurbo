@@ -13,6 +13,7 @@ from torchturbo.engine.backends.fsdp2.config import FSDPConfig
 from torchturbo.engine.backends.fsdp2.dcp import DcpCheckpoint
 from torchturbo.engine.optimizers import OptimizerClassPlan
 from torchturbo.models.weight_converter import BaseWeightConverter
+from torchturbo.runtime.cpu import CpuRuntime
 
 
 def test_load_adamw_checkpoint_without_parameter_names(tmp_path, monkeypatch):
@@ -58,6 +59,7 @@ def test_load_adamw_checkpoint_without_parameter_names(tmp_path, monkeypatch):
         {"lr": 0.002, "weight_decay": 0.1},
     )
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._device_runtime = CpuRuntime()
     backend.fsdp_config = FSDPConfig()
     backend._mesh = {"edp": object()}
     resumed_optimizer = backend.prepare_optimizer(plan)

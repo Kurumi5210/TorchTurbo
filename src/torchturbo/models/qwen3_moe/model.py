@@ -5,25 +5,25 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeConfig,
 )
 
-from torchturbo.runtime import is_npu_available, get_device_name
-from torchturbo.models.modules.attention.ulysses.utils import create_causal_mask
+from torchturbo.runtime import is_npu_available, get_device_runtime
 from ..base import TurboModel
 from ..registry import register_model
 from transformers import AutoModelForCausalLM
 
 
-class TurboQwen3MoeRotaryEmbedding(Qwen3MoeRotaryEmbedding):
-    def __init__(self, config, device=None):
-        super().__init__(
-            config,
-            device,
-        )
+def create_causal_mask(
+    config,
+    inputs_embeds,
+    attention_mask,
+    cache_position=None,
+    past_key_values=None,
+    position_ids=None,
+):
+    return attention_mask
 
-        inv_freq, attention_scaling = self.rope_init_fn(config, device)
-        self.attention_scaling = attention_scaling
-        self.register_buffer(
-            "inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False
-        )
+
+class TurboQwen3MoeRotaryEmbedding(Qwen3MoeRotaryEmbedding):
+    """Optional swap-in; inv_freq buffers are rebuilt in on_materialized."""
 
 
 @register_model("qwen3_moe", config_cls=Qwen3MoeConfig, auto_class=AutoModelForCausalLM)
@@ -65,12 +65,21 @@ class TurboQwen3MoeForCausalLM(TurboModel, Qwen3MoeForCausalLM):
 
     def on_materialized(self):
         """Initialize runtime buffers after weights are on real device."""
+        device = get_device_runtime().device
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
         # patch to rotary_emb
         rotary_emb = self.model.rotary_emb
-        inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(
-            rotary_emb.config, get_device_name()
+        rope_init_fn = rotary_emb.compute_default_rope_parameters
+        if rotary_emb.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rotary_emb.rope_type]
+        inv_freq, rotary_emb.attention_scaling = rope_init_fn(
+            rotary_emb.config, device
+        )
+        inv_freq = inv_freq.to(dtype=torch.bfloat16)
+        rotary_emb.register_buffer(
+            "inv_freq", inv_freq, persistent=False
         )
         rotary_emb.register_buffer(
-            "inv_freq", inv_freq.to(dtype=torch.bfloat16), persistent=False
+            "original_inv_freq", inv_freq.clone(), persistent=False
         )

@@ -15,6 +15,7 @@ from ...logging import get_logger
 logger = get_logger(__name__)
 
 PRESERVE_KEYS = ("input_ids",)
+DPO_DEBUG_EXPERIMENT = "history_think"
 
 
 def _post_process_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -38,6 +39,21 @@ def _make_kwarg_preserving_template_cls():
     preserve_keys = PRESERVE_KEYS
 
     class Qwen3_5KwargPreserveTemplate(Qwen3_5Template):
+        __turbo_dpo_debug__ = DPO_DEBUG_EXPERIMENT
+
+        def _get_preserve_thinking(self, inputs: Any = None) -> bool:
+            # Match Qwen3.8 history handling without changing loss boundaries.
+            if self.mode == "rlhf" and self.loss_scale.base_strategy == "last_round":
+                return True
+            return super()._get_preserve_thinking(inputs)
+
+        def _is_add_non_thinking_round(
+            self, messages: list[dict[str, Any]], i: int, start_idx: int
+        ) -> bool:
+            if self.mode == "rlhf" and self.loss_scale.base_strategy == "last_round":
+                start_idx = -1
+            return super()._is_add_non_thinking_round(messages, i, start_idx)
+
         def pre_forward_hook(self, model, args, kwargs):
             saved = {k: kwargs.get(k) for k in preserve_keys if k in kwargs}
             args, kwargs = super().pre_forward_hook(model, args, kwargs)
@@ -69,6 +85,10 @@ def register() -> None:
     wrapped = deepcopy(native)
     wrapped.template_cls = _make_kwarg_preserving_template_cls()
     register_template(wrapped, exist_ok=True)
+    logger.info_rank0(
+        "DPO debug template registered: %s (qwen3_5, mode=rlhf, last_round)",
+        DPO_DEBUG_EXPERIMENT,
+    )
     logger.debug_rank0("Wrapped ms-swift template 'qwen3_5' for turbo adapter kwargs")
 
 

@@ -7,6 +7,7 @@ export MODEL="/sfs_turbo/pretrained_models/Qwen3.8-27B"
 export REF_MODEL="$MODEL"
 export MODEL_TYPE=turbo_qwen3_5
 export TEMPLATE=qwen3_5
+export DPO_DEBUG_EXPERIMENT=history_think
 export FINETUNING_TYPE=full
 
 export DATASET="/workspace/bin/mf_qwen3.5_397b_a17b_instruct-Main-Selected/DPO/AntWealth-WealthMxc-AllIntent-All/20261013_business_user_flag_answer.json"
@@ -77,6 +78,7 @@ export NPROC_PER_NODE=16
 # ==================== Data and dependency checks ====================
 
 for item in \
+  "$PACKAGE_DIR/dpo_debug_swift_template.py" \
   "$MODEL/config.json" \
   "$REF_MODEL/config.json" \
   "$DATASET" \
@@ -100,12 +102,53 @@ runtime_dir="$(mktemp -d /tmp/qwen38-dpo.XXXXXX)"
 tar -xzf "$PACKAGE_DIR/torchturbo-c9c1ad2.tar.gz" -C "$runtime_dir"
 cd "$runtime_dir"
 
+# Apply this branch's template to the existing platform package.
+python3 - <<'PY'
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+source = Path(os.environ["PACKAGE_DIR"]) / "dpo_debug_swift_template.py"
+contents = source.read_bytes()
+tree = ast.parse(contents)
+variants = [
+    ast.literal_eval(node.value)
+    for node in tree.body
+    if isinstance(node, ast.Assign)
+    and any(isinstance(target, ast.Name) and target.id == "DPO_DEBUG_EXPERIMENT"
+            for target in node.targets)
+]
+if variants != [os.environ["DPO_DEBUG_EXPERIMENT"]]:
+    raise RuntimeError("The packaged template does not match this debug experiment.")
+
+target = Path("src/torchturbo/models/qwen3_5/swift_template.py")
+if not target.is_file():
+    raise RuntimeError(f"The unpacked runtime has no template at {target}.")
+target.write_bytes(contents)
+metadata = {
+    "experiment": variants[0],
+    "template_sha256": hashlib.sha256(contents).hexdigest(),
+    "swift_version": "4.4.2",
+}
+Path("dpo-debug-overlay.json").write_text(json.dumps(metadata, indent=2) + "\n")
+print("DPO debug overlay:", json.dumps(metadata), flush=True)
+PY
+
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 export HF_HOME="$runtime_dir/hf_cache"
 export HF_MODULES_CACHE="$HF_HOME/modules"
 
 bash internal/scripts/runs/qwen3_8_dense/install_swift_deps.sh
+
+python3 - <<'PY'
+import swift
+
+if swift.__version__ != "4.4.2":
+    raise RuntimeError(f"DPO debug comparison requires Swift 4.4.2, got {swift.__version__}.")
+PY
 
 # ==================== Connect to the official launcher ====================
 
@@ -174,6 +217,9 @@ mkdir -p "$OUTPUT_DIR"
 if [[ "$RANK" == 0 ]]; then
   cp "$PACKAGE_DIR/run_qwen38_27b_dpo.sh" \
     "$OUTPUT_DIR/run_qwen38_27b_dpo.sh"
+  cp src/torchturbo/models/qwen3_5/swift_template.py \
+    "$OUTPUT_DIR/dpo-debug-swift-template.py"
+  cp dpo-debug-overlay.json "$OUTPUT_DIR/dpo-debug-overlay.json"
 
   python3 - <<'PY'
 import json
@@ -192,6 +238,7 @@ config.update(
     model=os.environ["MODEL"],
     ref_model=os.environ["REF_MODEL"],
 )
+config["dpo_debug"] = json.loads(Path("dpo-debug-overlay.json").read_text())
 config["dataset"] = os.environ["DATASET"].split(
     "/mf_qwen3.5_397b_a17b_instruct-Main-Selected/", 1
 )[1]

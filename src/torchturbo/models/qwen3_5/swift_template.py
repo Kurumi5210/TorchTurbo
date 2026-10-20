@@ -29,23 +29,24 @@ def _post_process_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     return inputs
 
 
+class _KwargPreserveTemplateMixin:
+    def pre_forward_hook(
+        self, model: Any, args: tuple, kwargs: dict[str, Any]
+    ) -> tuple[tuple, dict[str, Any]]:
+        saved = {key: kwargs[key] for key in PRESERVE_KEYS if key in kwargs}
+        args, kwargs = super().pre_forward_hook(model, args, kwargs)
+        for key, value in saved.items():
+            if key not in kwargs:
+                kwargs[key] = value
+        return args, _post_process_inputs(kwargs)
+
+
 def _make_kwarg_preserving_template_cls():
-    """Subclass of swift's ``Qwen3_5Template`` that re-injects adapter kwargs
-    Swift's ``pre_forward_hook`` drops, then merges the mRoPE rows."""
-    # Deferred import: swift is not importable at module import time.
+    """Wrap the native Qwen3.5 template without importing Swift eagerly."""
     from swift.template.templates.qwen import Qwen3_5Template
 
-    preserve_keys = PRESERVE_KEYS
-
-    class Qwen3_5KwargPreserveTemplate(Qwen3_5Template):
-        def pre_forward_hook(self, model, args, kwargs):
-            saved = {k: kwargs.get(k) for k in preserve_keys if k in kwargs}
-            args, kwargs = super().pre_forward_hook(model, args, kwargs)
-            for key, value in saved.items():
-                if key in kwargs:
-                    continue
-                kwargs[key] = value
-            return args, _post_process_inputs(kwargs)
+    class Qwen3_5KwargPreserveTemplate(_KwargPreserveTemplateMixin, Qwen3_5Template):
+        pass
 
     Qwen3_5KwargPreserveTemplate.__turbo_kwarg_preserve__ = True
     return Qwen3_5KwargPreserveTemplate
@@ -63,13 +64,18 @@ def register() -> None:
         return
 
     # Idempotency: do not re-wrap a class we already wrapped.
-    if getattr(native.template_cls, "__turbo_kwarg_preserve__", False):
-        return
+    if not issubclass(native.template_cls, _KwargPreserveTemplateMixin):
+        wrapped = deepcopy(native)
+        wrapped.template_cls = _make_kwarg_preserving_template_cls()
+        register_template(wrapped, exist_ok=True)
+        logger.debug_rank0("Wrapped ms-swift template 'qwen3_5' for turbo adapter kwargs")
 
-    wrapped = deepcopy(native)
-    wrapped.template_cls = _make_kwarg_preserving_template_cls()
-    register_template(wrapped, exist_ok=True)
-    logger.debug_rank0("Wrapped ms-swift template 'qwen3_5' for turbo adapter kwargs")
+    from swift import __version__
+
+    if __version__ == "4.4.2" and "qwen3_8" not in TEMPLATE_MAPPING:
+        from .swift_qwen3_8 import register_qwen3_8
+
+        register_qwen3_8()
 
 
 __all__ = ["register"]

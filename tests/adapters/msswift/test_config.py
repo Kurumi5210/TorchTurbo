@@ -182,6 +182,38 @@ def test_native_dpo_args_build_config(tmp_path, padding_free):
     assert config.moe.aux_loss_coeff == pytest.approx(0.02)
 
 
+def test_dpo_alignment_args_keep_engine_owned_settings(tmp_path):
+    pytest.importorskip("swift", minversion="4.0")
+    from torchturbo.adapters.msswift.args import TurboRLHFArguments
+
+    model_dir = _save_tiny_llama(tmp_path)
+    args = TurboRLHFArguments(
+        model=str(model_dir), model_type="llama", template="llama", dataset=["training-data"],
+        rlhf_type="dpo", dpo_megatron_data=True, dpo_data_trace_dir=str(tmp_path / "trace"),
+        packing=True, num_train_epochs=1, attn_impl="flash_attn",
+        output_dir=str(tmp_path / "output"), add_version=False, tuner_type="full",
+        report_to=[], use_cpu=True, check_model=False,
+    )
+    assert args.dpo_megatron_data is True
+    assert args.gradient_checkpointing is False
+    assert args.sequence_parallel_size == 1
+    assert not args.fsdp and args.deepspeed is None
+
+
+@pytest.mark.parametrize("overrides", [
+    {"dpo_data_trace_dir": "trace", "dpo_megatron_data": False},
+    {"num_train_epochs": 2}, {"packing": False}, {"streaming": True}, {"group_by_length": True},
+])
+def test_dpo_alignment_rejects_incompatible_modes(overrides):
+    pytest.importorskip("swift", minversion="4.0")
+    from torchturbo.adapters.msswift.args import TurboRLHFArguments
+
+    fields = dict(rlhf_type="dpo", dpo_megatron_data=True, packing=True, num_train_epochs=1)
+    fields.update(overrides)
+    with pytest.raises(ValueError, match="(alignment|requires)"):
+        TurboRLHFArguments(**fields)
+
+
 @pytest.mark.parametrize("turbo_coefficient", [0.0, 0.03])
 def test_dpo_router_aux_loss_uses_engine_config(turbo_coefficient):
     _set_tt(moe_aux_loss_coeff=turbo_coefficient)

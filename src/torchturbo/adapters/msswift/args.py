@@ -5,8 +5,9 @@ The turbo ``--tt_*`` CLI surface lives on the shared
 (``scripts/runs/run_swift.py``) strips ``--tt_*`` from ``sys.argv`` and stashes
 a parsed ``TorchTurboArgs`` via :func:`set_torchturbo_args` before swift's
 parser runs. The swift argument classes below therefore declare NO ``tt_*``
-fields: swift's dataclass parser sees only swift-native args, and the turbo
-config builder reads ``--tt_*`` back through :func:`get_torchturbo_args`.
+fields: swift's dataclass parser sees Swift args and adapter-local DPO debug
+fields. The turbo config builder reads ``--tt_*`` back through
+:func:`get_torchturbo_args`.
 Adding a new ``--tt_*`` flag touches only ``engine/args.py`` + the shared
 ``engine/config.py`` (``build_from_args``) — ms-swift and llamafactory pick
 it up together.
@@ -15,7 +16,7 @@ it up together.
 swift/HF settings the turbo engine takes ownership of (activation
 checkpointing, sequence parallelism, FSDP / DeepSpeed sharding), so the two
 never compete. It is reused by every stage's arguments class (SFT, PT and
-DPO), so each stage only declares the swift-native fields specific to it.
+DPO). The DPO class also declares opt-in data alignment and tracing fields.
 
 These classes are **module-level** on purpose (not built inside a factory
 closure): swift's multiprocess dataset pipelines (``dataset.map`` with
@@ -88,3 +89,16 @@ class TurboPretrainArguments(TurboSwiftArgsMixin, PretrainArguments):  # type: i
 @dataclass
 class TurboRLHFArguments(TurboSwiftArgsMixin, RLHFArguments):  # type: ignore[misc]
     """Swift arguments for the TorchTurbo DPO stage."""
+
+    dpo_megatron_data: bool = False
+    dpo_data_trace_dir: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.dpo_data_trace_dir and not self.dpo_megatron_data:
+            raise ValueError("dpo_data_trace_dir requires dpo_megatron_data=true.")
+        if self.dpo_megatron_data:
+            if self.rlhf_type != "dpo" or self.num_train_epochs != 1:
+                raise ValueError("Megatron DPO data alignment currently supports one epoch of DPO.")
+            if self.streaming or not self.packing or self.group_by_length:
+                raise ValueError("Megatron DPO alignment requires packing, no streaming, and no group_by_length.")
+        super().__post_init__()

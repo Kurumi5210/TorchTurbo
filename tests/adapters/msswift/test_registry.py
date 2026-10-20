@@ -343,7 +343,8 @@ def test_dpo_pipeline_structure():
     assert issubclass(TurboRLHFArguments, RLHFArguments)
     amro = TurboRLHFArguments.__mro__
     assert amro.index(TurboSwiftArgsMixin) < amro.index(RLHFArguments)
-    assert TurboRLHFArguments.__post_init__ is TurboSwiftArgsMixin.__post_init__
+    assert TurboRLHFArguments.__dataclass_fields__["dpo_megatron_data"].default is False
+    assert TurboRLHFArguments.__dataclass_fields__["dpo_data_trace_dir"].default is None
     turbo_dropout = TurboRLHFArguments.__dataclass_fields__.get("disable_dropout")
     native_dropout = RLHFArguments.__dataclass_fields__.get("disable_dropout")
     assert (turbo_dropout.default if turbo_dropout else None) == (

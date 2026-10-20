@@ -24,15 +24,16 @@ is scoped to `qwen3_8`; the global `qwen3_5` agent registration is unchanged.
 
 ## Launch on NPU
 
-Use the same policy and reference checkpoint as the GPU run: RL step 176,
-exported to Hugging Face format. Matching directory names or model config
+The launcher defaults to the RL checkpoint recorded in the NPU logs for
+both policy and reference, and to the uploaded dataset at
+`/mnt/sfs_turbo/cx02308786/business_user_flag_answer.json`. `MODEL`,
+`REF_MODEL` and `DATASET` can still override these defaults.
+The GPU run used RL step 176; matching directory names or model config
 does not establish matching weight shards. Set `HASH_MODEL_WEIGHTS=1` to
 include every safetensors shard in the launch manifest; this reads the full
 checkpoint once on node 0.
 
 ```bash
-MODEL=/path/to/rl-step-176/huggingface \
-DATASET=/path/to/business_user_flag_answer.json \
 OUTPUT_DIR=/path/to/new-npu-debug-run \
 NNODES=2 NPROC_PER_NODE=16 NODE_RANK=0 MASTER_ADDR=<master-host> \
 bash internal/scripts/runs/qwen3_8_dense/swift_text_dpo_debug.sh

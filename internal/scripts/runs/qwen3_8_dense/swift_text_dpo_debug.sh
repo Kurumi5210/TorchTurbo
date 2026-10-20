@@ -2,8 +2,8 @@
 # Qwen3.8 DPO data alignment with Swift 4.4.2 and effective Megatron DP=2.
 set -euo pipefail
 
-: "${MODEL:?Set MODEL to the HF policy checkpoint (the GPU run used RL step 176).}"
-: "${DATASET:?Set DATASET to business_user_flag_answer.json.}"
+MODEL=${MODEL:-/sfs_turbo/fanyaxin.fyx/rl_ckpt/GSPO-mxc-38-0904-xiaxiao-nothink-mtp-cp-gdpo-epoch-rmv20/huggingface}
+DATASET=${DATASET:-/mnt/sfs_turbo/cx02308786/business_user_flag_answer.json}
 : "${OUTPUT_DIR:?Set OUTPUT_DIR to a new run directory.}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

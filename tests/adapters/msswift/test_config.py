@@ -10,6 +10,7 @@ path, output_dir, tuner/rlhf type, LoRA) stay on the swift args namespace.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -198,6 +199,36 @@ def test_dpo_alignment_args_keep_engine_owned_settings(tmp_path):
     assert args.gradient_checkpointing is False
     assert args.sequence_parallel_size == 1
     assert not args.fsdp and args.deepspeed is None
+
+
+@pytest.mark.parametrize("alignment", [False, True])
+def test_dpo_alignment_retains_validation_split_without_enabling_eval(tmp_path, alignment):
+    pytest.importorskip("swift", minversion="4.0")
+    from torchturbo.adapters.msswift.args import TurboRLHFArguments
+
+    model_dir = _save_tiny_llama(tmp_path)
+    dataset = tmp_path / "preferences.json"
+    dataset.write_text(json.dumps([
+        {"messages": [{"role": "user", "content": f"query {i}"},
+                      {"role": "assistant", "content": "chosen"}],
+         "rejected_response": "rejected"}
+        for i in range(100)
+    ]))
+    args = TurboRLHFArguments(
+        model=str(model_dir), model_type="llama", template="llama", dataset=[str(dataset)],
+        rlhf_type="dpo", dpo_megatron_data=alignment, packing=True, num_train_epochs=1,
+        attn_impl="flash_attn", eval_strategy="no", split_dataset_ratio=0.01,
+        dataset_num_proc=1, load_from_cache_file=False, data_seed=42,
+        output_dir=str(tmp_path / "output"), add_version=False, tuner_type="full",
+        report_to=[], use_cpu=True, check_model=False,
+    )
+    assert args.split_dataset_ratio == (0.01 if alignment else 0.0)
+    assert args.training_args.eval_strategy == "no" and args.training_args.do_eval is False
+    _set_tt()
+    build_config_from_swift_args(args)
+    train, validation = args.load_dataset()
+    assert len(train) == (99 if alignment else 100)
+    assert (len(validation) if validation is not None else 0) == (1 if alignment else 0)
 
 
 @pytest.mark.parametrize("overrides", [

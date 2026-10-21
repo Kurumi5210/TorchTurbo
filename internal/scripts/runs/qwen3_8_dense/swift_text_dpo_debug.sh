@@ -4,7 +4,7 @@ set -euo pipefail
 
 MODEL=${MODEL:-/sfs_turbo/fanyaxin.fyx/rl_ckpt/GSPO-mxc-38-0904-xiaxiao-nothink-mtp-cp-gdpo-epoch-rmv20/huggingface}
 DATASET=${DATASET:-/mnt/sfs_turbo/cx02308786/business_user_flag_answer.json}
-: "${OUTPUT_DIR:?Set OUTPUT_DIR to a new run directory.}"
+OUTPUT_DIR=${OUTPUT_DIR:-/mnt/sfs_turbo/cx02308786/ckpt/qwen38-dpo-debug}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
@@ -12,12 +12,15 @@ PYTHON=${PYTHON:-python3}
 REF_MODEL=${REF_MODEL:-${MODEL}}
 TT_CONFIG=${TT_CONFIG:-${SCRIPT_DIR}/swift_text_dpo_debug.yaml}
 SP_SIZE=${SP_SIZE:-16}
-NNODES=${NNODES:-2}
-NPROC_PER_NODE=${NPROC_PER_NODE:-16}
-NODE_RANK=${NODE_RANK:-${RANK:-0}}
-MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-MASTER_PORT=${MASTER_PORT:-23566}
+# Read the pod launch environment, matching swift_text_dpo.sh.
+export NNODES=${NNODES:-2}
+export NPUS_PER_NODE=${NPUS_PER_NODE:-16}
+export NPROC_PER_NODE=${NPROC_PER_NODE:-${NPUS_PER_NODE}}
+export NODE_RANK=${NODE_RANK:-${RANK:-0}}
+export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+export MASTER_PORT=${MASTER_PORT:-23566}
 NUM_PROCESSES=$((NNODES * NPROC_PER_NODE))
+export WORLD_SIZE=${NUM_PROCESSES}
 if (( SP_SIZE < 1 || NUM_PROCESSES != 2 * SP_SIZE )); then
     echo "Exact DP batch comparison requires NNODES * NPROC_PER_NODE = 2 * SP_SIZE." >&2
     exit 1
@@ -25,7 +28,8 @@ fi
 
 GLOBAL_BATCH_SIZE=24
 MICRO_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=12
+# tt_gbs derives effective GA=12; the framework argument must stay at 1.
+GRADIENT_ACCUMULATION_STEPS=1
 MAX_STEPS=${MAX_STEPS:--1}
 DATA_TRACE_DIR=${DATA_TRACE_DIR:-${OUTPUT_DIR}/data-trace}
 SWIFT_SRC_DIR=${SWIFT_SRC_DIR:-}

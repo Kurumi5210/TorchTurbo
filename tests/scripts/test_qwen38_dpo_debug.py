@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,8 +44,18 @@ def test_debug_launcher_arguments_parse_without_unknown_flags(monkeypatch):
     assert args.max_length == args.packing_length == 128000
     assert args.split_dataset_ratio == 0.01 and args.load_from_cache_file is False
     assert args.dpo_megatron_data is True and args.num_train_epochs == 1
-    assert args.per_device_train_batch_size == 1 and args.gradient_accumulation_steps == 12
+    assert args.per_device_train_batch_size == 1 and args.gradient_accumulation_steps == 1
     assert turbo.gbs == 24 and turbo.sp_size == 16
+    from torchturbo.engine import core as engine_core
+
+    # Exercise the actual engine contract; matching CLI values alone is not enough.
+    engine = object.__new__(engine_core.TorchTurboEngine)
+    engine.config = SimpleNamespace(gbs=turbo.gbs, mfu=SimpleNamespace(enabled=False))
+    engine.get_sp_info = lambda: {"sp_size": turbo.sp_size}
+    monkeypatch.setattr(engine_core, "dist", SimpleNamespace(
+        is_initialized=lambda: True, get_world_size=lambda: 32,
+    ))
+    assert engine.resolve_gradient_accumulation_steps(args.gradient_accumulation_steps) == 12
     assert args.adam_beta2 == 0.95 and args.weight_decay == 0.1
     assert args.lr_scheduler_type == "cosine_with_min_lr"
     assert args.lr_scheduler_kwargs == '{"min_lr":1e-7}'

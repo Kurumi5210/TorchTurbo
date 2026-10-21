@@ -93,6 +93,15 @@ class TurboRLHFArguments(TurboSwiftArgsMixin, RLHFArguments):  # type: ignore[mi
     dpo_megatron_data: bool = False
     dpo_data_trace_dir: str | None = None
 
+    def _init_eval_strategy(self) -> None:
+        if self.dpo_megatron_data and self.eval_strategy == "no":
+            # Hold out the same samples as Megatron even without evaluation.
+            # Swift normally clears split_dataset_ratio in this branch.
+            self.eval_steps = None
+            self.evaluation_strategy = "no"
+            return
+        super()._init_eval_strategy()
+
     def __post_init__(self) -> None:
         if self.dpo_data_trace_dir and not self.dpo_megatron_data:
             raise ValueError("dpo_data_trace_dir requires dpo_megatron_data=true.")

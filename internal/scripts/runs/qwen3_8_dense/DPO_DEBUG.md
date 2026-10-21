@@ -28,6 +28,7 @@ The launcher defaults to the RL checkpoint recorded in the NPU logs for
 both policy and reference, and to the uploaded dataset at
 `/mnt/sfs_turbo/cx02308786/business_user_flag_answer.json`. `MODEL`,
 `REF_MODEL` and `DATASET` can still override these defaults.
+`OUTPUT_DIR` defaults to `/mnt/sfs_turbo/cx02308786/ckpt/qwen38-dpo-debug`.
 The GPU run used RL step 176; matching directory names or model config
 does not establish matching weight shards. Set `HASH_MODEL_WEIGHTS=1` to
 include every safetensors shard in the launch manifest; this reads the full
@@ -41,7 +42,12 @@ bash internal/scripts/runs/qwen3_8_dense/swift_text_dpo_debug.sh
 
 Run the same command on the other node with `NODE_RANK=1`. The default is
 32 NPUs, SP16, effective DP2, micro batch 1, GA12, global batch 24. The
-launcher rejects a topology with a different DP size. `DRY_RUN=1` prints
+launcher reads `NODE_RANK` or the platform's `RANK`, along with `NNODES`,
+`NPUS_PER_NODE`/`NPROC_PER_NODE`, `MASTER_ADDR` and `MASTER_PORT`.
+Pass framework `gradient_accumulation_steps=1` together with `tt_gbs=24`;
+the engine derives the actual GA12. Passing both `tt_gbs=24` and an explicit
+framework GA12 fails the engine's mutual-exclusion check.
+The launcher rejects a topology with a different DP size. `DRY_RUN=1` prints
 the command without loading the runtime. `SWIFT_SRC_DIR`, if set, must
 resolve to Swift 4.4.2. Use the existing model dependency installer.
 The engine exports the final weights as Hugging Face safetensors under the
@@ -51,11 +57,18 @@ is not accepted by this Swift 4.4.2 launcher.
 The downloaded dataset has SHA256
 `d9910f21d7695d28f4310ef11baae0682f8fbdcdf14e90f9cef463c2b25d87e0`.
 With the GPU tokenizer and preprocessing, the earlier log showed 1203 raw
-pairs, 1171 training pairs after the 1% split and length filtering, 983 packs,
+pairs, 1171 training pairs after the 1% split and filtering, 983 packs,
 and 40 optimizer steps. These are comparison targets, not hard-coded
 filter counts. The packing limit is 128000, not 131072. Swift packs by
 chosen-length + rejected-length, but filters each sequence by max_length;
 an individual pair can exceed the packing limit.
+
+The dataset has 20 rows where a tool response is followed directly by a
+user message, with no intervening assistant response. Native GPU Swift
+and the backport both reject them with `response_role: "user"`. Filtering
+these rows is expected; do not repair or pre-delete them on only one side.
+The debug argument override preserves the 1% held-out split when
+`eval_strategy=no`; native Swift 4.4.2 would otherwise silently reset it to 0.
 
 The sampler matches Megatron's `data_sharding=false` permutation and DP
 striding. Its seed is **epoch 0**, while dataset split/shuffle use seed 42.
@@ -141,7 +154,8 @@ bash -n internal/scripts/runs/qwen3_8_dense/swift_text_dpo_debug.sh
 
 These checks include the actual Swift argument parser, scoped template
 behavior, resume/step trace validation, and trainer/plugin integration.
-Local result: 164 tests passed; the shell syntax check also passed.
+The regression checks also exercise real argument initialization, dataset
+splitting with evaluation disabled, and the engine's GBS/GA contract.
 The GPU private checkout hash and policy/reference weight hashes remain
 unverified. Distributed GPU/NPU execution and business score recovery still
 require a hardware run and the same evaluation set.

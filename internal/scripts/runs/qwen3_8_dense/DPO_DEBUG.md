@@ -10,7 +10,8 @@ unchanged outside the opt-in `qwen3_8` template and `--dpo_megatron_data true`.
 The original patch was based on TorchTurbo `qwen38-swift-dpo-rc1`, commit
 `c9c1ad2cf9b0ad2f59fbbc566c390c13775fc4cf`. The template/data adaptation is
 `6fa824b6`; the batch/split initialization fix is `91bc5c97`.
-The handoff branch is `feat/qwen38-dpo-data-alignment`.
+The reusable handoff branch is `feat/qwen38-dpo-data-alignment`.
+This fixed experiment branch is `feat/qwen38-dpo-global176-experiment`.
 
 ## Verified scope as of 2026-10-29
 
@@ -60,26 +61,30 @@ is scoped to `qwen3_8`; the global `qwen3_5` agent registration is unchanged.
 
 ## Launch on NPU
 
-For a new run, use `run_npu_alignment.sh`. It requires explicit `MODEL`,
-`DATASET`, `OUTPUT_DIR`, `MASTER_ADDR` and `NODE_RANK`, defaults the reference
-to the policy checkpoint, and enables complete weight-shard hashing on
-node 0. It delegates to the existing debug launcher, including
-`--tt_enable_mtp false`.
+Run this experiment with the repository-root `launch_experiment.sh`. It fixes the
+policy and reference to the transferred 18-shard `global_step_176`, the
+business DPO dataset, and the output directory. These paths, NNODES=2,
+NPROC_PER_NODE=16, SP_SIZE=16 and HASH_MODEL_WEIGHTS=1 are defined in the
+entry and do not depend on external parameter assignments. Change the
+entry's output directory before starting a separate repeat.
+
+The platform must provide `MASTER_ADDR` and either `NODE_RANK` or `RANK`
+as the node index (0 or 1). The script delegates to the existing debug
+launcher: BF16, MTP disabled, GBS24 and actual-consumption data traces.
 
 ```bash
-MODEL=/path/to/policy-checkpoint DATASET=/path/to/dpo.json \
-OUTPUT_DIR=/path/to/new-npu-run MASTER_ADDR=<master-host> NODE_RANK=0 \
-DRY_RUN=1 bash internal/scripts/runs/qwen3_8_dense/run_npu_alignment.sh
+bash launch_experiment.sh
 ```
 
-Use the same values on the other node with `NODE_RANK=1`. Remove
-`DRY_RUN=1` to launch training. Both nodes default to 16 processes, SP16,
-and effective DP2. Swift 4.4.2 and binpacking 1.5.2 are required.
+Use the same command on both nodes. For a command-only check, use
+`DRY_RUN=1 bash launch_experiment.sh`. Both nodes use 16 processes,
+SP16 and effective DP2. Swift 4.4.2 and binpacking 1.5.2 are required.
 
-The launcher defaults to the RL checkpoint recorded in the NPU logs for
+The underlying historical debug launcher defaults to the RL checkpoint recorded in the NPU logs for
 both policy and reference, and to the uploaded dataset at
 `/mnt/sfs_turbo/cx02308786/business_user_flag_answer.json`. `MODEL`,
-`REF_MODEL` and `DATASET` can still override these defaults.
+`REF_MODEL` and `DATASET` can override those defaults when invoking that
+historical launcher directly. The experiment entry above sets its own paths.
 `OUTPUT_DIR` defaults to `/mnt/sfs_turbo/cx02308786/ckpt/qwen38-dpo-debug`.
 The GPU run used RL step 176; matching directory names or model config
 does not establish matching weight shards. Set `HASH_MODEL_WEIGHTS=1` to

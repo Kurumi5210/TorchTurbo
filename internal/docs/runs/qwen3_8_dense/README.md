@@ -1,5 +1,9 @@
 # Qwen3.8 Dense 27B
 
+本实验分支可直接运行仓库根目录的
+[`launch_experiment.sh`](../../../../launch_experiment.sh)，具体配置和 NAS
+启动命令见 [EXPERIMENT.md](../../../../EXPERIMENT.md)。
+
 需要复现 Qwen3.8 DPO 模板和逐步数据对齐时，使用
 [`run_npu_alignment.sh`](../../../scripts/runs/qwen3_8_dense/run_npu_alignment.sh)，
 并阅读 [DPO 对齐说明](../../../scripts/runs/qwen3_8_dense/DPO_DEBUG.md)。

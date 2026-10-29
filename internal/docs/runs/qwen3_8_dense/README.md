@@ -1,5 +1,12 @@
 # Qwen3.8 Dense 27B
 
+需要复现 Qwen3.8 DPO 模板和逐步数据对齐时，使用
+[`run_npu_alignment.sh`](../../../scripts/runs/qwen3_8_dense/run_npu_alignment.sh)，
+并阅读 [DPO 对齐说明](../../../scripts/runs/qwen3_8_dense/DPO_DEBUG.md)。
+该入口使用 Swift 4.4.2 的 `qwen3_8` backport、SP16/DP2 和实际消费 trace。
+历史 GPU v7 与 NPU 的全程输入仍有差异，不能仅凭相同 seed 或 sampler
+认定每一步相同；需要两端完整 trace 比较通过。本页下方保留的是原始 DPO 入口。
+
 ## 支持范围
 
 | 特性 | 配置 |

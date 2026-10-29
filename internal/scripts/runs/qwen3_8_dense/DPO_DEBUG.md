@@ -7,8 +7,44 @@ upstream match for the GPU log's source lines, not a confirmed hash of the
 private GPU checkout. TorchTurbo and the installed Swift version remain
 unchanged outside the opt-in `qwen3_8` template and `--dpo_megatron_data true`.
 
-The patch is based on TorchTurbo `qwen38-swift-dpo-rc1`, commit
-`c9c1ad2cf9b0ad2f59fbbc566c390c13775fc4cf`, on branch `qwen38-dpo-debug`.
+The original patch was based on TorchTurbo `qwen38-swift-dpo-rc1`, commit
+`c9c1ad2cf9b0ad2f59fbbc566c390c13775fc4cf`. The template/data adaptation is
+`6fa824b6`; the batch/split initialization fix is `91bc5c97`.
+The handoff branch is `feat/qwen38-dpo-data-alignment`.
+
+## Verified scope as of 2026-10-29
+
+This branch provides template/sampler alignment and a verifier for every
+consumed microbatch. Complete GPU/NPU input equivalence has **not** passed
+for the historical runs.
+
+- The original full CPU preprocessing replay matched all 1171 retained
+  training pairs, 12 validation pairs, and 983/11 train/validation packs.
+  The sampler replay matched all 40 update steps.
+- Actual NPU consumption matched that CPU reference for the first 5 steps:
+  120 microbatches, 145 pairs, and 290 logical sequences, including input,
+  unshifted label and text-position hashes. The original GPU runtime trace
+  was unavailable for this check. The temporary CPU replay cache is no
+  longer available; a new verification requires a new reference replay.
+- A later audit of real GPU v7 and NPU training traces found different pack
+  length compositions in 244 of 960 consumed packs, affecting all 40
+  updates. NPU consumed 1144 pairs and GPU consumed 1143. Equal lengths in
+  the remaining packs do not prove equal tokens.
+- The old 10-shard RL export and the newer 18-shard `global_step_176` export
+  are different: 17 of 18 selected shared tensors differed when their full
+  contents were compared. This is a selected-tensor check, not a
+  whole-model difference percentage. Directory names alone do not identify
+  the same initialization.
+
+The verifier detects mismatches; it does not repair pack membership or
+force two different preprocessing pipelines to consume identical data.
+To certify a new pair of runs, first match dataset, policy/reference
+weights, tokenizer files, template settings, split/filtering, all pack
+memberships and sampler settings. Capture actual consumption on both
+backends and run the full comparison below without `--steps`. For the
+40-step, DP2, GA12 setup, success must cover all 960 microbatches. A short
+prefix pass does not establish full-run alignment. Matching inputs also
+does not establish matching floating-point arithmetic or trained weights.
 
 The template preserves historical thinking, inserts empty thinking prefixes
 in historical assistant turns, and applies `last_round` after the last user
@@ -23,6 +59,22 @@ though sequence lengths and label hashes already matched. This override
 is scoped to `qwen3_8`; the global `qwen3_5` agent registration is unchanged.
 
 ## Launch on NPU
+
+For a new run, use `run_npu_alignment.sh`. It requires explicit `MODEL`,
+`DATASET`, `OUTPUT_DIR`, `MASTER_ADDR` and `NODE_RANK`, defaults the reference
+to the policy checkpoint, and enables complete weight-shard hashing on
+node 0. It delegates to the existing debug launcher, including
+`--tt_enable_mtp false`.
+
+```bash
+MODEL=/path/to/policy-checkpoint DATASET=/path/to/dpo.json \
+OUTPUT_DIR=/path/to/new-npu-run MASTER_ADDR=<master-host> NODE_RANK=0 \
+DRY_RUN=1 bash internal/scripts/runs/qwen3_8_dense/run_npu_alignment.sh
+```
+
+Use the same values on the other node with `NODE_RANK=1`. Remove
+`DRY_RUN=1` to launch training. Both nodes default to 16 processes, SP16,
+and effective DP2. Swift 4.4.2 and binpacking 1.5.2 are required.
 
 The launcher defaults to the RL checkpoint recorded in the NPU logs for
 both policy and reference, and to the uploaded dataset at
@@ -156,9 +208,10 @@ These checks include the actual Swift argument parser, scoped template
 behavior, resume/step trace validation, and trainer/plugin integration.
 The regression checks also exercise real argument initialization, dataset
 splitting with evaluation disabled, and the engine's GBS/GA contract.
-The GPU private checkout hash and policy/reference weight hashes remain
-unverified. Distributed GPU/NPU execution and business score recovery still
-require a hardware run and the same evaluation set.
+The original private GPU checkout hash remains unverified. The later
+weight comparison and runtime data audit are summarized in the verified
+scope above. Distributed numerical equivalence and business score recovery
+still require matched hardware runs and the same evaluation set.
 
 ## Parameter mapping and remaining differences
 

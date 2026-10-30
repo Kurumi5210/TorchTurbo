@@ -128,6 +128,24 @@ class TurboSwiftRLHF(TurboEnginePipelineMixin, SwiftRLHF):  # type: ignore[misc]
     args_class = TurboRLHFArguments
     turbo_stage = "dpo"
 
+    def _prepare_dataset(self):
+        datasets = super()._prepare_dataset()
+        if self.args.dpo_data_trace_dir:
+            from swift.utils import is_master
+
+            from .dpo_alignment import save_dataset_manifest
+
+            if is_master():
+                save_dataset_manifest(self.args.dpo_data_trace_dir, *datasets)
+        return datasets
+
+    def _get_trainer_kwargs(self):
+        return {
+            **super()._get_trainer_kwargs(),
+            "dpo_megatron_data": self.args.dpo_megatron_data,
+            "dpo_data_trace_dir": self.args.dpo_data_trace_dir,
+        }
+
     def _prepare_single_model(self, key, origin_key, model_type, model_revision):
         if (origin_key or key) != "ref":
             return super()._prepare_single_model(key, origin_key, model_type, model_revision)

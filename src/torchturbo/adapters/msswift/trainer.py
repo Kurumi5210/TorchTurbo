@@ -34,6 +34,7 @@ import torch.nn.functional as F
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.data import DataLoader
 
 from ...engine import CPUOffloadMode
 from ...engine.distributed import assert_finite
@@ -439,6 +440,9 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
     """
 
     def __init__(self, model=None, ref_model=None, *_args, **kwargs):
+        self._dpo_megatron_data = kwargs.pop("dpo_megatron_data", False)
+        self._dpo_data_trace_dir = kwargs.pop("dpo_data_trace_dir", None)
+        self._dpo_trace_writer = None
         super().__init__(model, ref_model=None, *_args, **kwargs)
         # The engine's routers attach the auxiliary gradients and report their
         # metrics. Swift must not also read or add the model's HF aux_loss.
@@ -452,16 +456,68 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
 
     def _prepare_inputs(self, inputs):
         """Use Swift's preference-input preparation, not the SFT override."""
-        return super(TurboTrainerMixin, self)._prepare_inputs(inputs)
+        from .dpo_alignment import TRACE_KEY
 
-    def get_train_dataloader(self, *args, **kwargs):
-        """Use Swift's preference sampler at sp=1 and Turbo's sampler for SP."""
+        trace = inputs.pop(TRACE_KEY, None)
+        inputs = super(TurboTrainerMixin, self)._prepare_inputs(inputs)
+        if trace is not None:
+            inputs[TRACE_KEY] = trace
+        return inputs
+
+    def get_train_dataloader(self, skip_batches: int = 0) -> DataLoader:
+        """Use the opt-in Megatron sampler or the existing Swift/SP sampler."""
         engine = engine_registry.get_engine_or_none()
+        if self._dpo_megatron_data:
+            from ...engine.core import EpochDrivenDataLoader
+            from .dpo_alignment import DPOTraceCollator, IndexedDPODataset, MegatronDPOSampler
+
+            dp_info = engine.get_dp_info()
+            sampler = MegatronDPOSampler(
+                len(self.train_dataset),
+                dp_rank=dp_info["dp_rank"],
+                dp_size=dp_info["dp_size"],
+                micro_batch_size=self._train_batch_size,
+                gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+                shuffle=self.args.train_dataloader_shuffle,
+                skip_batches=skip_batches,
+            )
+            dataset, collator = self.train_dataset, self.data_collator
+            if self._dpo_data_trace_dir and engine.get_sp_info()["sp_rank"] == 0:
+                dataset = IndexedDPODataset(dataset)
+                collator = DPOTraceCollator(collator)
+            logger.info_rank0(
+                "Megatron DPO sampler: packs=%d, dp=%d, micro_batch=%d, ga=%d, steps=%d, "
+                "sampler_seed=epoch, data_sharding=false, dropped_packs=%d",
+                len(dataset), dp_info["dp_size"], self._train_batch_size,
+                self.args.gradient_accumulation_steps, sampler.num_steps,
+                len(dataset) - sampler.num_steps * sampler.global_batch_size,
+            )
+            return EpochDrivenDataLoader(
+                dataset, batch_size=self._train_batch_size, sampler=sampler,
+                collate_fn=collator, num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory, drop_last=True,
+                persistent_workers=self.args.dataloader_persistent_workers if self.args.dataloader_num_workers else False,
+                prefetch_factor=self.args.dataloader_prefetch_factor if self.args.dataloader_num_workers else None,
+            )
         if engine is None or engine.get_sp_info().get("sp_size", 1) <= 1:
-            return super(TurboTrainerMixin, self).get_train_dataloader(*args, **kwargs)
-        return super().get_train_dataloader(*args, **kwargs)
+            return super(TurboTrainerMixin, self).get_train_dataloader(skip_batches=skip_batches)
+        return super().get_train_dataloader(skip_batches=skip_batches)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        from .dpo_alignment import DPOTraceWriter, TRACE_KEY
+
+        trace = inputs.pop(TRACE_KEY, None)
+        if trace is not None:
+            if self._dpo_trace_writer is None:
+                dp_info = engine_registry.get_engine().get_dp_info()
+                self._dpo_trace_writer = DPOTraceWriter(
+                    self._dpo_data_trace_dir,
+                    dp_rank=dp_info["dp_rank"], dp_size=dp_info["dp_size"],
+                    gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+                    micro_batch_size=self._train_batch_size,
+                    start_step=self.state.global_step, max_steps=self.state.max_steps,
+                )
+            self._dpo_trace_writer.write(self.state.global_step, trace)
         # Resolve directly to Swift's DPO loss implementation.
         return super(TurboTrainerMixin, self).compute_loss(
             model,

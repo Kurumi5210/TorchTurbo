@@ -1,0 +1,9 @@
+engine_config:
+  parallel_plan:
+    sp_size: 16
+    ep_size: 1
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: true
+  loss_chunk:
+    enabled: true

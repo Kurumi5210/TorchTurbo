@@ -11,7 +11,7 @@ The original patch was based on TorchTurbo `qwen38-swift-dpo-rc1`, commit
 `c9c1ad2cf9b0ad2f59fbbc566c390c13775fc4cf`. The template/data adaptation is
 `6fa824b6`; the batch/split initialization fix is `91bc5c97`.
 The reusable handoff branch is `feat/qwen38-dpo-data-alignment`.
-This fixed experiment branch is `feat/qwen38-dpo-global176-experiment`.
+This fixed experiment branch is `Qwen38-swift-template`.
 
 ## Verified scope as of 2026-10-29
 

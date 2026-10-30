@@ -1,6 +1,6 @@
 # Qwen3.8 global_step_176 DPO 实验
 
-实验分支：`feat/qwen38-dpo-global176-experiment`。
+实验分支：`Qwen38-swift-template`。
 基于已整理的 Qwen3.8 模板与数据适配提交 `be5e24dd`。
 
 2026-10-29 的实际训练已完成 40/40 步，运行版本为 `0569b218`。

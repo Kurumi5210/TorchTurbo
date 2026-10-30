@@ -1,5 +1,11 @@
 # TorchTurbo
 
+This branch contains the Qwen3.8 global_step_176 NPU DPO experiment.
+Start with [EXPERIMENT.md](EXPERIMENT.md), use
+[launch_experiment.sh](launch_experiment.sh), and see
+[the completed NPU run record](NPU_RUN_20261029.md) for the verified revision,
+runtime versions, data trace coverage, and checkpoint location.
+
 A supernode-native post-training engine for rapidly adapting and training large language and vision models.
 
 ## Overview

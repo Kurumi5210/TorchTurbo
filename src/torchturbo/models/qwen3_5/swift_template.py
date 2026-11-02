@@ -54,8 +54,23 @@ def _make_kwarg_preserving_template_cls(base_template_cls: type) -> type:
 
 
 def register() -> None:
-    """Wrap registered Qwen templates without changing their encoding metadata."""
+    """Register missing Qwen3.8 support and preserve Turbo inputs for Qwen templates."""
     from swift.template.register import TEMPLATE_MAPPING, register_template
+
+    if "qwen3_8" not in TEMPLATE_MAPPING:
+        from .swift_qwen3_8 import Qwen3_8Template, Qwen3_8TemplateMeta
+
+        register_template(
+            Qwen3_8TemplateMeta(
+                "qwen3_8",
+                template_cls=Qwen3_8Template,
+                default_system=None,
+                thinking_prefix="<think>\n",
+                non_thinking_prefix="<think>\n\n</think>\n\n",
+                agent_template="qwen3_5",
+                is_thinking=True,
+            )
+        )
 
     for template_type in ("qwen3_5", "qwen3_8"):
         native = TEMPLATE_MAPPING.get(template_type)

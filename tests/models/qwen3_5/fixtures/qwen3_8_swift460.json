@@ -1,0 +1,1309 @@
+{
+  "source": "ms-swift==4.6.0, swift.template.templates.qwen.Qwen3_8Template.encode",
+  "tokenizer": "Lossless ByteLevel processor fixture in test_swift_template.py",
+  "encoding": "Full decoded input text and half-open supervised token ranges; remaining labels are -100. Native token round-trip and label identity were checked during generation.",
+  "cases": [
+    {
+      "name": "sft_plain_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": " question "
+          },
+          {
+            "role": "assistant",
+            "content": " answer "
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          33,
+          41
+        ]
+      ]
+    },
+    {
+      "name": "sft_thinking_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " system text "
+          },
+          {
+            "role": "user",
+            "content": "question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think> reasoning </think>answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nsystem text<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          48,
+          71
+        ]
+      ]
+    },
+    {
+      "name": "sft_history_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          33,
+          66
+        ],
+        [
+          106,
+          121
+        ]
+      ]
+    },
+    {
+      "name": "sft_history_plain_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          39,
+          53
+        ],
+        [
+          93,
+          108
+        ]
+      ]
+    },
+    {
+      "name": "sft_tool_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "lookup"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>check the source</think>"
+          },
+          {
+            "role": "tool_call",
+            "content": "{\"name\": \"lookup\", \"arguments\": {\"key\": \"value\"}}"
+          },
+          {
+            "role": "tool",
+            "content": " observation "
+          },
+          {
+            "role": "assistant",
+            "content": "final answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nlookup<|im_end|>\n<|im_start|>assistant\n<think>\ncheck the source\n</think>\n\n<tool_call>\n<function=lookup>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nobservation\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfinal answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          25,
+          138
+        ],
+        [
+          207,
+          221
+        ]
+      ]
+    },
+    {
+      "name": "last_round_history_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          106,
+          121
+        ]
+      ]
+    },
+    {
+      "name": "last_round_history_plain_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          93,
+          108
+        ]
+      ]
+    },
+    {
+      "name": "last_round_history_parts_non_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": " first "
+              },
+              {
+                "type": "text",
+                "text": "answer "
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          93,
+          108
+        ]
+      ]
+    },
+    {
+      "name": "inference_history_non_thinking",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_history_plain_non_thinking",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "sft_plain_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": " question "
+          },
+          {
+            "role": "assistant",
+            "content": " answer "
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          250,
+          258
+        ]
+      ]
+    },
+    {
+      "name": "sft_thinking_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " system text "
+          },
+          {
+            "role": "user",
+            "content": "question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think> reasoning </think>answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nsystem text<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          257,
+          280
+        ]
+      ]
+    },
+    {
+      "name": "sft_history_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          250,
+          283
+        ],
+        [
+          323,
+          338
+        ]
+      ]
+    },
+    {
+      "name": "sft_history_plain_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          256,
+          270
+        ],
+        [
+          310,
+          325
+        ]
+      ]
+    },
+    {
+      "name": "sft_tool_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "lookup"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>check the source</think>"
+          },
+          {
+            "role": "tool_call",
+            "content": "{\"name\": \"lookup\", \"arguments\": {\"key\": \"value\"}}"
+          },
+          {
+            "role": "tool",
+            "content": " observation "
+          },
+          {
+            "role": "assistant",
+            "content": "final answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nlookup<|im_end|>\n<|im_start|>assistant\n<think>\ncheck the source\n</think>\n\n<tool_call>\n<function=lookup>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nobservation\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfinal answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          242,
+          355
+        ],
+        [
+          424,
+          438
+        ]
+      ]
+    },
+    {
+      "name": "last_round_history_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "last_round+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          323,
+          338
+        ]
+      ]
+    },
+    {
+      "name": "last_round_history_plain_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "last_round+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          310,
+          325
+        ]
+      ]
+    },
+    {
+      "name": "last_round_history_parts_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "last_round+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": " first "
+              },
+              {
+                "type": "text",
+                "text": "answer "
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          310,
+          325
+        ]
+      ]
+    },
+    {
+      "name": "inference_history_thinking",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_history_plain_thinking",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "last_round_preserve_false",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": false
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          87,
+          102
+        ]
+      ]
+    },
+    {
+      "name": "last_round_sample_preserve_false",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": true
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ],
+        "chat_template_kwargs": {
+          "preserve_thinking": false
+        }
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          87,
+          102
+        ]
+      ]
+    },
+    {
+      "name": "last_round_preserve_true",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": true
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          106,
+          121
+        ]
+      ]
+    },
+    {
+      "name": "last_round_sample_preserve_true",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": false
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ],
+        "chat_template_kwargs": {
+          "preserve_thinking": true
+        }
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          106,
+          121
+        ]
+      ]
+    },
+    {
+      "name": "inference_preserve_false",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": false
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_sample_preserve_false",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": true
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ],
+        "chat_template_kwargs": {
+          "preserve_thinking": false
+        }
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_preserve_true",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": true
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_sample_preserve_true",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "last_round+ignore_empty_think",
+        "preserve_thinking": false
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ],
+        "chat_template_kwargs": {
+          "preserve_thinking": true
+        }
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "sft_effort_low_False",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " system text "
+          },
+          {
+            "role": "user",
+            "content": "question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think> reasoning </think>answer"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "low"
+        }
+      },
+      "text": "<|im_start|>system\nsystem text<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          48,
+          71
+        ]
+      ]
+    },
+    {
+      "name": "sft_effort_low_True",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " system text "
+          },
+          {
+            "role": "user",
+            "content": "question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think> reasoning </think>answer"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "low"
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nsystem text<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          186,
+          209
+        ]
+      ]
+    },
+    {
+      "name": "sft_effort_medium_True",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "system",
+            "content": " system text "
+          },
+          {
+            "role": "user",
+            "content": "question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think> reasoning </think>answer"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "medium"
+        }
+      },
+      "text": "<|im_start|>system\nsystem text<|im_end|>\n<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          48,
+          71
+        ]
+      ]
+    },
+    {
+      "name": "inference_global_effort_low",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ]
+      },
+      "chat_template_kwargs": {
+        "reasoning_effort": "low"
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_sample_effort_overrides_global",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ],
+        "chat_template_kwargs": {
+          "reasoning_effort": "medium"
+        }
+      },
+      "chat_template_kwargs": {
+        "reasoning_effort": "low"
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_sample_thinking_false",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": true,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "inference_sample_thinking_true",
+      "mode": "pt",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>old reasoning</think>first answer"
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        }
+      },
+      "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "supervised_token_ranges": null
+    },
+    {
+      "name": "sft_default_thinking",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": null,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": " question "
+          },
+          {
+            "role": "assistant",
+            "content": " answer "
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          33,
+          41
+        ]
+      ]
+    },
+    {
+      "name": "sft_no_empty_think_prefix",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think",
+        "add_non_thinking_prefix": false
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "first question"
+          },
+          {
+            "role": "assistant",
+            "content": " first answer "
+          },
+          {
+            "role": "user",
+            "content": "second question"
+          },
+          {
+            "role": "assistant",
+            "content": "second answer"
+          }
+        ]
+      },
+      "text": "<|im_start|>user\nfirst question<|im_end|>\n<|im_start|>assistant\nfirst answer<|im_end|>\n<|im_start|>user\nsecond question<|im_end|>\n<|im_start|>assistant\nsecond answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          33,
+          47
+        ],
+        [
+          81,
+          96
+        ]
+      ]
+    },
+    {
+      "name": "sft_tool_schema",
+      "mode": "train",
+      "template_kwargs": {
+        "enable_thinking": false,
+        "loss_scale": "default+ignore_empty_think"
+      },
+      "inputs": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "lookup"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>check the source</think>"
+          },
+          {
+            "role": "tool_call",
+            "content": "{\"name\": \"lookup\", \"arguments\": {\"key\": \"value\"}}"
+          },
+          {
+            "role": "tool",
+            "content": " observation "
+          },
+          {
+            "role": "assistant",
+            "content": "final answer"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "description": "Look up a value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "text": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"lookup\", \"description\": \"Look up a value.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"key\": {\"type\": \"string\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nlookup<|im_end|>\n<|im_start|>assistant\n<think>\ncheck the source\n</think>\n\n<tool_call>\n<function=lookup>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nobservation\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nfinal answer<|im_end|>\n",
+      "supervised_token_ranges": [
+        [
+          1087,
+          1200
+        ],
+        [
+          1269,
+          1283
+        ]
+      ]
+    }
+  ]
+}

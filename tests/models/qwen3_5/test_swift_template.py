@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,7 +23,8 @@ def native_templates(monkeypatch):
         ("qwen3_5", "Qwen3_5Template"),
         ("qwen3_8", "Qwen3_8Template"),
     ):
-        if name not in TEMPLATE_MAPPING:
+        if class_name not in vars(qwen):
+            monkeypatch.delitem(TEMPLATE_MAPPING, name, raising=False)
             continue
         native = deepcopy(TEMPLATE_MAPPING[name])
         native.template_cls = vars(qwen)[class_name]
@@ -97,14 +99,20 @@ def test_registration_preserves_native_metadata_and_is_idempotent(native_templat
         assert TEMPLATE_MAPPING[name] is wrapped
 
 
-def test_older_swift_keeps_qwen3_5_without_inventing_qwen3_8(native_templates, monkeypatch):
+def test_missing_qwen3_8_registers_backport(native_templates, monkeypatch):
+    from torchturbo.models.qwen3_5.swift_qwen3_8 import Qwen3_8Template
+
     monkeypatch.delitem(TEMPLATE_MAPPING, "qwen3_8", raising=False)
 
     register()
 
-    assert "qwen3_8" not in TEMPLATE_MAPPING
+    assert issubclass(TEMPLATE_MAPPING["qwen3_8"].template_cls, Qwen3_8Template)
+    assert TEMPLATE_MAPPING["qwen3_8"].preserve_thinking is True
     assert issubclass(TEMPLATE_MAPPING["qwen3_5"].template_cls, qwen.Qwen3_5Template)
     assert TEMPLATE_MAPPING["qwen3_5"].template_cls is not qwen.Qwen3_5Template
+    wrapped = TEMPLATE_MAPPING["qwen3_8"]
+    register()
+    assert TEMPLATE_MAPPING["qwen3_8"] is wrapped
 
 
 @pytest.mark.parametrize("replace_input_ids", [False, True], ids=["dropped", "replaced"])
@@ -189,8 +197,6 @@ def test_sft_encoding_and_labels_match_native(
 
 @pytest.mark.parametrize("enable_thinking,effort", [(False, "xhigh"), (True, "xhigh"), (True, "low"), (True, "medium")])
 def test_qwen3_8_retains_reasoning_policy(native_templates, processor, enable_thinking, effort):
-    if "qwen3_8" not in native_templates:
-        pytest.skip("Installed Swift does not provide qwen3_8.")
     register()
     metadata = TEMPLATE_MAPPING["qwen3_8"]
     template = metadata.template_cls(processor, metadata, enable_thinking=enable_thinking)
@@ -207,3 +213,42 @@ def test_qwen3_8_retains_reasoning_policy(native_templates, processor, enable_th
     assert (f"Reasoning effort is set to {effort}." in text) is (enable_thinking and effort != "medium")
     if not enable_thinking:
         assert text.endswith("<think>\n\n</think>\n\n")
+
+
+QWEN3_8_REFERENCE = json.loads(
+    (Path(__file__).parent / "fixtures" / "qwen3_8_swift460.json").read_text()
+)
+
+
+@pytest.mark.parametrize("case", QWEN3_8_REFERENCE["cases"], ids=lambda case: case["name"])
+def test_qwen3_8_encoding_matches_swift460(native_templates, processor, case):
+    """Compare every token and label with an independent native Swift reference."""
+    register()
+    metadata = TEMPLATE_MAPPING["qwen3_8"]
+    template = metadata.template_cls(processor, metadata, **case["template_kwargs"])
+    template.chat_template_kwargs.update(case.get("chat_template_kwargs", {}))
+    template.set_mode(case["mode"])
+
+    actual = template.encode(deepcopy(case["inputs"]))
+    expected_ids = processor.encode(case["text"], add_special_tokens=False)
+
+    assert actual["input_ids"] == expected_ids
+    if case["supervised_token_ranges"] is None:
+        assert actual.get("labels") is None
+    else:
+        expected_labels = [-100] * len(expected_ids)
+        for start, end in case["supervised_token_ranges"]:
+            expected_labels[start:end] = expected_ids[start:end]
+        assert actual["labels"] == expected_labels
+
+
+def test_qwen3_8_rejects_unknown_reasoning_effort(native_templates, processor):
+    register()
+    metadata = TEMPLATE_MAPPING["qwen3_8"]
+    template = metadata.template_cls(processor, metadata, enable_thinking=True)
+
+    with pytest.raises(ValueError, match="Unexpected reasoning effort unsupported"):
+        template.encode({
+            "messages": [{"role": "user", "content": "question"}],
+            "chat_template_kwargs": {"reasoning_effort": "unsupported"},
+        })

@@ -24,6 +24,11 @@ The adapter implements the full forward and backward chains, including GVA
 head reduction. It supports ``initial_state`` as a constant forward input,
 but does not implement initial-state or final-state gradients. Unsupported
 combinations are rejected before the first compute kernel is launched.
+
+The legacy and stable ``fwd_h`` APIs both default to ``[K, V]`` state layout,
+but name the flag ``transpose_state_layout`` and ``state_v_first`` respectively.
+Forward and backward recomputation use that common default. Intermediate ``h``
+stays in the installed library's layout for its downstream kernels.
 """
 
 from __future__ import annotations
@@ -560,7 +565,6 @@ def _forward_chain(
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens_list,
         chunk_indices=chunk_list,
-        state_v_first=False,
     )
     output_head = ascendc_chunk_fwd_o(
         q,
@@ -662,7 +666,6 @@ def _backward_chain(
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens_list,
             chunk_indices=chunk_list,
-            state_v_first=False,
         )
     else:
         assert saved_u is not None and saved_h is not None and saved_v_new is not None

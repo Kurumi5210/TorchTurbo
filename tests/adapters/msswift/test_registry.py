@@ -93,7 +93,11 @@ def test_native_registration_populates_swift_registries():
     assert qwen4_meta.candidate_templates == ["qwen3_5"]
     assert qwen4_meta.requires == SWIFT_MODEL_MAPPING[NATIVE_MODEL_TYPE].requires
     assert qwen4_meta.tags == SWIFT_MODEL_MAPPING[NATIVE_MODEL_TYPE].tags
-    assert qwen4_meta.task_type == "causal_lm"
+    native_qwen4_meta = SWIFT_MODEL_MAPPING.get("qwen4_exp")
+    expected_task_type = (
+        native_qwen4_meta.task_type if native_qwen4_meta is not None else "causal_lm"
+    )
+    assert qwen4_meta.task_type == expected_task_type
     assert qwen4_meta.is_multimodal is True
 
     # turbo trainer registered for causal_lm (and dpo if available).

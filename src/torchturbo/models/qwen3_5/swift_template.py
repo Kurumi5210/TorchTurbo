@@ -1,4 +1,4 @@
-"""ms-swift integration for the Qwen3.5 family: template wrap + input post-process.
+"""ms-swift integration for Qwen3.5 and Qwen3.8 templates.
 
 Swift's ``pre_forward_hook`` fuses vision into ``inputs_embeds`` and drops the
 original ``input_ids``. Turbo MTP needs those IDs to embed the shifted token.
@@ -29,16 +29,19 @@ def _post_process_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     return inputs
 
 
-def _make_kwarg_preserving_template_cls():
-    """Subclass of swift's ``Qwen3_5Template`` that re-injects adapter kwargs
-    Swift's ``pre_forward_hook`` drops, then merges the mRoPE rows."""
-    # Deferred import: swift is not importable at module import time.
-    from swift.template.templates.qwen import Qwen3_5Template
-
+def _make_kwarg_preserving_template_cls(base_template_cls: type) -> type:
+    """Preserve native template behavior while restoring Turbo model inputs."""
     preserve_keys = PRESERVE_KEYS
 
-    class Qwen3_5KwargPreserveTemplate(Qwen3_5Template):
-        def pre_forward_hook(self, model, args, kwargs):
+    class QwenKwargPreserveTemplate(base_template_cls):
+        __turbo_kwarg_preserve__ = True
+
+        def pre_forward_hook(
+            self,
+            model: torch.nn.Module,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+        ) -> tuple[tuple[Any, ...], dict[str, Any]]:
             saved = {k: kwargs.get(k) for k in preserve_keys if k in kwargs}
             args, kwargs = super().pre_forward_hook(model, args, kwargs)
             for key, value in saved.items():
@@ -47,29 +50,32 @@ def _make_kwarg_preserving_template_cls():
                 kwargs[key] = value
             return args, _post_process_inputs(kwargs)
 
-    Qwen3_5KwargPreserveTemplate.__turbo_kwarg_preserve__ = True
-    return Qwen3_5KwargPreserveTemplate
+    return QwenKwargPreserveTemplate
 
 
 def register() -> None:
-    """Wrap native ``qwen3_5`` so ``--template qwen3_5`` keeps MTP inputs."""
+    """Wrap registered Qwen templates without changing their encoding metadata."""
     from swift.template.register import TEMPLATE_MAPPING, register_template
 
-    native = TEMPLATE_MAPPING.get("qwen3_5")
-    if native is None:
+    for template_type in ("qwen3_5", "qwen3_8"):
+        native = TEMPLATE_MAPPING.get(template_type)
+        if native is None:
+            logger.debug_rank0(
+                "swift_template: native %r not registered; skipping turbo template",
+                template_type,
+            )
+            continue
+
+        # Idempotency: do not re-wrap a class we already wrapped.
+        if getattr(native.template_cls, "__turbo_kwarg_preserve__", False):
+            continue
+
+        wrapped = deepcopy(native)
+        wrapped.template_cls = _make_kwarg_preserving_template_cls(native.template_cls)
+        register_template(wrapped, exist_ok=True)
         logger.debug_rank0(
-            "swift_template: native 'qwen3_5' not registered; skipping turbo qwen3.5 template"
+            "Wrapped ms-swift template %r for turbo adapter kwargs", template_type
         )
-        return
-
-    # Idempotency: do not re-wrap a class we already wrapped.
-    if getattr(native.template_cls, "__turbo_kwarg_preserve__", False):
-        return
-
-    wrapped = deepcopy(native)
-    wrapped.template_cls = _make_kwarg_preserving_template_cls()
-    register_template(wrapped, exist_ok=True)
-    logger.debug_rank0("Wrapped ms-swift template 'qwen3_5' for turbo adapter kwargs")
 
 
 __all__ = ["register"]

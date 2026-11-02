@@ -1,0 +1,20 @@
+src/torchturbo/models/qwen3_5/swift_qwen3_8.py
+  h_71a678598a8a69 1-92
+src/torchturbo/models/qwen3_5/swift_template.py
+  h_71a678598a8a69 57,60-74
+tests/models/qwen3_5/fixtures/qwen3_8_swift460.json
+  h_71a678598a8a69 1-1309
+tests/models/qwen3_5/test_swift_template.py
+  h_71a678598a8a69 5,26-27,102-104,109-110,113-115,216-254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "929ca3de255279691dea81537967c6bf23d156a7",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

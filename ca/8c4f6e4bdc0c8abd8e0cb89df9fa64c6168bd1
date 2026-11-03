@@ -1,0 +1,18 @@
+EXPERIMENT.md
+  h_71a678598a8a69 3,25-27
+NPU_RUN_20261029.md
+  h_71a678598a8a69 4-5
+internal/scripts/runs/qwen3_8_dense/DPO_DEBUG.md
+  h_71a678598a8a69 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ca8c4f6e4bdc0c8abd8e0cb89df9fa64c6168bd1",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

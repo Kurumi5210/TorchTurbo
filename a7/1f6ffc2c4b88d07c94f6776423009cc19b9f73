@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a71f6ffc2c4b88d07c94f6776423009cc19b9f73",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+src/torchturbo/models/qwen3_5/swift_qwen3_8.py
+  h_71a678598a8a69 1,6-120,122-226
+  h_71a678598a8a69 2-5,121
+tests/adapters/msswift/test_qwen38_template.py
+  h_71a678598a8a69 1-104,106-108,110-114,127-186,189-192,194,196-203,208-216,218-219,233-251
+  h_71a678598a8a69 105,109,115-126,187-188,193,195,204-207,217,220-232
+src/torchturbo/models/qwen3_5/swift_template.py
+  h_71a678598a8a69 32-43,45,48-49,67-76,78
+  h_71a678598a8a69 56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c49e2bc7e3be59b7798b43126c5550a2a91171b5",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

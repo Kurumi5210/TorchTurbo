@@ -18,6 +18,7 @@ from .moe_utils import (
     MoEAuxLossAutoScaler,
     compute_routing_scores_for_aux_loss,
     mask_padding_tokens,
+    router_statistics_enabled,
     z_loss_func,
 )
 from .utils import RoutingResult, topk_softmax_with_capacity
@@ -109,7 +110,8 @@ class TopKRouter(Router):
         self,
         config: MoEConfig,
         layer_number: Optional[int] = None,
-        sp_group=None,
+        sp_group: dist.ProcessGroup | None = None,
+        routing_group: dist.ProcessGroup | None = None,
     ) -> None:
         """Initialize the zero token dropping router."""
         super().__init__(config=config)
@@ -119,6 +121,7 @@ class TopKRouter(Router):
         self.input_jitter = None
         self.layer_number = layer_number
         self.sp_group = sp_group
+        self.routing_group = routing_group
         self._metrics = None
         self.use_hash_routing = self._is_hash_routing_layer()
 
@@ -216,11 +219,13 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
     ) -> torch.Tensor:
         """Attach the scaled AUX loss and record its metrics."""
-        self._metrics = {
+        metrics = {
             **(self._metrics or {}),
             "aux_loss": (aux_loss / aux_loss_coeff).detach(),
             "aux_loss_scaled": aux_loss.detach(),
         }
+        if router_statistics_enabled():
+            self._metrics = metrics
         return MoEAuxLossAutoScaler.apply(activation, aux_loss)
 
     def apply_z_loss(
@@ -263,11 +268,13 @@ class TopKRouter(Router):
         global_token_denominator = torch.clamp(total_num_tokens, min=1)
         local_to_global_scale = sp_size * local_num_tokens / global_token_denominator
         z_loss = local_z_loss * local_to_global_scale
-        self._metrics = {
+        metrics = {
             **(self._metrics or {}),
             "z_loss": (z_loss / z_loss_coeff).detach(),
             "z_loss_scaled": z_loss.detach(),
         }
+        if router_statistics_enabled():
+            self._metrics = metrics
         return MoEAuxLossAutoScaler.apply(logits, z_loss)
 
     def pop_metrics(self) -> dict[str, torch.Tensor]:
@@ -312,6 +319,7 @@ class TopKRouter(Router):
                 use_hash_routing=self.use_hash_routing,
                 hash_table=getattr(self, "tid2eid", None),
                 input_ids=input_ids,
+                routing_group=self.routing_group,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
@@ -328,6 +336,7 @@ class TopKRouter(Router):
                 self.topk,
                 self.score_function,
                 padding_mask,
+                routing_group=self.routing_group,
             )
             routing = replace(
                 routing,
@@ -346,13 +355,14 @@ class TopKRouter(Router):
                     routing.routing_map, padding_mask
                 )
                 tokens_per_expert = bias_routing_map.sum(dim=0).to(torch.float32)
-                if not hasattr(self, "local_tokens_per_expert"):
-                    self.register_buffer(
-                        "local_tokens_per_expert",
-                        torch.zeros_like(tokens_per_expert),
-                        persistent=False,
-                    )
-                self.local_tokens_per_expert.add_(tokens_per_expert)
+                if router_statistics_enabled():
+                    if "local_tokens_per_expert" not in self._buffers:
+                        self.register_buffer(
+                            "local_tokens_per_expert",
+                            torch.zeros_like(tokens_per_expert),
+                            persistent=False,
+                        )
+                    self.local_tokens_per_expert.add_(tokens_per_expert)
 
         return routing
 

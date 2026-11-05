@@ -243,6 +243,7 @@ def test_vision_balance_registration_preserves_forward_and_backward(
     reference = copy.deepcopy(tower)
     if checkpoint_mode is not None:
         backend = FSDP2Backend.__new__(FSDP2Backend)
+        backend._parallel_context = None
         backend.logger = logging.getLogger(__name__)
         backend.config = EngineConfig(
             activation_checkpointing=ActivationCheckpointingConfig(
@@ -1208,7 +1209,7 @@ def test_on_parallelized_switches_text_but_leaves_vision_alone(
         Qwen3VLMoeVisionAttention,
     )
 
-    model = make_model()
+    model = make_model(hybrid=True)
     patched = []
     monkeypatch.setattr(wrapper, "patch_rms_norm", lambda *args: None)
     monkeypatch.setattr(
@@ -1227,7 +1228,8 @@ def test_on_parallelized_switches_text_but_leaves_vision_alone(
     model.config.vision_config._attn_implementation = attn_implementation
     model.on_parallelized({"sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}})
 
-    assert patched == [(wrapper.BailingMoeV3KimiDeltaAttention, None, 1, 0)]
+    assert patched == [(layer.attention, None, 1, 0) for layer in model.model.layers
+                       if isinstance(layer.attention, wrapper.BailingMoeV3KimiDeltaAttention)]
     # Only the text config switches to the registered SP interface; the
     # vision tower keeps resolving its own subconfig implementation.
     assert registered == [(model.config.text_config, 1)]

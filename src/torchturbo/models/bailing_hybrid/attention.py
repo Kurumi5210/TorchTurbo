@@ -5,8 +5,20 @@ from typing import Any
 import torch
 from torch import nn
 from torch.distributed import ProcessGroup
+from torch.distributed.tensor import DTensor, Partial, Replicate
 
 from torchturbo.runtime import get_device_runtime
+
+
+def local_mla_rotary_key(module: nn.Module, key: torch.Tensor) -> torch.Tensor:
+    """Complete the shared rotary-key gradient across local MLA head shards."""
+    weight = module.kv_b_proj.weight
+    if not isinstance(weight, DTensor):
+        return key
+    return DTensor.from_local(
+        key, weight.device_mesh, [Replicate()], run_check=False
+    ).to_local(grad_placements=[Partial()])
+
 
 def patch_rms_norm(norm_cls: type[nn.Module]) -> None:
     """Route the supplied RMSNorm class through the device operator dispatcher."""
@@ -21,7 +33,7 @@ def patch_rms_norm(norm_cls: type[nn.Module]) -> None:
 
 
 def patch_kda_forward(
-    attention_cls: type[nn.Module],
+    module: nn.Module | type[nn.Module],
     sp_group: ProcessGroup | None,
     sp_size: int,
     sp_rank: int,
@@ -53,6 +65,7 @@ def patch_kda_forward(
         qkv_events = [device_runtime.new_event() for _ in range(3)]
 
     def get_parameter_local_cp(weight: torch.Tensor, dim: int) -> torch.Tensor:
+        weight = weight.to_local() if isinstance(weight, DTensor) else weight
         if sp_size == 1:
             return weight
 
@@ -62,26 +75,6 @@ def patch_kda_forward(
             sp_rank * dim_size // sp_size, (sp_rank + 1) * dim_size // sp_size
         )
         return weight[tuple(slices)]
-
-    def norm_forward(
-        module: nn.Module,
-        x: torch.Tensor,
-        g: torch.Tensor,
-        residual: torch.Tensor | None = None,
-        prenorm: bool = False,
-        residual_in_fp32: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return rms_norm_gated(
-            x,
-            g,
-            module.weight,
-            None,
-            module.activation,
-            residual=residual,
-            eps=module.eps,
-            prenorm=prenorm,
-            residual_in_fp32=residual_in_fp32,
-        )
 
     def sp_forward(
         self: nn.Module,
@@ -195,6 +188,8 @@ def patch_kda_forward(
         v = v.unflatten(-1, (-1, self.head_dim))
         g = g.unflatten(-1, (-1, self.head_dim))
 
+        A_log_local = self.A_log.to_local() if isinstance(self.A_log, DTensor) else self.A_log
+        dt_bias_local = self.dt_bias.to_local() if isinstance(self.dt_bias, DTensor) else self.dt_bias
         if sp_size > 1:
             # Covers the gate/beta gathers trailing the QKV ones on the
             # shared stream.
@@ -202,13 +197,10 @@ def patch_kda_forward(
             heads_per_rank = self.num_heads // sp_size
             start_head = sp_rank * heads_per_rank
             end_head = start_head + heads_per_rank
-            A_log_local = self.A_log[start_head:end_head]
+            A_log_local = A_log_local[start_head:end_head]
             start_ch = start_head * self.head_dim
             end_ch = end_head * self.head_dim
-            dt_bias_local = self.dt_bias[start_ch:end_ch]
-        else:
-            A_log_local = self.A_log
-            dt_bias_local = self.dt_bias
+            dt_bias_local = dt_bias_local[start_ch:end_ch]
 
         o, _ = ops.kda(
             q=q,
@@ -245,9 +237,17 @@ def patch_kda_forward(
         g = g.unflatten(-1, (-1, self.head_dim))
         if sp_size > 1:
             get_device_runtime().current_stream().wait_stream(a2a_stream)
-        self.o_norm.forward = norm_forward.__get__(self.o_norm)
-        o = self.o_norm(o, g)
+        norm_weight = self.o_norm.weight
+        if isinstance(norm_weight, DTensor):
+            norm_weight = norm_weight.to_local(grad_placements=[Partial()])
+        o = rms_norm_gated(
+            o, g, norm_weight, None, self.o_norm.activation, eps=self.o_norm.eps
+        )
         o = self.o_proj(o.flatten(-2))
         return o, None, None
 
-    attention_cls.forward = sp_forward
+    # Class targets change the default forward; instance targets bind their own.
+    if isinstance(module, type):
+        module.forward = sp_forward
+    else:
+        module.forward = sp_forward.__get__(module, type(module))

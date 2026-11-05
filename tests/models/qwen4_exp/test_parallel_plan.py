@@ -50,6 +50,7 @@ def test_default_plan_recomputes_only_decoder_blocks(enabled):
     }
     assert targets == set(decoder_blocks)
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend.config = SimpleNamespace(
         activation_checkpointing=ActivationCheckpointingConfig(enabled=enabled)
     )

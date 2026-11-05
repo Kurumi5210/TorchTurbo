@@ -356,7 +356,10 @@ class TestEngineSetup:
                 assert context is parallel_context
                 assert flash_integration._flash_attention_forward is attention_forward
                 self.register_sp_attention_interface(context["sp"])
-                sp_binding.append(ALL_ATTENTION_FUNCTIONS.get(TURBO_ULYSSES_ATTENTION))
+                from torchturbo.models.modules.attention.ulysses.ulysses import (
+                    _module_attention_bindings,
+                )
+                sp_binding.append(_module_attention_bindings[self])
                 # The registry path must leave the shared FA helper alone.
                 assert flash_integration._flash_attention_forward is attention_forward
 
@@ -364,7 +367,10 @@ class TestEngineSetup:
                 order.append("on_materialized")
                 assert self.projection.weight.device.type == "cpu"
                 assert flash_integration._flash_attention_forward is attention_forward
-                assert ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION] is sp_binding[0]
+                from torchturbo.models.modules.attention.ulysses.ulysses import (
+                    _module_attention_bindings,
+                )
+                assert _module_attention_bindings[self] is sp_binding[0]
 
             def get_weight_converter(self, context, model_path):
                 order.append("weight_converter")
@@ -885,6 +891,7 @@ class TestEngineSetup:
         engine = object.__new__(TorchTurboEngine)
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_tp_info = lambda: {"tp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
 
         mb_item = {
@@ -908,11 +915,13 @@ class TestEngineSetup:
         assert calls[0][0] == (2, 1)
         assert engine.model.weight.grad is not None
         assert torch.isfinite(engine.model.weight.grad)
+        assert engine.model.weight.grad.item() == pytest.approx(2.5)
 
     def test_forward_backward_batch_forward_only_skips_backward(self):
         engine = object.__new__(TorchTurboEngine)
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_tp_info = lambda: {"tp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
 
         mb_item = {
@@ -1086,7 +1095,7 @@ class TestEngineSetup:
 # ---------------------------------------------------------------------------
 
 
-def _make_engine_for_ga(sp_size, world_size, gbs=None):
+def _make_engine_for_ga(sp_size, world_size, gbs=None, tp_size=1):
     """Build a bare TorchTurboEngine with mocked sp/dp info + config.gbs.
 
     Patches the engine module's ``dist`` reference so
@@ -1095,6 +1104,8 @@ def _make_engine_for_ga(sp_size, world_size, gbs=None):
     """
     engine = object.__new__(TorchTurboEngine)
     engine.get_sp_info = lambda: {"sp_size": sp_size}
+    engine.get_dp_info = lambda: {"dp_size": world_size // (sp_size * tp_size)}
+    engine.get_tp_info = lambda: {"tp_size": tp_size}
     engine.config = SimpleNamespace(
         gbs=gbs,
         mfu=SimpleNamespace(enabled=False),

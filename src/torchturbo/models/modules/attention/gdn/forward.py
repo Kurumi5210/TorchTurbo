@@ -8,6 +8,8 @@ from torch.distributed import ProcessGroup
 
 from torchturbo.runtime import get_device_runtime
 
+from .tensor_parallel import gated_norm, local_gdn_parameters
+
 
 def _slice_param(weight: torch.Tensor, sp_size: int, sp_rank: int) -> torch.Tensor:
     num_channels = weight.size(0)
@@ -36,6 +38,8 @@ def build_gdn_sp_forward(
 
     SP size one keeps the grouped Q/K/V projections and convolution parameters.
     With multiple ranks, convolution uses the interleaved all-to-all layout.
+    Under TP, head counts and widths are the module's TP-local metadata and
+    parameters are read through their TP-local views.
     The closure owns the stream for overlapping QKV exchange with gate
     projections. Gate projections share an exchange; the output gate stays local.
 
@@ -66,6 +70,7 @@ def build_gdn_sp_forward(
         # the full sequence on each rank.
         cu_seq_lens = kwargs.get("cu_seq_lens")
         B, local_T, _ = hidden_states.shape
+        conv_weight, A_log, dt_bias = local_gdn_parameters(self_attn)
 
         nk_full, nv_full = self_attn.num_k_heads, self_attn.num_v_heads
         dk, dv = self_attn.head_k_dim, self_attn.head_v_dim
@@ -116,9 +121,8 @@ def build_gdn_sp_forward(
         if sp_size > 1:
             # Depthwise convolution preserves the exchanged [Q, K, grouped-V]
             # order by reordering only the short filters, not the activation.
-            w = self_attn.conv1d.weight
             wq, wk, wv = torch.split(
-                w, [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim], dim=0
+                conv_weight, [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim], dim=0
             )
 
             K = self_attn.conv_kernel_size
@@ -166,7 +170,7 @@ def build_gdn_sp_forward(
                     nk,
                 )
         else:
-            local_conv_weight = self_attn.conv1d.weight
+            local_conv_weight = conv_weight
             local_conv_bias = self_attn.conv1d.bias
 
         local_qkv, _ = ops.causal_conv1d(
@@ -210,8 +214,8 @@ def build_gdn_sp_forward(
             b, a = packed_ba.unbind(dim=-1)
 
         beta = b.sigmoid()
-        A_log_local = _slice_param(self_attn.A_log, sp_size, sp_rank)
-        dt_bias_local = _slice_param(self_attn.dt_bias, sp_size, sp_rank)
+        A_log_local = _slice_param(A_log, sp_size, sp_rank)
+        dt_bias_local = _slice_param(dt_bias, sp_size, sp_rank)
         g = -A_log_local.float().exp() * F.softplus(a.float() + dt_bias_local)
 
         out, _ = ops.gated_delta_rule(
@@ -231,7 +235,7 @@ def build_gdn_sp_forward(
                 out, seq_dim=1, head_dim=2, sp_group=sp_group, sp_size=sp_size
             )
 
-        out = self_attn.norm(out.reshape(-1, dv), local_z.reshape(-1, dv))
+        out = gated_norm(self_attn, out.reshape(-1, dv), local_z.reshape(-1, dv))
         return self_attn.out_proj(out.reshape(B, local_T, -1))
 
     return sp_forward

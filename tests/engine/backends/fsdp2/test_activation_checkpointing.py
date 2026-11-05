@@ -15,6 +15,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend, FSDPModule, _FSDPUnit
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.engine.backends.fsdp2.prefetch import FSDPPrefetchManager
 from torchturbo.engine.config import EngineConfig
 from torchturbo.engine.peft.lora import GroupedMLPLoRA
@@ -86,6 +87,8 @@ def mixed_precision_backend(use_reentrant=False):
         fsdp_config=config.backend_config,
         reshard_after_forward=True,
         prefetch_manager=FSDPPrefetchManager(config.backend_config),
+        _parallel_context=None,
+        _parameter_ownership=ParameterOwnership(),
     )
 
 
@@ -203,7 +206,11 @@ def test_checkpointed_fsdp_clears_forward_root_across_accumulated_graphs(cpu_mes
     config = EngineConfig.from_dict({
         "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
     })
-    backend = SimpleNamespace(config=config, prefetch_manager=FSDPPrefetchManager(config.backend_config))
+    backend = SimpleNamespace(
+        config=config,
+        prefetch_manager=FSDPPrefetchManager(config.backend_config),
+        _parallel_context=None,
+    )
     FSDP2Backend._apply_activation_checkpointing(
         backend, candidate, SimpleNamespace(modules={"": FSDPPlanSpec(activation_checkpoint=True)}),
     )

@@ -47,7 +47,11 @@ def test_gdn_class_forward_covers_backbone_and_mtp(
     owner.patch_mtp_for_sp = lambda mtp_cls, sp_group, sp_size, sp_rank: None
 
     adapter_cls.on_parallelized(
-        owner, {"sp": {"sp_group": None, "sp_size": sp_size, "sp_rank": 0}}
+        owner,
+        {
+            "sp": {"sp_group": None, "sp_size": sp_size, "sp_rank": 0},
+            "tp": {"tp_size": 1},
+        },
     )
 
     assert gdn_cls.forward is not original_forward

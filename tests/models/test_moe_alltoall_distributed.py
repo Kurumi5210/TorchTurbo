@@ -64,6 +64,7 @@ def _check_moe(
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
+        _parallel_context=None,
     )
     backend.prefetch_manager = FSDPPrefetchManager(backend.config.backend_config)
     key = "" if boundary == "whole" else "experts"

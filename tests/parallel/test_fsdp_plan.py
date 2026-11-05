@@ -20,7 +20,7 @@ from torchturbo.parallel import (
     VisionBalanceMode,
     VisionBalanceSpec,
 )
-from torchturbo.engine.utils import match_fqn
+from torchturbo.utils.fqn import match_fqn
 
 
 def test_standalone_world_shard_spec_is_valid():

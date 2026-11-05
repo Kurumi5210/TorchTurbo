@@ -12,7 +12,9 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
+from .moe_utils import synchronize_routing_indices
 from torchturbo.runtime import get_device_runtime
 
 
@@ -156,8 +158,10 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
+    routing_group: dist.ProcessGroup | None = None,
 ) -> RoutingResult:
     """Select fixed-top-k experts and compute their routing probabilities.
+
     Args:
         logits (torch.Tensor): Logits tensor.
         topk (int): The number of experts to select for each token.
@@ -167,6 +171,7 @@ def topk_softmax_with_capacity(
         scaling_factor (float): Scaling factor of routing score in top-k selection.
         score_function (str): "softmax", "sigmoid", or "sqrtsoftplus".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        routing_group: Optional aligned group sharing lane zero's integer selections.
 
     Returns:
         RoutingResult: Dense weights and mask, plus selected expert IDs in
@@ -191,50 +196,42 @@ def topk_softmax_with_capacity(
             return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
-        if use_hash_routing:
-            assert (
-                hash_table is not None and input_ids is not None
-            ), "Hash routing requires hash_table and input_ids."
-            top_indices = hash_table[input_ids]
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            if use_hash_routing:
-                probs = torch.gather(scores, dim=1, index=top_indices)
-            elif expert_bias is not None:
+            selection_scores = scores
+            if expert_bias is not None:
                 # Some model adapters use bias only for softmax expert selection.
-                _, top_indices = compute_topk(scores + expert_bias.float(), topk, num_groups, group_topk)
-                probs = torch.gather(scores, dim=1, index=top_indices)
-            else:
-                probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+                selection_scores = scores + expert_bias.float()
         else:
-            if use_hash_routing:
-                top_scores = torch.gather(logits, dim=1, index=top_indices)
-            else:
-                top_scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(top_scores, dim=-1, dtype=torch.float32)
+            selection_scores = logits
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
             scores = torch.sigmoid(logits.float())
         else:
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
-
-        if use_hash_routing:
-            assert (
-                hash_table is not None and input_ids is not None
-            ), "Hash routing requires hash_table and input_ids."
-            top_indices = hash_table[input_ids]
-            scores = torch.gather(scores, dim=1, index=top_indices)
-        elif expert_bias is not None:
-            scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(
-                scores_for_routing, topk, num_groups, group_topk
-            )
-            scores = torch.gather(scores, dim=1, index=top_indices)
-        else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        selection_scores = scores
+        if expert_bias is not None:
+            selection_scores = scores + expert_bias.float()
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
+
+    if use_hash_routing:
+        assert hash_table is not None and input_ids is not None, (
+            "Hash routing requires hash_table and input_ids."
+        )
+        top_indices = hash_table[input_ids]
+    else:
+        _, top_indices = compute_topk(selection_scores, topk, num_groups, group_topk)
+    top_indices = synchronize_routing_indices(top_indices, routing_group)
+
+    # Only expert IDs are shared; each lane retains its own differentiable scores.
+    if score_function == "softmax" and not use_pre_softmax:
+        selected_logits = torch.gather(logits, dim=1, index=top_indices)
+        probs = torch.softmax(selected_logits, dim=-1, dtype=torch.float32)
+    else:
+        probs = torch.gather(scores, dim=1, index=top_indices)
+        if score_function != "softmax" and topk > 1:
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
 
     if scaling_factor:
         probs = probs * scaling_factor

@@ -207,6 +207,7 @@ def test_expert_only_checkpoint_preserves_routing_and_gradients(num_forwards, us
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
         prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        _parallel_context=None,
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, candidate, plan)

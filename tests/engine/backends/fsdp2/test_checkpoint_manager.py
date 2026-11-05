@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
@@ -19,6 +20,7 @@ from torchturbo.engine.backends.fsdp2.checkpoint.manager import FSDP2CheckpointM
 from torchturbo.engine.config import EngineConfig, MuonOptimizerConfig
 from torchturbo.engine.optimizers import MuonPlan, MuonRecipe, OptimizersContainer
 from torchturbo.engine.optimizers.lr_scheduler import create_lr_scheduler
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -72,9 +74,11 @@ def manager(export_plugin_consumer):
 
     checkpoint_manager = FSDP2CheckpointManager(
         rank=0,
-        mesh={"edp": object()},
-        world_mesh=None,
-        parallel_context=parallel_context,
+        parallel_context=SimpleNamespace(
+            get_ep_info=lambda: parallel_context["ep"], tp_size=1, etp_size=1,
+            expert_mesh={"edp": object()}, root_mesh=None,
+        ),
+        ownership=ParameterOwnership(),
         device_runtime=CpuRuntime(),
         cpu_offload=False,
         require_optimizer_not_suspended=lambda: None,
@@ -93,9 +97,10 @@ def recorder(monkeypatch):
     return recording_logger
 
 
-def _make_training_state():
+def _make_training_state(manager):
     """Return a model and a two-child optimizer with per-child state."""
     model = nn.Linear(2, 2)
+    manager._manager._dcp.ownership.register(model, set())
     model.config = ModelConfig()
     plan = MuonPlan(
         model,
@@ -149,7 +154,7 @@ def test_resume_matches_uninterrupted_training(manager, tmp_path, accelerated):
     from accelerate import Accelerator
 
     def build():
-        model, optimizer = _make_training_state()
+        model, optimizer = _make_training_state(manager)
         stepped_optimizer = optimizer
         if accelerated:
             stepped_optimizer = Accelerator(cpu=True).prepare_optimizer(
@@ -203,6 +208,7 @@ def test_optimizer_restore_rejects_ep_changes_before_mutation(
 ):
     manager._config.parallel_plan.ep_size = saved_ep_size
     model = ConvertibleModel()
+    manager._manager._dcp.ownership.register(model, set())
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
     model.layer(torch.ones(1, 2)).sum().backward()
     optimizer.step()
@@ -212,6 +218,7 @@ def test_optimizer_restore_rejects_ep_changes_before_mutation(
 
     manager._parallel_context["ep"]["ep_size"] = current_ep_size
     resumed = ConvertibleModel()
+    manager._manager._dcp.ownership.register(resumed, set())
     resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=0.07)
     with pytest.raises(
         ValueError, match=f"saved EP size {saved_ep_size}.*{current_ep_size}"
@@ -235,6 +242,7 @@ def test_optimizer_restore_keeps_unused_parameters_without_state(
         model = ConvertibleModel()
         model.unused = nn.Linear(2, 2)
         model.unused.requires_grad_(not frozen)
+        manager._manager._dcp.ownership.register(model, set())
         optimizer = torch.optim.AdamW(
             (parameter for parameter in model.parameters() if parameter.requires_grad),
             lr=0.02,
@@ -346,7 +354,7 @@ def test_load_model_rejects_checkpoints_without_complete_weights(manager, tmp_pa
 
 
 def test_missing_optimizer_state_is_not_resumable(manager, tmp_path):
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
     scheduler = _make_scheduler(optimizer)
 
     with pytest.raises(
@@ -365,7 +373,7 @@ def test_missing_optimizer_state_is_not_resumable(manager, tmp_path):
 def test_starting_a_dcp_save_discards_stale_training_state(
     manager, tmp_path, monkeypatch
 ):
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
     scheduler = _make_scheduler(optimizer)
     manager.save_model(
         model,
@@ -400,7 +408,7 @@ def test_starting_a_dcp_save_discards_stale_training_state(
 
 
 def test_model_only_dcp_loads_weights_but_cannot_resume_training(manager, tmp_path):
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
     manager.save_model(
         model,
         str(tmp_path),
@@ -419,7 +427,7 @@ def test_model_only_dcp_loads_weights_but_cannot_resume_training(manager, tmp_pa
 
 def test_interrupted_optimizer_save_is_rejected(manager, tmp_path):
     (tmp_path / fsdp_layout.OPTIMIZER_DCP_DIR).mkdir()
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
 
     with pytest.raises(RuntimeError, match="interrupted"):
         manager.load_optimizer_and_scheduler(model, optimizer, None, str(tmp_path))
@@ -428,7 +436,7 @@ def test_interrupted_optimizer_save_is_rejected(manager, tmp_path):
 def test_starting_optimizer_save_discards_a_stale_scheduler(
     manager, tmp_path, monkeypatch
 ):
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
     scheduler = _make_scheduler(optimizer)
     layout.save_scheduler(scheduler.state_dict(), str(tmp_path))
 
@@ -444,7 +452,7 @@ def test_starting_optimizer_save_discards_a_stale_scheduler(
 
 
 def test_missing_scheduler_state_is_rejected(manager, tmp_path):
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
     scheduler = _make_scheduler(optimizer)
     manager.save_model(
         model,
@@ -461,7 +469,7 @@ def test_missing_scheduler_state_is_rejected(manager, tmp_path):
 
 
 def test_save_without_scheduler_removes_stale_scheduler_state(manager, tmp_path):
-    model, optimizer = _make_training_state()
+    model, optimizer = _make_training_state(manager)
     scheduler = _make_scheduler(optimizer)
     manager.save_model(
         model,
@@ -505,6 +513,7 @@ def test_save_model_replaces_the_previous_save(
         lambda model, source_path, converter: RecordingSaver(),
     )
     model = ConvertibleModel()
+    manager._manager._dcp.ownership.register(model, set())
 
     manager.save_model(model, str(tmp_path), format=model_format, source_path="/source")
 
@@ -536,6 +545,7 @@ def test_export_rejects_source_overlap_before_removing_files(manager, tmp_path, 
 
 def test_model_only_save_removes_previous_native_and_optimizer_state(manager, tmp_path, monkeypatch):
     model = ConvertibleModel()
+    manager._manager._dcp.ownership.register(model, set())
     optimizer = torch.optim.AdamW(model.parameters())
     manager.save_model(model, str(tmp_path), source_path="/source")
     manager.save_optimizer_and_scheduler(model, optimizer, _make_scheduler(optimizer), str(tmp_path))
@@ -548,6 +558,7 @@ def test_model_only_save_removes_previous_native_and_optimizer_state(manager, tm
 
 def test_combined_save_keeps_just_written_native_state(manager, tmp_path, monkeypatch):
     model = ConvertibleModel()
+    manager._manager._dcp.ownership.register(model, set())
     monkeypatch.setattr(manager._manager, "save_hf", lambda *args, **kwargs: None)
     manager.save_model(model, str(tmp_path), source_path="/source", final=True)
     assert (tmp_path / fsdp_layout.MODEL_DCP_DIR / ".metadata").is_file()
@@ -575,6 +586,8 @@ def test_native_load_ignores_checkpoint_only_parameters(
     else:
         saved.checkpoint_only = nn.Linear(2, 2)
 
+    manager._manager._dcp.ownership.register(saved, set())
+    manager._manager._dcp.ownership.register(resumed, set())
     with torch.no_grad():
         for parameter in saved.parameters():
             parameter.fill_(0.5)
@@ -599,9 +612,11 @@ def test_native_load_keeps_new_training_settings_and_rejects_scaling_changes(
         base.config = PretrainedConfig()
         base.linear = nn.Linear(2, 2, bias=False)
         base.other = nn.Linear(2, 2, bias=False)
-        return get_peft_model(
+        model = get_peft_model(
             base, LoraConfig(r=2, target_modules=["linear", "other"], **settings)
         )
+        manager._manager._dcp.ownership.register(model, set())
+        return model
 
     trained = build(lora_alpha=32)
     with torch.no_grad():

@@ -6,6 +6,7 @@ import sys
 import weakref
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -49,6 +50,12 @@ def single_rank_group(tmp_path, monkeypatch):
     finally:
         NodeSharedCPUResidentParameter._node_group = None
         dist.destroy_process_group()
+
+
+def _checkpoint() -> DcpCheckpoint:
+    # Node-shared CPU tables are never owned by expert FSDP units.
+    ownership = SimpleNamespace(expert_fqns=lambda model: frozenset())
+    return DcpCheckpoint(ep_rank=0, ep_size=1, ownership=ownership)
 
 
 def _shared_model(root):
@@ -106,10 +113,9 @@ def _round_trip_worker(rank, world_size, root):
         timeout=timedelta(seconds=30),
     )
     try:
-        mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("edp",))
         model, expected = _shared_model(root)
         pointers = {name: model.get_parameter(name).data_ptr() for name in expected}
-        checkpoint = DcpCheckpoint(0, 1, mesh)
+        checkpoint = _checkpoint()
         native_write = FileSystemWriter.write_data
         writes = []
         write_source = [model.table.untyped_storage()]
@@ -326,7 +332,7 @@ def _zero_shards_worker(rank, root):
     )
     try:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("edp",))
-        checkpoint = DcpCheckpoint(0, 1, mesh)
+        checkpoint = _checkpoint()
         for case, sizes in enumerate(([2, 0, 5, 3], [0, 2, 0, 5, 3, 0], [], [0, 0])):
             expected = torch.arange(sum(sizes) * 2).reshape(-1, 2).float()
             model = nn.Module()
@@ -416,7 +422,7 @@ def test_node_shared_dcp_save_requires_current_mapping(
         model.table.materialize_()
         model.double()
     assert model.table.group is other.group
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     with pytest.raises(
         RuntimeError, match="Call materialize_ before shared shard I/O"
     ):
@@ -430,7 +436,7 @@ def test_node_shared_dcp_load_rejects_stale_shard_coverage(
     source.table = NodeSharedCPUResidentParameter(
         torch.ones(4, 2), requires_grad=False, directory=tmp_path
     ).materialize_()
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_model(source, str(tmp_path / "dcp"))
     parameter = NodeSharedCPUResidentParameter(
         torch.ones(2, 2), requires_grad=False, directory=tmp_path
@@ -467,7 +473,7 @@ def _native_layout_failure_worker(rank, root):
         model.table.load_((2, 2), lambda index, target: target.fill_(index + 1))
         expected = model.table.detach().clone()
         pointer = model.table.data_ptr()
-        checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+        checkpoint = _checkpoint()
         checkpoint.save_model(model, str(root / "dcp"))
         if rank % 2 == 0:
             model.table.zero_()
@@ -511,9 +517,8 @@ def _io_failure_worker(rank, root, operation):
         timeout=timedelta(seconds=30),
     )
     try:
-        mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("edp",))
         model, _ = _shared_model(root)
-        checkpoint = DcpCheckpoint(0, 1, mesh)
+        checkpoint = _checkpoint()
         native_write = FileSystemWriter.write_data
         native_read = FileSystemReader.read_data
         message = f"injected shard {operation} failure"
@@ -577,7 +582,7 @@ def test_node_shared_dcp_releases_replaced_storage_before_native_read(
         requires_grad=False,
         directory=tmp_path,
     ).materialize_()
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_model(source, str(tmp_path / "dcp"))
     model = nn.Module()
     model.first = NodeSharedCPUResidentParameter(
@@ -622,7 +627,7 @@ def test_node_shared_dcp_layout_changes_only_after_strict_model_load(
         torch.ones(10, 2), requires_grad=False, directory=tmp_path
     )
     source.table.load_((2, 0, 5, 3), lambda index, target: target.fill_(index))
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_model(source, str(tmp_path / "dcp"))
     model = nn.Module()
     model.table = NodeSharedCPUResidentParameter(
@@ -651,7 +656,7 @@ def test_node_shared_dcp_rejects_conflicting_tied_layouts(tmp_path, single_rank_
         )
         parameter.load_(sizes, lambda index, target: target.fill_(1))
         source.register_parameter(name, parameter)
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_model(source, str(tmp_path / "dcp"))
     model = nn.Module()
     model.table = NodeSharedCPUResidentParameter(
@@ -676,7 +681,7 @@ def test_node_shared_dcp_saves_state_dict_hook_values(tmp_path, single_rank_grou
         state_dict[key] = state_dict[key].bfloat16() * 2
 
     hook = model.register_state_dict_post_hook(export_hook)
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_model(model, str(tmp_path / "dcp"))
     restored = {"model": {"table": torch.empty(4, 2, dtype=torch.bfloat16)}}
     dcp.load(restored, checkpoint_id=tmp_path / "dcp")
@@ -701,7 +706,7 @@ def test_node_shared_dcp_rejects_state_dict_hook_shape_change(
     model.table = NodeSharedCPUResidentParameter(
         torch.ones(4, 2), requires_grad=False, directory=tmp_path
     ).materialize_()
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
 
     def reshape_hook(module, state_dict, prefix, local_metadata):
         key = f"{prefix}table"

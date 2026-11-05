@@ -1,6 +1,7 @@
 """Tests for restoring optimizer state when some parameters are unused."""
 
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("TORCH_TURBO_DISABLE", "1")
 
@@ -14,6 +15,12 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from torchturbo.engine.backends.fsdp2.checkpoint.dcp import DcpCheckpoint
 from torchturbo.engine.config import MuonOptimizerConfig
 from torchturbo.engine.optimizers import MuonPlan, MuonRecipe, OptimizersContainer
+
+
+def _checkpoint() -> DcpCheckpoint:
+    # These models have no parameters owned by expert FSDP units.
+    ownership = SimpleNamespace(expert_fqns=lambda model: frozenset())
+    return DcpCheckpoint(ep_rank=0, ep_size=1, ownership=ownership)
 
 
 def _model() -> nn.ModuleDict:
@@ -81,7 +88,7 @@ def test_restore_partial_state_preserves_first_update(tmp_path, container, targe
     for _ in range(3):
         _step(reference, reference_optimizer, include_unused=False)
 
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_optimizer(reference_optimizer, reference, str(tmp_path))
 
     resumed = _model()
@@ -116,7 +123,7 @@ def test_restore_rejects_missing_saved_state_leaves(tmp_path, missing):
 
     resumed = _model()
     resumed_optimizer = _optimizer(resumed, container=False)
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     with pytest.raises(CheckpointException, match=f"Missing key.*{missing}"):
         checkpoint.load_optimizer(resumed_optimizer, resumed, str(tmp_path))
 
@@ -125,7 +132,7 @@ def test_restore_stateless_optimizer(tmp_path):
     model = _model()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.02)
     _step(model, optimizer, include_unused=False)
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_optimizer(optimizer, model, str(tmp_path))
 
     resumed_optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -137,7 +144,7 @@ def test_restore_rejects_saved_state_without_a_target(tmp_path):
     reference = _model()
     reference_optimizer = _optimizer(reference, container=False)
     _step(reference, reference_optimizer, include_unused=False)
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_optimizer(reference_optimizer, reference, str(tmp_path))
 
     resumed = _model()
@@ -154,7 +161,7 @@ def test_restore_ignores_state_outside_current_parameter_groups(tmp_path):
     reference = _model()
     reference_optimizer = _optimizer(reference, container=False)
     _step(reference, reference_optimizer, include_unused=True)
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = _checkpoint()
     checkpoint.save_optimizer(reference_optimizer, reference, str(tmp_path))
 
     resumed = _model()

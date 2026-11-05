@@ -15,13 +15,16 @@ from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.checkpoint.dcp import DcpCheckpoint
 from torchturbo.engine.backends.fsdp2.config import FSDPConfig
 from torchturbo.engine.optimizers import OptimizerClassPlan
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-def _checkpoint() -> DcpCheckpoint:
-    # Plain tensors are never sharded on the edp mesh, so no key gets an EP
-    # suffix. DCP supports single-process CPU save/load without a process group.
-    return DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+def _checkpoint(model: nn.Module) -> DcpCheckpoint:
+    # This model has no expert units. DCP supports single-process CPU save/load
+    # without a process group.
+    ownership = ParameterOwnership()
+    ownership.register(model, set())
+    return DcpCheckpoint(ep_rank=0, ep_size=1, ownership=ownership)
 
 
 class FrozenBaseModel(nn.Module):
@@ -77,19 +80,21 @@ def test_load_adamw_checkpoint_without_parameter_names(tmp_path):
         reference_optimizer.step()
         reference_optimizer.zero_grad()
 
-    checkpoint = _checkpoint()
+    checkpoint = _checkpoint(reference_model)
     model_dir = str(tmp_path / "model")
     optimizer_dir = str(tmp_path / "optimizer")
     checkpoint.save_model(reference_model, model_dir)
     checkpoint.save_optimizer(reference_optimizer, reference_model, optimizer_dir)
 
     resumed_model = nn.Sequential(nn.Linear(3, 4), nn.Tanh(), nn.Linear(4, 2))
+    checkpoint.ownership.register(resumed_model, set())
     plan = OptimizerClassPlan(
         resumed_model,
         torch.optim.AdamW,
         {"lr": 0.002, "weight_decay": 0.1},
     )
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = CpuRuntime()
     backend.fsdp_config = FSDPConfig()
     backend._mesh = {"edp": object()}
@@ -128,7 +133,7 @@ def test_model_state_stores_frozen_parameters_and_buffers(tmp_path):
     trained = FrozenBaseModel()
     trained.bias_state.fill_(3.0)
     model_dir = str(tmp_path / "model")
-    _checkpoint().save_model(trained, model_dir)
+    _checkpoint(trained).save_model(trained, model_dir)
 
     assert _saved_model_keys(model_dir) == {
         "model.base.weight",
@@ -140,7 +145,7 @@ def test_model_state_stores_frozen_parameters_and_buffers(tmp_path):
 
     torch.manual_seed(1)
     resumed = FrozenBaseModel()
-    _checkpoint().load_model(resumed, model_dir)
+    _checkpoint(resumed).load_model(resumed, model_dir)
 
     torch.testing.assert_close(
         resumed.state_dict(), trained.state_dict(), rtol=0, atol=0
@@ -152,11 +157,11 @@ def test_load_restores_stored_entries_that_are_frozen_now(tmp_path):
     trained = FrozenBaseModel()
     trained.base.requires_grad_(True)
     model_dir = str(tmp_path / "model")
-    _checkpoint().save_model(trained, model_dir)
+    _checkpoint(trained).save_model(trained, model_dir)
 
     torch.manual_seed(1)
     resumed = FrozenBaseModel()
-    _checkpoint().load_model(resumed, model_dir)
+    _checkpoint(resumed).load_model(resumed, model_dir)
 
     torch.testing.assert_close(
         resumed.state_dict(), trained.state_dict(), rtol=0, atol=0
@@ -180,12 +185,12 @@ def test_load_preserves_tied_parameter_identity(tmp_path):
     torch.manual_seed(0)
     trained = TiedModel()
     model_dir = str(tmp_path / "model")
-    _checkpoint().save_model(trained, model_dir)
+    _checkpoint(trained).save_model(trained, model_dir)
 
     resumed = TiedModel()
     original_parameter = resumed.embed.weight
 
-    _checkpoint().load_model(resumed, model_dir)
+    _checkpoint(resumed).load_model(resumed, model_dir)
 
     assert resumed.embed.weight is original_parameter
     assert resumed.head.weight is original_parameter
@@ -212,33 +217,35 @@ def test_load_applies_populated_state_through_model_load_state_dict(tmp_path):
     saved = CloningStateDictModel()
     saved.weight.data.fill_(1.0)
     model_dir = str(tmp_path / "model")
-    _checkpoint().save_model(saved, model_dir)
+    _checkpoint(saved).save_model(saved, model_dir)
 
     resumed = CloningStateDictModel()
     resumed.weight.data.fill_(9.0)
-    _checkpoint().load_model(resumed, model_dir)
+    _checkpoint(resumed).load_model(resumed, model_dir)
 
     torch.testing.assert_close(resumed.weight, saved.weight, rtol=0, atol=0)
 
 
 def test_load_rejects_missing_entries(tmp_path):
     model_dir = str(tmp_path / "model")
-    _checkpoint().save_model(SmallerModel(), model_dir)
+    saved = SmallerModel()
+    resumed = LargerModel()
+    _checkpoint(saved).save_model(saved, model_dir)
     with pytest.raises(RuntimeError, match=r"missing entries.*checkpoint_only"):
-        _checkpoint().load_model(LargerModel(), model_dir)
+        _checkpoint(resumed).load_model(resumed, model_dir)
 
 
 def test_load_ignores_checkpoint_only_entries(tmp_path):
     model_dir = str(tmp_path / "model")
     saved = LargerModel()
-    _checkpoint().save_model(saved, model_dir)
+    _checkpoint(saved).save_model(saved, model_dir)
     resumed = SmallerModel()
-    _checkpoint().load_model(resumed, model_dir)
+    _checkpoint(resumed).load_model(resumed, model_dir)
     torch.testing.assert_close(resumed.shared.state_dict(), saved.shared.state_dict())
 
 
 def test_ep_size_validation_rejects_a_different_size():
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, ownership=ParameterOwnership())
     saved_keys = {
         "model.experts.weight::ep0",
         "model.experts.weight::ep1",
@@ -253,7 +260,7 @@ def test_ep_size_validation_rejects_a_different_size():
 
 
 def test_ep_size_validation_ignores_checkpoint_only_entries():
-    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=object())
+    checkpoint = DcpCheckpoint(ep_rank=0, ep_size=1, ownership=ParameterOwnership())
     saved_keys = {
         "model.removed_experts.weight::ep0",
         "model.removed_experts.weight::ep1",
@@ -267,7 +274,7 @@ def test_ep_size_validation_ignores_checkpoint_only_entries():
 
 
 def test_ep_size_validation_rejects_a_missing_rank():
-    checkpoint = DcpCheckpoint(ep_rank=1, ep_size=2, edp_mesh=object())
+    checkpoint = DcpCheckpoint(ep_rank=1, ep_size=2, ownership=ParameterOwnership())
     saved_keys = {"model.experts.weight::ep1"}
 
     with pytest.raises(ValueError, match=r"saved experts\.weight on EP ranks \[1\]"):
@@ -281,13 +288,15 @@ def test_ep_size_validation_rejects_a_missing_rank():
 def test_trained_then_frozen_weights_survive_subsequent_checkpoints(tmp_path):
     trained = FrozenBaseModel()
     trained.base.weight.data.fill_(3)
-    checkpoint = _checkpoint()
+    checkpoint = _checkpoint(trained)
     checkpoint.save_model(trained, str(tmp_path / "first"))
     resumed = FrozenBaseModel()
     resumed.base.weight.data.fill_(1)
+    checkpoint.ownership.register(resumed, set())
     checkpoint.load_model(resumed, str(tmp_path / "first"))
     checkpoint.save_model(resumed, str(tmp_path / "second"))
     restored = FrozenBaseModel()
+    checkpoint.ownership.register(restored, set())
     checkpoint.load_model(restored, str(tmp_path / "second"))
     torch.testing.assert_close(restored.state_dict(), trained.state_dict())
 
@@ -307,9 +316,9 @@ class ExtraStateModel(nn.Module):
 
 def test_nested_extra_state_round_trip(tmp_path):
     model = ExtraStateModel(7)
-    _checkpoint().save_model(model, str(tmp_path))
+    _checkpoint(model).save_model(model, str(tmp_path))
     resumed = ExtraStateModel(0)
-    _checkpoint().load_model(resumed, str(tmp_path))
+    _checkpoint(resumed).load_model(resumed, str(tmp_path))
     torch.testing.assert_close(resumed.state_dict(), model.state_dict())
 
 
@@ -323,6 +332,7 @@ def test_dcp_rejects_missing_base_weights_after_removing_lora_wrappers(tmp_path)
         return get_peft_model(base, LoraConfig(r=1, target_modules=targets))
 
     model = build(["a", "b"])
-    _checkpoint().save_model(model, str(tmp_path))
+    _checkpoint(model).save_model(model, str(tmp_path))
+    resumed = build(["a"])
     with pytest.raises(RuntimeError, match=r"missing entries.*b.weight"):
-        _checkpoint().load_model(build(["a"]), str(tmp_path))
+        _checkpoint(resumed).load_model(resumed, str(tmp_path))

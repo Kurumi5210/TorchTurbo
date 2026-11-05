@@ -29,6 +29,7 @@ from torchturbo.engine.backends.fsdp2.checkpoint.dcp import DcpCheckpoint
 from torchturbo.engine.backends.fsdp2.checkpoint.weight_loader import DistParamLoader
 from torchturbo.engine.backends.fsdp2.checkpoint.weight_saver import ShardedParamManager
 from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
 from torchturbo.models.qwen4_exp.model import Qwen4ExpWeightConverter
 from torchturbo.models.qwen4_exp.ple import NGramEmbedding
@@ -80,7 +81,6 @@ def _worker(rank, world_size, root):
     )
     try:
         mesh = init_device_mesh("cpu", (world_size, 1), mesh_dim_names=("edp", "ep"))
-        world_mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",))
         model = ResidentModel()
         parameter = model.ngram_embedding.weight
         parameter.directory = root
@@ -94,7 +94,6 @@ def _worker(rank, world_size, root):
             root / "source",
             rank,
             mesh,
-            world_mesh,
             CpuRuntime(),
             False,
             converter,
@@ -167,7 +166,9 @@ def _worker(rank, world_size, root):
         loader.load_weights(assign=False)
         assert parameter.data_ptr() == pointer
         torch.testing.assert_close(parameter, expected)
-        checkpoint = DcpCheckpoint(0, 1, mesh["edp"])
+        # CPU-resident tables are never owned by expert FSDP units.
+        ownership = SimpleNamespace(expert_fqns=lambda model: frozenset())
+        checkpoint = DcpCheckpoint(0, 1, ownership)
         model.alias = parameter
         native_write = FileSystemWriter.write_data
         cpu_writes = []
@@ -347,7 +348,7 @@ def test_omitted_tied_cpu_parameter_hf_round_trip(tmp_path, checkpoint_group):
     converter = BaseWeightConverter(model, context, source)
     mesh = init_device_mesh("cpu", (1, 1), mesh_dim_names=("edp", "ep"))
     loader = DistParamLoader(
-        model, source, 0, mesh, checkpoint_group, CpuRuntime(), False, converter
+        model, source, 0, mesh, CpuRuntime(), False, converter
     )
     loader.load_weights()
     parameter = model.target
@@ -368,7 +369,7 @@ def test_omitted_tied_cpu_parameter_hf_round_trip(tmp_path, checkpoint_group):
     parameter.zero_()
     converter = BaseWeightConverter(model, context, output)
     loader = DistParamLoader(
-        model, output, 0, mesh, checkpoint_group, CpuRuntime(), False, converter
+        model, output, 0, mesh, CpuRuntime(), False, converter
     )
     loader.load_weights()
     assert model.target is model.source is parameter
@@ -450,7 +451,9 @@ def test_cpu_dcp_file_failure_uses_native_checkpoint_exception(
         torch.ones(3, 2), requires_grad=False, directory=tmp_path
     )
     model.weight.materialize_()
-    checkpoint = DcpCheckpoint(0, 1, checkpoint_group)
+    ownership = ParameterOwnership()
+    ownership.register(model, set())
+    checkpoint = DcpCheckpoint(0, 1, ownership)
     checkpoint.save_model(model, str(tmp_path / "dcp"))
     for shard in (tmp_path / "dcp").glob("*.distcp"):
         shard.unlink()

@@ -276,12 +276,13 @@ class TurboQwen3_5MoeForConditionalGeneration(
             sp_group, sp_size, sp_rank
         )
 
-        if sp_size > 1:
+        if sp_size > 1 or parallel_context["tp"]["tp_size"] > 1:
             # Vision keeps flash_attention_2 on its own subconfig and stays
             # on the native flash path; only text attention switches to the
             # registered SP interface.
             self.register_sp_attention_interface(sp_info)
 
+        if sp_size > 1:
             if self.mtp is not None:
                 self.patch_mtp_for_sp(
                     Qwen3_5MoeMultiTokenPredictor, sp_group, sp_size, sp_rank

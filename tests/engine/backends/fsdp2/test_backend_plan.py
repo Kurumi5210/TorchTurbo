@@ -19,6 +19,7 @@ import torch.nn as nn
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 from torchturbo.engine.model_fqn import build_model_fqn_map
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
 from torchturbo.parallel import (
@@ -59,6 +60,8 @@ def module_tags(module):
 
 def make_backend(*, mtp_enabled=False):
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parameter_ownership = ParameterOwnership()
+    backend._parallel_context = None
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=mtp_enabled),
         loss_chunk=types.SimpleNamespace(enabled=False),
@@ -855,7 +858,7 @@ def test_chunked_loss_keeps_output_embedding_separate_from_tail_norm(
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")

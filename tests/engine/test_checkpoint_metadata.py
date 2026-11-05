@@ -192,7 +192,7 @@ def test_checkpoint_without_metadata_is_legacy(tmp_path):
 
 @pytest.mark.parametrize(
     "content",
-    [None, '{"schema_version": 1', '{"schema_version": 2}'],
+    [None, '{"schema_version": 1', '{"schema_version": 99}'],
     ids=["missing", "corrupt", "unsupported_schema"],
 )
 def test_invalid_metadata_file_is_rejected(tmp_path, content):

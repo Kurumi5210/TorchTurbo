@@ -18,6 +18,8 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
+
 
 _HAS_GLOO = dist.is_available() and dist.is_gloo_available()
 
@@ -87,10 +89,12 @@ def _run_ep_checkpoint_test(
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("edp", "ep"))
         ep_rank = mesh["ep"].get_local_rank()
         checkpoint = DcpCheckpoint(
-            ep_rank=ep_rank, ep_size=mesh["ep"].size(), edp_mesh=mesh["edp"]
+            ep_rank=ep_rank, ep_size=mesh["ep"].size(),
+            ownership=ParameterOwnership(),
         )
 
         trained = _build_model(world_mesh, mesh["edp"], ep_rank, scale=1.0)
+        checkpoint.ownership.register(trained, set(trained.experts.parameters()))
         assert checkpoint._ep_partitioned_fqns(trained) == {
             "experts.weight1",
             "experts.lora_A.default.weight",
@@ -106,6 +110,7 @@ def _run_ep_checkpoint_test(
         checkpoint.save_optimizer(optimizer, trained, optimizer_dir)
 
         resumed = _build_model(world_mesh, mesh["edp"], ep_rank, scale=0.0)
+        checkpoint.ownership.register(resumed, set(resumed.experts.parameters()))
         resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=0.1)
         checkpoint.load_model(resumed, model_dir)
         checkpoint.load_optimizer(resumed_optimizer, resumed, optimizer_dir)
@@ -132,6 +137,7 @@ def _run_ep_checkpoint_test(
         # EP state from the same checkpoint.
         reduced = _build_model(world_mesh, mesh["edp"], ep_rank, scale=0.0)
         del reduced.experts.lora_A
+        checkpoint.ownership.register(reduced, set(reduced.experts.parameters()))
         checkpoint.load_model(reduced, model_dir)
         for name, actual in reduced.state_dict().items():
             torch.testing.assert_close(
@@ -171,9 +177,11 @@ def _run_ep_checkpoint_test(
         parallel_context = {"ep": {"ep_rank": ep_rank, "ep_size": mesh["ep"].size()}}
         manager = FSDP2CheckpointManager(
             rank=rank,
-            mesh=mesh,
-            world_mesh=world_mesh,
-            parallel_context=parallel_context,
+            parallel_context=SimpleNamespace(
+                get_ep_info=lambda: parallel_context["ep"], tp_size=1, etp_size=1,
+                expert_mesh=mesh, root_mesh=world_mesh,
+            ),
+            ownership=checkpoint.ownership,
             device_runtime=CpuRuntime(),
             cpu_offload=False,
             require_optimizer_not_suspended=controller.require_not_suspended,

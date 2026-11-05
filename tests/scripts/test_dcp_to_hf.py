@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -391,7 +392,7 @@ def test_export_restores_structural_settings_and_rejects_ep_override():
     from torchturbo.engine import ParameterGroup, TorchTurboArgs
     from torchturbo.engine.args import parse_torchturbo_args
 
-    metadata = {"engine_config": {
+    metadata = {"schema_version": 1, "engine_config": {
         "backend": "fsdp2", "mixed_precision": "fp32",
         "parallel_plan": {"ep_size": 2},
         "mtp": {"enabled": True, "loss_scaling_factor": 0.3, "log_loss": True},

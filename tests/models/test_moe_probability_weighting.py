@@ -224,6 +224,7 @@ def test_checkpoint_keeps_each_runtime_mask_with_frozen_inputs(use_reentrant):
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
         prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        _parallel_context=None,
     )
     FSDP2Backend._apply_activation_checkpointing(
         backend, candidate, SimpleNamespace(modules={"": FSDPPlanSpec(activation_checkpoint=True)}),
@@ -298,6 +299,7 @@ def test_expert_checkpoint_with_frozen_inputs_preserves_parameter_gradients(
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
         prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        _parallel_context=None,
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, layer, plan)
@@ -334,6 +336,7 @@ def test_expert_checkpoint_with_disabled_adapters_preserves_router_gradients(use
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
         prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        _parallel_context=None,
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, layer, plan)

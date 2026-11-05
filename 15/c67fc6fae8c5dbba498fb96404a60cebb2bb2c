@@ -1,0 +1,14 @@
+internal/scripts/runs/bailing_moe_v3_vl/install_swift_deps.sh
+  h_71a678598a8a69 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "15c67fc6fae8c5dbba498fb96404a60cebb2bb2c",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

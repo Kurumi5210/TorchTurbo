@@ -1,0 +1,21 @@
+engine_config:
+  parallel_plan:
+    sp_size: 8
+    ep_size: 1  # dense: no experts
+
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: true
+
+  # Multi-Token Prediction, supervising the chosen completions only.
+  mtp:
+    enabled: true
+    loss_scaling_factor: 0.1
+
+  # The DPO path always chunks the MTP streams and reads only chunk_size;
+  # `enabled` gates the SFT path.
+  loss_chunk:
+    chunk_size: 1024
+
+  mfu:
+    enabled: true

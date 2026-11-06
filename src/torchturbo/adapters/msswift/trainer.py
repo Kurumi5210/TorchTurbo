@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 from functools import partial
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -436,6 +437,25 @@ def get_turbo_seq2seq_trainer():
     return _cls
 
 
+class _MTPAuxLossAutoScaler(torch.autograd.Function):
+    """Add the MTP gradient to the graph, as ``MoEAuxLossAutoScaler`` does."""
+
+    @staticmethod
+    def forward(
+        ctx, output: torch.Tensor, mtp_loss: torch.Tensor, loss_scale: float
+    ) -> torch.Tensor:
+        ctx.save_for_backward(mtp_loss)
+        ctx.loss_scale = loss_scale
+        return output
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        (mtp_loss,) = ctx.saved_tensors
+        return grad_output, torch.ones_like(mtp_loss) * ctx.loss_scale, None
+
+
 class TurboDPOTrainerMixin(TurboTrainerMixin):
     """Add Swift DPO wiring while retaining TorchTurbo engine ownership.
 
@@ -520,6 +540,24 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
         num_segments = cu_seqlens.numel() - 1
         num_examples = num_segments // 2
         segment_ids = cu_seqlens_to_segment_ids(cu_seqlens, labels.size(-1))
+        # The reference pass reaches the model's MTP block too, so shadow the
+        # LM head for both; only the policy pass turns MTP into a loss.
+        mtp_enabled = (
+            engine.config.mtp.enabled
+            and model.config.num_nextn_predict_layers > 0
+        )
+        shadow_lm_head = mtp_enabled and model.training
+        run_mtp = shadow_lm_head and not is_ref_model
+        # MTP stages shift this same row further, so build their labels first.
+        mtp_labels: list[torch.Tensor] = []
+        mtp_normalizers: list[torch.Tensor] = []
+        if run_mtp:
+            mtp_labels, mtp_normalizers = self._mtp_stage_labels(
+                labels,
+                segment_ids,
+                num_examples,
+                model.config.num_nextn_predict_layers,
+            )
         labels = self._shift_packed_labels(labels, segment_ids, self.label_pad_token_id)
         loss_mask = labels != self.label_pad_token_id
 
@@ -562,6 +600,8 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
             labels = shard(labels)
             segment_ids = shard(segment_ids)
             token_weights = shard(token_weights)
+            # MTP hidden states cover the same local tokens as the backbone's.
+            mtp_labels = [shard(stage_labels) for stage_labels in mtp_labels]
 
         if self.get_use_logits_to_keep():
             # Project only the positions that predict a target token.
@@ -570,7 +610,21 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
             labels = labels[:, keep]
             segment_ids = segment_ids[:, keep]
             token_weights = token_weights[:, keep]
-        outputs = model(**inputs, use_cache=False)
+
+        if shadow_lm_head:
+            outputs = self._forward_with_shadowed_lm_head(model, inputs)
+            # The head was bypassed, so project the kept positions here instead.
+            (
+                lm_head_weight,
+                main_hidden_states,
+                loss_anchor,
+            ) = engine.backend._prepare_chunk_loss_lm_head(model, outputs.logits)
+            main_logits = F.linear(
+                main_hidden_states.to(lm_head_weight.dtype), lm_head_weight
+            )
+        else:
+            outputs = model(**inputs, use_cache=False)
+            main_logits = outputs.logits
         if getattr(outputs, "dspark_loss_fn", None) is not None:
             raise ValueError(
                 "DeepSeek V4 DSpark training is not implemented for Swift DPO; "
@@ -578,8 +632,34 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
             )
 
         per_token_logps, mean_logits, loss_mask = self.get_per_token_logps(
-            outputs.logits, labels, label_pad_token_id=self.label_pad_token_id
+            main_logits, labels, label_pad_token_id=self.label_pad_token_id
         )
+        if run_mtp:
+            if not outputs.mtp_logits:
+                raise RuntimeError(
+                    "MTP is enabled but the model returned no MTP outputs. MTP "
+                    "needs 'input_ids' in the forward kwargs, which Swift drops "
+                    "unless the template preserves them; use a turbo-registered "
+                    "template such as qwen3_5 or qwen3_8."
+                )
+            mtp_loss, stage_losses = self._mtp_auxiliary_loss(
+                engine,
+                outputs.mtp_logits,
+                mtp_labels,
+                mtp_normalizers,
+                lm_head_weight,
+                sp_size,
+                sp_info["sp_group"],
+            )
+            # Always zero; it only carries the autograd edge FSDP needs.
+            mtp_loss = mtp_loss + loss_anchor.to(mtp_loss.dtype)
+            # The kernel applied the factor; only the accumulation divisor is left.
+            per_token_logps = _MTPAuxLossAutoScaler.apply(
+                per_token_logps, mtp_loss, 1.0 / gradient_accumulation_steps
+            )
+            self._record_mtp_metrics(
+                engine, stage_losses, engine.config.mtp.loss_scaling_factor
+            )
         segment_logps = self._sum_by_segment(
             per_token_logps * token_weights, segment_ids, num_segments
         )
@@ -627,14 +707,115 @@ class TurboDPOTrainerMixin(TurboTrainerMixin):
 
     @staticmethod
     def _shift_packed_labels(
-        labels: torch.Tensor, segment_ids: torch.Tensor, pad_token_id: int
+        labels: torch.Tensor,
+        segment_ids: torch.Tensor,
+        pad_token_id: int,
+        shift: int = 1,
     ) -> torch.Tensor:
-        """Shift labels only inside each packed segment."""
-        next_labels = F.pad(labels, (0, 1), value=pad_token_id)[..., 1:]
+        """Shift labels ``shift`` positions ahead, only inside each segment."""
+        next_labels = F.pad(labels, (0, shift), value=pad_token_id)[..., shift:]
         segment = segment_ids.to(torch.long)
-        same_segment = segment == F.pad(segment, (0, 1), value=0)[..., 1:]
+        same_segment = segment == F.pad(segment, (0, shift), value=0)[..., shift:]
         valid = segment.ne(0) & same_segment
         return torch.where(valid, next_labels, torch.full_like(labels, pad_token_id))
+
+    def _mtp_stage_labels(
+        self,
+        labels: torch.Tensor,
+        segment_ids: torch.Tensor,
+        num_examples: int,
+        num_stages: int,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Build one target row and one normalizer per stage, chosen rows only."""
+        # Supervising the rejected segments would pull against the preference
+        # objective. Normalizers span the whole row so every rank agrees.
+        is_rejected = segment_ids > num_examples
+        stage_labels: list[torch.Tensor] = []
+        normalizers: list[torch.Tensor] = []
+        for stage in range(num_stages):
+            shifted = self._shift_packed_labels(
+                labels, segment_ids, self.label_pad_token_id, shift=stage + 2
+            )
+            shifted = shifted.masked_fill(is_rejected, self.label_pad_token_id)
+            stage_labels.append(shifted)
+            supervised = shifted != self.label_pad_token_id
+            normalizers.append(supervised.sum().clamp_min(1))
+        return stage_labels, normalizers
+
+    @staticmethod
+    def _forward_with_shadowed_lm_head(model, inputs: dict) -> Any:
+        """Run the forward with the LM head shadowed by an identity module."""
+        # Leaving the head in place costs one [tokens, vocab] tensor per MTP
+        # stage; with it shadowed, logits and mtp_logits hold hidden states.
+        # The shadow sits on the parent attribute so FSDP registration stays.
+        lm_head = model.get_lm_head()
+        if lm_head.bias is not None:
+            raise NotImplementedError(
+                "Swift DPO with MTP does not support an lm_head bias"
+            )
+        module_name = next(
+            name for name, module in model.named_modules() if module is lm_head
+        )
+        parent_name, _, attr_name = module_name.rpartition(".")
+        parent = model.get_submodule(parent_name)
+
+        object.__setattr__(parent, attr_name, torch.nn.Identity())
+        try:
+            return model(**inputs, use_cache=False)
+        finally:
+            object.__delattr__(parent, attr_name)
+
+    def _mtp_auxiliary_loss(
+        self,
+        engine: Any,
+        mtp_hidden_states: list[torch.Tensor],
+        stage_labels: list[torch.Tensor],
+        normalizers: list[torch.Tensor],
+        lm_head_weight: torch.Tensor,
+        sp_size: int,
+        sp_group: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the scaled total and the raw per-stage MTP cross-entropy."""
+        from torch.distributed.nn.functional import all_reduce
+
+        from ...models.modules.loss import chunk_loss
+
+        hidden_states = [
+            hidden_state.to(lm_head_weight.dtype).contiguous()
+            for hidden_state in mtp_hidden_states
+        ]
+        # Every stage carries the full factor; Megatron divides by stage count.
+        loss_scale = engine.config.mtp.loss_scaling_factor
+        # The streams span the whole row, not the kept positions, so this path
+        # always chunks; only chunk_size comes from loss_chunk. The factor goes
+        # to the kernel so a zero detaches the streams.
+        total_loss, stage_losses = chunk_loss(
+            hidden_states,
+            stage_labels,
+            lm_head=lm_head_weight,
+            normalizers=normalizers,
+            loss_scales=[loss_scale] * len(hidden_states),
+            chunk_size=engine.config.loss_chunk.chunk_size,
+        )
+        if sp_size > 1:
+            # Reduce the objective and its per-stage breakdown in one collective.
+            reduced = all_reduce(
+                torch.cat((total_loss.reshape(1), stage_losses)), group=sp_group
+            )
+            total_loss = reduced[0]
+            stage_losses = reduced[1:]
+        return total_loss, stage_losses
+
+    @staticmethod
+    def _record_mtp_metrics(
+        engine: Any, stage_losses: torch.Tensor, loss_scale: float
+    ) -> None:
+        """Report mtp_loss/*; the DPO path never runs the engine's reporting."""
+        stages = stage_losses.detach().unbind()
+        metrics = {f"mtp_loss/{index}": value for index, value in enumerate(stages)}
+        metrics["mtp_loss/avg"] = sum(stages) / len(stages)
+        metrics["mtp_loss/scaled"] = stage_losses.detach().sum() * loss_scale
+        engine.metric_tracker.record(metrics)
 
     def get_per_token_logps(self, logits, labels, label_pad_token_id=-100, reduction="mean"):
         # Use LF's full-vocabulary log-softmax while preserving Swift's return contract.

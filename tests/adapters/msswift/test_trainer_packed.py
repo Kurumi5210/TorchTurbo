@@ -73,9 +73,19 @@ class _DSparkTokenModel(_TokenModel):
 
 
 class _Engine:
-    def __init__(self):
+    def __init__(self, mtp_enabled=False, mtp_loss_scale=0.1, chunk_size=1024):
         self.backend = SimpleNamespace(prepare_inputs=lambda model, inputs: inputs)
         self.sp_info = {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+        self.config = SimpleNamespace(
+            mtp=SimpleNamespace(
+                enabled=mtp_enabled,
+                loss_scaling_factor=mtp_loss_scale,
+                log_loss=False,
+            ),
+            loss_chunk=SimpleNamespace(chunk_size=chunk_size),
+        )
+        self.metrics = {}
+        self.metric_tracker = SimpleNamespace(record=self.metrics.update)
         self.recorded = []
         self.moe_steps = []
 

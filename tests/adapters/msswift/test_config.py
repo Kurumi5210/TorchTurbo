@@ -715,10 +715,11 @@ def test_dpo_rejects_lora():
         build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="lora"))
 
 
-def test_dpo_rejects_mtp():
+def test_dpo_accepts_mtp():
+    """MTP runs under DPO as an auxiliary objective on the chosen completions."""
     _set_tt(enable_mtp=True)
-    with pytest.raises(NotImplementedError, match="DPO with MTP"):
-        build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="full"))
+    cfg = build_config_from_swift_args(_base_args(rlhf_type="dpo", tuner_type="full"))
+    assert cfg.mtp.enabled
 
 
 def test_dpo_with_yaml_sp_is_accepted(tmp_path):

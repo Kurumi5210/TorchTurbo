@@ -1,0 +1,14 @@
+EXPERIMENT.md
+  h_71a678598a8a69 25-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "53b8026d1cbe351fa991c8dc4e248c1a85f0b5b1",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

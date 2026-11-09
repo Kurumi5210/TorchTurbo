@@ -1,0 +1,30 @@
+.gitignore
+  h_71a678598a8a69 49-50
+scripts/runs/bailing_v3/tau2_mfu/README.md
+  h_71a678598a8a69 1-98
+scripts/runs/bailing_v3/tau2_mfu/hxb_sft_plugin.py
+  h_71a678598a8a69 1-74
+scripts/runs/bailing_v3/tau2_mfu/prepare_hxb_data.py
+  h_71a678598a8a69 1-217
+scripts/runs/bailing_v3/tau2_mfu/run_full.sh
+  h_71a678598a8a69 1-4
+scripts/runs/bailing_v3/tau2_mfu/run_lora.sh
+  h_71a678598a8a69 1-4
+scripts/runs/bailing_v3/tau2_mfu/run_sft.sh
+  h_71a678598a8a69 1-115
+scripts/runs/bailing_v3/tau2_mfu/run_sft_worker.sh
+  h_71a678598a8a69 1-16
+scripts/runs/bailing_v3/tau2_mfu/shared.yaml
+  h_71a678598a8a69 1-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9e2330af041ad243add1cb1eb389315a644dd613",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

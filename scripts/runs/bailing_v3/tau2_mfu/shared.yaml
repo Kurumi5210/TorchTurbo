@@ -1,0 +1,30 @@
+engine_config:
+  backend: fsdp2
+  mixed_precision: bf16
+  parallel_plan:
+    sp_size: 8
+    ep_size: 8
+  gbs: 4
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: optimizer
+  activation_checkpointing:
+    enabled: true
+    use_reentrant: true
+  optimizer:
+    name: null
+  ops:
+    overrides:
+      kda: fla_kda
+  loss_chunk:
+    enabled: true
+    chunk_size: 1024
+  mtp:
+    enabled: false
+  moe:
+    aux_loss_coeff: 0.0
+    z_loss_coeff: 0.0
+  mfu:
+    enabled: true
+    card: 910c

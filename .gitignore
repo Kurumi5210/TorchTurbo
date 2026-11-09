@@ -46,6 +46,8 @@ htmlcov/
 # Logs & runtime artifacts
 *.log
 logs/
+/outputs/
+/data/tau2/
 
 # OS generated files
 **/.DS_Store

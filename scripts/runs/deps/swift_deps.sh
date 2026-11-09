@@ -21,8 +21,9 @@ pip install matplotlib
 pip install ms_swift==4.4.2
 pip install transformers==5.9.0
 pip install peft==0.18.0
-pip install datasets==5.0.1
 pip install binpacking==1.5.2
 pip install safetensors==0.7.0
 
-pip install numpy==2.0
+# Keep the NumPy/Arrow versions validated with this Ascend image.
+# Swift 4.4.2 requires datasets >=3.0,<4.8.5.
+pip install numpy==1.26.4 pyarrow==21.0.0 datasets==4.8.4

@@ -8,8 +8,10 @@ from inspect import signature
 
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ParallelStyle,
+    RowwiseParallel,
     SequenceParallel,
     parallelize_module,
 )
@@ -130,6 +132,10 @@ def validate_tensor_parallel_targets(
         if mesh is not None and mesh.ndim != 1:
             raise ValueError(f"TP target {fqn!r} requires a 1D device mesh.")
         module = model.get_submodule(fqn)
+        if isinstance(module, nn.Embedding) and isinstance(style, RowwiseParallel):
+            shard_rows = (module.num_embeddings + tp_mesh.size() - 1) // tp_mesh.size()
+            if shard_rows * (tp_mesh.size() - 1) >= module.num_embeddings:
+                raise ValueError("Vocabulary TP requires nonempty embedding shards.")
         if isinstance(style, PrepareModuleMetadata):
             style.validate(module, tp_mesh.size())
         elif isinstance(style, GroupedMLPParallel):
@@ -147,9 +153,33 @@ def apply_tensor_parallel_plan(
 ) -> nn.Module:
     """Apply exact native styles after validating every metadata/expert target."""
     validate_tensor_parallel_targets(model, plan, tp_mesh=tp_mesh, etp_mesh=etp_mesh)
+    # Native styles replace Parameters. Retain aliases and frozen flags before
+    # those replacements so FSDP sees each shared weight as one parameter.
+    parameter_owners: dict[int, list[tuple[nn.Module, str]]] = {}
+    requires_grad: dict[int, bool] = {}
+    for module in model.modules():
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False):
+            parameter_owners.setdefault(id(parameter), []).append((module, name))
+            requires_grad[id(parameter)] = parameter.requires_grad
     for fqn, style in plan.items():
         mesh = etp_mesh if isinstance(style, GroupedMLPParallel) else tp_mesh
         if mesh is None:
             raise ValueError("GroupedMLPParallel requires a nontrivial ETP mesh.")
         parallelize_module(model.get_submodule(fqn), mesh, style)
+    for parameter_id, owners in parameter_owners.items():
+        source_module, source_name = owners[0]
+        source = source_module.get_parameter(source_name)
+        source.requires_grad_(requires_grad[parameter_id])
+        for module, name in owners[1:]:
+            parameter = module.get_parameter(name)
+            if isinstance(source, DTensor) != isinstance(parameter, DTensor) or (
+                isinstance(source, DTensor)
+                and (
+                    source.device_mesh != parameter.device_mesh
+                    or source.placements != parameter.placements
+                    or source.shape != parameter.shape
+                )
+            ):
+                raise ValueError("Tied parameters require matching TP layouts.")
+            module.register_parameter(name, source)
     return model

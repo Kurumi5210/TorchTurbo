@@ -6,8 +6,11 @@ import math
 from collections.abc import Sequence
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from torchturbo.ops import ops
+
+from .vocab_parallel import vocab_parallel_cross_entropy
 
 __all__ = ["logits_loss"]
 
@@ -88,15 +91,18 @@ def logits_loss(
         logits, labels, normalizer_tensor, loss_scale_values
     ):
         loss_logits = logits_i if loss_scale != 0.0 else logits_i.detach()
-        raw_loss = (
-            ops.cross_entropy_loss(
-                loss_logits.reshape(-1, loss_logits.shape[-1]),
-                label.reshape(-1).to(logits_i.device),
+        flat_logits = loss_logits.reshape(-1, loss_logits.shape[-1])
+        flat_labels = label.reshape(-1).to(logits_i.device)
+        if isinstance(flat_logits, DTensor):
+            raw_loss = vocab_parallel_cross_entropy(
+                flat_logits, flat_labels, ignore_index=ignore_index,
+            ) / normalizer
+        else:
+            raw_loss = ops.cross_entropy_loss(
+                flat_logits, flat_labels,
                 reduction="sum",
                 ignore_index=ignore_index,
-            )
-            / normalizer
-        )
+            ) / normalizer
         if loss_scale != 0.0:
             scaled_loss = raw_loss * loss_scale
             total_loss = (

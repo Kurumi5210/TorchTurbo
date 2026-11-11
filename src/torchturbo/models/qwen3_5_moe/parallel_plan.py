@@ -1,5 +1,7 @@
 from typing import Any
 import torch.nn.functional as F
+from torch.distributed.tensor import Replicate
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
 from ...parallel import TensorParallelPlanSpec, FSDPPlanSpec, FSDPParallelPlan
 from ..modules.moe.moe_layer import MoELayer, MoEConfig, MoESubmodules
@@ -107,6 +109,10 @@ def get_parallel_plan() -> FSDPParallelPlan:
         tensor_parallel_plan=TensorParallelPlanSpec(
             validator=Qwen3_5MoeTensorParallelValidator("model.language_model"),
             plan={
+                "model.language_model.embed_tokens": RowwiseParallel(
+                    input_layouts=Replicate(), output_layouts=Replicate(),
+                ),
+                "lm_head": ColwiseParallel(use_local_output=False),
                 "": Qwen3_5MoeTensorParallel("model.language_model"),
                 "model.language_model.layers.*.mlp.experts": GroupedMLPParallel(),
             },

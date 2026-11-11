@@ -11,9 +11,13 @@ import math
 from collections.abc import Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Shard
 
 from torchturbo.ops import ops
+
+from .vocab_parallel import vocab_parallel_cross_entropy
 
 __all__ = ["chunk_loss"]
 
@@ -30,6 +34,8 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         chunk_size,
         ignore_index,
         num_inputs,
+        tp_mesh,
+        vocab_size,
         *hidden_and_labels,
     ):
         num_inputs = int(num_inputs)
@@ -40,7 +46,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         backward_mask = tuple(loss_scale != 0.0 for loss_scale in loss_scales)
         need_grad_weight = bool(needs[0]) and any(backward_mask)
         need_grad_hidden = [
-            bool(needs[6 + i]) and backward_mask[i]
+            bool(needs[8 + i]) and backward_mask[i]
             for i in range(num_inputs)
         ]
 
@@ -99,15 +105,22 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
                 with torch.enable_grad():
                     logits = linear_output.float()
-                    loss_c = (
-                        ops.cross_entropy_loss(
+                    if tp_mesh is not None:
+                        logits = DTensor.from_local(
+                            logits, tp_mesh, [Shard(1)], run_check=False,
+                            shape=torch.Size((logits.shape[0], vocab_size)),
+                            stride=(vocab_size, 1),
+                        )
+                        loss_c = vocab_parallel_cross_entropy(
+                            logits, labels_c, ignore_index=ignore_index,
+                        ) / normalizer
+                    else:
+                        loss_c = ops.cross_entropy_loss(
                             logits,
                             labels_c,
                             reduction="sum",
                             ignore_index=ignore_index,
-                        )
-                        / normalizer
-                    )
+                        ) / normalizer
                     scaled_loss_c = loss_c * loss_scale
 
                 raw_loss.add_(loss_c.detach())
@@ -136,6 +149,9 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
                 del linear_output, logits, loss_c, scaled_loss_c
 
+            if tp_mesh is not None and grad_input is not None:
+                # Each vocabulary shard contributes to the same hidden states.
+                dist.all_reduce(grad_input, group=tp_mesh.get_group())
             grad_inputs.append(grad_input)
             raw_losses.append(raw_loss)
 
@@ -166,9 +182,12 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             grad_weight = grad_weight.to(ctx.weight_dtype)
 
         # weight, normalizers, scales, chunk_size, ignore_index, num_inputs,
+        # TP mesh, global vocabulary size,
         # then N hidden states and N labels.
         return (
             grad_weight,
+            None,
+            None,
             None,
             None,
             None,
@@ -205,6 +224,16 @@ def chunk_loss(
         )
     if weight.dim() != 2:
         raise ValueError(f"lm_head weight must be [V, H], got {tuple(weight.shape)}")
+
+    tp_mesh = None
+    vocab_size = weight.shape[0]
+    if isinstance(weight, DTensor):
+        if weight.device_mesh.ndim != 1 or weight.placements != (Shard(0),):
+            raise ValueError("Chunked vocabulary CE requires an unsharded FSDP head with TP Shard(0).")
+        tp_mesh = weight.device_mesh
+        # Keep this conversion outside the custom Function so its local
+        # weight gradient reaches the live TP parameter and FSDP hooks.
+        weight = weight.to_local()
 
     hidden_states = tuple(hidden_states)
     labels = tuple(labels)
@@ -297,6 +326,8 @@ def chunk_loss(
         chunk_size,
         int(ignore_index),
         num_inputs,
+        tp_mesh,
+        vocab_size,
         *hidden_states,
         *labels,
     )

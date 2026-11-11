@@ -1,3 +1,6 @@
+from torch.distributed.tensor import Replicate
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
 from ...parallel import TensorParallelPlanSpec, FSDPParallelPlan, FSDPPlanSpec
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.moe.experts import GroupedMLP
@@ -43,6 +46,10 @@ def get_parallel_plan() -> FSDPParallelPlan:
         tensor_parallel_plan=TensorParallelPlanSpec(
             validator=Qwen3_5MoeTensorParallelValidator("model"),
             plan={
+                "model.embed_tokens": RowwiseParallel(
+                    input_layouts=Replicate(), output_layouts=Replicate(),
+                ),
+                "lm_head": ColwiseParallel(use_local_output=False),
                 "": Qwen3_5MoeTensorParallel("model"),
                 "model.layers.*.mlp.experts": GroupedMLPParallel(),
             },

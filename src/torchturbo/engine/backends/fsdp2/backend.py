@@ -538,20 +538,6 @@ class FSDP2Backend(BaseBackend):
             validate_tensor_parallel_targets(
                 model, resolved_tp, tp_mesh=context.tp_mesh, etp_mesh=context.etp_mesh
             )
-            # Vocabulary stays complete on each TP lane in the first version.
-            from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
-
-            vocabulary_modules = {model.get_lm_head()}
-            get_input_embeddings = model.get_input_embeddings
-            try:
-                vocabulary_modules.add(get_input_embeddings())
-            except NotImplementedError:
-                pass
-            for fqn, style in resolved_tp.items():
-                if model.get_submodule(fqn) in vocabulary_modules and isinstance(
-                    style, (ColwiseParallel, RowwiseParallel)
-                ):
-                    raise ValueError("TP vocabulary sharding is not supported.")
             self._prepare_expert_tensor_parallel(model)
             model = apply_tensor_parallel_plan(
                 model, resolved_tp, tp_mesh=context.tp_mesh, etp_mesh=context.etp_mesh
@@ -900,7 +886,7 @@ class FSDP2Backend(BaseBackend):
 
         loss_chunk_enabled = self.config.loss_chunk.enabled
         lm_head = model.get_lm_head()
-        if loss_chunk_enabled and is_tied:
+        if loss_chunk_enabled and is_tied and not tensor_parallel:
             raise ValueError(
                 "chunked LM loss does not support tied input/output "
                 "embeddings. Disable it (--tt_enable_chunk_loss false) or "
@@ -1002,6 +988,24 @@ class FSDP2Backend(BaseBackend):
                     reshard_after_forward=False,
                 )
             )
+
+        if tensor_parallel and is_tied and loss_chunk_enabled:
+            # Chunked loss bypasses the head forward. A synthetic head forward
+            # on a shared tail unit would reshard its norm before norm backward.
+            # Let the root own this unit so both uses of the shared weight and
+            # the final norm finish backward before FSDP reduces their gradients.
+            shared_units = [
+                unit for unit in optimized
+                if model not in unit.modules
+                and any(
+                    child is input_embed or child is output_embed
+                    for root in unit.modules for child in root.modules()
+                )
+            ]
+            for unit in shared_units:
+                if unit.mesh != self._world_mesh:
+                    raise ValueError("TP tied chunked loss requires the dense FSDP domain.")
+                optimized.remove(unit)
 
         # Root and tail units are kept resident after forward. Their backward
         # all-gathers happen at the step edges, where there is little useful
@@ -1332,7 +1336,7 @@ class FSDP2Backend(BaseBackend):
     def _prepare_chunk_loss_lm_head(
         self, model: nn.Module, reference: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the full LM-head weight, FSDP input, and fallback anchor."""
+        """Unshard the LM head over FSDP, preserving its vocabulary TP shard."""
         lm_head = model.get_lm_head()
 
         if isinstance(lm_head, FSDPModule):
@@ -1344,7 +1348,7 @@ class FSDP2Backend(BaseBackend):
 
             # The model forward bypasses this unit. This synthetic forward
             # all-gathers it only after the backbone and MTP forwards finish,
-            # then keeps the full weight resident until chunk loss backward.
+            # then keeps the TP-local weight resident until chunk loss backward.
             lm_head.set_reshard_after_forward(False, recurse=False)
             method_name = "_tt_prepare_chunk_loss_input"
             if not hasattr(lm_head, method_name):
@@ -1381,13 +1385,18 @@ class FSDP2Backend(BaseBackend):
             # Keep the caller branch-free. This constant has no autograd edge
             # and is negligible compared with the chunked projection itself.
             prepared_reference = reference
-            loss_anchor = lm_head.weight.new_zeros(())
+            loss_anchor = reference.new_zeros(())
 
         weight = lm_head.weight
-        if isinstance(weight, DTensor):
+        if isinstance(weight, DTensor) and not (
+            self._parallel_context is not None
+            and weight.device_mesh == self._parallel_context.tp_mesh
+            and len(weight.placements) == 1
+            and weight.placements[0].is_shard(0)
+        ):
             raise RuntimeError(
-                "lm_head.weight is still sharded; chunked LM loss needs "
-                "the full [vocab, hidden] matrix. Give the LM head its own "
+                "lm_head.weight is still FSDP-sharded; chunked LM loss needs "
+                "the FSDP-unsharded weight. Give the LM head its own "
                 "unit in the parallel plan."
             )
         if not isinstance(weight, torch.Tensor):

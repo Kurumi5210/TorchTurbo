@@ -3,7 +3,8 @@
 from typing import Any
 
 from torch import nn
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
 from torchturbo.engine.config import EngineConfig
 from torchturbo.parallel import (
@@ -54,6 +55,10 @@ def get_parallel_plan() -> FSDPParallelPlan:
         tensor_parallel_plan=TensorParallelPlanSpec(
             validator=BailingTensorParallelValidator(),
             plan={
+                "model.word_embeddings": RowwiseParallel(
+                    input_layouts=Replicate(), output_layouts=Replicate(),
+                ),
+                "lm_head": ColwiseParallel(use_local_output=False),
                 "": BailingTensorParallel(),
                 "model.layers.*.mlp.experts": GroupedMLPParallel(),
             },

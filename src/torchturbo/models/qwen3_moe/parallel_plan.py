@@ -1,5 +1,5 @@
 from torch import nn
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
@@ -112,6 +112,10 @@ def get_parallel_plan() -> FSDPParallelPlan:
         tensor_parallel_plan=TensorParallelPlanSpec(
             validator=Qwen3MoeTensorParallelValidator(),
             plan={
+                "model.embed_tokens": RowwiseParallel(
+                    input_layouts=Replicate(), output_layouts=Replicate(),
+                ),
+                "lm_head": ColwiseParallel(use_local_output=False),
                 "model.layers.*.self_attn.q_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.k_proj": ColwiseParallel(),
                 "model.layers.*.self_attn.v_proj": ColwiseParallel(),

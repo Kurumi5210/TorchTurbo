@@ -1,0 +1,65 @@
+EXPERIMENT.md
+  h_71a678598a8a69 3,25-27
+  h_71a678598a8a69 1-2,4-24,28-81
+NPU_RUN_20261029.md
+  h_71a678598a8a69 4-5
+  h_71a678598a8a69 1-3,6-78
+internal/scripts/runs/qwen3_8_dense/DPO_DEBUG.md
+  h_71a678598a8a69 14
+  h_71a678598a8a69 1-13,15-243
+README.md
+  h_71a678598a8a69 3-8
+internal/docs/runs/qwen3_8_dense/README.md
+  h_71a678598a8a69 1-142
+internal/scripts/diagnostics/compare_dpo_traces.py
+  h_71a678598a8a69 1-119
+internal/scripts/diagnostics/megatron_dpo_trace.py
+  h_71a678598a8a69 1-84
+internal/scripts/runs/qwen3_8_dense/install_swift_deps.sh
+  h_71a678598a8a69 1-18
+internal/scripts/runs/qwen3_8_dense/run_npu_alignment.sh
+  h_71a678598a8a69 1-22
+internal/scripts/runs/qwen3_8_dense/swift_text_dpo.sh
+  h_71a678598a8a69 1-150
+internal/scripts/runs/qwen3_8_dense/swift_text_dpo.yaml
+  h_71a678598a8a69 1-8
+internal/scripts/runs/qwen3_8_dense/swift_text_dpo_debug.sh
+  h_71a678598a8a69 1-147
+internal/scripts/runs/qwen3_8_dense/swift_text_dpo_debug.yaml
+  h_71a678598a8a69 1-9
+launch_experiment.sh
+  h_71a678598a8a69 1-40
+src/torchturbo/adapters/msswift/args.py
+  h_71a678598a8a69 8-10,19,92-113
+src/torchturbo/adapters/msswift/dpo_alignment.py
+  h_71a678598a8a69 1-243
+src/torchturbo/adapters/msswift/pipeline.py
+  h_71a678598a8a69 131-148
+src/torchturbo/adapters/msswift/trainer.py
+  h_71a678598a8a69 38,449-451,465,467-474,476-507,509-510,513-526
+src/torchturbo/models/qwen3_5/swift_qwen3_8.py
+  h_71a678598a8a69 1-225
+src/torchturbo/models/qwen3_5/swift_template.py
+  h_71a678598a8a69 32-43,45,48-49,67-76,78
+tests/adapters/msswift/test_config.py
+  h_71a678598a8a69 13,188-249
+tests/adapters/msswift/test_dpo_alignment.py
+  h_71a678598a8a69 1-282
+tests/adapters/msswift/test_qwen38_template.py
+  h_71a678598a8a69 1-217
+tests/adapters/msswift/test_registry.py
+  h_71a678598a8a69 366-367
+tests/scripts/test_qwen38_dpo_debug.py
+  h_71a678598a8a69 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "59ad769b82639d721f7a9f24914839f85a3473ab",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

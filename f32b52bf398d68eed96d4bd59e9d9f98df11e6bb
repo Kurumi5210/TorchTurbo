@@ -1,0 +1,16 @@
+src/torchturbo/ops/providers/npu/_fla_gdn/chunk_gated_delta_rule_function.py
+  h_71a678598a8a69 27-31
+tests/ops/providers/npu/test_gdn_state_layout.py
+  h_71a678598a8a69 1-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f32b52bf398d68eed96d4bd59e9d9f98df11e6bb",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

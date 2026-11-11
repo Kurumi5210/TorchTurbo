@@ -1,0 +1,14 @@
+scripts/runs/deps/swift_deps.sh
+  h_71a678598a8a69 27-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7b6d386c7d9640d557fafb8d19d7239165b639a3",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

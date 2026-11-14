@@ -7,7 +7,7 @@ Uses PreAttention/InnerAttention/PostAttention structure for compilation support
 """
 
 import math
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -1483,6 +1483,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cu_seq_lens_q: Optional[torch.Tensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1578,9 +1579,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
 
+        # Only compute necessary logits
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         # Apply head: HC aggregation -> norm -> output projection -> logits
         logits = self.head(
-            hidden_states,
+            hidden_states[:, slice_indices, :],
             self.hc_head_fn,
             self.hc_head_scale,
             self.hc_head_base,

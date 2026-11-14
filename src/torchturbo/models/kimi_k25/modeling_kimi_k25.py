@@ -1165,6 +1165,7 @@ class KimiK25ForConditionalGeneration(KimiK25PreTrainedModel, GenerationMixin):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs,
     ) -> tuple | LlavaCausalLMOutputWithPast:
         r"""
@@ -1273,6 +1274,7 @@ class KimiK25ForConditionalGeneration(KimiK25PreTrainedModel, GenerationMixin):
             cu_seq_lens_k=kwargs.get("cu_seq_lens_k"),
             max_length_q=kwargs.get("max_length_q"),
             max_length_k=kwargs.get("max_length_k"),
+            logits_to_keep=logits_to_keep,
         )
 
         logits = outputs[0]

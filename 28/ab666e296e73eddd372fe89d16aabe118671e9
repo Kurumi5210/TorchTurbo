@@ -1,0 +1,22 @@
+src/torchturbo/adapters/msswift/utils.py
+  s_be9a69090594ce::t_e35ecb9b93eb11 14
+  s_be9a69090594ce::t_10b2044585fede 110-122
+tests/adapters/msswift/test_config.py
+  s_be9a69090594ce::t_10b2044585fede 727-807
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "28ab666e296e73eddd372fe89d16aabe118671e9",
+  "prompts": {},
+  "sessions": {
+    "s_be9a69090594ce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e044-326e-7342-ad69-33fd0a29edd3",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

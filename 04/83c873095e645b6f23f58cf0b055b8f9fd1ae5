@@ -1,0 +1,45 @@
+src/torchturbo/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+  h_71a678598a8a69 5,895,916-922
+  s_be9a69090594ce::t_1987dd795eaf92 878-879
+tests/models/test_logits_to_keep.py
+  s_be9a69090594ce::t_ad9d71e614d24a 134
+  s_be9a69090594ce::t_cdab2587febfb4 205,207-209
+  h_71a678598a8a69 1-26,34-36,41-115,121-133,135-164,216
+  s_be9a69090594ce::t_f92fdd12fee426 27-33,37-40,116-120,165-204,206,210-215,217-227
+src/torchturbo/models/bailing_hybrid/modeling_bailing_moe_v3.py
+  h_71a678598a8a69 1631,1680-1682,1694
+tests/models/kimi_k25/test_packed_attention_mask.py
+  h_71a678598a8a69 163
+tests/models/glm_moe_dsa/test_chunked_loss_contract.py
+  h_71a678598a8a69 48
+src/torchturbo/models/llada2_moe/modeling_llada2_moe.py
+  h_71a678598a8a69 1004,1063-1069
+  s_be9a69090594ce::t_1987dd795eaf92 1166-1167
+src/torchturbo/models/kimi_k25/modeling_deepseek.py
+  h_71a678598a8a69 1784,1843-1849
+  s_be9a69090594ce::t_1987dd795eaf92 1946-1947
+src/torchturbo/models/kimi_k25/modeling_kimi_k25.py
+  s_be9a69090594ce::t_1987dd795eaf92 1379-1380
+  h_71a678598a8a69 1168,1277
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0483c873095e645b6f23f58cf0b055b8f9fd1ae5",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_be9a69090594ce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e044-326e-7342-ad69-33fd0a29edd3",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": null
+    }
+  }
+}

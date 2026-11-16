@@ -1,0 +1,21 @@
+src/torchturbo/models/deepseek_v4/model.py
+  s_8a0aec64e8535b::t_5aa528249cec95 133-137
+tests/models/deepseek_v4/test_chunked_loss_contract.py
+  s_8a0aec64e8535b::t_3fcaecbdf23ac1 132-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4b07222b383818a5abe34279fae707063091216b",
+  "prompts": {},
+  "sessions": {
+    "s_8a0aec64e8535b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e37f-1ce5-7c81-bbe2-0234442d11bd",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

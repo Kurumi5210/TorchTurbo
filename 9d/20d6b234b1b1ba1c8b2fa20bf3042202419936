@@ -1,0 +1,32 @@
+src/torchturbo/models/kimi_k25/modeling_deepseek.py
+  s_be9a69090594ce::t_c8452522baf163 1414-1415
+src/torchturbo/models/deepseek_v4/modeling_deepseek_v4.py
+  s_be9a69090594ce::t_c8452522baf163 1315-1316
+src/torchturbo/models/deepseek_v4/mtp.py
+  s_be9a69090594ce::t_c8452522baf163 348-349
+tests/models/deepseek_v4/test_mtp.py
+  s_be9a69090594ce::t_c2d7eaf81f5a8c 22
+src/torchturbo/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+  s_be9a69090594ce::t_c8452522baf163 550-551
+tests/models/test_moe_forward_contract.py
+  s_be9a69090594ce::t_c2d7eaf81f5a8c 1-24,26-28,30-139,143-150,154,157-158,161-164,196
+  s_be9a69090594ce::t_53042c64c68a49 151-153,155-156,159-160
+  s_be9a69090594ce::t_38dbdefccb4ca4 25,140-142,165-195
+  s_be9a69090594ce::t_e35ecb9b93eb11 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9d20d6b234b1b1ba1c8b2fa20bf3042202419936",
+  "prompts": {},
+  "sessions": {
+    "s_be9a69090594ce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e044-326e-7342-ad69-33fd0a29edd3",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

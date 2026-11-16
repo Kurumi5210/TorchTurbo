@@ -1,0 +1,21 @@
+tests/models/test_logits_to_keep.py
+  s_be9a69090594ce::t_ad9d71e614d24a 122
+src/torchturbo/models/deepseek_v4/modeling_deepseek_v4.py
+  s_be9a69090594ce::t_af8e2bd15d17a8 10,1583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bd59062694c702d6fc37e11581ca460ba9181fb1",
+  "prompts": {},
+  "sessions": {
+    "s_be9a69090594ce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e044-326e-7342-ad69-33fd0a29edd3",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

@@ -9,7 +9,6 @@ from torchturbo.engine.optimizers import OptimizerRecipe
 from torchturbo.runtime import is_npu_available, get_device_name
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .configuration_kimi_k25 import KimiK25Config
-from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..base import TurboVLMModel
 from ..modules.attention.ulysses import SequenceParallelInputSlicingSpec
@@ -100,15 +99,6 @@ class TurboKimiK25ForConditionalGeneration(
             from .npu import apply_rotary_pos_emb_kimi_moe
 
             ds.apply_rotary_pos_emb = apply_rotary_pos_emb_kimi_moe
-
-        # patch moe_layer forward
-        origin_moe_forward = MoELayer.forward
-
-        def deepseek_moe_forward(self, hidden_states: torch.Tensor):
-            output, _ = origin_moe_forward(self, hidden_states)
-            return output
-
-        MoELayer.forward = deepseek_moe_forward
 
     def _post_init_patches(self):
         pass

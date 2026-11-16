@@ -1312,6 +1312,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.ffn(hidden_states, input_ids)
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         outputs = (hidden_states,)

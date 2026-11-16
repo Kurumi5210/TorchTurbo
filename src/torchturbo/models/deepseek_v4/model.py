@@ -15,7 +15,6 @@ from torchturbo.models.modules.attention.ulysses import all_gather_sp_with_grad_
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 from . import packing_utils as pu
-from torchturbo.models.modules.moe.moe_layer import MoELayer
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.runtime import is_npu_available
 
@@ -154,17 +153,6 @@ class TurboDeepseekV4ForCausalLM(TurboModel, DeepseekV4ForCausalLM):
     def _pre_init_patches(config):
         from . import modeling_deepseek_v4 as deepseek_v4_model
         from torchturbo.ops import ops
-
-        origin_moe_forward = getattr(
-            MoELayer, "_torchturbo_deepseek_v4_origin_forward", MoELayer.forward
-        )
-        MoELayer._torchturbo_deepseek_v4_origin_forward = origin_moe_forward
-
-        def deepseek_moe_forward(self, hidden_states: torch.Tensor, input_ids=None):
-            output, _ = origin_moe_forward(self, hidden_states, input_ids)
-            return output
-
-        MoELayer.forward = deepseek_moe_forward
 
         def rms_norm_forward(self, hidden_states):
             return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)

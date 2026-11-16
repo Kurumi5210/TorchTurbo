@@ -5,12 +5,9 @@ try:
 except ImportError:
     from typing_extensions import override  # Older versions
 
-import torch
-
 from torchturbo.runtime import is_npu_available, get_device_name
 from .modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
 from .configuration_glm_moe_dsa import GlmMoeDsaConfig
-from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 from ..base import TurboModel
 from ..registry import register_model
@@ -68,15 +65,6 @@ class TurboGlmMoeDsaForCausalLM(TurboModel, GlmMoeDsaForCausalLM):
             return ops.rms_norm(hidden_states, self.weight, self.variance_epsilon)
 
         glm5_model.GlmMoeDsaRMSNorm.forward = rms_norm_forward
-
-        # patch moe_layer forward
-        origin_moe_forward = MoELayer.forward
-
-        def deepseek_moe_forward(self, hidden_states: torch.Tensor):
-            output, _ = origin_moe_forward(self, hidden_states)
-            return output
-
-        MoELayer.forward = deepseek_moe_forward
 
         # code path of model creation with sparse attn is same as eager mode
         config._attn_implementation = "eager"

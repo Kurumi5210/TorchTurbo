@@ -19,7 +19,7 @@ from torchturbo.models.deepseek_v4.parallel_plan import _replace_moe_only
 from torchturbo.engine.config import EngineConfig
 from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.module import ModuleSpec
-from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
+from torchturbo.models.modules.moe.moe_layer import MoESubmodules
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
@@ -392,11 +392,6 @@ def test_dspark_placeholder_blocks_do_not_train_router(
         model = _make_mtp_model(block_size=2, num_stages=1)
         model.config.num_hash_layers = 0
         model.config.routed_scaling_factor = model.config.route_scale
-        monkeypatch.setattr(MoELayer, "forward", MoELayer.forward)
-        monkeypatch.setattr(
-            MoELayer, "_torchturbo_deepseek_v4_origin_forward", MoELayer.forward,
-            raising=False,
-        )
         monkeypatch.setattr(dsv4.DeepseekV4RMSNorm, "forward", dsv4.DeepseekV4RMSNorm.forward)
         turbo_model.TurboDeepseekV4ForCausalLM._pre_init_patches(model.config)
         model.mtp[0].ffn = _replace_moe_only(

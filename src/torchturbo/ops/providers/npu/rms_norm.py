@@ -23,7 +23,13 @@ class NpuRMSNorm(OpImpl):
             return False
         return True
 
-    def __call__(self, hidden_states: torch.Tensor, weight: torch.Tensor, eps: float):
+    def __call__(
+        self, hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> torch.Tensor:
         from torch_npu import npu_rms_norm
+
+        if hidden_states.numel() == 0:
+            # Empty SP shards still need zero gradients for input and weight.
+            return hidden_states * weight.to(hidden_states.dtype)
 
         return npu_rms_norm(hidden_states, weight, eps)[0]

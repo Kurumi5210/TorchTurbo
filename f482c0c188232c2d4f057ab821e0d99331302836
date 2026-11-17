@@ -1,0 +1,39 @@
+tests/models/glm_moe_dsa/test_chunked_loss_contract.py
+  h_71a678598a8a69 48
+src/torchturbo/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+  h_71a678598a8a69 5,893,914-920
+tests/models/kimi_k25/test_packed_attention_mask.py
+  h_71a678598a8a69 163
+tests/models/test_logits_to_keep.py
+  s_be9a69090594ce::t_ad9d71e614d24a 122
+  h_71a678598a8a69 1-121,123-153
+src/torchturbo/models/llada2_moe/modeling_llada2_moe.py
+  h_71a678598a8a69 1004,1063-1069
+src/torchturbo/models/kimi_k25/modeling_kimi_k25.py
+  h_71a678598a8a69 1168,1277
+src/torchturbo/models/kimi_k25/modeling_deepseek.py
+  h_71a678598a8a69 1784,1843-1849
+src/torchturbo/models/bailing_hybrid/modeling_bailing_moe_v3.py
+  h_71a678598a8a69 1631,1680-1682,1694
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f482c0c188232c2d4f057ab821e0d99331302836",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_be9a69090594ce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e044-326e-7342-ad69-33fd0a29edd3",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

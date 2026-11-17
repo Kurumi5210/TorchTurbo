@@ -1,0 +1,32 @@
+tests/models/bailing_hybrid/test_chunked_loss_contract.py
+  h_71a678598a8a69 28
+tests/models/bailing_hybrid/test_logits_to_keep.py
+  h_71a678598a8a69 1-131
+tests/adapters/msswift/test_dpo_moe_loss.py
+  h_71a678598a8a69 127-128,171-292
+tests/engine/backends/fsdp2/test_lora_checkpoint.py
+  h_71a678598a8a69 1-180
+tests/adapters/msswift/test_dpo_dataloader.py
+  h_71a678598a8a69 1-106
+src/torchturbo/models/bailing_hybrid/model.py
+  h_71a678598a8a69 1-3,15-19,56-155
+src/torchturbo/adapters/msswift/trainer.py
+  h_71a678598a8a69 31-32,397,411,465-476,482-484,519-526
+tests/adapters/msswift/test_config.py
+  h_71a678598a8a69 150,176,713-720,722-725
+tests/adapters/msswift/test_dpo_lora.py
+  h_71a678598a8a69 1-289
+src/torchturbo/adapters/msswift/utils.py
+  h_71a678598a8a69 110-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "21940e45e7715ddb47e68bd6e7a922bb666dc2a5",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

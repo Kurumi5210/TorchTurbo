@@ -1,0 +1,22 @@
+src/torchturbo/ops/providers/npu/rms_norm.py
+  s_be9a69090594ce::t_0a7207b24d65f6 26-28,31-33
+  s_be9a69090594ce::t_5b626c61feafc6 34
+tests/ops/test_npu_rms_norm.py
+  s_be9a69090594ce::t_34ea7ce6d58a7a 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bda4b572d011b85892556c318d1b59b60e3646e4",
+  "prompts": {},
+  "sessions": {
+    "s_be9a69090594ce": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e044-326e-7342-ad69-33fd0a29edd3",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

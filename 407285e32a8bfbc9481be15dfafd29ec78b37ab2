@@ -1,0 +1,30 @@
+src/torchturbo/models/bailing_hybrid/modeling_bailing_moe_v3.py
+  h_71a678598a8a69 1631,1680-1682,1694
+src/torchturbo/models/deepseek_v4/modeling_deepseek_v4.py
+  h_71a678598a8a69 10,1486,1582-1583,1586
+src/torchturbo/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+  h_71a678598a8a69 5,893,914-920
+src/torchturbo/models/kimi_k25/modeling_deepseek.py
+  h_71a678598a8a69 1784,1843-1849
+src/torchturbo/models/kimi_k25/modeling_kimi_k25.py
+  h_71a678598a8a69 1168,1277
+src/torchturbo/models/llada2_moe/modeling_llada2_moe.py
+  h_71a678598a8a69 1004,1063-1069
+tests/models/glm_moe_dsa/test_chunked_loss_contract.py
+  h_71a678598a8a69 48
+tests/models/kimi_k25/test_packed_attention_mask.py
+  h_71a678598a8a69 163
+tests/models/test_logits_to_keep.py
+  h_71a678598a8a69 1-159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "407285e32a8bfbc9481be15dfafd29ec78b37ab2",
+  "prompts": {},
+  "humans": {
+    "h_71a678598a8a69": {
+      "author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

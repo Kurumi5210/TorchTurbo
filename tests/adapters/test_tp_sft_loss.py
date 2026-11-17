@@ -8,7 +8,9 @@ from torch import nn
 
 
 class _Engine:
-    def __init__(self):
+    def __init__(self, *, etp_size=1, gbs=8):
+        self.etp_size = etp_size
+        self.config = SimpleNamespace(gbs=gbs)
         self.calls = []
 
     def compute_loss(self, model, inputs, **kwargs):
@@ -21,6 +23,12 @@ class _Engine:
 
     def get_sp_info(self):
         return {"sp_size": 1}
+
+    def get_tp_info(self):
+        return {"tp_size": 1}
+
+    def get_etp_info(self):
+        return {"etp_size": self.etp_size}
 
 
 def _llamafactory(engine, monkeypatch):
@@ -37,6 +45,36 @@ def _msswift(engine, monkeypatch):
     monkeypatch.setattr(swift_trainer.engine_registry, "get_engine_or_none", lambda: engine)
     trainer = object.__new__(swift_trainer.TurboTrainerMixin)
     return trainer, trainer.compute_loss
+
+
+@pytest.mark.parametrize("adapter", [_llamafactory, _msswift], ids=["llamafactory", "msswift"])
+@pytest.mark.parametrize("stage", ["sft", "pt"])
+def test_etp_only_activates_prepared_loss(monkeypatch, adapter, stage):
+    engine = _Engine(etp_size=2)
+    trainer, _ = adapter(engine, monkeypatch)
+    trainer.model = SimpleNamespace(is_diffusion_model=False)
+    trainer.model_accepts_loss_kwargs = False
+
+    trainer._activate_tp_sft(engine, stage)
+
+    assert trainer._tp_sft_enabled is True
+    assert trainer.model_accepts_loss_kwargs is True
+
+
+@pytest.mark.parametrize("adapter", [_llamafactory, _msswift], ids=["llamafactory", "msswift"])
+@pytest.mark.parametrize(
+    ("stage", "gbs", "error"),
+    [("dpo", 8, "SFT/PT training only"), ("sft", None, "require explicit tt_gbs")],
+)
+def test_etp_only_rejects_unsupported_training(monkeypatch, adapter, stage, gbs, error):
+    engine = _Engine(etp_size=2, gbs=gbs)
+    trainer, _ = adapter(engine, monkeypatch)
+    trainer.model = SimpleNamespace(is_diffusion_model=False)
+
+    with pytest.raises(ValueError, match=error):
+        trainer._activate_tp_sft(engine, stage)
+
+    assert trainer._tp_sft_enabled is False
 
 
 @pytest.mark.parametrize("adapter", [_llamafactory, _msswift], ids=["llamafactory", "msswift"])

@@ -31,6 +31,7 @@ def _process_ops(monkeypatch):
 def _backend(dspark_scaling=_SCALING):
     backend = FSDP2Backend.__new__(FSDP2Backend)
     backend.get_tp_info = lambda: {"tp_size": 1}
+    backend.get_etp_info = lambda: {"etp_size": 1}
     backend.rank = 0
     backend.config = SimpleNamespace(
         loss_chunk=LossChunkConfig(enabled=False),

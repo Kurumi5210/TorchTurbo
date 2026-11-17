@@ -141,6 +141,7 @@ class Qwen3_5MoeTensorParallelValidator(TensorParallelValidator):
 
     def validate(self, model: nn.Module, parallel_plan: FSDPParallelPlan) -> None:
         tp_size, sp_size = parallel_plan.tp_size, parallel_plan.sp_size
+        etp_size = parallel_plan.etp_size
         if model.mtp is not None:
             raise ValueError("Qwen3.5 TP does not support an active MTP module.")
         backbone = model.get_submodule(self.backbone)
@@ -161,7 +162,7 @@ class Qwen3_5MoeTensorParallelValidator(TensorParallelValidator):
                 _require_shape(f"shared_expert.{name}", projection.weight, (features, layer.hidden_size))
             _require_shape("shared_expert.down_proj", shared.down_proj.weight, (layer.hidden_size, features))
             if isinstance(layer.mlp, Qwen3_5MoeSparseMoeBlock):
-                if layer.mlp.experts.intermediate_dim % tp_size:
+                if layer.mlp.experts.intermediate_dim % etp_size:
                     raise ValueError("Qwen3.5 ETP expert width must be divisible by ETP size.")
 
 

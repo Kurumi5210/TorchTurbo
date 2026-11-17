@@ -134,6 +134,7 @@ class BailingTensorParallelValidator(TensorParallelValidator):
 
     def validate(self, model: nn.Module, parallel_plan: FSDPParallelPlan) -> None:
         tp_size, sp_size = parallel_plan.tp_size, parallel_plan.sp_size
+        etp_size = parallel_plan.etp_size
         backbone = model.model
         decoder, mla, kda, dense, sparse = _family_types(backbone)
         config = backbone.config
@@ -159,7 +160,7 @@ class BailingTensorParallelValidator(TensorParallelValidator):
                 for expert in mlp.experts:
                     if not isinstance(expert, dense):
                         raise ValueError("Bailing TP requires actual routed expert MLPs.")
-                    _mlp("expert", expert, config.hidden_size, config.moe_intermediate_size, tp_size)
+                    _mlp("expert", expert, config.hidden_size, config.moe_intermediate_size, etp_size)
                 if config.num_shared_experts is not None:
                     _mlp("shared", mlp.shared_experts, config.hidden_size,
                          config.moe_shared_expert_intermediate_size * config.num_shared_experts, tp_size)
@@ -172,7 +173,7 @@ class BailingTensorParallelValidator(TensorParallelValidator):
                     config.moe_intermediate_size, config.num_experts
                 ):
                     raise ValueError("Bailing TP prepared expert metadata must match global config.")
-                if features < 1 or features % tp_size:
+                if features < 1 or features % etp_size:
                     raise ValueError("Bailing ETP expert features must be divisible by ETP size.")
                 _shape("expert.weight1", mlp.experts.weight1,
                        (mlp.num_local_experts * config.hidden_size, 2 * features))

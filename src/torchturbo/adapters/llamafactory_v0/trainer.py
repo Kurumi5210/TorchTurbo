@@ -74,14 +74,14 @@ class TorchTurboTrainerBase:
             self.data_collator = LlamaFactoryInputCollator(self.data_collator)
 
     def _activate_tp_sft(self, engine: Any, stage: str | None) -> None:
-        if engine.get_tp_info()["tp_size"] == 1:
+        if engine.get_tp_info()["tp_size"] == 1 and engine.get_etp_info()["etp_size"] == 1:
             return
         if stage not in {"sft", "pt"}:
-            raise ValueError("TP adapters support SFT/PT training only")
+            raise ValueError("TP/ETP adapters support SFT/PT training only")
         if self.model.is_diffusion_model:
-            raise ValueError("TP adapters do not support diffusion training")
+            raise ValueError("TP/ETP adapters do not support diffusion training")
         if engine.config.gbs is None:
-            raise ValueError("TP adapters require explicit tt_gbs")
+            raise ValueError("TP/ETP adapters require explicit tt_gbs")
         self._tp_sft_enabled = True
         # The prepared loss consumes the exact step count, so HF must not divide GA.
         self.model_accepts_loss_kwargs = True
@@ -102,7 +102,7 @@ class TorchTurboTrainerBase:
         return count
 
     def get_total_train_batch_size(self, args: Any) -> int:
-        """Report the nominal batch using logical data replicas for TP."""
+        """Report the nominal batch using logical data replicas for TP/ETP."""
         if not self._tp_sft_enabled:
             return super().get_total_train_batch_size(args)
         return (
@@ -494,7 +494,7 @@ class TorchTurboTrainerBase:
             self._tp_main_loss = None
         result = super().training_step(model, inputs, *args, **kwargs)
         if self._tp_sft_enabled and self._tp_main_loss is None:
-            raise RuntimeError("TP training_step requires a fresh main loss report.")
+            raise RuntimeError("TP/ETP training_step requires a fresh main loss report.")
         assert_finite(result, "loss")
         engine = getattr(self, "engine", None)
         if engine is not None:
@@ -516,7 +516,7 @@ class TorchTurboTrainerBase:
     def _compute_causal_lm_loss(self, model, inputs, return_outputs=False, **kwargs):
         if "labels" not in inputs:
             if self._tp_sft_enabled:
-                raise ValueError("TP SFT loss requires prepared labels")
+                raise ValueError("TP/ETP SFT loss requires prepared labels")
             return super().compute_loss(
                 model,
                 inputs,

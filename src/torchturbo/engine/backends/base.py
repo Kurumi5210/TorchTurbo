@@ -216,6 +216,10 @@ class BaseBackend(ABC):
         """Return the unpartitioned TP default for backends without tensor parallelism."""
         return {"tp_rank": 0, "tp_size": 1, "tp_group": None}
 
+    def get_etp_info(self) -> dict[str, Any]:
+        """Return the unpartitioned expert TP default for other backends."""
+        return {"etp_rank": 0, "etp_size": 1, "etp_group": None}
+
     @abstractmethod
     def get_parallel_context(self) -> dict[str, Any]:
         """Return parallel-context dict of EP/SP/DP info.

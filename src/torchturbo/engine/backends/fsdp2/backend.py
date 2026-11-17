@@ -227,10 +227,7 @@ class FSDP2Backend(BaseBackend):
             isinstance(style, GroupedMLPParallel)
             for style in plan.tensor_parallel_plan.plan.values()
         )
-        if has_expert_style:
-            if plan.tp_size != plan.etp_size or plan.etp_size <= 1:
-                raise ValueError("Routed TP requires aligned tp_size=etp_size>1.")
-        elif plan.etp_size != 1 or plan.ep_size != 1:
+        if not has_expert_style and (plan.etp_size != 1 or plan.ep_size != 1):
             raise ValueError("Dense TP requires ep_size=etp_size=1; ETP needs the shared expert style.")
         if not plan.tensor_parallel_plan.plan:
             raise ValueError("TP requires a nonempty tensor_parallel_plan from the model.")
@@ -248,7 +245,7 @@ class FSDP2Backend(BaseBackend):
             raise ValueError("TP does not support DSpark.")
         for module in model.modules():
             if isinstance(module, BaseMoELayer) and not has_expert_style:
-                raise ValueError("TP with routed experts requires the aligned ETP style.")
+                raise ValueError("TP with routed experts requires the shared expert style.")
             if isinstance(module, nn.Dropout) and module.p:
                 raise ValueError("TP currently requires dropout=0.")
         for name in (
@@ -333,8 +330,12 @@ class FSDP2Backend(BaseBackend):
 
         for module in model.modules():
             if isinstance(module, BaseMoELayer):
-                module.router.sp_group = self._parallel_context.sp_mesh.get_group()
-                module.router.routing_group = self._parallel_context.etp_mesh.get_group()
+                context = self._parallel_context
+                module.router.sp_group = context.sp_mesh.get_group()
+                module.router.routing_group = (
+                    context.tp_mesh.get_group() if context.tp_mesh is not None else None
+                )
+                module.set_tensor_parallel_context(context.tp_mesh, context.etp_mesh)
 
     def _init_mesh(self, plan: FSDPParallelPlan) -> Any | None:
         """Create the shared topology and legacy mesh aliases."""
@@ -387,7 +388,7 @@ class FSDP2Backend(BaseBackend):
                     kwargs["ep_info"] = self.get_ep_info()
                     kwargs["sp_info"] = self.get_sp_info()
                     kwargs["engine_config"] = self.config
-                    if plan.tp_size > 1:
+                    if plan.tp_size > 1 or plan.etp_size > 1:
                         kwargs["parallel_context"] = self.get_parallel_context()
                     new_module = spec.replace_module(submodule, **kwargs)
 
@@ -522,9 +523,10 @@ class FSDP2Backend(BaseBackend):
             plan, self._model_fqn_map
         )
 
-        if plan.tp_size > 1:
+        if plan.tp_size > 1 or plan.etp_size > 1:
             from torchturbo.engine.tensor_parallel.parallelize import (
                 apply_tensor_parallel_plan,
+                register_tensor_parallel_cache_guard,
                 resolve_tensor_parallel_plan,
                 validate_tensor_parallel_targets,
             )
@@ -542,6 +544,9 @@ class FSDP2Backend(BaseBackend):
             model = apply_tensor_parallel_plan(
                 model, resolved_tp, tp_mesh=context.tp_mesh, etp_mesh=context.etp_mesh
             )
+            if plan.tp_size == 1:
+                # Inactive dense styles do not install their cache guards.
+                register_tensor_parallel_cache_guard(model)
 
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.
@@ -590,7 +595,7 @@ class FSDP2Backend(BaseBackend):
             )
 
         ep_size = self.get_ep_info()["ep_size"]
-        if plan.tp_size > 1:
+        if plan.tp_size > 1 or plan.etp_size > 1:
             self.gradient_scaling_factor = 1.0
         elif ep_size > 1:
             self.gradient_scaling_factor = 1 / ep_size
@@ -750,7 +755,10 @@ class FSDP2Backend(BaseBackend):
             if (
                 unit.expert_parallel
                 and self._parallel_context is not None
-                and self._parallel_context.tp_size > 1
+                and (
+                    self._parallel_context.tp_size > 1
+                    or self._parallel_context.etp_size > 1
+                )
             ):
                 self._configure_expert_gradient_divisor(unit, target_fsdp_kwargs)
             # Earlier child units already own their DTensors. Ignored
@@ -776,7 +784,7 @@ class FSDP2Backend(BaseBackend):
     def _configure_expert_gradient_divisor(
         self, unit: _FSDPUnit, fsdp_kwargs: dict[str, Any]
     ) -> None:
-        # Aligned TP=ETP combines K independent dense-lane contributions via EP/EDP.
+        # The token bridge assigns each original token to one expert replica.
         # Dividing by dense K pairs with the backward multiplier K/N_step.
         divisor = self._parallel_context.dense_fsdp_mesh.size()
         num_shards = unit.mesh.size()
@@ -806,7 +814,7 @@ class FSDP2Backend(BaseBackend):
             unit.mesh.device_type == "cpu"
             and dist.get_backend(unit.mesh.get_group()) == "gloo"
             and num_shards > 1
-            and divisor > num_shards
+            and divisor != num_shards
             and reduction_dtypes & {torch.float32, torch.bfloat16}
         ):
             # Gloo cannot execute the default custom-divisor PREMUL_SUM.
@@ -1086,7 +1094,9 @@ class FSDP2Backend(BaseBackend):
                 # replay keeps grad mode enabled, so TP suppresses its router
                 # bookkeeping explicitly.
                 context = self._parallel_context
-                if not use_reentrant and context is not None and context.tp_size > 1:
+                if not use_reentrant and context is not None and (
+                    context.tp_size > 1 or context.etp_size > 1
+                ):
                     stack.enter_context(suppress_router_statistics())
                 yield
 
@@ -1959,8 +1969,10 @@ class FSDP2Backend(BaseBackend):
         **kwargs: Any,
     ) -> Any:
         inputs = dict(inputs)
-        tp_size = self.get_tp_info()["tp_size"]
-        if tp_size > 1:
+        tensor_parallel = (
+            self.get_tp_info()["tp_size"] > 1 or self.get_etp_info()["etp_size"] > 1
+        )
+        if tensor_parallel:
             self._validate_tp_loss_count(kwargs.get("num_items_in_batch"))
         if (
             inputs.get("position_ids", None) is None
@@ -1991,7 +2003,7 @@ class FSDP2Backend(BaseBackend):
             use_chunked_loss=use_chunked_loss,
         )
         dspark_loss_fn = getattr(outputs, "dspark_loss_fn", None)
-        if tp_size > 1 and dspark_loss_fn is not None:
+        if tensor_parallel and dspark_loss_fn is not None:
             raise ValueError("TP does not support DSpark loss outputs.")
 
         total_loss, component_losses = self._compute_lm_loss_with_sp(
@@ -2049,7 +2061,7 @@ class FSDP2Backend(BaseBackend):
 
         outputs.loss = total_loss
         outputs.main_loss = component_losses[0].detach()
-        if tp_size > 1:
+        if tensor_parallel:
             dense_mesh = self._parallel_context.dense_fsdp_mesh
             outputs.main_loss = outputs.main_loss.clone() / dense_mesh.size()
             dist.all_reduce(outputs.main_loss, group=dense_mesh.get_group())
@@ -2094,7 +2106,7 @@ class FSDP2Backend(BaseBackend):
     ) -> tuple[list[torch.Tensor], list[float | torch.Tensor]]:
         """Build shifted labels and normalizers for each LM prediction stream.
 
-        TP uses the exact positive optimizer-step target count divided by the
+        TP/ETP uses the exact positive optimizer-step target count divided by the
         dense FSDP domain size. Legacy loss preserves its WORLD/SP arithmetic;
         positive legacy device counts remain a caller precondition.
         """
@@ -2185,9 +2197,11 @@ class FSDP2Backend(BaseBackend):
         Returns the scaled total plus ``1 + num_mtp`` detached per-stream
         losses, main path first.
         """
-        tp_size = self.get_tp_info()["tp_size"]
+        tensor_parallel = (
+            self.get_tp_info()["tp_size"] > 1 or self.get_etp_info()["etp_size"] > 1
+        )
         dense_size = (
-            self._parallel_context.dense_fsdp_mesh.size() if tp_size > 1 else None
+            self._parallel_context.dense_fsdp_mesh.size() if tensor_parallel else None
         )
         if chunk_hidden_states is not None:
             hidden_states = chunk_hidden_states
@@ -2249,7 +2263,7 @@ class FSDP2Backend(BaseBackend):
                 loss_scales=loss_scales,
             )
 
-        if tp_size == 1 and sp_size > 1 and sp_group is not None:
+        if not tensor_parallel and sp_size > 1 and sp_group is not None:
             total_loss = torch.distributed.nn.all_reduce(
                 total_loss, op=dist.ReduceOp.SUM, group=sp_group
             )

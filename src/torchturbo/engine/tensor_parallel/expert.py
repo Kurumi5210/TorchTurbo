@@ -1,4 +1,4 @@
-"""Aligned expert tensor parallelism at the shared local-kernel boundary."""
+"""Expert feature parallelism at the shared local-kernel boundary."""
 
 import torch
 from torch import nn

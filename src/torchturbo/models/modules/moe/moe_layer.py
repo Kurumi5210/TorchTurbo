@@ -13,11 +13,13 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 
 from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
+from .token_parallel import MoETokenLayout
 
 
 @dataclass
@@ -107,6 +109,7 @@ class MoELayer(BaseMoELayer):
     ) -> None:
         self.use_te = use_te
         self.submodules = submodules
+        self._token_parallel_meshes: tuple[DeviceMesh | None, DeviceMesh | None] | None = None
         super(MoELayer, self).__init__(
             config=config, ep_group=ep_group, layer_number=layer_number
         )
@@ -146,6 +149,14 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
+    def set_tensor_parallel_context(
+        self, tp_mesh: DeviceMesh | None, etp_mesh: DeviceMesh | None,
+    ) -> None:
+        """Enable routed token redistribution when dense and expert TP differ."""
+        tp_size = tp_mesh.size() if tp_mesh is not None else 1
+        etp_size = etp_mesh.size() if etp_mesh is not None else 1
+        self._token_parallel_meshes = (tp_mesh, etp_mesh) if tp_size != etp_size else None
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -156,9 +167,15 @@ class MoELayer(BaseMoELayer):
         )
         logits = logits.view(-1, logits.shape[-1])
 
+        token_layout = None
+        routed_hidden_states = hidden_states
+        if self._token_parallel_meshes is not None:
+            token_layout = MoETokenLayout(hidden_states, *self._token_parallel_meshes)
+            routed_hidden_states, routing = token_layout.dispatch(hidden_states, routing)
+
         dispatcher = self.token_dispatcher
         # Reuse stage variables so completed layouts are not kept alive here.
-        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(hidden_states, routing)
+        expert_tokens, expert_probs = dispatcher.dispatch_preprocess(routed_hidden_states, routing)
         expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
         expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
             expert_tokens, expert_probs,
@@ -168,6 +185,8 @@ class MoELayer(BaseMoELayer):
         expert_tokens = dispatcher.combine_preprocess(expert_tokens)
         expert_tokens = dispatcher.token_combine(expert_tokens)
         expert_tokens = dispatcher.combine_postprocess(expert_tokens)
+        if token_layout is not None:
+            expert_tokens = token_layout.combine(expert_tokens)
         output = expert_tokens.to(hidden_states.dtype)
 
         if self.shared_expert is not None:

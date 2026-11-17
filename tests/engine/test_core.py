@@ -892,6 +892,7 @@ class TestEngineSetup:
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
         engine.get_tp_info = lambda: {"tp_size": 1}
+        engine.get_etp_info = lambda: {"etp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
 
         mb_item = {
@@ -922,6 +923,7 @@ class TestEngineSetup:
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
         engine.get_tp_info = lambda: {"tp_size": 1}
+        engine.get_etp_info = lambda: {"etp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
 
         mb_item = {
@@ -1095,7 +1097,7 @@ class TestEngineSetup:
 # ---------------------------------------------------------------------------
 
 
-def _make_engine_for_ga(sp_size, world_size, gbs=None, tp_size=1):
+def _make_engine_for_ga(sp_size, world_size, gbs=None, tp_size=1, etp_size=1):
     """Build a bare TorchTurboEngine with mocked sp/dp info + config.gbs.
 
     Patches the engine module's ``dist`` reference so
@@ -1106,6 +1108,7 @@ def _make_engine_for_ga(sp_size, world_size, gbs=None, tp_size=1):
     engine.get_sp_info = lambda: {"sp_size": sp_size}
     engine.get_dp_info = lambda: {"dp_size": world_size // (sp_size * tp_size)}
     engine.get_tp_info = lambda: {"tp_size": tp_size}
+    engine.get_etp_info = lambda: {"etp_size": etp_size}
     engine.config = SimpleNamespace(
         gbs=gbs,
         mfu=SimpleNamespace(enabled=False),
@@ -1157,6 +1160,107 @@ def test_resolve_ga_legacy_sp1_noop():
         assert engine.resolve_gradient_accumulation_steps(5) == 5
     finally:
         restore()
+
+
+@pytest.mark.parametrize(("gbs", "framework_ga", "expected"), [(None, 3, 3), (8, 1, 2)])
+def test_resolve_ga_etp_only_uses_dense_data_replicas(gbs, framework_ga, expected):
+    engine, restore = _make_engine_for_ga(
+        sp_size=2, world_size=8, gbs=gbs, etp_size=4,
+    )
+    try:
+        assert engine.resolve_gradient_accumulation_steps(framework_ga) == expected
+    finally:
+        restore()
+
+
+@pytest.mark.parametrize("gbs", [None, 8])
+def test_etp_only_sampler_replicates_sp_and_keeps_source_batches_unique(monkeypatch, gbs):
+    monkeypatch.setattr(engine_core.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(engine_core.dist, "get_world_size", lambda: 8)
+    samples = []
+    for rank in range(8):
+        monkeypatch.setattr(engine_core.dist, "get_rank", lambda: rank)
+        engine = object.__new__(TorchTurboEngine)
+        engine.config = SimpleNamespace(gbs=gbs)
+        engine.get_tp_info = lambda: {"tp_size": 1}
+        engine.get_etp_info = lambda: {"etp_size": 4}
+        engine.get_sp_info = lambda: {"sp_size": 2}
+        engine.get_dp_info = lambda: {"dp_size": 4, "dp_rank": rank // 2}
+        dataloader = engine.create_dataloader(
+            list(range(26)), batch_size=3, shuffle=False, pin_memory=False,
+        )
+        samples.append([batch.tolist() for batch in dataloader])
+
+    if gbs is None:
+        expected = [
+            [[0, 1, 2], [12, 13, 14]],
+            [[3, 4, 5], [15, 16, 17]],
+            [[6, 7, 8], [18, 19, 20]],
+            [[9, 10, 11], [21, 22, 23]],
+        ]
+    else:
+        expected = [
+            [[0, 1, 2], [3, 4, 5]],
+            [[6, 7, 8], [9, 10, 11]],
+            [[12, 13, 14], [15, 16, 17]],
+            [[18, 19, 20], [21, 22, 23]],
+        ]
+    assert samples == [batches for batches in expected for _ in range(2)]
+
+
+def test_etp_only_loss_step_counts_prepared_targets_once_per_data_replica(monkeypatch):
+    prepared_calls = []
+
+    class Model(PackedLossModel):
+        def on_prepare_inputs(self, inputs, **kwargs):
+            inputs = super().on_prepare_inputs(inputs, **kwargs)
+            prepared_calls.append(inputs)
+            inputs["labels"] = inputs["labels"].clone()
+            inputs["labels"][:, 3] = -100
+            return inputs
+
+    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
+    backend.get_etp_info = lambda: {"etp_size": 4}
+    backend.get_sp_info = lambda: {"sp_size": 2}
+    data_group = object()
+    backend.get_dp_info = lambda: {"dp_size": 4, "dp_group": data_group}
+    engine = object.__new__(TorchTurboEngine)
+    engine.backend = backend
+    reductions = []
+
+    def reduce_count(count, *, group):
+        reductions.append((count.item(), group))
+        assert count.dtype == torch.int64 and count.device.type == "cpu"
+        # The other three logical data replicas contribute five valid targets.
+        count.add_(5)
+
+    monkeypatch.setattr(engine_core.dist, "all_reduce", reduce_count)
+    boundaries = torch.tensor([0, 2, 5], dtype=torch.int32)
+    batches = [
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
+            "position_ids": torch.tensor([[0, 1, 0, 1, 2]]),
+            "labels": labels,
+            "cu_seq_lens_q": boundaries,
+            "cu_seq_lens_k": boundaries,
+            "max_length_q": 3,
+            "max_length_k": 3,
+        }
+        for labels in (
+            torch.tensor([[1, 2, 3, 4, 5]]),
+            torch.full((1, 5), -100),
+        )
+    ]
+
+    prepared, count = engine.prepare_loss_step(Model(), batches, torch.device("cpu"))
+
+    assert len(prepared_calls) == 2
+    assert reductions == [(2, data_group)]
+    assert count == 7
+    assert prepared[0]["labels"].tolist() == [[1, 2, 3, -100, 5, -100]]
+    assert prepared[1]["labels"].tolist() == [[-100] * 6]
+    assert batches[0]["labels"].tolist() == [[1, 2, 3, 4, 5]]
 
 
 def test_resolve_ga_tt_gbs_indivisible_raises():

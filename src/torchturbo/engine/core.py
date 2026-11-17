@@ -48,7 +48,7 @@ class DPBlockDistributedSampler(DistributedSampler):
     ``dp_rank`` (e.g. an SP group) yield the identical sequence. The
     sampler only knows the dp info and the block size; the engine picks
     ``rank_block`` as ``ga * batch_size`` with ``tt_gbs`` (whole optimizer
-    steps), ``batch_size`` for native TP, or legacy ``sp_size`` otherwise.
+    steps), ``batch_size`` for native TP/ETP, or legacy ``sp_size`` otherwise.
     """
 
     def __init__(
@@ -934,14 +934,14 @@ class TorchTurboEngine:
         sp_info = self.get_sp_info()
 
         # Block granularity is one optimizer step with tt_gbs, one logical
-        # microbatch for native TP, or the legacy SP layout otherwise.
+        # microbatch for native TP/ETP, or the legacy SP layout otherwise.
         gbs = self.config.gbs
         if gbs is not None:
             gradient_accumulation_steps = self._ga_from_gbs(
                 gbs, dp_info["dp_size"]
             )
             rank_block = gradient_accumulation_steps * batch_size
-        elif self.get_tp_info()["tp_size"] > 1:
+        elif self.get_tp_info()["tp_size"] > 1 or self.get_etp_info()["etp_size"] > 1:
             rank_block = batch_size
         else:
             rank_block = sp_info["sp_size"]
@@ -1014,6 +1014,10 @@ class TorchTurboEngine:
         """Get tensor-parallel rank, size and group."""
         return self.backend.get_tp_info()
 
+    def get_etp_info(self) -> dict[str, Any]:
+        """Get expert tensor-parallel rank, size and group."""
+        return self.backend.get_etp_info()
+
     @staticmethod
     def _ga_from_gbs(gbs: int, dp_size: int) -> int:
         """Derive accumulation from global microbatches and logical data replicas."""
@@ -1024,7 +1028,7 @@ class TorchTurboEngine:
         return gbs // dp_size
 
     def resolve_gradient_accumulation_steps(self, framework_ga: int) -> int:
-        """Resolve global microbatches, native TP GA, or legacy SP accumulation."""
+        """Resolve global microbatches, native TP/ETP GA, or legacy SP accumulation."""
         sp_size = int(self.get_sp_info()["sp_size"])
         gbs = self.config.gbs
         if gbs is not None:
@@ -1041,9 +1045,9 @@ class TorchTurboEngine:
                 gbs, dp_size, ga,
             )
             return ga
-        if self.get_tp_info()["tp_size"] > 1:
+        if self.get_tp_info()["tp_size"] > 1 or self.get_etp_info()["etp_size"] > 1:
             logger.info_rank0(
-                "TP logical data_dp=%d: explicit gradient_accumulation_steps=%d",
+                "TP/ETP logical data_dp=%d: explicit gradient_accumulation_steps=%d",
                 self.get_dp_info()["dp_size"], framework_ga,
             )
             return framework_ga
@@ -1116,14 +1120,14 @@ class TorchTurboEngine:
         self, model: nn.Module, batch_samples: list[dict[str, Any]],
         device: torch.device,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Prepare TP SFT microbatches and count unique step targets.
+        """Prepare TP/ETP SFT microbatches and count unique step targets.
 
-        This unique logical-data-DP count is for TP SFT only; legacy loss keeps
+        This unique logical-data-DP count is for TP/ETP SFT; legacy loss keeps
         its historical WORLD/SP denominator. Hooks and padding run on each
         source device. Only the count moves to the collective device.
         """
-        if self.get_tp_info()["tp_size"] == 1:
-            raise ValueError("prepare_loss_step requires TP SFT (tp_size > 1)")
+        if self.get_tp_info()["tp_size"] == 1 and self.get_etp_info()["etp_size"] == 1:
+            raise ValueError("prepare_loss_step requires TP/ETP SFT (tp_size > 1 or etp_size > 1)")
         prepared = [self.prepare_loss_inputs(model, batch) for batch in batch_samples]
         local_count = 0
         for batch in prepared:
@@ -1321,15 +1325,15 @@ class TorchTurboEngine:
     ) -> None:
         """Run packed-token policy losses and optional backward over micro-batches.
 
-        TP policy-loss execution is unsupported, including forward-only mode.
+        TP/ETP policy-loss execution is unsupported, including forward-only mode.
         """
 
         if self.model is None:
             raise RuntimeError("Call engine.prepare_model() before forward_backward_batch().")
-        if self.get_tp_info()["tp_size"] > 1:
+        if self.get_tp_info()["tp_size"] > 1 or self.get_etp_info()["etp_size"] > 1:
             raise ValueError(
                 "forward_backward_batch() does not support packed RL policy losses "
-                "with TP>1, including forward_only=True."
+                "with TP>1 or ETP>1, including forward_only=True."
             )
 
         total_loss_weight = self._compute_total_loss_weight(mb_list, device)

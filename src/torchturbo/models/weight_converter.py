@@ -201,7 +201,7 @@ class BaseWeightConverter:
     def _packed_expert_view(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         """View the prepared logical grouped-expert layout at the HF boundary.
 
-        The aligned ETP path prepares homogeneous gated GroupedMLP modules.
+        The ETP path prepares homogeneous gated GroupedMLP modules.
         Shape validation prevents equal-size buffers from silently changing the
         gate/up or expert ordering. Legacy storage already uses packed matrices.
         """

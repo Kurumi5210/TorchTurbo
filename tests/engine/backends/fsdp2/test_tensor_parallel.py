@@ -35,6 +35,7 @@ from torchturbo.parallel import (
     TensorParallelPlanSpec,
 )
 from torchturbo.runtime.cpu import CpuRuntime
+import torchturbo.runtime.runtime as runtime_module
 
 
 class DenseModel(nn.Module):
@@ -116,17 +117,63 @@ def test_metadata_style_validates_before_dividing_counts():
         PrepareModuleMetadata(divide=("num_kv_heads",)).validate(module, 2)
 
 
-def test_cache_guard_rejects_cached_calls():
+@pytest.mark.parametrize("variadic", [False, True])
+def test_cache_guard_rejects_cached_calls(variadic):
     class Decoder(nn.Module):
         def forward(self, x, past_key_values=None, use_cache=None):
             return x
 
-    decoder = Decoder()
+    source = Decoder()
+    if variadic:
+        class Wrapper(nn.Module):
+            def forward(self, *args, **model_kwargs):
+                return source(*args, **model_kwargs)
+
+        decoder = Wrapper()
+    else:
+        decoder = source
     register_tensor_parallel_cache_guard(decoder)
     assert decoder(torch.ones(1)).item() == 1
     for kwargs in ({"use_cache": True}, {"past_key_values": object()}):
         with pytest.raises(ValueError, match="cache"):
             decoder(torch.ones(1), **kwargs)
+
+
+@pytest.mark.parametrize("variadic", [False, True])
+def test_cache_guard_disables_implicit_config_cache(variadic):
+    class Decoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(use_cache=True)
+
+        def forward(self, x, past_key_values=None, use_cache=None):
+            return self.config.use_cache if use_cache is None else use_cache
+
+    source = Decoder()
+    if variadic:
+        class Wrapper(nn.Module):
+            def forward(self, *args, **model_kwargs):
+                return source(*args, **model_kwargs)
+
+        decoder = Wrapper()
+    else:
+        decoder = source
+    register_tensor_parallel_cache_guard(decoder)
+    for kwargs in ({}, {"use_cache": None}, {"use_cache": False}):
+        assert decoder(torch.ones(1), **kwargs) is False
+    if not variadic:
+        assert decoder(torch.ones(1), None, None) is False
+        with pytest.raises(ValueError, match="cache"):
+            decoder(torch.ones(1), None, True)
+    assert source.config.use_cache is True
+
+
+def test_cache_guard_keeps_noncache_forward_signature():
+    module = nn.Linear(2, 1)
+    hidden = torch.ones(1, 2)
+    expected = module(hidden)
+    register_tensor_parallel_cache_guard(module)
+    torch.testing.assert_close(module(hidden), expected)
 
 
 @pytest.mark.parametrize("case,message", [
@@ -135,7 +182,6 @@ def test_cache_guard_rejects_cached_calls():
     ("cpu_offload", "offload"),
     ("mtp", "MTP"),
     ("dense_with_ep", "Dense TP requires ep_size=etp_size=1"),
-    ("unaligned_etp", "aligned tp_size=etp_size>1"),
     ("empty_plan", "nonempty tensor_parallel_plan"),
     ("dropout", "dropout=0"),
     ("no_shard", "no_shard"),
@@ -158,9 +204,6 @@ def test_admission_rejects_unsupported_features(monkeypatch, case, message):
         config.mtp.enabled = True
     elif case == "dense_with_ep":
         plan.ep_size = 2
-    elif case == "unaligned_etp":
-        plan.etp_size = 1
-        plan.tensor_parallel_plan.plan["up"] = GroupedMLPParallel()
     elif case == "empty_plan":
         plan.tensor_parallel_plan.plan.clear()
     elif case == "no_shard":
@@ -170,7 +213,14 @@ def test_admission_rejects_unsupported_features(monkeypatch, case, message):
 
 
 def _init(rank, world, path):
+    from torchturbo.ops import OpPolicy, get_or_create_ops
+
     torch.set_num_threads(1)
+    # Dispatch metadata and native kernels must use the same CPU runtime even
+    # when an accelerator extension is installed in the test environment.
+    runtime = CpuRuntime()
+    runtime_module._SELECTED_RUNTIME = runtime
+    get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
     dist.init_process_group("gloo", init_method=f"file://{path}", rank=rank,
                             world_size=world, timeout=timedelta(seconds=120))
 
@@ -343,11 +393,11 @@ class DenseMoE(nn.Module):
 def _routing_consensus(context):
     from torchturbo.models.modules.moe.utils import topk_softmax_with_capacity
 
-    lane = context.etp_mesh.get_local_rank()
+    lane = context.tp_mesh.get_local_rank()
     # Lane 1 alone would select experts {0, 2}; it must follow lane zero's {0, 1}.
     logits = torch.tensor([[.30, .29, .10, 0.]]) + lane * torch.tensor([0., -.25, 0., 0.])
     routing = topk_softmax_with_capacity(
-        logits, topk=2, score_function="sigmoid", routing_group=context.etp_mesh.get_group()
+        logits, topk=2, score_function="sigmoid", routing_group=context.tp_mesh.get_group()
     )
     assert routing.routing_map.tolist() == [[True, True, False, False]]
     selected = logits.sigmoid()[:, :2]
@@ -355,11 +405,8 @@ def _routing_consensus(context):
 
 
 def _etp_worker(rank, path):
-    from torchturbo.ops import get_or_create_ops
-
     _init(rank, 4, path)
     try:
-        get_or_create_ops(device_runtime=CpuRuntime())
         context = ParallelContext("cpu", sp_size=1, ep_size=2, tp_size=2, etp_size=2)
         _routing_consensus(context)
         torch.manual_seed(5)
@@ -380,7 +427,7 @@ def _etp_worker(rank, path):
             plan={"moe.experts": FSDPPlanSpec(placement=FSDPPlacementSpec(Shard(0), "edp"))},
             tensor_parallel_plan=TensorParallelPlanSpec(plan={"moe.experts": GroupedMLPParallel()}),
         ))
-        assert model.moe.router.routing_group is context.etp_mesh.get_group()
+        assert model.moe.router.routing_group is context.tp_mesh.get_group()
         assert backend._parameter_ownership.is_expert(model.moe.experts.weight1)
         optimizer = backend.prepare_optimizer(OptimizerClassPlan(model, torch.optim.AdamW, {"lr": .05, "weight_decay": 0.}))
         reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=.05, weight_decay=0.)

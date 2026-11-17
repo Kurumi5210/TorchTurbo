@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
-from inspect import signature
+from inspect import Parameter, signature
 
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -23,16 +23,36 @@ from .expert import GroupedMLPParallel
 
 
 def register_tensor_parallel_cache_guard(module: nn.Module) -> None:
-    """Reject explicit cache requests before a TP module starts computation."""
+    """Disable implicit cache defaults and reject explicit TP cache requests."""
     forward_signature = signature(module.forward)
+    variadic_kwargs = next(
+        (
+            parameter.name for parameter in forward_signature.parameters.values()
+            if parameter.kind is Parameter.VAR_KEYWORD
+        ),
+        None,
+    )
 
-    def reject_cache(current: nn.Module, args: tuple, kwargs: dict) -> None:
-        arguments = forward_signature.bind_partial(*args, **kwargs).arguments
+    def reject_cache(
+        current: nn.Module, args: tuple, kwargs: dict,
+    ) -> tuple[tuple, dict] | None:
+        bound = forward_signature.bind_partial(*args, **kwargs)
+        arguments = bound.arguments
         # Variadic wrappers keep cache options inside bound kwargs rather than named arguments.
         cache = arguments.get("past_key_values", kwargs.get("past_key_values"))
         use_cache = arguments.get("use_cache", kwargs.get("use_cache"))
         if cache is not None or use_cache:
             raise ValueError("TP does not support cache or cached generation.")
+        if use_cache is not None:
+            return None
+        if "use_cache" in forward_signature.parameters:
+            bound.apply_defaults()
+            bound.arguments["use_cache"] = False
+        elif variadic_kwargs is not None:
+            arguments.setdefault(variadic_kwargs, {})["use_cache"] = False
+        else:
+            return None
+        return bound.args, bound.kwargs
 
     module.register_forward_pre_hook(reject_cache, with_kwargs=True)
 
@@ -123,7 +143,7 @@ def validate_tensor_parallel_targets(
     model: nn.Module,
     plan: Mapping[str, ParallelStyle],
     *,
-    tp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh | None,
     etp_mesh: DeviceMesh | None = None,
 ) -> None:
     """Validate used meshes and all targets before any native TP mutation."""
@@ -132,23 +152,25 @@ def validate_tensor_parallel_targets(
         if mesh is not None and mesh.ndim != 1:
             raise ValueError(f"TP target {fqn!r} requires a 1D device mesh.")
         module = model.get_submodule(fqn)
-        if isinstance(module, nn.Embedding) and isinstance(style, RowwiseParallel):
+        if (
+            tp_mesh is not None
+            and isinstance(module, nn.Embedding)
+            and isinstance(style, RowwiseParallel)
+        ):
             shard_rows = (module.num_embeddings + tp_mesh.size() - 1) // tp_mesh.size()
             if shard_rows * (tp_mesh.size() - 1) >= module.num_embeddings:
                 raise ValueError("Vocabulary TP requires nonempty embedding shards.")
         if isinstance(style, PrepareModuleMetadata):
-            style.validate(module, tp_mesh.size())
+            style.validate(module, tp_mesh.size() if tp_mesh is not None else 1)
         elif isinstance(style, GroupedMLPParallel):
-            if etp_mesh is None:
-                raise ValueError("GroupedMLPParallel requires a nontrivial ETP mesh.")
-            style.validate(module, etp_mesh.size())
+            style.validate(module, etp_mesh.size() if etp_mesh is not None else 1)
 
 
 def apply_tensor_parallel_plan(
     model: nn.Module,
     plan: Mapping[str, ParallelStyle],
     *,
-    tp_mesh: DeviceMesh,
+    tp_mesh: DeviceMesh | None,
     etp_mesh: DeviceMesh | None = None,
 ) -> nn.Module:
     """Apply exact native styles after validating every metadata/expert target."""
@@ -164,7 +186,7 @@ def apply_tensor_parallel_plan(
     for fqn, style in plan.items():
         mesh = etp_mesh if isinstance(style, GroupedMLPParallel) else tp_mesh
         if mesh is None:
-            raise ValueError("GroupedMLPParallel requires a nontrivial ETP mesh.")
+            continue
         parallelize_module(model.get_submodule(fqn), mesh, style)
     for parameter_id, owners in parameter_owners.items():
         source_module, source_name = owners[0]

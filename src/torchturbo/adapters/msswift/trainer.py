@@ -211,14 +211,14 @@ class TurboTrainerMixin:
                 setattr(type(model), "device", _offload_device(model))
 
     def _activate_tp_sft(self, engine: Any, stage: str | None) -> None:
-        if engine.get_tp_info()["tp_size"] == 1:
+        if engine.get_tp_info()["tp_size"] == 1 and engine.get_etp_info()["etp_size"] == 1:
             return
         if stage not in {"sft", "pt"}:
-            raise ValueError("TP adapters support SFT/PT training only")
+            raise ValueError("TP/ETP adapters support SFT/PT training only")
         if self.model.is_diffusion_model:
-            raise ValueError("TP adapters do not support diffusion training")
+            raise ValueError("TP/ETP adapters do not support diffusion training")
         if engine.config.gbs is None:
-            raise ValueError("TP adapters require explicit tt_gbs")
+            raise ValueError("TP/ETP adapters require explicit tt_gbs")
         self._tp_sft_enabled = True
         # Swift templates can override the native default during construction.
         # The prepared loss consumes the exact step count, so HF must not divide GA.
@@ -240,7 +240,7 @@ class TurboTrainerMixin:
         return count
 
     def get_total_train_batch_size(self, args: Any) -> int:
-        """Report the nominal batch using logical data replicas for TP."""
+        """Report the nominal batch using logical data replicas for TP/ETP."""
         if not self._tp_sft_enabled:
             return super().get_total_train_batch_size(args)
         return (
@@ -430,7 +430,7 @@ class TurboTrainerMixin:
             self._tp_main_loss = None
         result = super().training_step(model, inputs, *args, **kwargs)
         if self._tp_sft_enabled and self._tp_main_loss is None:
-            raise RuntimeError("TP training_step requires a fresh main loss report.")
+            raise RuntimeError("TP/ETP training_step requires a fresh main loss report.")
         engine = engine_registry.get_engine_or_none()
         if engine is not None:
             assert_finite(result, "loss")

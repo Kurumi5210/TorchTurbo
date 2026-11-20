@@ -1,0 +1,55 @@
+tests/engine/backends/fsdp2/test_tensor_parallel.py
+  s_0f3bf92c5dbcd0::t_6ec043b4a2c18b 38,120-121,127-129,131-132,142-178,216-217,219-223,396,400,430
+  s_0f3bf92c5dbcd0::t_e906672a50c89c 126,130,133-134
+src/torchturbo/engine/tensor_parallel/expert.py
+  s_0f3bf92c5dbcd0::t_33f8cb72e3a683 1
+tests/adapters/llamafactory_v0/test_trainer.py
+  s_0f3bf92c5dbcd0::t_94588beada4c5b 99-103
+src/torchturbo/models/weight_converter.py
+  s_0f3bf92c5dbcd0::t_33f8cb72e3a683 204
+tests/models/qwen3_5/test_mtp.py
+  s_0f3bf92c5dbcd0::t_03b6c09dbd0693 86
+src/torchturbo/engine/backends/fsdp2/backend.py
+  s_0f3bf92c5dbcd0::t_e7bd36cdca3fa1 333
+  s_0f3bf92c5dbcd0::t_b0f6e014959e1a 230,248,334-338,391,526,529,547-549,598,758-761,787,817,1097-1099,1972-1975,2006,2064,2109,2200-2202,2204,2266
+tests/engine/backends/fsdp2/test_chunked_loss.py
+  s_0f3bf92c5dbcd0::t_03b6c09dbd0693 32
+tests/engine/test_core.py
+  s_0f3bf92c5dbcd0::t_03b6c09dbd0693 895,926,1100,1111,1165-1263
+  s_0f3bf92c5dbcd0::t_5f5e776d02ea55 1264-1265
+tests/adapters/test_tp_sft_loss.py
+  s_0f3bf92c5dbcd0::t_94588beada4c5b 11-13,27-32,50-77
+  s_0f3bf92c5dbcd0::t_ceb0940095e239 78-79
+tests/engine/test_packed_inputs.py
+  s_0f3bf92c5dbcd0::t_03b6c09dbd0693 50,111,152
+tests/engine/backends/fsdp2/test_dspark_loss.py
+  s_0f3bf92c5dbcd0::t_03b6c09dbd0693 34
+src/torchturbo/engine/tensor_parallel/parallelize.py
+  s_0f3bf92c5dbcd0::t_6ec043b4a2c18b 7,26,28-35,39-40,55,146,155-159,164,166,173,189
+  s_0f3bf92c5dbcd0::t_e906672a50c89c 36-38,46-54
+docs/tensor_parallel.md
+  s_0f3bf92c5dbcd0::t_06ad87a325bbcf 45-52
+  s_0f3bf92c5dbcd0::t_33f8cb72e3a683 19-22,28,30,33-37,54-55,70-72,82-85
+  s_0f3bf92c5dbcd0::t_c5a792286f945c 38,41-44
+  s_0f3bf92c5dbcd0::t_277ecfc78e572e 53,86
+tests/engine/backends/fsdp2/test_independent_tp_etp.py
+  s_0f3bf92c5dbcd0::t_ed99739deee2a9 1-502
+tests/adapters/llamafactory_v0/test_patches.py
+  s_0f3bf92c5dbcd0::t_94588beada4c5b 570
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "31aa086aa1e91baacdb12d5ac7ad500584ea2be7",
+  "prompts": {},
+  "sessions": {
+    "s_0f3bf92c5dbcd0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1d9c7-6a43-7733-9dc2-a8915504e4f7",
+        "model": "gpt-6-astra-flex"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

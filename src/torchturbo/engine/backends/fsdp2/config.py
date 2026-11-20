@@ -54,10 +54,11 @@ class CPUOffloadConfig:
 
     ``enabled`` controls CPU offload. When enabled, ``mode`` selects either
     full offload or optimizer-state-only offload. ``optimizer_memory_fraction``
-    bounds optimizer workspaces: AdamWSwap sizes its staging slab from that
-    fraction of free device memory, while Muon checks its complete-matrix
-    compute and exchange buffers against that fraction of free device memory
-    plus blocks cached by the device allocator. Muon stages offloaded tensors
+    bounds each rank's optimizer workspaces using that fraction of free device
+    memory plus reusable blocks cached by the device allocator. AdamWSwap also
+    caps total staging storage by active state demand and calibrates chunk size
+    and transfer overlap before the first update. Muon checks its complete-matrix
+    compute and exchange buffers against this budget. Muon stages offloaded tensors
     with blocking copies, so ``overlap_comm_compute`` gives little overlap
     there. Zero selects synchronous CPU updates, which for Muon includes CPU
     collectives in either mode. Full-mode native AdamW retains its existing

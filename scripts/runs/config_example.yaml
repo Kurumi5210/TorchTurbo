@@ -56,7 +56,8 @@ engine_config:
       enabled: false
       # "optimizer" keeps parameters on device; "full" also offloads FSDP parameters
       mode: optimizer
-      # Fraction of free device memory for AdamWSwap/Muon workspaces
+      # Per-rank budget: fraction * (free device memory + reusable allocator cache)
+      # AdamWSwap caps total slot storage and tunes chunk size/overlap before the first update
       # Zero selects CPU updates, including CPU Newton-Schulz and exchange for Muon
       optimizer_memory_fraction: 0.8
 

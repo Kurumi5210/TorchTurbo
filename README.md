@@ -177,6 +177,57 @@ Muon supports `full` and `optimizer` CPU offload, and
 `optimizer_memory_fraction=0` selects CPU Newton-Schulz and CPU exchange. These
 paths are experimental until they are fully validated.
 
+With optimizer-state offload, AdamWSwap calibrates chunk size and transfer overlap
+before its first parameter update, after backward has produced real gradients.
+Contiguous parameters and their moments can span multiple chunks; each original
+parameter's step counter advances once per update. Dense noncontiguous tensors
+stay whole and set the minimum slot size; parameter and gradient layouts must
+match. Unsupported layouts fail before any update. Each rank's total workspace is capped by
+active state demand and
+`optimizer_memory_fraction * (free device memory + reusable allocator cache)`.
+
+The search compares serial slots of 64 MiB, 256 MiB and 1 GiB with two slots of
+64 MiB or 256 MiB each, fitted to each rank's budget. Separate H2D and D2H streams overlap
+transfers with computation when the two-slot plan wins. CPU moment writes finish
+before `step()` returns. If no rank has more than 64 MiB of feasible workspace
+or more than one feasible size, calibration trials are skipped. A globally empty
+step leaves calibration pending until gradients produce real work.
+
+All ranks run each trial together, with one warmup and three timing samples per
+candidate. Each sample times a complete pipeline, including fill and drain,
+and uses the slowest rank's time. Within 3% of the fastest median, AdamWSwap
+selects the candidate with the smallest total HBM allocation across ranks.
+Later steps fit that plan to current budgets and active parameter requirements.
+Allocation failures are coordinated across ranks; a rank that runs out of memory
+shrinks its buffer before any update. A failed update cannot be replayed safely:
+reload the model checkpoint and recreate the optimizer before continuing.
+
+For an explicit calibration before the training loop, call
+`adamw_swap.autotune_workspace()` on every training rank after a representative
+warmup backward, then clear the warmup gradients. Calibration saves one CPU
+snapshot of all active local parameters and clones step counters. If the active
+CPU moments are verified to be zero, trials write back to their real addresses
+and reset them after every trial. Successful trials restore zeros by copying from
+the existing device slot; failed execution retains CPU recovery. Nonzero moments use an
+independent pinned output ring to preserve the original state. The zero-state
+path needs roughly the active parameter bytes of extra host memory; nonzero
+state additionally needs the largest candidate workspace. The output ring is an
+approximation of real writeback traffic, so its timings may differ from training.
+Backup, restore and rank coordination are outside timed execution; there are no
+per-chunk collectives. Parameter, gradient and optimizer-state values are
+preserved, but parameter version counters increase: do not reuse a retained
+autograd graph afterwards.
+
+Calibration preserves existing allocator cache. After releasing temporary
+storage, it clears cache only if reserved memory grew beyond the selected
+workspace plus a 64 MiB allowance. Allocation and trial OOM recovery still clear
+cache when needed. Logs report setup, snapshot, trials and cleanup separately.
+Each real step binds its current gradients once. Successful execution drains its
+streams before releasing the slab; external and error cleanup retain device
+synchronization. Ordinary steps do not clear cache. The result is the measured
+best candidate, not a guarantee of globally optimal performance. CPU updates
+(`optimizer_memory_fraction=0`) do not calibrate.
+
 To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.
 
 ## Quick Start

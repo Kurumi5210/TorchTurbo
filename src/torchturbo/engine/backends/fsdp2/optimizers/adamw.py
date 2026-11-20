@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from itertools import chain, groupby
-from typing import Any, Union
+from statistics import median
+from time import perf_counter
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -17,6 +19,15 @@ from .....logging import get_logger
 from .....runtime import DeviceRuntime, TurboDevice
 from ....optimizers.plan import ParamGroup
 from ..config import CPUOffloadConfig, CPUOffloadMode
+from .adamw_workspace import (
+    BoundParameter,
+    DeviceWorkspace,
+    PipelineStreams,
+    WorkspacePlan,
+    bind_parameters,
+    reset_workspace_moments,
+    run_workspace,
+)
 from .state import wrap_cpu_state
 
 __all__ = [
@@ -25,6 +36,10 @@ __all__ = [
 ]
 
 logger = get_logger(__name__)
+
+
+class _WorkspaceRestoreError(RuntimeError):
+    """Calibration could not restore the parameter values it saved."""
 
 
 def prepare_fsdp_adamw_optimizer(
@@ -64,89 +79,14 @@ def prepare_fsdp_adamw_optimizer(
     return torch.optim.AdamW(param_groups, **options)
 
 
-class DeviceWorkspace:
-    """Byte-backed temporary device storage that yields typed tensor views."""
-
-    _ALIGNMENT_BYTES = 16
-
-    def __init__(
-        self,
-        device_runtime: DeviceRuntime,
-        memory_fraction: float,
-    ) -> None:
-        """Reserve temporary device storage from currently free memory."""
-        self._storage: torch.Tensor | None = None
-        if device_runtime.turbo_device is TurboDevice.CPU:
-            return
-
-        device = device_runtime.device
-        free_memory, _ = device_runtime.memory_info()
-        capacity = int(free_memory * memory_fraction)
-        capacity = self._reduce_capacity_to_minimum(capacity, device)
-        if capacity < self._ALIGNMENT_BYTES:
-            raise RuntimeError(
-                f"workspace capacity {capacity} bytes is too small "
-                f"(memory_fraction={memory_fraction}); increase "
-                "optimizer_memory_fraction or reduce device memory usage"
-            )
-        self._storage = torch.empty(capacity, dtype=torch.uint8, device=device)
-        logger.info_rank0(
-            "FSDP2 workspace reserved: device=%s, capacity=%d MiB, "
-            "memory_fraction=%.3f",
-            device.type,
-            capacity // (1024 * 1024),
-            memory_fraction,
-        )
-
-    @staticmethod
-    def _reduce_capacity_to_minimum(capacity: int, device: torch.device) -> int:
-        if not (dist.is_available() and dist.is_initialized()):
-            return capacity
-
-        capacity_tensor = torch.tensor([capacity], dtype=torch.int64, device=device)
-        dist.all_reduce(
-            capacity_tensor,
-            op=dist.ReduceOp.MIN,
-            group=dist.group.WORLD,
-        )
-        return int(capacity_tensor.item())
-
-    @property
-    def is_available(self) -> bool:
-        return self._storage is not None
-
-    def _require_storage(self) -> torch.Tensor:
-        if self._storage is None:
-            raise RuntimeError("workspace is unavailable")
-        return self._storage
-
-    @property
-    def device(self) -> torch.device:
-        return self._require_storage().device
-
-    @property
-    def capacity_bytes(self) -> int:
-        return self._require_storage().numel()
-
-    @classmethod
-    def align(cls, offset: int) -> int:
-        alignment = cls._ALIGNMENT_BYTES
-        return (offset + alignment - 1) // alignment * alignment
-
-    def view_like(self, offset: int, tensor: torch.Tensor) -> torch.Tensor:
-        nbytes = tensor.numel() * tensor.element_size()
-        if offset % tensor.element_size() != 0:
-            raise ValueError("workspace offset is not aligned for tensor dtype")
-        if offset + nbytes > self.capacity_bytes:
-            raise RuntimeError("workspace capacity exceeded")
-        raw = self._require_storage().narrow(0, offset, nbytes)
-        return raw.view(tensor.dtype).view(tensor.shape)
-
-
 class AdamWSwapMixin:
     """Run AdamW with CPU-resident optimizer state."""
 
     state_keys = ("exp_avg", "exp_avg_sq")
+    _WORKSPACE_TARGET_BYTES = 1 << 30
+    _WORKSPACE_CHUNK_BYTES = 64 << 20
+    _WORKSPACE_PIPELINE_BYTES = 256 << 20
+    _WORKSPACE_CACHE_MARGIN_BYTES = 64 << 20
 
     def __init__(
         self,
@@ -156,36 +96,444 @@ class AdamWSwapMixin:
     ) -> None:
         self.device_runtime = device_runtime
         self.optimizer_memory_fraction = optimizer_memory_fraction
-        self.param_to_name_map = (
-            dict(param_names) if param_names is not None else {}
-        )
+        self.param_to_name_map = dict(param_names) if param_names is not None else {}
         self.param_to_cpu_states_map = {}
         self.param_to_step_map = {}
-        self.param_to_state_bytes_map = {}
         self.workspace: DeviceWorkspace | None = None
+        self._tuned_workspace_bytes: int | None = None
+        self._tuned_workspace_plan: WorkspacePlan | None = None
+        self._workspace_plan = WorkspacePlan(1, 0)
+        self._pipeline: PipelineStreams | None = None
+        self._workspace_update_failed = False
+        self._workspace_restore_failed = False
         self._workspace_adamw_logged = False
+        self._workspace_calibration_stats: dict[str, Any] = {}
         self._checkpoint_meshes: dict[DeviceMesh, DeviceMesh] = {}
         self._opt_states_initialization()
 
-    def _acquire_workspace(self) -> DeviceWorkspace | None:
+    @staticmethod
+    def _reduce_workspace_value(tensor: torch.Tensor, op) -> None:
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(tensor, op=op, group=dist.group.WORLD)
+
+    def _active_parameters(self):
+        return [
+            (param, group)
+            for group in self.param_groups
+            for param in group["params"]
+            if param.grad is not None
+        ]
+
+    def _workspace_bounds(self, bound: list[BoundParameter]) -> tuple[int, int]:
+        """Return local aligned bounds, including reusable allocator memory."""
+        minimum = max((param.minimum_slot_bytes for param in bound), default=0)
+        if not minimum:
+            return 0, 0
+        alignment = 2 * DeviceWorkspace._ALIGNMENT_BYTES
+        total = sum(
+            2
+            * DeviceWorkspace.align(max(param.exp_avg.nbytes, param.exp_avg_sq.nbytes))
+            for param in bound
+        )
+        runtime = self.device_runtime
+        free, _ = runtime.memory_info()
+        cached = runtime.memory_reserved() - runtime.memory_allocated()
+        budget = int((free + cached) * self.optimizer_memory_fraction)
+        budget = budget // alignment * alignment
+        if minimum > budget:
+            largest = max(bound, key=lambda param: param.minimum_slot_bytes)
+            raise RuntimeError(
+                f"optimizer state for parameter '{self._parameter_name(largest.original)}' "
+                f"does not fit in the per-step workspace budget "
+                f"({minimum} aligned bytes required, budget={budget} bytes, "
+                f"optimizer_memory_fraction={self.optimizer_memory_fraction}); "
+                "increase optimizer_memory_fraction or reduce device memory usage"
+            )
+        return minimum, min(budget, total)
+
+    @staticmethod
+    def _fit_workspace_plan(
+        plan: WorkspacePlan,
+        minimum: int,
+        maximum: int,
+    ) -> WorkspacePlan:
+        """Fit total storage while retaining room for unsliceable parameters."""
+        if maximum == 0:
+            return WorkspacePlan(1, 0)
+        slots = plan.num_slots if maximum >= plan.num_slots * minimum else 1
+        slot_bytes = max(minimum, min(plan.slot_bytes, maximum // slots // 32 * 32))
+        return WorkspacePlan(slots, slot_bytes)
+
+    def _get_pipeline(self, plan: WorkspacePlan) -> PipelineStreams | None:
+        if plan.num_slots == 1 or not plan.capacity_bytes:
+            return None
+        if self._pipeline is None:
+            self._pipeline = PipelineStreams(self.device_runtime, num_slots=2)
+        return self._pipeline
+
+    def _reserve_workspace(
+        self, capacity: int, minimum: int, *, status=None, error=None
+    ) -> DeviceWorkspace | None:
+        """Coordinate failures while only the failed ranks shrink allocations."""
+        runtime = self.device_runtime
+        if status is None:
+            status = torch.ones(2, dtype=torch.int32, device=runtime.device)
+        workspace = None
+        while True:
+            status.fill_(1)
+            if error is None and workspace is None and capacity:
+                try:
+                    workspace = DeviceWorkspace(runtime, capacity)
+                except RuntimeError as allocation_error:
+                    error = allocation_error.with_traceback(None)
+            if error is not None:
+                status[0] = 0
+                status[1] = self._is_out_of_memory(error) and capacity > minimum
+            self._reduce_workspace_value(status, dist.ReduceOp.MIN)
+            succeeded, retryable = status.tolist()
+            if succeeded:
+                self.workspace = workspace
+                return workspace
+            if not retryable:
+                workspace = None
+                raise RuntimeError(
+                    "AdamW workspace allocation failed on a training rank "
+                    f"before any update (capacity={capacity} bytes)"
+                ) from error
+            if error is not None:
+                error = None
+                runtime.empty_cache()
+                alignment = 2 * DeviceWorkspace._ALIGNMENT_BYTES
+                capacity = max(minimum, capacity // 2 // alignment * alignment)
+                logger.debug("Retrying AdamW workspace with %d bytes", capacity)
+
+    @staticmethod
+    def _is_out_of_memory(error: RuntimeError) -> bool:
+        return isinstance(error, torch.OutOfMemoryError) or (
+            "out of memory" in str(error).lower()
+        )
+
+    def _check_workspace_restore(self) -> None:
+        if self._workspace_update_failed:
+            raise RuntimeError(
+                "AdamW update failed after it started on a training rank; "
+                "reload the model checkpoint and recreate the optimizer before continuing"
+            )
+        if self._workspace_restore_failed:
+            raise RuntimeError(
+                "AdamW calibration could not restore parameter values on a training "
+                "rank; reload the model checkpoint and recreate the optimizer "
+                "before continuing"
+            )
+
+    def _acquire_workspace(
+        self, bound=None, *, error: Exception | None = None
+    ) -> DeviceWorkspace | None:
         """Allocate the per-step workspace for AdamW state staging."""
         self.release_workspace()
         self.device_runtime.synchronize()
-        workspace = DeviceWorkspace(
-            self.device_runtime,
-            self.optimizer_memory_fraction,
+        if self.device_runtime.turbo_device is TurboDevice.CPU:
+            return None
+        # This tensor must exist before either budget validation or allocation fails.
+        status = torch.ones(2, dtype=torch.int32, device=self.device_runtime.device)
+        minimum = capacity = 0
+        plan = WorkspacePlan(1, 0)
+        try:
+            if error is not None:
+                raise error
+            if bound is None:
+                bound = bind_parameters(
+                    self._active_parameters(), self.param_to_cpu_states_map
+                )
+            minimum, maximum = self._workspace_bounds(bound)
+            target = self._tuned_workspace_plan
+            if target is None or target.capacity_bytes == 0:
+                target = WorkspacePlan(1, self._WORKSPACE_TARGET_BYTES)
+            plan = self._fit_workspace_plan(target, minimum, maximum)
+            self._get_pipeline(plan)
+            capacity = plan.capacity_bytes
+        except Exception as budget_error:  # noqa: BLE001 - Propagate errors to every rank.
+            error = budget_error.with_traceback(None)
+        workspace = self._reserve_workspace(
+            capacity, minimum, status=status, error=error
         )
-        self.workspace = workspace if workspace.is_available else None
-        return self.workspace
+        capacity = workspace.capacity_bytes if workspace is not None else 0
+        self._workspace_plan = self._fit_workspace_plan(plan, minimum, capacity)
+        return workspace
+
+    def _workspace_candidates(
+        self, minimum: int, maximum: int
+    ) -> tuple[WorkspacePlan, ...]:
+        """Compare serial chunking and two-slot overlap under the total HBM cap."""
+        candidates = [
+            WorkspacePlan(1, self._WORKSPACE_TARGET_BYTES),
+            WorkspacePlan(1, self._WORKSPACE_CHUNK_BYTES),
+            WorkspacePlan(1, self._WORKSPACE_PIPELINE_BYTES),
+        ]
+        if self.device_runtime.supports_async_streams:
+            candidates.extend(
+                (
+                    WorkspacePlan(2, self._WORKSPACE_CHUNK_BYTES),
+                    WorkspacePlan(2, self._WORKSPACE_PIPELINE_BYTES),
+                )
+            )
+        return tuple(
+            self._fit_workspace_plan(plan, minimum, maximum) for plan in candidates
+        )
+
+    @torch.no_grad()
+    def autotune_workspace(self) -> int:
+        """Calibrate chunk size and overlap after a representative backward.
+
+        Call on every training rank, or let the first device step call it.
+        Complete trial updates are timed, then parameter values are restored
+        from one reusable CPU snapshot. Verified zero moments use their real CPU
+        destinations and are reset after every trial. Nonzero moments use an
+        independent output ring. Gradients and real counters stay unchanged.
+        A retained autograd graph must not be reused afterwards.
+        Returns the selected total workspace capacity in bytes on this rank.
+        """
+        self._check_workspace_restore()
+        if self.optimizer_memory_fraction == 0:
+            return 0
+        bound = []
+        error = None
+        try:
+            bound = bind_parameters(
+                self._active_parameters(), self.param_to_cpu_states_map
+            )
+        except Exception as binding_error:  # noqa: BLE001 - Propagate errors to every rank.
+            error = binding_error.with_traceback(None)
+        return self._autotune_workspace(bound, error=error)
+
+    def _autotune_workspace(
+        self, bound: list[BoundParameter], *, error: Exception | None = None
+    ) -> int:
+        """Calibrate using the same bindings as the upcoming update."""
+        started = perf_counter()
+        self._check_workspace_restore()
+        runtime = self.device_runtime
+        if runtime.turbo_device is TurboDevice.CPU:
+            raise RuntimeError(
+                "workspace is unavailable; calibration requires CUDA/NPU"
+            )
+        self.release_workspace()
+        runtime.synchronize()
+        status = torch.ones(3, dtype=torch.int64, device=runtime.device)
+        allocation_status = torch.ones(2, dtype=torch.int64, device=runtime.device)
+        control = torch.zeros(1, dtype=torch.int64, device=runtime.device)
+        demand = torch.zeros(2, dtype=torch.int64, device=runtime.device)
+        timing = torch.zeros((), dtype=torch.float32, device=runtime.device)
+        stats = self._workspace_calibration_stats = {
+            "reserved_before_bytes": runtime.memory_reserved(),
+            "cleanup_cleared_cache": False,
+            "output_mode": "none",
+        }
+        minimum = maximum = 0
+        try:
+            if error is not None:
+                raise error
+            minimum, maximum = self._workspace_bounds(bound)
+        except Exception as budget_error:  # noqa: BLE001 - Propagate errors to every rank.
+            error = budget_error.with_traceback(None)
+        self._check_benchmark_phase(
+            status, error, "budget validation before any update"
+        )
+        demand[0] = maximum > 0
+        demand[1] = minimum < maximum and maximum > self._WORKSPACE_CHUNK_BYTES
+        self._reduce_workspace_value(demand, dist.ReduceOp.MAX)
+        has_work, needs_calibration = demand.tolist()
+        stats["setup_seconds"] = perf_counter() - started
+        if not has_work:
+            # All ranks must remain eligible for a later first real update.
+            stats["total_seconds"] = perf_counter() - started
+            return 0
+        if not needs_calibration:
+            plan = WorkspacePlan(1, maximum)
+            self._tuned_workspace_plan = plan
+            self._tuned_workspace_bytes = plan.capacity_bytes
+            logger.info_rank0(
+                "AdamW workspace selected: rank0 slots=1, capacity=%d bytes "
+                "(small demand or a single feasible size)",
+                maximum,
+            )
+            stats["total_seconds"] = perf_counter() - started
+            return maximum
+
+        measurements = []
+        previous_plans = []
+        saved_params = []
+        cpu_sink = None
+        selected_capacity = 0
+        trials_started = None
+        candidates = self._workspace_candidates(minimum, maximum)
+        try:
+            preparation_started = perf_counter()
+            error = None
+            try:
+                saved_params = [
+                    param.local_param.detach().to(device="cpu", copy=True)
+                    for param in bound
+                ]
+                stats["snapshot_parameter_bytes"] = sum(
+                    param.nbytes for param in saved_params
+                )
+                zero_check_started = perf_counter()
+                zero_moments = all(
+                    torch.count_nonzero(moment).item() == 0
+                    for param in bound
+                    for moment in (param.exp_avg, param.exp_avg_sq)
+                )
+                stats["zero_check_seconds"] = perf_counter() - zero_check_started
+                if zero_moments:
+                    stats["output_mode"] = "real_zero_moments"
+                else:
+                    sink_bytes = max(plan.capacity_bytes for plan in candidates)
+                    cpu_sink = torch.empty(
+                        sink_bytes, dtype=torch.uint8, pin_memory=True
+                    )
+                    stats["output_mode"] = "scratch"
+                stats["output_bytes"] = cpu_sink.nbytes if cpu_sink is not None else 0
+                for plan in candidates:
+                    self._get_pipeline(plan)
+                runtime.synchronize()
+            except Exception as preparation_error:  # noqa: BLE001 - Propagate errors to every rank.
+                error = preparation_error.with_traceback(None)
+            self._check_benchmark_phase(status, error, "snapshot preparation")
+            stats["snapshot_seconds"] = perf_counter() - preparation_started
+            trials_started = perf_counter()
+            last_error = None
+            for candidate in candidates:
+                self.release_workspace()
+                self._reserve_workspace(
+                    candidate.capacity_bytes, minimum, status=allocation_status
+                )
+                capacity = (
+                    self.workspace.capacity_bytes if self.workspace is not None else 0
+                )
+                plan = self._fit_workspace_plan(candidate, minimum, capacity)
+                self._workspace_plan = plan
+                # Deduplicate the entire plan vector, not just this rank's size.
+                duplicate = False
+                for previous in previous_plans:
+                    control.fill_(plan == previous)
+                    self._reduce_workspace_value(control, dist.ReduceOp.MIN)
+                    if control.item():
+                        duplicate = True
+                        break
+                if duplicate:
+                    continue
+                previous_plans.append(plan)
+                samples = []
+                for trial in range(4):
+                    try:
+                        elapsed = self._benchmark_workspace(
+                            bound, status, saved_params, cpu_sink
+                        )
+                    except _WorkspaceRestoreError:
+                        self._workspace_restore_failed = True
+                        self._check_workspace_restore()
+                    except torch.OutOfMemoryError as benchmark_error:
+                        last_error = benchmark_error.with_traceback(None)
+                        break
+                    timing.fill_(elapsed)
+                    self._reduce_workspace_value(timing, dist.ReduceOp.MAX)
+                    if trial:
+                        samples.append(timing.item())
+                if len(samples) != 3:
+                    self.release_workspace()
+                    runtime.empty_cache()
+                    logger.info_rank0(
+                        "AdamW workspace calibration ran out of memory at %d bytes; "
+                        "trying the next candidate",
+                        plan.capacity_bytes,
+                    )
+                    continue
+                control.fill_(plan.capacity_bytes)
+                self._reduce_workspace_value(control, dist.ReduceOp.SUM)
+                elapsed = median(samples)
+                measurements.append((plan, elapsed, control.item()))
+                logger.info_rank0(
+                    "AdamW workspace calibration: rank0 slots=%d, slot=%d bytes, "
+                    "capacity=%d bytes, step=%.3f ms",
+                    plan.num_slots,
+                    plan.slot_bytes,
+                    plan.capacity_bytes,
+                    elapsed * 1000,
+                )
+            if not measurements:
+                raise RuntimeError(
+                    "AdamW workspace calibration ran out of memory at every candidate; "
+                    "release host/device memory before retrying"
+                ) from last_error
+            fastest = min(elapsed for _, elapsed, _ in measurements)
+            selected = min(
+                (entry for entry in measurements if entry[1] <= fastest * 1.03),
+                key=lambda entry: (entry[2], entry[1]),
+            )
+            self._tuned_workspace_plan = selected[0]
+            self._tuned_workspace_bytes = selected[0].capacity_bytes
+            selected_capacity = selected[0].capacity_bytes
+            logger.info_rank0(
+                "AdamW workspace selected: rank0 slots=%d, slot=%d bytes, "
+                "capacity=%d bytes, step=%.3f ms, output=%s "
+                "(least total HBM within 3%% of fastest)",
+                selected[0].num_slots,
+                selected[0].slot_bytes,
+                self._tuned_workspace_bytes,
+                selected[1] * 1000,
+                stats["output_mode"],
+            )
+            return self._tuned_workspace_bytes
+        finally:
+            if trials_started is not None:
+                stats["trials_seconds"] = perf_counter() - trials_started
+            cleanup_started = perf_counter()
+            saved_params.clear()
+            cpu_sink = None
+            stats["release_host_seconds"] = perf_counter() - cleanup_started
+            cleanup_started = perf_counter()
+            self.release_workspace()
+            stats["release_workspace_seconds"] = perf_counter() - cleanup_started
+            reserved = runtime.memory_reserved()
+            stats["reserved_after_trials_bytes"] = reserved
+            # Retain the selected slab and allocator rounding, and preserve
+            # cached forward/backward storage when trials reused that storage.
+            allowance = selected_capacity + self._WORKSPACE_CACHE_MARGIN_BYTES
+            cleanup_started = perf_counter()
+            if reserved - stats["reserved_before_bytes"] > allowance:
+                runtime.empty_cache()
+                stats["cleanup_cleared_cache"] = True
+            stats["empty_cache_seconds"] = perf_counter() - cleanup_started
+            stats["reserved_after_cleanup_bytes"] = runtime.memory_reserved()
+            stats["total_seconds"] = perf_counter() - started
+            logger.info_rank0(
+                "AdamW workspace calibration: rank0 total=%.3f s, setup=%.3f s, "
+                "snapshot=%.3f s, trials=%.3f s, release_host=%.3f s, "
+                "release_workspace=%.3f s, empty_cache=%.3f s, cleanup_cleared_cache=%s",
+                stats["total_seconds"],
+                stats["setup_seconds"],
+                stats.get("snapshot_seconds", 0.0),
+                stats.get("trials_seconds", 0.0),
+                stats["release_host_seconds"],
+                stats["release_workspace_seconds"],
+                stats["empty_cache_seconds"],
+                stats["cleanup_cleared_cache"],
+            )
 
     def release_workspace(self) -> None:
         """Synchronize and release the workspace."""
         if self.workspace is None:
             return
         self.device_runtime.synchronize()
+        self._drop_workspace()
+
+    def _drop_workspace(self) -> None:
+        """Release storage after the caller has finished all workspace operations."""
+        assert self.workspace is not None
         capacity_mib = self.workspace.capacity_bytes // (1024 * 1024)
         self.workspace = None
-        logger.info_rank0(
+        logger.debug(
             "FSDP2 workspace released: capacity=%d MiB",
             capacity_mib,
         )
@@ -219,9 +567,6 @@ class AdamWSwapMixin:
                 self.state[param] = state
                 self.param_to_cpu_states_map[param] = state
                 self.param_to_step_map[param] = step
-                self.param_to_state_bytes_map[param] = sum(
-                    tensor.untyped_storage().nbytes() for tensor in cpu_state.values()
-                )
 
     def _run_adamw(
         self,
@@ -231,8 +576,6 @@ class AdamWSwapMixin:
         steps: list[torch.Tensor],
         group: dict,
     ) -> None:
-        for step in steps:
-            step.add_(1)
         beta1, beta2 = group["betas"]
         torch._fused_adamw_(
             params,
@@ -250,58 +593,43 @@ class AdamWSwapMixin:
             maximize=group["maximize"],
         )
 
+    def _advance_steps(self, params_with_groups) -> None:
+        steps = [self.param_to_step_map[param] for param, _ in params_with_groups]
+        if steps:
+            torch._foreach_add_(steps, 1)
+
     def _step_on_device(self, params_with_groups) -> None:
-        if self._acquire_workspace() is None:
+        if self.device_runtime.turbo_device is TurboDevice.CPU:
             raise RuntimeError(
-                "workspace is unavailable; AdamW device update requires a "
-                "CUDA/NPU runtime"
+                "workspace is unavailable; AdamW device update requires a CUDA/NPU runtime"
             )
-        self._ensure_workspace_capacity(params_with_groups)
-        self._step_on_device_workspace(params_with_groups)
-
-    def _ensure_workspace_capacity(self, params_with_groups) -> None:
-        assert self.workspace is not None
-        error = self._workspace_capacity_error(params_with_groups)
-        if not (dist.is_available() and dist.is_initialized()):
-            if error is not None:
-                raise RuntimeError(error)
-            return
-
-        status = torch.tensor(
-            [error is None], dtype=torch.int64, device=self.workspace.device
-        )
-        dist.all_reduce(
-            status,
-            op=dist.ReduceOp.MIN,
-            group=dist.group.WORLD,
-        )
-        if int(status.item()) == 1:
-            return
-
-        if error is not None:
-            raise RuntimeError(error)
-        raise RuntimeError(
-            "Per-step workspace capacity validation failed on another rank"
-        )
-
-    def _workspace_capacity_error(self, params_with_groups) -> str | None:
-        if not params_with_groups:
-            return None
-
-        param, _ = max(
-            params_with_groups,
-            key=lambda item: self.param_to_state_bytes_map[item[0]],
-        )
-        if self._workspace_state_fits(self.param_to_cpu_states_map[param]):
-            return None
-
-        state_bytes = self.param_to_state_bytes_map[param]
-        return (
-            f"optimizer state for parameter '{self._parameter_name(param)}' "
-            "does not fit in the per-step workspace "
-            f"({state_bytes} bytes required per state pair, "
-            f"workspace={self.workspace.capacity_bytes} bytes)"
-        )
+        bound = []
+        error = None
+        try:
+            bound = bind_parameters(params_with_groups, self.param_to_cpu_states_map)
+        except Exception as binding_error:  # noqa: BLE001 - Propagate errors to every rank.
+            error = binding_error.with_traceback(None)
+        if self._tuned_workspace_plan is None:
+            self._autotune_workspace(bound, error=error)
+        status = torch.ones(1, dtype=torch.int32, device=self.device_runtime.device)
+        self._acquire_workspace(bound, error=error)
+        # Allocation and stream creation must finish before counters or values change.
+        error = None
+        try:
+            self._advance_steps(params_with_groups)
+            if self.workspace is not None:
+                self._step_on_device_workspace(bound)
+                self._drop_workspace()
+        except Exception as update_error:  # noqa: BLE001 - Propagate errors to every rank.
+            error = update_error.with_traceback(None)
+            status.zero_()
+        self._reduce_workspace_value(status, dist.ReduceOp.MIN)
+        if not status.item():
+            self._workspace_update_failed = True
+            raise RuntimeError(
+                "AdamW update failed after it started on a training rank; "
+                "reload the model checkpoint and recreate the optimizer before continuing"
+            ) from error
 
     def _parameter_name(self, param: torch.Tensor) -> str:
         return self.param_to_name_map.get(param, "<unnamed parameter>")
@@ -311,119 +639,162 @@ class AdamWSwapMixin:
     ) -> torch.Tensor:
         return wrap_cpu_state(tensor, param, self._checkpoint_meshes)
 
-    def _workspace_state_fits(self, state: dict[str, torch.Tensor]) -> bool:
-        assert self.workspace is not None
-        second_base = self.workspace.align(self.workspace.capacity_bytes // 2)
-        capacities = (second_base, self.workspace.capacity_bytes - second_base)
-        return all(
-            state[key].numel() * state[key].element_size() <= capacity
-            for key, capacity in zip(self.state_keys, capacities)
+    def _check_benchmark_phase(
+        self,
+        status: torch.Tensor,
+        error: Exception | None,
+        phase: str,
+    ) -> None:
+        """Finish a phase together, preserving the failure type across ranks."""
+        started = perf_counter()
+        status.fill_(1)
+        if error is not None:
+            status[0] = 0
+            status[1] = self._is_out_of_memory(error)
+            status[2] = phase != "restore"
+        self._reduce_workspace_value(status, dist.ReduceOp.MIN)
+        succeeded, retryable, restored = status.tolist()
+        stats = self._workspace_calibration_stats
+        stats["coordination_seconds"] = stats.get("coordination_seconds", 0.0) + (
+            perf_counter() - started
         )
+        detail = f": {error}" if error is not None else ""
+        if not restored:
+            raise _WorkspaceRestoreError(
+                "Could not restore parameters after workspace calibration" + detail
+            ) from error
+        if not succeeded:
+            message = (
+                f"AdamW workspace calibration {phase} failed on a training rank"
+                + detail
+            )
+            if retryable:
+                raise torch.OutOfMemoryError(message) from error
+            raise RuntimeError(message) from error
 
-    def _stage_workspace_batch(self, params_with_groups, index: int):
+    def _benchmark_workspace(
+        self,
+        bound: list[BoundParameter],
+        status: torch.Tensor,
+        saved_params: list[torch.Tensor],
+        cpu_sink: torch.Tensor | None,
+    ) -> float:
+        """Time one complete fill/compute/drain, with no per-chunk collectives.
+
+        A missing sink requires verified zero moments, restored after the trial.
+        """
+        runtime = self.device_runtime
+        stats = self._workspace_calibration_stats
+        preparation_started = perf_counter()
+        steps = {}
+        preparation_error = None
+        try:
+            if bound:
+                step_values = torch.stack(
+                    [self.param_to_step_map[param.original] for param in bound]
+                ).add_(1)
+                steps = {
+                    param.original: step_values[index]
+                    for index, param in enumerate(bound)
+                }
+            runtime.synchronize()
+        except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+            preparation_error = error.with_traceback(None)
+        self._check_benchmark_phase(status, preparation_error, "prepare")
+        stats["prepare_seconds"] = stats.get("prepare_seconds", 0.0) + (
+            perf_counter() - preparation_started
+        )
+        execution_error = None
+        elapsed = 0.0
+        try:
+            try:
+                started = perf_counter()
+                if self.workspace is not None:
+                    run_workspace(
+                        bound,
+                        self._workspace_plan,
+                        self.workspace,
+                        steps,
+                        self._run_adamw,
+                        pipeline=self._get_pipeline(self._workspace_plan),
+                        cpu_sink=cpu_sink,
+                    )
+                elapsed = perf_counter() - started
+                stats["execute_seconds"] = stats.get("execute_seconds", 0.0) + elapsed
+            except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+                execution_error = error.with_traceback(None)
+            self._check_benchmark_phase(status, execution_error, "execute")
+        finally:
+            restore_started = perf_counter()
+            restore_error = None
+            drained = True
+            if execution_error is not None:
+                # Do not rewrite host inputs while a failed submission might
+                # still be transferring them on a device stream.
+                try:
+                    runtime.synchronize()
+                except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+                    restore_error = error.with_traceback(None)
+                    drained = False
+            parameter_restore_started = perf_counter()
+            for param, saved in zip(bound, saved_params):
+                try:
+                    param.local_param.copy_(saved)
+                except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+                    restore_error = error.with_traceback(None)
+            stats["parameter_restore_seconds"] = stats.get(
+                "parameter_restore_seconds", 0.0
+            ) + (perf_counter() - parameter_restore_started)
+            moment_reset_started = perf_counter()
+            if cpu_sink is None and drained:
+                if execution_error is None and self.workspace is not None:
+                    try:
+                        reset_workspace_moments(
+                            bound, self._workspace_plan, self.workspace
+                        )
+                    except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+                        restore_error = error.with_traceback(None)
+                else:
+                    for param in bound:
+                        for moment in (param.exp_avg, param.exp_avg_sq):
+                            try:
+                                moment.zero_()
+                            except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+                                restore_error = error.with_traceback(None)
+            stats["moment_reset_seconds"] = stats.get("moment_reset_seconds", 0.0) + (
+                perf_counter() - moment_reset_started
+            )
+            try:
+                runtime.synchronize()
+            except Exception as error:  # noqa: BLE001 - Propagate errors to every rank.
+                restore_error = error.with_traceback(None)
+            stats["restore_seconds"] = stats.get("restore_seconds", 0.0) + (
+                perf_counter() - restore_started
+            )
+            self._check_benchmark_phase(status, restore_error, "restore")
+        return elapsed
+
+    def _step_on_device_workspace(self, bound: list[BoundParameter]) -> None:
+        """Update fresh parameter views with the selected chunk and stream plan."""
         assert self.workspace is not None
-        first_key, second_key = self.state_keys
-        second_base = self.workspace.align(self.workspace.capacity_bytes // 2)
-        first_capacity = second_base
-        second_capacity = self.workspace.capacity_bytes - second_base
-        if first_capacity <= 0 or second_capacity <= 0:
-            return [], index
-
-        first_offset = 0
-        second_offset = 0
-        entries = []
-        while index < len(params_with_groups):
-            param, group = params_with_groups[index]
-            cpu_state = self.param_to_cpu_states_map[param]
-            first_offset = self.workspace.align(first_offset)
-            second_offset = self.workspace.align(second_offset)
-            first_size = (
-                cpu_state[first_key].numel() * cpu_state[first_key].element_size()
-            )
-            second_size = (
-                cpu_state[second_key].numel() * cpu_state[second_key].element_size()
-            )
-            if (
-                first_offset + first_size > first_capacity
-                or second_offset + second_size > second_capacity
-            ):
-                break
-
-            state = {
-                first_key: self.workspace.view_like(first_offset, cpu_state[first_key]),
-                second_key: self.workspace.view_like(
-                    second_base + second_offset, cpu_state[second_key]
-                ),
-            }
-            entries.append((param, group, state))
-            first_offset += first_size
-            second_offset += second_size
-            index += 1
-        return entries, index
-
-    def _step_device_entries(self, entries) -> None:
-        for _, group_entries in groupby(entries, key=lambda entry: id(entry[1])):
-            batch = list(group_entries)
-            group = batch[0][1]
-            params = [
-                param.to_local() if isinstance(param, DTensor) else param
-                for param, _, _ in batch
-            ]
-            grads = [
-                param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-                for param, _, _ in batch
-            ]
-            self._run_adamw(
-                params,
-                grads,
-                [state for _, _, state in batch],
-                [self.param_to_step_map[param] for param, _, _ in batch],
-                group,
-            )
-
-    def _step_on_device_workspace(self, params_with_groups) -> None:
-        """Run AdamW with reusable state views from the fixed workspace slab."""
-        assert self.workspace is not None
-
-        index = 0
         if not self._workspace_adamw_logged:
             logger.info_rank0(
-                "FSDP2 workspace: AdamW is using a %d MiB slab for %d parameters",
-                self.workspace.capacity_bytes // (1024 * 1024),
-                len(params_with_groups),
+                "FSDP2 workspace: AdamW slots=%d, slot=%d MiB, capacity=%d MiB, "
+                "parameters=%d",
+                self._workspace_plan.num_slots,
+                self._workspace_plan.slot_bytes // (1024 * 1024),
+                self._workspace_plan.capacity_bytes // (1024 * 1024),
+                len(bound),
             )
             self._workspace_adamw_logged = True
-        while index < len(params_with_groups):
-            entries, next_index = self._stage_workspace_batch(
-                params_with_groups, index
-            )
-            if not entries:
-                param = params_with_groups[index][0]
-                state_bytes = self.param_to_state_bytes_map[param]
-                raise RuntimeError(
-                    "optimizer state for parameter "
-                    f"'{self._parameter_name(param)}' does not fit in the "
-                    "per-step workspace "
-                    f"({state_bytes} bytes required per state pair, "
-                    f"workspace={self.workspace.capacity_bytes} bytes)"
-                )
-
-            for param, _, state in entries:
-                for key in self.state_keys:
-                    state[key].copy_(
-                        self.param_to_cpu_states_map[param][key], non_blocking=True
-                    )
-            self.device_runtime.synchronize()
-
-            self._step_device_entries(entries)
-
-            for param, _, state in entries:
-                for key in self.state_keys:
-                    self.param_to_cpu_states_map[param][key].copy_(
-                        state[key], non_blocking=True
-                    )
-            self.device_runtime.synchronize()
-            index = next_index
+        run_workspace(
+            bound,
+            self._workspace_plan,
+            self.workspace,
+            self.param_to_step_map,
+            self._run_adamw,
+            pipeline=self._get_pipeline(self._workspace_plan),
+        )
 
     def _step_on_host(self, params_with_groups) -> None:
         for _, group_entries in groupby(
@@ -451,6 +822,7 @@ class AdamWSwapMixin:
                 cpu_param.copy_(local_param.detach())
             for cpu_grad, local_grad in zip(cpu_grads, local_grads):
                 cpu_grad.copy_(local_grad)
+            self._advance_steps(batch)
             self._run_adamw(
                 cpu_params,
                 cpu_grads,
@@ -468,7 +840,7 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
     def __init__(
         self,
         params,
-        lr: Union[float, Tensor] = 1e-3,
+        lr: float | Tensor = 1e-3,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 1e-2,
@@ -508,9 +880,7 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
         for (param_id, entry), param in zip(state_dict["state"].items(), params):
             checkpoint_entry = dict(entry)
             for key in self.state_keys:
-                checkpoint_entry[key] = self._wrap_checkpoint_tensor(
-                    entry[key], param
-                )
+                checkpoint_entry[key] = self._wrap_checkpoint_tensor(entry[key], param)
             state_dict["state"][param_id] = checkpoint_entry
         return state_dict
 
@@ -597,15 +967,11 @@ class AdamWSwap(torch.optim.AdamW, AdamWSwapMixin):
     def step(self, closure=None):
         loss = None
         try:
+            self._check_workspace_restore()
             if closure is not None:
                 with torch.enable_grad():
                     loss = closure()
-            params_with_groups = [
-                (param, group)
-                for group in self.param_groups
-                for param in group["params"]
-                if param.grad is not None
-            ]
+            params_with_groups = self._active_parameters()
             if self.optimizer_memory_fraction == 0:
                 self._step_on_host(params_with_groups)
             else:

@@ -1,0 +1,43 @@
+README.md
+  s_7b4c29d2633edb::t_6c791ee157803d 152-156
+README_zh.md
+  s_7b4c29d2633edb::t_9b0bdf328b558f 120-123
+src/torchturbo/adapters/msswift/inputs_bridging.py
+  s_7b4c29d2633edb::t_d7ecc05f7a6ccd 46-47,200-207,216
+src/torchturbo/adapters/msswift/trainer.py
+  s_7b4c29d2633edb::t_03f6e14475f7ab 339
+src/torchturbo/engine/backends/fsdp2/backend.py
+  s_7b4c29d2633edb::t_5d96421abee86f 1738,1770,1786,1833-1838,1841-1847,1900-1911,1914-1916,1919,1931,1933-1935,1941,1955,1959-1962,1969,1977,1991,2009,2017,2025
+src/torchturbo/models/modules/attention/ulysses/ulysses.py
+  s_7b4c29d2633edb::t_98405e3bd8354d 536
+src/torchturbo/models/modules/loss/chunk_loss.py
+  s_7b4c29d2633edb::t_c706e2744e2db3 18-19,34,37,76-81,100-101,110,187,191-196,247,304
+src/torchturbo/models/modules/loss/logits_loss.py
+  s_7b4c29d2633edb::t_0087ce705c197e 10,21,24-31,43,96-97,100-104
+src/torchturbo/models/modules/loss/token_ce.py
+  s_7b4c29d2633edb::t_2c39b513744d17 1-33
+src/torchturbo/models/qwen4_exp/model.py
+  s_7b4c29d2633edb::t_cf7932518501cc 227
+tests/adapters/msswift/test_inputs_bridging.py
+  s_7b4c29d2633edb::t_c81ba66f5e7ed7 98-102,196,198-199,402-416,419-436,439-450,453-461,464-476
+tests/engine/backends/fsdp2/test_chunked_loss.py
+  s_7b4c29d2633edb::t_048e9344cef096 15,251-269,425,427,435,437-438,440,445-448,452-454,458
+tests/models/modules/test_lm_loss.py
+  s_7b4c29d2633edb::t_8362f1cfa6e964 467-641
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5203614e0b8aaccb8eef1857508333383d494fcc",
+  "prompts": {},
+  "sessions": {
+    "s_7b4c29d2633edb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20c9b-305e-7670-99d0-10721e08797d",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

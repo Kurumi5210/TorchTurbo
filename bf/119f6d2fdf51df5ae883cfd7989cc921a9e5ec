@@ -1,0 +1,37 @@
+src/torchturbo/models/modules/moe/moe_layer.py
+  s_2b47ac95c6ab80::t_c21e684ffc5733 119
+src/torchturbo/models/modules/moe/router.py
+  s_2b47ac95c6ab80::t_b6f1fd0b80277c 15-16,114,124,295,319
+src/torchturbo/models/modules/moe/utils.py
+  s_2b47ac95c6ab80::t_525f1526501b6c 15-16,141,156,227-232
+src/torchturbo/ops/dispatcher.py
+  s_2b47ac95c6ab80::t_a0ffb870852efb 639-649
+src/torchturbo/ops/moe.py
+  s_2b47ac95c6ab80::t_c2150cff991e75 10-20
+src/torchturbo/ops/providers/native/moe_pack_top8_routes.py
+  s_2b47ac95c6ab80::t_4412f060f110b0 1-19
+src/torchturbo/ops/providers/npu/_pack_top8.py
+  s_2b47ac95c6ab80::t_8e3654ad66325f 1-41
+src/torchturbo/ops/providers/npu/moe_pack_top8_routes.py
+  s_2b47ac95c6ab80::t_03e753099a69d6 1-40
+tests/models/test_moe_routing_result.py
+  s_2b47ac95c6ab80::t_32d378ea20fce1 36,39-40
+tests/ops/test_moe_pack_top8_routes.py
+  s_2b47ac95c6ab80::t_7e6221beaeb538 1-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bf119f6d2fdf51df5ae883cfd7989cc921a9e5ec",
+  "prompts": {},
+  "sessions": {
+    "s_2b47ac95c6ab80": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20b6d-1b04-7f63-9fa0-c10fdc4fcf67",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

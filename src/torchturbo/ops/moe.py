@@ -7,6 +7,17 @@ from dataclasses import dataclass
 import torch
 
 
+def pack_routes(
+    weights: torch.Tensor, ids: torch.Tensor, num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Place weights by expert ID and return the same assignments in ID order."""
+    shape = (ids.shape[0], num_experts)
+    dense = weights.new_zeros(shape).scatter_(1, ids, weights)
+    mask = torch.zeros(shape, dtype=torch.bool, device=ids.device).scatter_(1, ids, True)
+    ordered = ids.sort(dim=-1).values if ids.shape[1] > 1 else ids
+    return dense, mask, ordered
+
+
 @dataclass(frozen=True, slots=True)
 class MoEPermutation:
     """Data interface shared by ``moe_permutation`` and ``moe_unpermutation``.

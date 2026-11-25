@@ -12,6 +12,8 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from torchturbo.ops import ops
+
 from .moe_config import MoEConfig
 from .moe_utils import (
     MoEAuxLossAutoScaler,
@@ -109,6 +111,7 @@ class TopKRouter(Router):
         config: MoEConfig,
         layer_number: Optional[int] = None,
         sp_group=None,
+        dispatch_routes: bool = False,
     ) -> None:
         """Initialize the zero token dropping router."""
         super().__init__(config=config)
@@ -118,6 +121,7 @@ class TopKRouter(Router):
         self.input_jitter = None
         self.layer_number = layer_number
         self.sp_group = sp_group
+        self.dispatch_routes = dispatch_routes
         self._metrics = None
         self.use_hash_routing = self._is_hash_routing_layer()
 
@@ -288,7 +292,7 @@ class TopKRouter(Router):
 
         Returns:
             Dense routing weights, boolean assignment mask, and the selected
-            expert IDs in their native top-k order.
+            expert IDs in ascending order for dispatch.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -312,6 +316,7 @@ class TopKRouter(Router):
                 use_hash_routing=self.use_hash_routing,
                 hash_table=getattr(self, "tid2eid", None),
                 input_ids=input_ids,
+                route_ops=ops if self.dispatch_routes else None,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")

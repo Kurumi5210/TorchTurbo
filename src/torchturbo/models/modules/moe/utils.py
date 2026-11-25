@@ -12,6 +12,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from torchturbo.ops import OpDispatcher
+from torchturbo.ops.moe import pack_routes
 from torchturbo.runtime import get_device_runtime
 
 
@@ -136,6 +138,7 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
+    route_ops: OpDispatcher | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select fixed-top-k experts and compute their routing probabilities.
     Args:
@@ -150,9 +153,7 @@ def topk_softmax_with_capacity(
 
     Returns:
         Dense weights, boolean assignment mask, and the selected expert IDs.
-        Both learned and hash routing return the compact top-k IDs in their
-        native order; the packed layout only needs a consistent pairing
-        between expert IDs, row indices, and gathered probabilities.
+        The compact IDs are in ascending expert-ID order for dispatch.
     """
     assert (
         logits.dim() == 2
@@ -223,11 +224,12 @@ def topk_softmax_with_capacity(
 
     probs = probs.type_as(logits)
 
-    # TODO Try using element-wise operations instead of scatter?
-    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-
-    return topk_masked_gates, topk_map, top_indices
+    if (
+        route_ops is not None and topk == 8 and num_experts == 512
+        and not use_hash_routing and probs.dtype == torch.float32
+    ):
+        return route_ops.moe_pack_top8_routes(probs, top_indices, num_experts)
+    return pack_routes(probs, top_indices, num_experts)
 
 
 def ensure_divisibility(numerator, denominator):

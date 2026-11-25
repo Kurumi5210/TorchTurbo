@@ -116,6 +116,7 @@ class MoELayer(BaseMoELayer):
             config=self.config,
             layer_number=self.layer_number,
             sp_group=sp_group,
+            dispatch_routes=True,
         )
 
         # Initialize token dispatcher

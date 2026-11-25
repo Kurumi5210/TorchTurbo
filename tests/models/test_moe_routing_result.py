@@ -33,14 +33,12 @@ def test_topk_result_packs_weights_map_and_expert_ids(
     assert expert_indices.shape == (17, 8)
     if hash_routing:
         torch.testing.assert_close(
-            expert_indices.sort(-1).values, hash_table.sort(-1).values,
+            expert_indices, hash_table.sort(-1).values,
         )
 
-    selected_ids = expert_indices
-    order = selected_ids.sort(-1).indices
-    selected = probs.gather(1, selected_ids).gather(1, order)
+    torch.testing.assert_close(expert_indices, expected_indices)
+    selected = probs.gather(1, expert_indices)
     expected = probs.masked_select(routing_map).reshape(17, 8)
-    torch.testing.assert_close(selected_ids.gather(1, order), expected_indices)
     torch.testing.assert_close(selected, expected, rtol=0, atol=0)
 
     upstream = torch.randn(17, 8, generator=generator)

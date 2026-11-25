@@ -636,6 +636,17 @@ class OpDispatcher:
             impl=impl,
         )
 
+    def moe_pack_top8_routes(
+        self, weights: torch.Tensor, ids: torch.Tensor, num_experts: int,
+        *, impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack FP32 weights for eight distinct selected IDs in [0, 512) per row."""
+        if weights.ndim != 2 or weights.shape != ids.shape or ids.shape[1] != 8 or num_experts != 512:
+            raise ValueError("Expected top-8 weights and IDs of shape [tokens, 8] for 512 experts.")
+        if weights.dtype != torch.float32 or ids.dtype != torch.int64 or weights.device != ids.device:
+            raise ValueError("Expected FP32 weights and int64 IDs on the same device.")
+        return self._dispatch("moe_pack_top8_routes", weights, ids, num_experts, impl=impl)
+
     def moe_sort_chunks(
         self,
         input: torch.Tensor,

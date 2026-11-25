@@ -1,0 +1,21 @@
+src/torchturbo/models/qwen4_exp/model.py
+  s_7b4c29d2633edb::t_b9bc1b6ba69fa1 19,219-221
+tests/models/qwen4_exp/test_model.py
+  s_7b4c29d2633edb::t_dc7e914c9cf7ef 589
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "27f8a09d12cf47703af1e9bc89745beda214b984",
+  "prompts": {},
+  "sessions": {
+    "s_7b4c29d2633edb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20c9b-305e-7670-99d0-10721e08797d",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

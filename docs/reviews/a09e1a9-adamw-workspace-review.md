@@ -6,6 +6,8 @@
 - 第二轮：复核 Codex 根据本评审改的版本 `54eeedb`（分支 `dev-chunk-optimizer`），见文末
   [第二轮复核](#第二轮复核)；修复方案见 [建议修复方案](#建议修复方案)，
   补丁文件 [`a09e1a9-adamw-workspace-fixes.patch`](a09e1a9-adamw-workspace-fixes.patch)
+- 第三轮：按讨论结果增加"OOM 时缩小范围重试"，并说明重试时状态为什么正确，见
+  [修复 F](#修复-f校准或分配-oom-时缩小范围重试)
 
 下文的行号都以 a09e1a9 为准；没有写目录的文件都在
 `src/torchturbo/engine/backends/fsdp2/optimizers/` 下。
@@ -310,7 +312,7 @@ LoRA candidates= 45 trials= 180 max_capacity=57.0 GiB redundant= 21
 
 我在 `54eeedb` 上实现了一版原型，补丁见同目录的
 [`a09e1a9-adamw-workspace-fixes.patch`](a09e1a9-adamw-workspace-fixes.patch)
-（8 个文件，+260 / -46），在 `dev-chunk-optimizer` 上可以直接 `git apply`：
+（包含修复 A–F，8 个文件，+653 / -69），在 `dev-chunk-optimizer` 上可以直接 `git apply`：
 
 ```bash
 git fetch origin
@@ -325,10 +327,12 @@ git show origin/dev-workspace-opus:docs/reviews/a09e1a9-adamw-workspace-fixes.pa
 | C. 方案放不下时，所有 rank 一起回退到已测候选 | 第 3 条 | `adamw.py` |
 | D. 校准时为空的 rank 也保存全局方案 | 第 3 条 | `adamw.py` |
 | E. 54eeedb 的代码细节和 README | 第二轮"代码细节" | `adamw_workspace.py`、README |
+| F. 校准或分配 OOM 时缩小范围重试 | 第三轮讨论 | `adamw.py`、README |
 
 **验证范围**：本机 CPU 版 torch 2.10 的 venv。`test_adamw_pipeline.py`、
 `test_adamw_workspace.py`、`test_adamw_workspace_distributed.py`（真实 Gloo 双进程）、
-`test_cpu_offload_optimizer.py`、`tests/engine/test_config.py`、`tests/runtime` 共 180 个通过；
+`test_cpu_offload_optimizer.py`、`tests/engine/test_config.py`、`tests/runtime` 共 192 个通过
+（A–E 后为 180 个，F 新增 12 个）；
 5 个失败仍是 `test_cpu_offload_optimizer.py` 里 pin memory 的环境问题，和 a09e1a9、54eeedb 相同。
 上面的 sink 随机测试在补丁后同样通过。**GPU/NPU 上的真实路径、NPU 的 host 缓存接口和真实计时
 都没有验证。**
@@ -456,32 +460,49 @@ if cpu_sink is not None:
 这份数据在各 rank 上完全相同。真实 step 中如果某个 rank 放不下调好的方案，所有 rank 用同一组
 全局约束从测量结果里重新选，规则和校准时相同（最快 3% 以内选显存最小的）。
 
-**正常路径不增加 collective**：利用 `_reserve_workspace` 已有的状态归约，把状态从 0/1 扩成三态：
+**正常路径不增加 collective**：利用 `_reserve_workspace` 已有的状态归约，把原来的"成功 / 失败"
+扩成多态状态码，MIN 归约后取最坏的情况（修复 F 又加了"分配 OOM"，最终是四态）：
 
 ```python
-status.fill_(0 if error is not None else 1 if refit else 2)
+# 0 其他错误，1 分配 OOM（修复 F），2 需要回退，3 分配成功
+if error is None:
+    status.fill_(2 if refit else 3)
+else:
+    status.fill_(1 if out_of_memory else 0)   # out_of_memory 只针对本次分配自己的异常
 self._reduce_workspace_value(status, dist.ReduceOp.MIN)
-if status.item() == 1:
+code = status.item()
+if code == 2:
     return None            # 有 rank 需要回退；本 rank 已分配的 workspace 直接丢弃
-if not status.item():
-    raise ...              # 和原来一样，任一 rank 出错则全部报错
+if code < 2:
+    raise ...              # 和原来一样，任一 rank 出错则全部报错；全是 OOM 时抛 OutOfMemoryError
 ```
 
-`_acquire_workspace` 中，放不下不再直接报错，而是标记 `refit`；归约结果为 1 时，所有 rank
-一起进入回退：
+`_acquire_workspace` 中，放不下不再直接报错，而是标记 `refit`；归约结果为 2 时，所有 rank
+一起进入回退。修复 C 和修复 F 共用下面这个循环：
 
 ```python
 refit = target.slot_bytes < minimum or target.capacity_bytes > maximum
 ...
-workspace = self._reserve_workspace(plan.capacity_bytes, status=status, error=error, refit=refit)
-if status.item() == 1:
-    # Rare path: some rank cannot use the tuned plan. Every rank reaches it.
-    plan, error = self._refit_workspace_plan(minimum, maximum), None
+shared, cause = self._tuned_workspace_plan, None
+while True:
+    try:
+        workspace = self._reserve_workspace(plan.capacity_bytes, status=status, error=error, refit=refit)
+    except torch.OutOfMemoryError as out_of_memory:          # 修复 F
+        if shared is None or not self._workspace_measurements:
+            raise
+        maximum = min(maximum, shared.capacity_bytes - 1) if maximum else 0
+        cause = out_of_memory
+    else:
+        if status.item() != 2:
+            break                                            # 所有 rank 都分配成功（或本 rank 无参数）
+    # Rare path: every rank reaches it and selects the same shared plan.
+    shared = self._refit_workspace_plan(minimum, maximum, cause)
+    plan = shared if maximum else WorkspacePlan(1, 0)
+    refit, error = False, None
     try:
         self._get_pipeline(plan)
     except Exception as pipeline_error:
         error = pipeline_error.with_traceback(None)
-    workspace = self._reserve_workspace(plan.capacity_bytes, status=status, error=error)
 ```
 
 `_refit_workspace_plan` 用一次 2 元素 MIN 归约同时得到"各 rank 最小 slot 的最大值"和
@@ -499,7 +520,7 @@ if not fitting:
     raise RuntimeError("... no longer fits ... and no measured candidate fits; recalibrate on all ranks")
 selected = self._select_measurement(fitting)      # 和校准共用同一个选择规则
 self._tuned_workspace_plan = selected[0]          # 粘性降级，后续 step 回到正常路径
-return selected[0] if maximum else WorkspacePlan(1, 0)
+return selected[0]                                # 调用方再决定本 rank 是否分配
 ```
 
 - **一致性**：所有输入都是全局归约值或各 rank 相同的测量结果，所以各 rank 一定选中同一方案，
@@ -545,6 +566,133 @@ selected_capacity = selected[0].capacity_bytes if minimum else 0
   停止、双槽停在它之下；补充"空 rank 保存全局方案"；把"不再适用时须显式重新校准"改为
   修复 C 的回退行为。
 
+### 修复 F：校准或分配 OOM 时缩小范围重试
+
+a09e1a9 的设计是"分配或试跑失败时所有 rank 报错，不缩容重试，也不换候选"：任何一个候选 OOM，
+整次校准作废，作业退出。重启后显存状态差不多，很可能在同一个候选上再次 OOM。修复 F 改成：
+
+- **校准中**：某个候选在任一 rank 上 OOM（分配 workspace 时，或 trial 执行时），所有 rank 先恢复
+  状态，再跳过这个容量**及以上**的所有候选，继续测更小的；最后从测成功的候选里按原规则选。
+  - 按容量跳过，不按顺序截断：候选按 slot 大小排序，容量并不单调，例如 `(2, 96)` = 192 字节
+    排在 `(1, 128)` = 128 字节前面，前者 OOM 后者仍然要测。
+  - 最小的候选也 OOM 时报错：说明最大的参数分片都放不下，无法再缩小。
+- **真实 step 中**：分配 workspace 时 OOM，所有 rank 在任何值改变之前退到容量更小的已测方案，
+  可能连退多次。没有更小的已测方案时报错（`... ran out of memory ... no measured candidate fits`，
+  异常的 cause 是原始 OOM）。
+- **不变**：非 OOM 错误、任何恢复失败、真实更新做到一半的失败，仍然在所有 rank 上报错；
+  后两种仍会打上永久失败标记，必须重新加载 checkpoint。
+
+#### 怎么保证状态是对的
+
+**① 只在两个时刻接受 OOM 重试：状态要么没动过，要么已经全部恢复。**
+
+| OOM 发生在 | 此时的状态 |
+|---|---|
+| 给候选分配 workspace | 该候选还没跑任何 trial；上一个候选的每次 trial 都已全局确认恢复完成 |
+| trial 的 prepare 阶段 | 只创建了 step 计数的副本（`torch.stack(...).add_(1)`），没改任何状态 |
+| trial 的 execute 阶段 | 异常不会马上冒出来：`_benchmark_workspace` 的 `finally` 先恢复，再做一次全局恢复检查；任一 rank 恢复失败就改抛 `_WorkspaceRestoreError` |
+
+所以校准循环里**只要捕获到的是 `torch.OutOfMemoryError`，就说明所有 rank 都已恢复成功**。循环只捕获
+这一种异常；`_WorkspaceRestoreError` 和其他错误照旧向上抛。
+
+**② 恢复覆盖了 trial 能改动的全部状态。**
+
+| 状态 | trial 会不会改 | 怎么恢复 |
+|---|---|---|
+| 设备上的参数 | 会：fused kernel 原地更新，失败时可能只更新了一部分 chunk | 校准开始时拍一份 CPU 快照；每次 trial 后（不论成败）把所有活跃参数整体拷回 |
+| CPU moments，全零（首次训练） | 会：trial 直接写真实地址，失败时可能只写了一部分 | 本 rank 的 trial 跑完了（包括"自己成功、别的 rank 失败"）：用设备上的零 slot 经 D2H 清零。本 rank 自己失败：先同步整个设备，等所有在途 D2H 落地，再在 CPU 上清零；同步失败就不清零，按恢复失败处理 |
+| CPU moments，非零（resume） | 不会：trial 写到独立的 pinned 输出区 | 不需要 |
+| step 计数 | 不会：trial 用的是副本 | 不需要 |
+| 梯度 | 不会：不传 `grad_scale` 时 fused kernel 不改写梯度 | 不需要 |
+| workspace、stream、event | 内容作废 | 下一个候选前释放 workspace；stream 已排空，event 每次使用前都会重新 record |
+
+**③ 所有 rank 做同一个决定。**
+
+- "是不是 OOM"和成败放在同一次 MIN 归约里：只有所有失败的 rank 都是 OOM 才进入重试，只要有一个
+  rank 是别的错误就全部报错。分配阶段用上面的四态状态码；trial 阶段沿用原有的
+  `[成功, 是否 OOM, 是否已恢复]` 三元组。分配阶段的"OOM"只认本次分配自己抛出的异常，
+  调用方传进来的预算错误等不算。
+- 跳过的门槛用全局方案的容量，各 rank 相同。所以各 rank 剩下的候选、之后 collective 的次数和顺序
+  完全一致。
+- 异常在所有 rank 的同一个 collective 之后同时抛出，之后的计时归约所有 rank 一起跳过，不会出现
+  某个 rank 卡在 collective 上的情况。
+
+**④ 设备真出问题时不会静默继续。** 恢复阶段最后有一次整设备同步。如果 OOM 让设备进入不可用的
+状态，这次同步会失败，按恢复失败处理：打上永久失败标记，必须重新加载 checkpoint。
+
+**真实 step 为什么只重试分配 OOM**：分配发生在 step 计数加一之前，什么都还没改。更新做到一半的
+OOM 已经改了部分参数和 moments，而真实 step 没有快照（每步拍快照要多拷一整份参数），所以仍然
+不能重试。
+
+**仍然不保证的**：
+
+- 参数的 version counter 会增加（a09e1a9 就是这样），校准后不能复用保留的 autograd 图。
+- "该容量及以上都放不下"是保守推断：碎片或其他进程的显存波动可能让更大的候选其实放得下，
+  被跳过的候选不会再测。
+- OOM 的判断靠异常类型，或消息里含 "out of memory"。NPU 上如果有不含这个字样的显存错误，会按
+  普通错误报错退出，不会误重试，这是安全的方向。
+- 只在本机 CPU + Gloo 上验证过。真实 GPU/NPU 上 OOM 之后设备能否继续使用（尤其是 NPU）没有验证；
+  如果不能，由第 ④ 点兜底。
+
+#### 实现
+
+校准循环只捕获 `torch.OutOfMemoryError`：
+
+```python
+ceiling, out_of_memory = None, None
+for plan, shared_plan in zip(candidates, shared_candidates):
+    # Candidates are ordered by slot size, not capacity.
+    if ceiling is not None and shared_plan.capacity_bytes >= ceiling:
+        continue
+    self.release_workspace()
+    try:
+        self._reserve_workspace(plan.capacity_bytes, status=allocation_status)
+        ...  # 4 trials, unchanged
+    except torch.OutOfMemoryError as error:
+        # Every rank raises at the same collective, and only when every
+        # failing rank ran out of memory. Allocation precedes the trial;
+        # a trial raises it only after every rank restored its state.
+        ceiling, out_of_memory = shared_plan.capacity_bytes, error
+        continue
+    ...  # record the measurement, unchanged
+if not measurements:
+    raise torch.OutOfMemoryError(
+        f"AdamW workspace calibration ran out of memory at the smallest candidate ({ceiling} bytes): {out_of_memory}"
+    ) from out_of_memory
+```
+
+真实 step 的重试和修复 C 共用 `_acquire_workspace` 里的循环（代码见修复 C）。OOM 时所有 rank 把
+显存上限压到 `失败的容量 - 1`，再走同一套"从已测结果中选"的逻辑。每次 OOM 都会严格降低上限，
+已测方案又是有限的，所以循环一定会结束。
+
+#### 测试
+
+新增 12 个用例：
+
+| 用例 | 验证什么 |
+|---|---|
+| `test_calibration_oom_skips_that_capacity_and_larger_but_keeps_smaller` | `(2, 96)` 分配 OOM 后跳过 ≥192 字节的候选，但排在它后面的 `(1, 128)` 仍然测并被选中 |
+| `test_trial_oom_after_partial_update_restores_state_for_the_next_step[zero/nonzero-moments]` | 第一个 chunk 已更新参数、写过 moments 后第二个 chunk OOM：状态与校准前完全一致；之后真实 step 的结果与原生 AdamW **逐位相同** |
+| `test_allocation_raises_oom_only_when_every_failure_is_oom[peer-error/local-oom/peer-oom]` | 本 rank OOM、peer 其他错误：不是 OOM，不重试；本 rank 或 peer 单独 OOM：所有 rank 都抛 OOM |
+| `test_trial_oom_with_peer_non_oom_failure_aborts_calibration` | trial 中本 rank OOM，但 peer 同时有别的错误：整体报错，不重试，状态不变 |
+| `test_trial_oom_with_failed_restore_is_sticky` | OOM 之后恢复失败：打上永久失败标记，之后 step 和校准都拒绝执行 |
+| `test_step_allocation_oom_retries_smaller_measured_plans_before_any_update` | 真实 step 连续 OOM 两次（256 → 128 → 64）后成功，结果与原生 AdamW 逐位相同 |
+| `test_step_allocation_oom_without_smaller_measured_plan_fails_before_any_update` | 没有更小的已测方案：报错，cause 是 OOM，step 计数和参数不变，不打永久失败标记 |
+| `test_trial_oom_on_one_rank_shrinks_calibration_on_every_rank[...]`（Gloo 双进程，2 个用例） | 只有 rank 1 在 trial 中途 OOM，rank 0 跑完了整个 trial 并写入真实 moments：两个 rank 都恢复、选同一方案，之后 step 与原生 AdamW 逐位相同。两个参数化分别覆盖"失败的 rank 是零态（CPU 清零）"和"失败的 rank 是非零态（输出区）" |
+
+已有的三个 OOM 用例不用改，仍然通过：`test_trial_oom_restores_values_and_aborts_calibration`
+（最小候选就 OOM，仍报错）、`test_workspace_oom_aborts_all_ranks_without_retry`
+（`_reserve_workspace` 本身不重试，重试在调用方）、`test_pipeline_allocation_oom_does_not_switch_to_serial`
+（没有测量结果时仍抛原始 OOM）。
+
+为了确认这些测试真的能抓到状态错误，我做了三个变异实验，每次故意弄坏一处，跑 OOM 相关用例：
+
+| 变异 | 结果 |
+|---|---|
+| 失败的 trial 之后不把 CPU moments 清零 | 2 个用例失败（两个零态用例） |
+| 失败的 trial 之后不从快照恢复参数 | 7 个用例失败 |
+| 把 peer 的非 OOM 分配错误也当成 OOM | 1 个用例失败（`peer-error`） |
+
 ### 需要作者决定、补丁里没有改的事项
 
 1. **默认值**：`optimizer_memory_fraction` 默认从 `0.8` 改为 `None`（自动校准）。
@@ -560,3 +708,5 @@ selected_capacity = selected[0].capacity_bytes if minimum else 0
 4. **README 粒度**：仍建议用户文档只保留默认行为、显式 fraction 的含义、`autotune_workspace()`
    的用法、失败后怎么处理和额外的 host 内存，实现细节移到 docstring。补丁只改了与修复相关的句子。
 5. **回退是否粘性**：见修复 C。
+6. **OOM 重试推翻了原设计**：a09e1a9 和 README 明确写了"不缩容重试，也不换候选"。修复 F 按讨论结果
+   改成缩小范围重试，状态正确性的论证和测试见修复 F，合入前需要作者同意。

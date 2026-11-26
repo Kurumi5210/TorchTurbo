@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index 001c7ad..41ebc58 100644
+index 001c7ad..a5a2080 100644
 --- a/README.md
 +++ b/README.md
-@@ -186,15 +186,16 @@ With optimizer-state offload, an explicit positive `optimizer_memory_fraction` s
+@@ -186,17 +186,24 @@ With optimizer-state offload, an explicit positive `optimizer_memory_fraction` s
  before its first parameter update, after backward has produced real gradients.
  Contiguous parameters and their moments can span multiple chunks; each original
  parameter's step counter advances once per update. Local parameters, gradients, and both CPU moments must be contiguous.
@@ -16,17 +16,27 @@ index 001c7ad..41ebc58 100644
  Two-slot candidates are excluded if any active rank cannot fit both slots.
 -Later updates use the selected plan unchanged. If it no longer fits, explicitly
 -recalibrate on all ranks. Allocation or trial failures stop all ranks without
+-shrinking the workspace or trying another candidate. A failed update cannot be replayed safely:
+-reload the model checkpoint and recreate the optimizer before continuing.
 +Later updates use the selected plan unchanged. If it no longer fits, all ranks
 +switch to the measured candidate that fits now, chosen by the same rule; only if
-+none fits must you recalibrate on all ranks. Allocation or trial failures stop all ranks without
- shrinking the workspace or trying another candidate. A failed update cannot be replayed safely:
- reload the model checkpoint and recreate the optimizer before continuing.
++none fits must you recalibrate on all ranks.
++If a calibration candidate runs out of device memory on any rank, every rank
++first restores its parameters and moments, then skips that capacity and every
++larger one and continues with the smaller candidates. Calibration fails only if
++the smallest candidate runs out of memory. If a real update cannot allocate its
++workspace, all ranks retry the measured plans below that capacity before any
++value changes. Other allocation or trial failures, and any restore failure, stop
++all ranks. A failed update cannot be replayed safely: reload the model checkpoint
++and recreate the optimizer before continuing.
  
+ For an explicit calibration before the training loop, call
+ `adamw_swap.autotune_workspace()` on every training rank after a representative
 diff --git a/README_zh.md b/README_zh.md
-index d9a307a..884940a 100644
+index d9a307a..3ee01ac 100644
 --- a/README_zh.md
 +++ b/README_zh.md
-@@ -148,12 +148,12 @@ Muon 支持 `full` 和 `optimizer` 两种 CPU offload，`optimizer_memory_fracti
+@@ -148,13 +148,15 @@ Muon 支持 `full` 和 `optimizer` 两种 CPU offload，`optimizer_memory_fracti
  显式设置正的 `optimizer_memory_fraction` 时，AdamWSwap 不探测，每步直接按各活跃 rank 中最小空闲显存乘系数分配单槽（向下对齐至 32 字节）。省略该配置时，AdamWSwap 在首次参数更新前，使用 backward 产生的真实梯度联合校准 chunk 大小与
  传输 overlap。连续参数及其状态可以拆到多个 chunk 中，原参数的 step 计数每次更新
  只增加一次；本地参数、梯度及两份 CPU moment 都必须连续，否则在校准或更新前报错。
@@ -37,12 +47,16 @@ index d9a307a..884940a 100644
  每次取最慢 rank 的耗时，再计算中位数。在比最快中位数慢不超过 3% 的候选组合中，
  选择各 rank 的 HBM 分配总量最小的一组。任一活跃 rank 放不下双槽时，寻优不考虑双槽。
 -后续 step 按原方案执行；方案不再适用时，须在所有 rank 上显式重新校准。
+-分配或试跑失败时所有 rank 报错，不缩容重试，也不换候选。实际更新中途失败后
 +后续 step 按原方案执行；方案不再适用时，所有 rank 一起改用已测候选中当前放得下的方案（同样取最快 3% 内显存最小者），都放不下才报错并要求重新校准。
- 分配或试跑失败时所有 rank 报错，不缩容重试，也不换候选。实际更新中途失败后
++校准中任一 rank 的某个候选显存不足（OOM）时，所有 rank 先恢复参数和 moments，再跳过该容量及更大的候选，
++继续测更小的候选；最小候选也 OOM 才报错。正式更新分配 workspace 时 OOM，所有 rank 在任何值改变前
++改用该容量以下的已测方案重试。其他分配或试跑失败、以及任何恢复失败，所有 rank 报错。实际更新中途失败后
  禁止直接重试，需要重新加载模型 checkpoint 并重建优化器。
  
+ 显式校准时，先执行有代表性的 warmup backward，再在所有训练 rank 调用
 diff --git a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
-index d22fbc8..e3acc4e 100644
+index d22fbc8..f463f11 100644
 --- a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
 +++ b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
 @@ -28,6 +28,7 @@ from .adamw_workspace import (
@@ -62,7 +76,7 @@ index d22fbc8..e3acc4e 100644
          self._workspace_plan = WorkspacePlan(1, 0)
          self._pipeline: PipelineStreams | None = None
          self._workspace_update_failed = False
-@@ -157,17 +160,23 @@ class AdamWSwapMixin:
+@@ -157,24 +160,43 @@ class AdamWSwapMixin:
          return self._pipeline
  
      def _reserve_workspace(
@@ -72,25 +86,48 @@ index d22fbc8..e3acc4e 100644
 -        """Allocate once; no rank proceeds if another rank fails."""
 +        """Allocate once; no rank proceeds if another rank fails.
 +
-+        ``refit`` reports that this rank cannot use the tuned plan. Every rank
-+        then leaves ``status`` at 1 and returns without a workspace.
++        Status codes are reduced with MIN: 0 error, 1 allocation out of memory,
++        2 refit, 3 allocated. ``refit`` reports that this rank cannot use the
++        tuned plan; every rank then leaves ``status`` at 2 and returns without a
++        workspace. ``torch.OutOfMemoryError`` is raised on every rank only when
++        every failing rank ran out of memory in this allocation. Nothing has
++        been updated at that point, so callers may retry a smaller capacity.
 +        """
          workspace = None
 -        if error is None and capacity:
++        out_of_memory = False
 +        if error is None and capacity and not refit:
              try:
                  workspace = DeviceWorkspace(self.device_runtime, capacity)
              except Exception as allocation_error:  # noqa: BLE001 - Coordinate all ranks.
                  error = allocation_error.with_traceback(None)
 -        status.fill_(error is None)
-+        status.fill_(0 if error is not None else 1 if refit else 2)
++                out_of_memory = self._is_out_of_memory(error)
++        if error is None:
++            status.fill_(2 if refit else 3)
++        else:
++            status.fill_(1 if out_of_memory else 0)
          self._reduce_workspace_value(status, dist.ReduceOp.MIN)
-+        if status.item() == 1:
+-        if not status.item():
++        code = status.item()
++        if code == 2:
 +            return None
-         if not status.item():
++        if code < 2:
              workspace = None
              detail = f": {error}" if error is not None else ""
-@@ -237,6 +246,8 @@ class AdamWSwapMixin:
+-            raise RuntimeError(
++            message = (
+                 "AdamW workspace allocation failed on a training rank "
+                 f"before any update (local capacity={capacity} bytes){detail}"
+-            ) from error
++            )
++            if code == 1:
++                raise torch.OutOfMemoryError(message) from error
++            raise RuntimeError(message) from error
+         self.workspace = workspace
+         return workspace
+ 
+@@ -237,6 +259,8 @@ class AdamWSwapMixin:
              plan = self._fixed_workspace_plan(bound, error)
              self._workspace_plan = plan
              return self._reserve_workspace(plan.capacity_bytes, status=status)
@@ -99,7 +136,7 @@ index d22fbc8..e3acc4e 100644
          try:
              if error is not None:
                  raise error
-@@ -247,26 +258,77 @@ class AdamWSwapMixin:
+@@ -247,26 +271,93 @@ class AdamWSwapMixin:
                      raise RuntimeError(
                          "active rank has no calibrated AdamW workspace; recalibrate on all ranks"
                      )
@@ -115,24 +152,40 @@ index d22fbc8..e3acc4e 100644
              self._get_pipeline(plan)
          except Exception as budget_error:  # noqa: BLE001 - Propagate errors to every rank.
              error = budget_error.with_traceback(None)
-         workspace = self._reserve_workspace(
+-        workspace = self._reserve_workspace(
 -            plan.capacity_bytes, status=status, error=error
-+            plan.capacity_bytes, status=status, error=error, refit=refit
-         )
-+        if status.item() == 1:
-+            # Rare path: some rank cannot use the tuned plan. Every rank reaches it.
-+            plan, error = self._refit_workspace_plan(minimum, maximum), None
+-        )
++        shared = self._tuned_workspace_plan
++        cause = None
++        while True:
++            try:
++                workspace = self._reserve_workspace(
++                    plan.capacity_bytes, status=status, error=error, refit=refit
++                )
++            except torch.OutOfMemoryError as out_of_memory:
++                # Allocation precedes every counter or value change, so every
++                # rank may retry a measured plan below the capacity that failed.
++                if shared is None or not self._workspace_measurements:
++                    raise
++                maximum = min(maximum, shared.capacity_bytes - 1) if maximum else 0
++                cause = out_of_memory
++            else:
++                if status.item() != 2:
++                    break
++            # Rare path: every rank reaches it and selects the same shared plan.
++            shared = self._refit_workspace_plan(minimum, maximum, cause)
++            plan = shared if maximum else WorkspacePlan(1, 0)
++            refit, error = False, None
 +            try:
 +                self._get_pipeline(plan)
 +            except Exception as pipeline_error:  # noqa: BLE001 - Propagate errors to every rank.
 +                error = pipeline_error.with_traceback(None)
-+            workspace = self._reserve_workspace(
-+                plan.capacity_bytes, status=status, error=error
-+            )
          self._workspace_plan = plan
          return workspace
  
-+    def _refit_workspace_plan(self, minimum: int, maximum: int) -> WorkspacePlan:
++    def _refit_workspace_plan(
++        self, minimum: int, maximum: int, cause: Exception | None = None
++    ) -> WorkspacePlan:
 +        """Select a measured plan that fits every active rank, or fail on all ranks."""
 +        inactive = torch.iinfo(torch.int64).max
 +        bounds = torch.tensor(
@@ -148,20 +201,22 @@ index d22fbc8..e3acc4e 100644
 +            if entry[0].slot_bytes >= shared_minimum
 +            and entry[0].capacity_bytes <= shared_maximum
 +        ]
++        reason = "ran out of memory" if cause is not None else "no longer fits"
 +        if not fitting:
 +            raise RuntimeError(
-+                f"selected AdamW workspace {self._tuned_workspace_plan} no longer fits "
++                f"selected AdamW workspace {self._tuned_workspace_plan} {reason} "
 +                f"(minimum slot={shared_minimum}, maximum total={shared_maximum}) and no "
 +                "measured candidate fits; recalibrate on all ranks"
-+            )
++            ) from cause
 +        selected = self._select_measurement(fitting)
 +        logger.warning_rank0(
-+            "AdamW workspace %s no longer fits; switching to measured plan %s",
++            "AdamW workspace %s %s; switching to measured plan %s",
 +            self._tuned_workspace_plan,
++            reason,
 +            selected[0],
 +        )
 +        self._tuned_workspace_plan = selected[0]
-+        return selected[0] if maximum else WorkspacePlan(1, 0)
++        return selected[0]
 +
 +    @staticmethod
 +    def _select_measurement(measurements):
@@ -186,7 +241,7 @@ index d22fbc8..e3acc4e 100644
          alignment = 2 * DeviceWorkspace._ALIGNMENT_BYTES
          start = (shard_bytes + alignment - 1) // alignment * alignment
          if start <= 0 or start > budget:
-@@ -276,6 +338,9 @@ class AdamWSwapMixin:
+@@ -276,6 +367,9 @@ class AdamWSwapMixin:
          plans = []
          for slots in (1, 2) if overlap else (1,):
              endpoint = budget // slots // alignment * alignment
@@ -196,7 +251,16 @@ index d22fbc8..e3acc4e 100644
              if endpoint < start:
                  continue
              size = start
-@@ -328,7 +393,8 @@ class AdamWSwapMixin:
+@@ -295,6 +389,8 @@ class AdamWSwapMixin:
+         destinations and are reset after every trial. Nonzero moments use an
+         independent output ring. Gradients and real counters stay unchanged.
+         A retained autograd graph must not be reused afterwards.
++        A candidate that runs out of device memory on any rank is skipped with
++        every larger capacity once all ranks have restored their state.
+         Returns the selected total workspace capacity in bytes on this rank.
+         """
+         self._check_workspace_restore()
+@@ -328,7 +424,8 @@ class AdamWSwapMixin:
          status = torch.ones(3, dtype=torch.int64, device=runtime.device)
          allocation_status = torch.ones(1, dtype=torch.int64, device=runtime.device)
          control = torch.zeros(1, dtype=torch.int64, device=runtime.device)
@@ -206,7 +270,7 @@ index d22fbc8..e3acc4e 100644
          limits = torch.ones(2, dtype=torch.int64, device=runtime.device)
          timing = torch.zeros((), dtype=torch.float32, device=runtime.device)
          stats = self._workspace_calibration_stats = {
-@@ -341,7 +407,8 @@ class AdamWSwapMixin:
+@@ -341,7 +438,8 @@ class AdamWSwapMixin:
              if error is not None:
                  raise error
              minimum, maximum = self._workspace_bounds(bound, calibration=True)
@@ -216,7 +280,7 @@ index d22fbc8..e3acc4e 100644
              limits[0] = maximum if minimum else torch.iinfo(torch.int64).max
              limits[1] = not minimum or runtime.supports_async_streams
          except Exception as budget_error:  # noqa: BLE001 - Propagate errors to every rank.
-@@ -350,16 +417,27 @@ class AdamWSwapMixin:
+@@ -350,16 +448,27 @@ class AdamWSwapMixin:
              status, error, "budget validation before any update"
          )
          self._reduce_workspace_value(shard, dist.ReduceOp.MAX)
@@ -249,16 +313,63 @@ index d22fbc8..e3acc4e 100644
  
          measurements = []
          saved_params = []
-@@ -401,7 +479,7 @@ class AdamWSwapMixin:
+@@ -401,27 +510,47 @@ class AdamWSwapMixin:
              self._check_benchmark_phase(status, error, "snapshot preparation")
              stats["snapshot_seconds"] = perf_counter() - preparation_started
              trials_started = perf_counter()
 -            for plan in candidates:
++            # Smallest shared capacity that ran out of memory, and its error.
++            ceiling, out_of_memory = None, None
 +            for plan, shared_plan in zip(candidates, shared_candidates):
++                # Candidates are ordered by slot size, not capacity.
++                if ceiling is not None and shared_plan.capacity_bytes >= ceiling:
++                    continue
                  self.release_workspace()
-                 self._reserve_workspace(plan.capacity_bytes, status=allocation_status)
-                 self._workspace_plan = plan
-@@ -421,7 +499,7 @@ class AdamWSwapMixin:
+-                self._reserve_workspace(plan.capacity_bytes, status=allocation_status)
+-                self._workspace_plan = plan
+-                samples = []
+-                for trial in range(4):
+-                    try:
+-                        elapsed = self._benchmark_workspace(
+-                            bound, status, saved_params, cpu_sink
+-                        )
+-                    except _WorkspaceRestoreError:
+-                        self._workspace_restore_failed = True
+-                        self._check_workspace_restore()
+-                    timing.fill_(elapsed)
+-                    self._reduce_workspace_value(timing, dist.ReduceOp.MAX)
+-                    if trial:
+-                        samples.append(timing.item())
++                try:
++                    self._reserve_workspace(
++                        plan.capacity_bytes, status=allocation_status
++                    )
++                    self._workspace_plan = plan
++                    samples = []
++                    for trial in range(4):
++                        try:
++                            elapsed = self._benchmark_workspace(
++                                bound, status, saved_params, cpu_sink
++                            )
++                        except _WorkspaceRestoreError:
++                            self._workspace_restore_failed = True
++                            self._check_workspace_restore()
++                        timing.fill_(elapsed)
++                        self._reduce_workspace_value(timing, dist.ReduceOp.MAX)
++                        if trial:
++                            samples.append(timing.item())
++                except torch.OutOfMemoryError as error:
++                    # Every rank raises at the same collective, and only when every
++                    # failing rank ran out of memory. Allocation precedes the trial;
++                    # a trial raises it only after every rank restored its state.
++                    ceiling, out_of_memory = shared_plan.capacity_bytes, error
++                    stats["out_of_memory_capacity_bytes"] = ceiling
++                    logger.warning_rank0(
++                        "AdamW workspace calibration ran out of memory on a training "
++                        "rank at capacity=%d bytes; skipping it and larger candidates",
++                        ceiling,
++                    )
++                    continue
                  control.fill_(plan.capacity_bytes)
                  self._reduce_workspace_value(control, dist.ReduceOp.SUM)
                  elapsed = median(samples)
@@ -267,7 +378,7 @@ index d22fbc8..e3acc4e 100644
                  logger.info_rank0(
                      "AdamW workspace calibration: rank0 slots=%d, slot=%d bytes, "
                      "capacity=%d bytes, step=%.3f ms",
-@@ -430,14 +508,11 @@ class AdamWSwapMixin:
+@@ -430,14 +559,16 @@ class AdamWSwapMixin:
                      plan.capacity_bytes,
                      elapsed * 1000,
                  )
@@ -276,6 +387,11 @@ index d22fbc8..e3acc4e 100644
 -                (entry for entry in measurements if entry[1] <= fastest * 1.03),
 -                key=lambda entry: (entry[2], entry[1]),
 -            )
++            if not measurements:
++                raise torch.OutOfMemoryError(
++                    "AdamW workspace calibration ran out of memory at the smallest "
++                    f"candidate ({ceiling} bytes): {out_of_memory}"
++                ) from out_of_memory
 +            selected = self._select_measurement(measurements)
 +            self._workspace_measurements = measurements
              self._tuned_workspace_plan = selected[0]
@@ -286,7 +402,7 @@ index d22fbc8..e3acc4e 100644
              logger.info_rank0(
                  "AdamW workspace selected: rank0 slots=%d, slot=%d bytes, "
                  "capacity=%d bytes, step=%.3f ms, output=%s "
-@@ -454,7 +529,11 @@ class AdamWSwapMixin:
+@@ -454,7 +585,11 @@ class AdamWSwapMixin:
                  stats["trials_seconds"] = perf_counter() - trials_started
              cleanup_started = perf_counter()
              saved_params.clear()
@@ -385,7 +501,7 @@ index 9d624bc..e05314e 100644
          return torch.cuda.mem_get_info()
  
 diff --git a/tests/engine/backends/fsdp2/test_adamw_workspace.py b/tests/engine/backends/fsdp2/test_adamw_workspace.py
-index d5f8a3c..685619b 100644
+index d5f8a3c..13aaea7 100644
 --- a/tests/engine/backends/fsdp2/test_adamw_workspace.py
 +++ b/tests/engine/backends/fsdp2/test_adamw_workspace.py
 @@ -37,6 +37,7 @@ class WorkspaceRuntime(CpuRuntime):
@@ -533,8 +649,231 @@ index d5f8a3c..685619b 100644
  def test_tuned_plan_exceeding_live_budget_is_rejected():
      optimizer, _ = _optimizer((65,), WorkspaceRuntime(free=128))
      _select_plan(optimizer, WorkspacePlan(1, 128))
+@@ -663,6 +767,222 @@ def test_trial_oom_restores_values_and_aborts_calibration(monkeypatch, cpu_adamw
+     assert not optimizer._workspace_calibration_stats["cleanup_cleared_cache"]
+ 
+ 
++def _reference_adamw(optimizer, params):
++    """Native AdamW over copies of the current values, gradients and state."""
++    reference_params = [torch.nn.Parameter(param.detach().clone()) for param in params]
++    reference = torch.optim.AdamW(reference_params, fused=False, foreach=False)
++    for param, reference_param in zip(params, reference_params):
++        reference_param.grad = param.grad.clone()
++        reference.state[reference_param] = {
++            key: tensor.detach().clone() for key, tensor in optimizer.state[param].items()
++        }
++    return reference, reference_params
++
++
++def _assert_matches_reference(optimizer, params, reference, reference_params):
++    for param, reference_param in zip(params, reference_params):
++        torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
++        for key, value in reference.state[reference_param].items():
++            torch.testing.assert_close(optimizer.state[param][key], value, rtol=0, atol=0)
++
++
++def test_calibration_oom_skips_that_capacity_and_larger_but_keeps_smaller(
++    monkeypatch, cpu_adamw
++):
++    optimizer, params = _optimizer(runtime=AsyncWorkspaceRuntime())
++    saved, initialize, measured = _snapshot(optimizer, params), DeviceWorkspace.__init__, []
++
++    def allocate(workspace, runtime, capacity):
++        if capacity >= 192:
++            raise torch.OutOfMemoryError("injected workspace allocation failure")
++        initialize(workspace, runtime, capacity)
++
++    def benchmark(*args):
++        measured.append(optimizer._workspace_plan)
++        return 0.5 if optimizer._workspace_plan == WorkspacePlan(1, 128) else 1.0
++
++    monkeypatch.setattr(optimizer, "_get_pipeline", lambda _: None)
++    monkeypatch.setattr(DeviceWorkspace, "__init__", allocate)
++    monkeypatch.setattr(optimizer, "_benchmark_workspace", benchmark)
++    assert optimizer.autotune_workspace() == 128
++    # (2, 96) runs out of memory at 192 bytes. (1, 128) follows it in slot order
++    # but needs less memory, so it is still measured and wins.
++    plans = [
++        WorkspacePlan(1, 32),
++        WorkspacePlan(2, 32),
++        WorkspacePlan(1, 64),
++        WorkspacePlan(2, 64),
++        WorkspacePlan(1, 128),
++    ]
++    assert measured == [plan for plan in plans for _ in range(4)]
++    assert [entry[0] for entry in optimizer._workspace_measurements] == plans
++    assert optimizer._tuned_workspace_plan == WorkspacePlan(1, 128)
++    assert optimizer._workspace_calibration_stats["out_of_memory_capacity_bytes"] == 192
++    _assert_unchanged(optimizer, params, saved)
++
++
++@pytest.mark.parametrize("dirty", [False, True], ids=["zero-moments", "nonzero-moments"])
++def test_trial_oom_after_partial_update_restores_state_for_the_next_step(
++    monkeypatch, cpu_adamw, dirty
++):
++    optimizer, params = _optimizer((33, 17))
++    if dirty:
++        for state in optimizer.param_to_cpu_states_map.values():
++            state["exp_avg"].fill_(0.25)
++            state["exp_avg_sq"].fill_(0.5)
++    saved = _snapshot(optimizer, params)
++    reference, reference_params = _reference_adamw(optimizer, params)
++    run, large_calls = optimizer._run_adamw, 0
++
++    def fail_second_large_chunk(local_params, grads, states, steps, group):
++        nonlocal large_calls
++        run(local_params, grads, states, steps, group)
++        if optimizer.workspace.capacity_bytes >= 320:
++            large_calls += 1
++            if large_calls == 2:
++                # The first chunk already updated values and wrote its moments.
++                local_params[0].add_(10)
++                raise torch.OutOfMemoryError("injected kernel workspace failure")
++
++    monkeypatch.setattr(optimizer, "_run_adamw", fail_second_large_chunk)
++    assert optimizer.autotune_workspace() == 160
++    assert large_calls == 2
++    assert optimizer._tuned_workspace_plan == WorkspacePlan(1, 160)
++    assert [entry[0] for entry in optimizer._workspace_measurements] == [
++        WorkspacePlan(1, 160)
++    ]
++    assert not optimizer._workspace_restore_failed
++    _assert_unchanged(optimizer, params, saved)
++    monkeypatch.setattr(optimizer, "_run_adamw", run)
++    optimizer.step()
++    reference.step()
++    _assert_matches_reference(optimizer, params, reference, reference_params)
++
++
++@pytest.mark.parametrize(
++    "local_oom,peer_code,expected_oom",
++    [(True, 0, False), (True, 3, True), (False, 1, True)],
++    ids=["peer-error", "local-oom", "peer-oom"],
++)
++def test_allocation_raises_oom_only_when_every_failure_is_oom(
++    monkeypatch, local_oom, peer_code, expected_oom
++):
++    optimizer, _ = _optimizer()
++    initialize = DeviceWorkspace.__init__
++
++    def allocate(workspace, runtime, capacity):
++        if local_oom:
++            raise torch.OutOfMemoryError("injected workspace failure")
++        initialize(workspace, runtime, capacity)
++
++    def all_reduce(value, op, group):
++        value.fill_(min(int(value.item()), peer_code))
++
++    monkeypatch.setattr(DeviceWorkspace, "__init__", allocate)
++    _distributed(monkeypatch, all_reduce)
++    with pytest.raises(RuntimeError, match="before any update") as info:
++        optimizer._reserve_workspace(64, status=torch.ones(1))
++    assert isinstance(info.value, torch.OutOfMemoryError) == expected_oom
++    assert optimizer.workspace is None
++
++
++def test_trial_oom_with_peer_non_oom_failure_aborts_calibration(monkeypatch, cpu_adamw):
++    optimizer, params = _optimizer((33, 17))
++    saved, run = _snapshot(optimizer, params), optimizer._run_adamw
++
++    def fail_large(local_params, grads, states, steps, group):
++        if optimizer.workspace.capacity_bytes >= 320:
++            local_params[0].add_(10)
++            raise torch.OutOfMemoryError("injected kernel workspace failure")
++        run(local_params, grads, states, steps, group)
++
++    def all_reduce(value, op, group):
++        if value.numel() == 3 and not value[0]:
++            value[1] = 0  # A peer failed in the same phase without running out of memory.
++
++    monkeypatch.setattr(optimizer, "_run_adamw", fail_large)
++    _distributed(monkeypatch, all_reduce)
++    with pytest.raises(RuntimeError, match="execute failed") as info:
++        optimizer.autotune_workspace()
++    assert not isinstance(info.value, torch.OutOfMemoryError)
++    assert optimizer._tuned_workspace_plan is None
++    _assert_unchanged(optimizer, params, saved)
++
++
++def test_trial_oom_with_failed_restore_is_sticky(monkeypatch, cpu_adamw):
++    optimizer, params = _optimizer((33, 17))
++    run, copy_tensor = optimizer._run_adamw, torch.Tensor.copy_
++
++    def fail_large(local_params, grads, states, steps, group):
++        if optimizer.workspace.capacity_bytes >= 320:
++            local_params[0].add_(10)
++            raise torch.OutOfMemoryError("injected kernel workspace failure")
++        run(local_params, grads, states, steps, group)
++
++    def restore(tensor, source, *args, **kwargs):
++        workspace = optimizer.workspace
++        if tensor is params[0] and workspace is not None and workspace.capacity_bytes >= 320:
++            raise RuntimeError("injected parameter restore failure")
++        return copy_tensor(tensor, source, *args, **kwargs)
++
++    monkeypatch.setattr(optimizer, "_run_adamw", fail_large)
++    monkeypatch.setattr(torch.Tensor, "copy_", restore)
++    with pytest.raises(RuntimeError, match="could not restore"):
++        optimizer.autotune_workspace()
++    monkeypatch.setattr(torch.Tensor, "copy_", copy_tensor)
++    assert optimizer._workspace_restore_failed
++    assert optimizer._tuned_workspace_plan is None
++    for operation in (optimizer.step, optimizer.autotune_workspace):
++        with pytest.raises(RuntimeError, match="could not restore"):
++            operation()
++
++
++def test_step_allocation_oom_retries_smaller_measured_plans_before_any_update(
++    monkeypatch, cpu_adamw
++):
++    optimizer, params = _optimizer((33,))
++    _select_plan(optimizer, WorkspacePlan(1, 256))
++    optimizer._workspace_measurements = [
++        (WorkspacePlan(1, 256), 1.0, 256),
++        (WorkspacePlan(1, 128), 1.2, 128),
++        (WorkspacePlan(1, 64), 1.5, 64),
++    ]
++    reference, reference_params = _reference_adamw(optimizer, params)
++    allocations, initialize = [], DeviceWorkspace.__init__
++
++    def allocate(workspace, runtime, capacity):
++        allocations.append(capacity)
++        if capacity >= 128:
++            raise torch.OutOfMemoryError("injected workspace allocation failure")
++        initialize(workspace, runtime, capacity)
++
++    monkeypatch.setattr(DeviceWorkspace, "__init__", allocate)
++    optimizer.step()
++    assert allocations == [256, 128, 64]
++    assert optimizer._tuned_workspace_plan == WorkspacePlan(1, 64)
++    reference.step()
++    _assert_matches_reference(optimizer, params, reference, reference_params)
++
++
++def test_step_allocation_oom_without_smaller_measured_plan_fails_before_any_update(
++    monkeypatch, cpu_adamw
++):
++    optimizer, params = _optimizer((33,))
++    _select_plan(optimizer, WorkspacePlan(1, 256))
++    optimizer._workspace_measurements = [(WorkspacePlan(1, 256), 1.0, 256)]
++    saved = _snapshot(optimizer, params)
++
++    def allocate(workspace, runtime, capacity):
++        raise torch.OutOfMemoryError("injected workspace allocation failure")
++
++    monkeypatch.setattr(DeviceWorkspace, "__init__", allocate)
++    with pytest.raises(RuntimeError, match="ran out of memory") as info:
++        optimizer.step()
++    assert isinstance(info.value.__cause__, torch.OutOfMemoryError)
++    assert not optimizer._workspace_update_failed
++    _assert_unchanged(optimizer, params, saved)
++
++
+ def test_execution_failure_then_cpu_zero_failure_blocks_future_updates(
+     monkeypatch, cpu_adamw
+ ):
 diff --git a/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py b/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
-index 07008e6..5f31382 100644
+index 07008e6..715bf0a 100644
 --- a/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
 +++ b/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
 @@ -120,7 +120,7 @@ def _run_workspace_coordination(rank, init_file, empty_peer):
@@ -563,3 +902,97 @@ index 07008e6..5f31382 100644
                  if rank == 1:
                      expected_measurements = [0] * 12
              assert measured_capacities == expected_measurements
+@@ -471,3 +475,93 @@ def test_zero_and_nonzero_moment_ranks_calibrate_without_mutating_step_zero_stat
+         nprocs=2,
+         join=True,
+     )
++
++
++def _run_one_rank_trial_oom(rank, init_file, dirty_rank):
++    os.environ.setdefault(
++        "GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo"
++    )
++    dist.init_process_group(
++        "gloo",
++        init_method=f"file://{init_file}",
++        rank=rank,
++        world_size=2,
++        timeout=timedelta(seconds=60),
++    )
++    try:
++        optimizer, params = _optimizer((33, 17))
++        if rank == dirty_rank:
++            for param in params:
++                optimizer.state[param]["exp_avg"].fill_(0.25)
++                optimizer.state[param]["exp_avg_sq"].fill_(0.5)
++        saved = _snapshot(optimizer, params)
++        reference_params = [
++            torch.nn.Parameter(param.detach().clone()) for param in params
++        ]
++        reference = torch.optim.AdamW(reference_params, fused=False, foreach=False)
++        for param, reference_param in zip(params, reference_params):
++            reference_param.grad = param.grad.clone()
++            reference.state[reference_param] = {
++                key: tensor.detach().clone()
++                for key, tensor in optimizer.state[param].items()
++            }
++        large_calls, measured = 0, []
++        benchmark = optimizer._benchmark_workspace
++
++        def execute(self, local_params, grads, states, steps, group):
++            nonlocal large_calls
++            _run_cpu_adamw(self, local_params, grads, states, steps, group)
++            if rank == 1 and self.workspace.capacity_bytes >= 320:
++                large_calls += 1
++                if large_calls == 2:
++                    # Rank 1 fails after its first chunk; rank 0 completes the trial.
++                    local_params[0].add_(10)
++                    raise torch.OutOfMemoryError("injected rank 1 kernel failure")
++
++        def measure(bound, status, saved_params, cpu_sink):
++            measured.append(optimizer.workspace.capacity_bytes)
++            return benchmark(bound, status, saved_params, cpu_sink)
++
++        with _cpu_calibration():
++            with (
++                patch.object(AdamWSwap, "_run_adamw", execute),
++                patch.object(optimizer, "_benchmark_workspace", measure),
++            ):
++                assert optimizer.autotune_workspace() == 160
++            assert measured == [160] * 4 + [320]
++            assert optimizer._tuned_workspace_plan == WorkspacePlan(1, 160)
++            stats = optimizer._workspace_calibration_stats
++            assert stats["out_of_memory_capacity_bytes"] == 320
++            assert stats["output_mode"] == (
++                "scratch" if rank == dirty_rank else "real_zero_moments"
++            )
++            assert not optimizer._workspace_restore_failed
++            _assert_unchanged(optimizer, params, saved)
++            optimizer.step()
++        reference.step()
++        for param, reference_param in zip(params, reference_params):
++            torch.testing.assert_close(param, reference_param, rtol=0, atol=0)
++            for key, value in reference.state[reference_param].items():
++                torch.testing.assert_close(
++                    optimizer.state[param][key], value, rtol=0, atol=0
++                )
++        plans = [None, None]
++        dist.all_gather_object(plans, optimizer._tuned_workspace_plan)
++        assert plans[0] == plans[1]
++    finally:
++        dist.destroy_process_group()
++
++
++@pytest.mark.skipif(
++    not _HAS_GLOO, reason="requires torch.distributed with Gloo support"
++)
++@pytest.mark.parametrize(
++    "dirty_rank", [0, 1], ids=["failing-rank-zero-moments", "failing-rank-nonzero-moments"]
++)
++def test_trial_oom_on_one_rank_shrinks_calibration_on_every_rank(tmp_path, dirty_rank):
++    mp.spawn(
++        _run_one_rank_trial_oom,
++        args=(str(tmp_path / "one-rank-oom"), dirty_rank),
++        nprocs=2,
++        join=True,
++    )

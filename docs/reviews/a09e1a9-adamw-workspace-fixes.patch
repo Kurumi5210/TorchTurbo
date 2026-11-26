@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index 001c7ad..a5a2080 100644
+index 001c7ad..41d6326 100644
 --- a/README.md
 +++ b/README.md
 @@ -186,17 +186,24 @@ With optimizer-state offload, an explicit positive `optimizer_memory_fraction` s
@@ -7,7 +7,7 @@ index 001c7ad..a5a2080 100644
  Contiguous parameters and their moments can span multiple chunks; each original
  parameter's step counter advances once per update. Local parameters, gradients, and both CPU moments must be contiguous.
 -Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.95 * free device memory` over active ranks at calibration time; cached memory is not added, and moment size does not cap the sweep. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
-+Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.95 * free device memory` over active ranks at calibration time; cached memory is not added. The sweep stops at the slot that holds the largest rank's active moments in one chunk, and two slots stop below it, since larger slots only add HBM. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating and keep the shared plan; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
++Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.9 * free device memory` over active ranks at calibration time; cached memory is not added. The sweep stops at the slot that holds the largest rank's active moments in one chunk, and two slots stop below it, since larger slots only add HBM. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating and keep the shared plan; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
  
  All ranks run each trial together, with one warmup and three timing samples per
  candidate. Each sample times a complete pipeline, including fill and drain,
@@ -33,7 +33,7 @@ index 001c7ad..a5a2080 100644
  For an explicit calibration before the training loop, call
  `adamw_swap.autotune_workspace()` on every training rank after a representative
 diff --git a/README_zh.md b/README_zh.md
-index d9a307a..3ee01ac 100644
+index d9a307a..bb5f840 100644
 --- a/README_zh.md
 +++ b/README_zh.md
 @@ -148,13 +148,15 @@ Muon 支持 `full` 和 `optimizer` 两种 CPU offload，`optimizer_memory_fracti
@@ -41,7 +41,7 @@ index d9a307a..3ee01ac 100644
  传输 overlap。连续参数及其状态可以拆到多个 chunk 中，原参数的 step 计数每次更新
  只增加一次；本地参数、梯度及两份 CPU moment 都必须连续，否则在校准或更新前报错。
 -校准时，每槽从所有 rank 最大的活跃权重分片字节数 M 起步（向上对齐至 32 字节），依次翻倍。单槽、双槽分别补测总预算允许的最大对齐槽容量。总预算取各活跃 rank 的 `0.95 × 设备当前空闲显存` 的最小值，不加分配器缓存，也不按 moment 总量截断。单槽 M 超预算直接报错；空 rank 不分配但参与同步，全局无工作时推迟校准。双槽使用独立传输流做 overlap，`step()` 返回前完成 CPU 写回。
-+校准时，每槽从所有 rank 最大的活跃权重分片字节数 M 起步（向上对齐至 32 字节），依次翻倍。单槽、双槽分别补测总预算允许的最大对齐槽容量。总预算取各活跃 rank 的 `0.95 × 设备当前空闲显存` 的最小值，不加分配器缓存。扫描在最大 rank 的活跃 moments 能一次装下的槽容量处停止，双槽停在它之下，因为更大的槽只会多占显存。单槽 M 超预算直接报错；空 rank 不分配但参与同步，并保存全局方案，全局无工作时推迟校准。双槽使用独立传输流做 overlap，`step()` 返回前完成 CPU 写回。
++校准时，每槽从所有 rank 最大的活跃权重分片字节数 M 起步（向上对齐至 32 字节），依次翻倍。单槽、双槽分别补测总预算允许的最大对齐槽容量。总预算取各活跃 rank 的 `0.9 × 设备当前空闲显存` 的最小值，不加分配器缓存。扫描在最大 rank 的活跃 moments 能一次装下的槽容量处停止，双槽停在它之下，因为更大的槽只会多占显存。单槽 M 超预算直接报错；空 rank 不分配但参与同步，并保存全局方案，全局无工作时推迟校准。双槽使用独立传输流做 overlap，`step()` 返回前完成 CPU 写回。
  
  所有 rank 共同试跑，每档预热 1 次、测量 3 次。计时覆盖整轮流水线的填充、计算和排空，
  每次取最慢 rank 的耗时，再计算中位数。在比最快中位数慢不超过 3% 的候选组合中，
@@ -55,8 +55,34 @@ index d9a307a..3ee01ac 100644
  禁止直接重试，需要重新加载模型 checkpoint 并重建优化器。
  
  显式校准时，先执行有代表性的 warmup backward，再在所有训练 rank 调用
+diff --git a/scripts/runs/config_example.yaml b/scripts/runs/config_example.yaml
+index 37cb04d..1ce3b29 100644
+--- a/scripts/runs/config_example.yaml
++++ b/scripts/runs/config_example.yaml
+@@ -56,7 +56,7 @@ engine_config:
+       enabled: false
+       # "optimizer" keeps parameters on device; "full" also offloads FSDP parameters
+       mode: optimizer
+-      # Omit to autotune AdamWSwap up to 95% of free memory; Muon defaults to 0.8.
++      # Omit to autotune AdamWSwap up to 90% of free memory; Muon defaults to 0.8.
+       # A positive fraction fixes AdamWSwap's single-slot budget without probing.
+       # Zero selects CPU updates, including CPU Newton-Schulz and exchange for Muon
+       # optimizer_memory_fraction: 0.8
+diff --git a/src/torchturbo/engine/backends/fsdp2/config.py b/src/torchturbo/engine/backends/fsdp2/config.py
+index 60d5f81..81ea72d 100644
+--- a/src/torchturbo/engine/backends/fsdp2/config.py
++++ b/src/torchturbo/engine/backends/fsdp2/config.py
+@@ -56,7 +56,7 @@ class CPUOffloadConfig:
+     full offload or optimizer-state-only offload. ``optimizer_memory_fraction``
+     bounds each rank's optimizer workspaces using that fraction of free device
+     memory. When omitted, AdamWSwap calibrates chunk size and transfer overlap
+-    up to 95% of free memory. An explicit positive fraction selects a fixed
++    up to 90% of free memory. An explicit positive fraction selects a fixed
+     single-slot budget without calibration. Muon defaults to 0.8, includes
+     reusable allocator cache, and checks its complete-matrix
+     compute and exchange buffers against this budget. Muon stages offloaded tensors
 diff --git a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
-index d22fbc8..f463f11 100644
+index d22fbc8..764a8cb 100644
 --- a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
 +++ b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
 @@ -28,6 +28,7 @@ from .adamw_workspace import (
@@ -67,6 +93,15 @@ index d22fbc8..f463f11 100644
  )
  from .state import wrap_cpu_state
  
+@@ -84,7 +85,7 @@ class AdamWSwapMixin:
+     """Run AdamW with CPU-resident optimizer state."""
+ 
+     state_keys = ("exp_avg", "exp_avg_sq")
+-    _AUTO_WORKSPACE_FRACTION = 0.95
++    _AUTO_WORKSPACE_FRACTION = 0.9
+     _WORKSPACE_CACHE_MARGIN_BYTES = 64 << 20
+ 
+     def __init__(
 @@ -101,6 +102,8 @@ class AdamWSwapMixin:
          self.workspace: DeviceWorkspace | None = None
          self._tuned_workspace_bytes: int | None = None
@@ -501,7 +536,7 @@ index 9d624bc..e05314e 100644
          return torch.cuda.mem_get_info()
  
 diff --git a/tests/engine/backends/fsdp2/test_adamw_workspace.py b/tests/engine/backends/fsdp2/test_adamw_workspace.py
-index d5f8a3c..13aaea7 100644
+index d5f8a3c..ee22ed9 100644
 --- a/tests/engine/backends/fsdp2/test_adamw_workspace.py
 +++ b/tests/engine/backends/fsdp2/test_adamw_workspace.py
 @@ -37,6 +37,7 @@ class WorkspaceRuntime(CpuRuntime):
@@ -522,7 +557,22 @@ index d5f8a3c..13aaea7 100644
  
  class AsyncWorkspaceRuntime(WorkspaceRuntime):
      supports_async_streams = True
-@@ -296,6 +300,55 @@ def test_candidates_probe_aligned_shards_and_both_budget_endpoints():
+@@ -86,11 +90,12 @@ def test_explicit_fraction_uses_free_memory_without_trials(monkeypatch, cpu_adam
+         assert optimizer._workspace_plan == WorkspacePlan(1, capacity)
+ 
+ 
+-def test_omitted_fraction_probes_to_95_percent(cpu_adamw):
++def test_omitted_fraction_probes_to_90_percent(cpu_adamw):
+     optimizer, _ = _optimizer((4,), WorkspaceRuntime(free=1024, reserved=4096))
+     del optimizer._AUTO_WORKSPACE_FRACTION
+     optimizer.autotune_workspace()
+-    assert optimizer._workspace_calibration_stats["probe_budget_bytes"] == 960
++    # int(1024 * 0.9) = 921, aligned down to 32 bytes.
++    assert optimizer._workspace_calibration_stats["probe_budget_bytes"] == 896
+ 
+ 
+ def _distributed(monkeypatch, all_reduce):
+@@ -296,6 +301,55 @@ def test_candidates_probe_aligned_shards_and_both_budget_endpoints():
          AdamWSwap._workspace_candidates(97, 96, False)
  
  
@@ -578,7 +628,7 @@ index d5f8a3c..13aaea7 100644
  def test_calibration_ignores_warmup_and_outliers_and_prefers_near_fastest(
      monkeypatch, cpu_adamw
  ):
-@@ -331,9 +384,7 @@ def test_calibration_uses_slowest_rank_time(monkeypatch, cpu_adamw):
+@@ -331,9 +385,7 @@ def test_calibration_uses_slowest_rank_time(monkeypatch, cpu_adamw):
  
      _distributed(monkeypatch, all_reduce)
      assert optimizer.autotune_workspace() == 128
@@ -589,7 +639,7 @@ index d5f8a3c..13aaea7 100644
  
  
  def test_equal_capacity_serial_and_pipeline_plans_are_both_measured(
-@@ -539,6 +590,59 @@ def test_allocation_failure_terminates_before_any_update(monkeypatch, oom):
+@@ -539,6 +591,59 @@ def test_allocation_failure_terminates_before_any_update(monkeypatch, oom):
      _assert_unchanged(optimizer, params, saved)
  
  
@@ -649,7 +699,7 @@ index d5f8a3c..13aaea7 100644
  def test_tuned_plan_exceeding_live_budget_is_rejected():
      optimizer, _ = _optimizer((65,), WorkspaceRuntime(free=128))
      _select_plan(optimizer, WorkspacePlan(1, 128))
-@@ -663,6 +767,222 @@ def test_trial_oom_restores_values_and_aborts_calibration(monkeypatch, cpu_adamw
+@@ -663,6 +768,222 @@ def test_trial_oom_restores_values_and_aborts_calibration(monkeypatch, cpu_adamw
      assert not optimizer._workspace_calibration_stats["cleanup_cleared_cache"]
  
  

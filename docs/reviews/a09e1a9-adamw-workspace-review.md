@@ -7,7 +7,8 @@
   [第二轮复核](#第二轮复核)；修复方案见 [建议修复方案](#建议修复方案)，
   补丁文件 [`a09e1a9-adamw-workspace-fixes.patch`](a09e1a9-adamw-workspace-fixes.patch)
 - 第三轮：按讨论结果增加"OOM 时缩小范围重试"，并说明重试时状态为什么正确，见
-  [修复 F](#修复-f校准或分配-oom-时缩小范围重试)
+  [修复 F](#修复-f校准或分配-oom-时缩小范围重试)；预算系数从 0.95 改为 0.9，见
+  [修复 G](#修复-g预算系数从-095-改为-09)
 
 下文的行号都以 a09e1a9 为准；没有写目录的文件都在
 `src/torchturbo/engine/backends/fsdp2/optimizers/` 下。
@@ -312,7 +313,7 @@ LoRA candidates= 45 trials= 180 max_capacity=57.0 GiB redundant= 21
 
 我在 `54eeedb` 上实现了一版原型，补丁见同目录的
 [`a09e1a9-adamw-workspace-fixes.patch`](a09e1a9-adamw-workspace-fixes.patch)
-（包含修复 A–F，8 个文件，+653 / -69），在 `dev-chunk-optimizer` 上可以直接 `git apply`：
+（包含修复 A–G，10 个文件，+659 / -74），在 `dev-chunk-optimizer` 上可以直接 `git apply`：
 
 ```bash
 git fetch origin
@@ -328,11 +329,12 @@ git show origin/dev-workspace-opus:docs/reviews/a09e1a9-adamw-workspace-fixes.pa
 | D. 校准时为空的 rank 也保存全局方案 | 第 3 条 | `adamw.py` |
 | E. 54eeedb 的代码细节和 README | 第二轮"代码细节" | `adamw_workspace.py`、README |
 | F. 校准或分配 OOM 时缩小范围重试 | 第三轮讨论 | `adamw.py`、README |
+| G. 预算系数从 0.95 改为 0.9 | 第三轮讨论 | `adamw.py`、`config.py`、`config_example.yaml`、README、测试 |
 
 **验证范围**：本机 CPU 版 torch 2.10 的 venv。`test_adamw_pipeline.py`、
 `test_adamw_workspace.py`、`test_adamw_workspace_distributed.py`（真实 Gloo 双进程）、
 `test_cpu_offload_optimizer.py`、`tests/engine/test_config.py`、`tests/runtime` 共 192 个通过
-（A–E 后为 180 个，F 新增 12 个）；
+（A–E 后为 180 个，F 新增 12 个，G 不增减用例）；
 5 个失败仍是 `test_cpu_offload_optimizer.py` 里 pin memory 的环境问题，和 a09e1a9、54eeedb 相同。
 上面的 sink 随机测试在补丁后同样通过。**GPU/NPU 上的真实路径、NPU 的 host 缓存接口和真实计时
 都没有验证。**
@@ -692,6 +694,34 @@ if not measurements:
 | 失败的 trial 之后不把 CPU moments 清零 | 2 个用例失败（两个零态用例） |
 | 失败的 trial 之后不从快照恢复参数 | 7 个用例失败 |
 | 把 peer 的非 OOM 分配错误也当成 OOM | 1 个用例失败（`peer-error`） |
+
+### 修复 G：预算系数从 0.95 改为 0.9
+
+`AdamWSwapMixin._AUTO_WORKSPACE_FRACTION` 从 `0.95` 改为 `0.9`。它同时用于两处：
+
+- 校准预算：各活跃 rank 的 `0.9 × 驱动报告的空闲显存` 取最小值，不算 allocator 缓存；
+- 真实 step 检查方案是否放得下：`0.9 × (空闲显存 + allocator 缓存)`。
+
+两处用同一个系数，所以校准选出的方案在真实 step 中的判断口径不变。
+
+**影响范围**：只有每卡 moments 超过预算（单 chunk 槽容量 S 大于预算）时，最大候选才会变小。
+修复 A 的两个例子上限由 S 决定，候选完全不变：
+
+| 场景（空闲显存） | 0.95 时的预算 | 0.9 时的预算 | 候选数 | 最大候选 |
+|---|---|---|---|---|
+| LoRA（60 GiB） | 57 GiB | 54 GiB | 26，不变 | 128 MiB，不变 |
+| 7B 全参 8 卡（40 GiB） | 38 GiB | 36 GiB | 12，不变 | 7 GiB，不变 |
+| 每卡 moments 70 GiB（40 GiB） | 38 GiB | 36 GiB | 13 | 38 GiB → 36 GiB |
+
+多留出的 5% 显存给 NCCL/HCCL 首次通信时才分配的缓冲区、新建 stream 的开销、kernel 的临时显存
+和同卡上的其他进程，降低最大那个候选 OOM 的概率；即使 OOM，也会按修复 F 缩小范围重试。
+代价是 moments 超过预算时，最大的 slot 小 5%，chunk 数会略多一些。
+
+**改动**：常量本身；`config.py` 的 docstring 和 `config_example.yaml` 的注释从 "up to 95%" 改为
+"up to 90%"；README 中英文的预算公式；`test_omitted_fraction_probes_to_95_percent` 改名为
+`..._90_percent`，期望值从 960 改为 896（`int(1024 × 0.9) = 921`，向下对齐到 32 字节）。
+显式 `optimizer_memory_fraction` 的行为不受影响。54eeedb 的 commit message 里写的是
+"up to 95% of free memory"，合入时 PR 描述也要同步改。
 
 ### 需要作者决定、补丁里没有改的事项
 

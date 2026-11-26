@@ -1,0 +1,565 @@
+diff --git a/README.md b/README.md
+index 001c7ad..41ebc58 100644
+--- a/README.md
++++ b/README.md
+@@ -186,15 +186,16 @@ With optimizer-state offload, an explicit positive `optimizer_memory_fraction` s
+ before its first parameter update, after backward has produced real gradients.
+ Contiguous parameters and their moments can span multiple chunks; each original
+ parameter's step counter advances once per update. Local parameters, gradients, and both CPU moments must be contiguous.
+-Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.95 * free device memory` over active ranks at calibration time; cached memory is not added, and moment size does not cap the sweep. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
++Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.95 * free device memory` over active ranks at calibration time; cached memory is not added. The sweep stops at the slot that holds the largest rank's active moments in one chunk, and two slots stop below it, since larger slots only add HBM. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating and keep the shared plan; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
+ 
+ All ranks run each trial together, with one warmup and three timing samples per
+ candidate. Each sample times a complete pipeline, including fill and drain,
+ and uses the slowest rank's time. Within 3% of the fastest median, AdamWSwap
+ selects the candidate with the smallest total HBM allocation across ranks.
+ Two-slot candidates are excluded if any active rank cannot fit both slots.
+-Later updates use the selected plan unchanged. If it no longer fits, explicitly
+-recalibrate on all ranks. Allocation or trial failures stop all ranks without
++Later updates use the selected plan unchanged. If it no longer fits, all ranks
++switch to the measured candidate that fits now, chosen by the same rule; only if
++none fits must you recalibrate on all ranks. Allocation or trial failures stop all ranks without
+ shrinking the workspace or trying another candidate. A failed update cannot be replayed safely:
+ reload the model checkpoint and recreate the optimizer before continuing.
+ 
+diff --git a/README_zh.md b/README_zh.md
+index d9a307a..884940a 100644
+--- a/README_zh.md
++++ b/README_zh.md
+@@ -148,12 +148,12 @@ Muon 支持 `full` 和 `optimizer` 两种 CPU offload，`optimizer_memory_fracti
+ 显式设置正的 `optimizer_memory_fraction` 时，AdamWSwap 不探测，每步直接按各活跃 rank 中最小空闲显存乘系数分配单槽（向下对齐至 32 字节）。省略该配置时，AdamWSwap 在首次参数更新前，使用 backward 产生的真实梯度联合校准 chunk 大小与
+ 传输 overlap。连续参数及其状态可以拆到多个 chunk 中，原参数的 step 计数每次更新
+ 只增加一次；本地参数、梯度及两份 CPU moment 都必须连续，否则在校准或更新前报错。
+-校准时，每槽从所有 rank 最大的活跃权重分片字节数 M 起步（向上对齐至 32 字节），依次翻倍。单槽、双槽分别补测总预算允许的最大对齐槽容量。总预算取各活跃 rank 的 `0.95 × 设备当前空闲显存` 的最小值，不加分配器缓存，也不按 moment 总量截断。单槽 M 超预算直接报错；空 rank 不分配但参与同步，全局无工作时推迟校准。双槽使用独立传输流做 overlap，`step()` 返回前完成 CPU 写回。
++校准时，每槽从所有 rank 最大的活跃权重分片字节数 M 起步（向上对齐至 32 字节），依次翻倍。单槽、双槽分别补测总预算允许的最大对齐槽容量。总预算取各活跃 rank 的 `0.95 × 设备当前空闲显存` 的最小值，不加分配器缓存。扫描在最大 rank 的活跃 moments 能一次装下的槽容量处停止，双槽停在它之下，因为更大的槽只会多占显存。单槽 M 超预算直接报错；空 rank 不分配但参与同步，并保存全局方案，全局无工作时推迟校准。双槽使用独立传输流做 overlap，`step()` 返回前完成 CPU 写回。
+ 
+ 所有 rank 共同试跑，每档预热 1 次、测量 3 次。计时覆盖整轮流水线的填充、计算和排空，
+ 每次取最慢 rank 的耗时，再计算中位数。在比最快中位数慢不超过 3% 的候选组合中，
+ 选择各 rank 的 HBM 分配总量最小的一组。任一活跃 rank 放不下双槽时，寻优不考虑双槽。
+-后续 step 按原方案执行；方案不再适用时，须在所有 rank 上显式重新校准。
++后续 step 按原方案执行；方案不再适用时，所有 rank 一起改用已测候选中当前放得下的方案（同样取最快 3% 内显存最小者），都放不下才报错并要求重新校准。
+ 分配或试跑失败时所有 rank 报错，不缩容重试，也不换候选。实际更新中途失败后
+ 禁止直接重试，需要重新加载模型 checkpoint 并重建优化器。
+ 
+diff --git a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
+index d22fbc8..e3acc4e 100644
+--- a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
++++ b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
+@@ -28,6 +28,7 @@ from .adamw_workspace import (
+     calibration_sink_bytes,
+     reset_workspace_moments,
+     run_workspace,
++    single_chunk_slot_bytes,
+ )
+ from .state import wrap_cpu_state
+ 
+@@ -101,6 +102,8 @@ class AdamWSwapMixin:
+         self.workspace: DeviceWorkspace | None = None
+         self._tuned_workspace_bytes: int | None = None
+         self._tuned_workspace_plan: WorkspacePlan | None = None
++        # (shared plan, slowest-rank median seconds, total HBM over ranks); identical on every rank.
++        self._workspace_measurements: list[tuple[WorkspacePlan, float, int]] = []
+         self._workspace_plan = WorkspacePlan(1, 0)
+         self._pipeline: PipelineStreams | None = None
+         self._workspace_update_failed = False
+@@ -157,17 +160,23 @@ class AdamWSwapMixin:
+         return self._pipeline
+ 
+     def _reserve_workspace(
+-        self, capacity: int, *, status: torch.Tensor, error=None
++        self, capacity: int, *, status: torch.Tensor, error=None, refit: bool = False
+     ) -> DeviceWorkspace | None:
+-        """Allocate once; no rank proceeds if another rank fails."""
++        """Allocate once; no rank proceeds if another rank fails.
++
++        ``refit`` reports that this rank cannot use the tuned plan. Every rank
++        then leaves ``status`` at 1 and returns without a workspace.
++        """
+         workspace = None
+-        if error is None and capacity:
++        if error is None and capacity and not refit:
+             try:
+                 workspace = DeviceWorkspace(self.device_runtime, capacity)
+             except Exception as allocation_error:  # noqa: BLE001 - Coordinate all ranks.
+                 error = allocation_error.with_traceback(None)
+-        status.fill_(error is None)
++        status.fill_(0 if error is not None else 1 if refit else 2)
+         self._reduce_workspace_value(status, dist.ReduceOp.MIN)
++        if status.item() == 1:
++            return None
+         if not status.item():
+             workspace = None
+             detail = f": {error}" if error is not None else ""
+@@ -237,6 +246,8 @@ class AdamWSwapMixin:
+             plan = self._fixed_workspace_plan(bound, error)
+             self._workspace_plan = plan
+             return self._reserve_workspace(plan.capacity_bytes, status=status)
++        minimum = maximum = 0
++        refit = False
+         try:
+             if error is not None:
+                 raise error
+@@ -247,26 +258,77 @@ class AdamWSwapMixin:
+                     raise RuntimeError(
+                         "active rank has no calibrated AdamW workspace; recalibrate on all ranks"
+                     )
+-                if target.slot_bytes < minimum or target.capacity_bytes > maximum:
+-                    raise RuntimeError(
+-                        f"selected AdamW workspace {target} no longer fits "
+-                        f"(minimum slot={minimum}, maximum total={maximum}); recalibrate on all ranks"
+-                    )
+-                plan = target
++                refit = target.slot_bytes < minimum or target.capacity_bytes > maximum
++                if not refit:
++                    plan = target
+             self._get_pipeline(plan)
+         except Exception as budget_error:  # noqa: BLE001 - Propagate errors to every rank.
+             error = budget_error.with_traceback(None)
+         workspace = self._reserve_workspace(
+-            plan.capacity_bytes, status=status, error=error
++            plan.capacity_bytes, status=status, error=error, refit=refit
+         )
++        if status.item() == 1:
++            # Rare path: some rank cannot use the tuned plan. Every rank reaches it.
++            plan, error = self._refit_workspace_plan(minimum, maximum), None
++            try:
++                self._get_pipeline(plan)
++            except Exception as pipeline_error:  # noqa: BLE001 - Propagate errors to every rank.
++                error = pipeline_error.with_traceback(None)
++            workspace = self._reserve_workspace(
++                plan.capacity_bytes, status=status, error=error
++            )
+         self._workspace_plan = plan
+         return workspace
+ 
++    def _refit_workspace_plan(self, minimum: int, maximum: int) -> WorkspacePlan:
++        """Select a measured plan that fits every active rank, or fail on all ranks."""
++        inactive = torch.iinfo(torch.int64).max
++        bounds = torch.tensor(
++            [-minimum, maximum or inactive],
++            dtype=torch.int64,
++            device=self.device_runtime.device,
++        )
++        self._reduce_workspace_value(bounds, dist.ReduceOp.MIN)
++        shared_minimum, shared_maximum = -bounds[0].item(), bounds[1].item()
++        fitting = [
++            entry
++            for entry in self._workspace_measurements
++            if entry[0].slot_bytes >= shared_minimum
++            and entry[0].capacity_bytes <= shared_maximum
++        ]
++        if not fitting:
++            raise RuntimeError(
++                f"selected AdamW workspace {self._tuned_workspace_plan} no longer fits "
++                f"(minimum slot={shared_minimum}, maximum total={shared_maximum}) and no "
++                "measured candidate fits; recalibrate on all ranks"
++            )
++        selected = self._select_measurement(fitting)
++        logger.warning_rank0(
++            "AdamW workspace %s no longer fits; switching to measured plan %s",
++            self._tuned_workspace_plan,
++            selected[0],
++        )
++        self._tuned_workspace_plan = selected[0]
++        return selected[0] if maximum else WorkspacePlan(1, 0)
++
++    @staticmethod
++    def _select_measurement(measurements):
++        """Least total HBM within 3% of the fastest median."""
++        fastest = min(elapsed for _, elapsed, _ in measurements)
++        return min(
++            (entry for entry in measurements if entry[1] <= fastest * 1.03),
++            key=lambda entry: (entry[2], entry[1]),
++        )
++
+     @staticmethod
+     def _workspace_candidates(
+-        shard_bytes: int, budget: int, overlap: bool
++        shard_bytes: int, budget: int, overlap: bool, full_slot: int | None = None
+     ) -> tuple[WorkspacePlan, ...]:
+-        """Double the slot size from the largest active shard to each aligned endpoint."""
++        """Double the slot size from the largest active shard to each aligned endpoint.
++
++        ``full_slot`` is the largest rank's single-chunk slot. Larger slots only
++        add HBM, and two slots overlap nothing unless that rank has two chunks.
++        """
+         alignment = 2 * DeviceWorkspace._ALIGNMENT_BYTES
+         start = (shard_bytes + alignment - 1) // alignment * alignment
+         if start <= 0 or start > budget:
+@@ -276,6 +338,9 @@ class AdamWSwapMixin:
+         plans = []
+         for slots in (1, 2) if overlap else (1,):
+             endpoint = budget // slots // alignment * alignment
++            if full_slot is not None:
++                limit = max(full_slot, start) if slots == 1 else full_slot - alignment
++                endpoint = min(endpoint, limit)
+             if endpoint < start:
+                 continue
+             size = start
+@@ -328,7 +393,8 @@ class AdamWSwapMixin:
+         status = torch.ones(3, dtype=torch.int64, device=runtime.device)
+         allocation_status = torch.ones(1, dtype=torch.int64, device=runtime.device)
+         control = torch.zeros(1, dtype=torch.int64, device=runtime.device)
+-        shard = torch.zeros(1, dtype=torch.int64, device=runtime.device)
++        # Largest active shard and single-chunk slot, reduced together.
++        shard = torch.zeros(2, dtype=torch.int64, device=runtime.device)
+         limits = torch.ones(2, dtype=torch.int64, device=runtime.device)
+         timing = torch.zeros((), dtype=torch.float32, device=runtime.device)
+         stats = self._workspace_calibration_stats = {
+@@ -341,7 +407,8 @@ class AdamWSwapMixin:
+             if error is not None:
+                 raise error
+             minimum, maximum = self._workspace_bounds(bound, calibration=True)
+-            shard.fill_(max((param.local_param.nbytes for param in bound), default=0))
++            shard[0] = max((param.local_param.nbytes for param in bound), default=0)
++            shard[1] = single_chunk_slot_bytes(bound)
+             limits[0] = maximum if minimum else torch.iinfo(torch.int64).max
+             limits[1] = not minimum or runtime.supports_async_streams
+         except Exception as budget_error:  # noqa: BLE001 - Propagate errors to every rank.
+@@ -350,16 +417,27 @@ class AdamWSwapMixin:
+             status, error, "budget validation before any update"
+         )
+         self._reduce_workspace_value(shard, dist.ReduceOp.MAX)
++        max_shard, full_slot = shard.tolist()
+         stats["setup_seconds"] = perf_counter() - started
+-        if not shard.item():
++        if not max_shard:
+             stats["total_seconds"] = perf_counter() - started
+             return 0
+         self._reduce_workspace_value(limits, dist.ReduceOp.MIN)
+         budget, overlap = limits.tolist()
+-        candidates = self._workspace_candidates(shard.item(), budget, bool(overlap))
+-        stats.update(max_shard_bytes=shard.item(), probe_budget_bytes=budget)
+-        if not minimum:
+-            candidates = (WorkspacePlan(1, 0),) * len(candidates)
++        shared_candidates = self._workspace_candidates(
++            max_shard, budget, bool(overlap), full_slot
++        )
++        stats.update(
++            max_shard_bytes=max_shard,
++            single_chunk_slot_bytes=full_slot,
++            probe_budget_bytes=budget,
++        )
++        # Empty ranks run every trial without allocating, but keep the shared plan.
++        candidates = (
++            shared_candidates
++            if minimum
++            else (WorkspacePlan(1, 0),) * len(shared_candidates)
++        )
+ 
+         measurements = []
+         saved_params = []
+@@ -401,7 +479,7 @@ class AdamWSwapMixin:
+             self._check_benchmark_phase(status, error, "snapshot preparation")
+             stats["snapshot_seconds"] = perf_counter() - preparation_started
+             trials_started = perf_counter()
+-            for plan in candidates:
++            for plan, shared_plan in zip(candidates, shared_candidates):
+                 self.release_workspace()
+                 self._reserve_workspace(plan.capacity_bytes, status=allocation_status)
+                 self._workspace_plan = plan
+@@ -421,7 +499,7 @@ class AdamWSwapMixin:
+                 control.fill_(plan.capacity_bytes)
+                 self._reduce_workspace_value(control, dist.ReduceOp.SUM)
+                 elapsed = median(samples)
+-                measurements.append((plan, elapsed, control.item()))
++                measurements.append((shared_plan, elapsed, control.item()))
+                 logger.info_rank0(
+                     "AdamW workspace calibration: rank0 slots=%d, slot=%d bytes, "
+                     "capacity=%d bytes, step=%.3f ms",
+@@ -430,14 +508,11 @@ class AdamWSwapMixin:
+                     plan.capacity_bytes,
+                     elapsed * 1000,
+                 )
+-            fastest = min(elapsed for _, elapsed, _ in measurements)
+-            selected = min(
+-                (entry for entry in measurements if entry[1] <= fastest * 1.03),
+-                key=lambda entry: (entry[2], entry[1]),
+-            )
++            selected = self._select_measurement(measurements)
++            self._workspace_measurements = measurements
+             self._tuned_workspace_plan = selected[0]
+-            self._tuned_workspace_bytes = selected[0].capacity_bytes
+-            selected_capacity = selected[0].capacity_bytes
++            selected_capacity = selected[0].capacity_bytes if minimum else 0
++            self._tuned_workspace_bytes = selected_capacity
+             logger.info_rank0(
+                 "AdamW workspace selected: rank0 slots=%d, slot=%d bytes, "
+                 "capacity=%d bytes, step=%.3f ms, output=%s "
+@@ -454,7 +529,11 @@ class AdamWSwapMixin:
+                 stats["trials_seconds"] = perf_counter() - trials_started
+             cleanup_started = perf_counter()
+             saved_params.clear()
+-            cpu_sink = None
++            if cpu_sink is not None:
++                # The caching host allocator would otherwise keep the pinned
++                # sink until exit. Every trial has synchronized its copies.
++                cpu_sink = None
++                runtime.empty_host_cache()
+             stats["release_host_seconds"] = perf_counter() - cleanup_started
+             cleanup_started = perf_counter()
+             self.release_workspace()
+diff --git a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw_workspace.py b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw_workspace.py
+index 49707ea..97b221a 100644
+--- a/src/torchturbo/engine/backends/fsdp2/optimizers/adamw_workspace.py
++++ b/src/torchturbo/engine/backends/fsdp2/optimizers/adamw_workspace.py
+@@ -227,11 +227,22 @@ class PipelineStreams:
+         )
+ 
+ 
++def single_chunk_slot_bytes(bound: Sequence[BoundParameter]) -> int:
++    """Return the smallest slot that holds every active moment pair in one chunk.
++
++    Each half packs one moment per parameter at 16-byte aligned offsets, as
++    ``iter_chunks`` does. Any larger slot yields the same single chunk.
++    """
++    half = 0
++    for param in bound:
++        element_bytes = max(param.exp_avg.element_size(), param.exp_avg_sq.element_size())
++        half += DeviceWorkspace.align(param.numel * element_bytes)
++    return 2 * half
++
++
+ def calibration_sink_bytes(bound: Sequence[BoundParameter], capacity: int) -> int:
+     """Bound the output ring by the aligned size of all active moment pairs."""
+-    half = sum(DeviceWorkspace.align(max(param.exp_avg.nbytes, param.exp_avg_sq.nbytes))
+-               for param in bound)
+-    return min(capacity, 2 * half)
++    return min(capacity, single_chunk_slot_bytes(bound))
+ 
+ 
+ def _sink_view(
+@@ -264,6 +275,10 @@ def _stage_views(
+             if cpu_sink is None:
+                 output[key] = moment
+             else:
++                # The sink packs exp_avg for every slot in its first half and
++                # exp_avg_sq in its second half. Chunks fill slots in order, so
++                # slot k starts at k * half_slot of the unchunked packing and
++                # never ends beyond single_chunk_slot_bytes(bound) // 2.
+                 sink_offset = base // 2 + span.moment_offset
+                 if key == "exp_avg_sq":
+                     sink_offset += cpu_sink.numel() // 2
+@@ -359,8 +374,7 @@ def run_workspace(
+         or cpu_sink.dtype is not torch.uint8
+         or cpu_sink.ndim != 1
+         or cpu_sink.numel() % 32
+-        or (cpu_sink.numel() < plan.capacity_bytes
+-            and cpu_sink.numel() < calibration_sink_bytes(bound, plan.capacity_bytes))
++        or cpu_sink.numel() < calibration_sink_bytes(bound, plan.capacity_bytes)
+     ):
+         raise ValueError("AdamW calibration sink must cover the active aligned moment pairs as CPU bytes")
+     if plan.num_slots == 2 and pipeline is None:
+diff --git a/src/torchturbo/runtime/base.py b/src/torchturbo/runtime/base.py
+index fe9477c..2772195 100644
+--- a/src/torchturbo/runtime/base.py
++++ b/src/torchturbo/runtime/base.py
+@@ -81,6 +81,9 @@ class DeviceRuntime(ABC):
+     def empty_cache(self) -> None:
+         ...
+ 
++    def empty_host_cache(self) -> None:
++        """Release cached pinned host blocks that are no longer in use."""
++
+     @abstractmethod
+     def memory_info(self) -> tuple[int, int]:
+         ...
+diff --git a/src/torchturbo/runtime/cuda.py b/src/torchturbo/runtime/cuda.py
+index 9d624bc..e05314e 100644
+--- a/src/torchturbo/runtime/cuda.py
++++ b/src/torchturbo/runtime/cuda.py
+@@ -103,6 +103,15 @@ class CudaRuntime(DeviceRuntime):
+         if self.available():
+             torch.cuda.empty_cache()
+ 
++    def empty_host_cache(self) -> None:
++        # torch.cuda.empty_cache() leaves the pinned host allocator untouched.
++        accelerator = getattr(torch, "accelerator", None)
++        release = getattr(accelerator, "empty_host_cache", None) or getattr(
++            torch._C, "_host_emptyCache", None
++        )
++        if self.available() and release is not None:
++            release()
++
+     def memory_info(self) -> tuple[int, int]:
+         return torch.cuda.mem_get_info()
+ 
+diff --git a/tests/engine/backends/fsdp2/test_adamw_workspace.py b/tests/engine/backends/fsdp2/test_adamw_workspace.py
+index d5f8a3c..685619b 100644
+--- a/tests/engine/backends/fsdp2/test_adamw_workspace.py
++++ b/tests/engine/backends/fsdp2/test_adamw_workspace.py
+@@ -37,6 +37,7 @@ class WorkspaceRuntime(CpuRuntime):
+         self.reserved = reserved
+         self.allocated = allocated
+         self.cache_clears = 0
++        self.host_cache_clears = 0
+ 
+     def memory_info(self):
+         return self.free, self.free + self.reserved
+@@ -50,6 +51,9 @@ class WorkspaceRuntime(CpuRuntime):
+     def empty_cache(self):
+         self.cache_clears += 1
+ 
++    def empty_host_cache(self):
++        self.host_cache_clears += 1
++
+ 
+ class AsyncWorkspaceRuntime(WorkspaceRuntime):
+     supports_async_streams = True
+@@ -296,6 +300,55 @@ def test_candidates_probe_aligned_shards_and_both_budget_endpoints():
+         AdamWSwap._workspace_candidates(97, 96, False)
+ 
+ 
++def test_candidates_stop_at_one_chunk_and_need_two_chunks_for_overlap():
++    # One slot stops at the single-chunk slot; two slots stop one step below it.
++    assert AdamWSwap._workspace_candidates(65, 510, True, full_slot=192) == (
++        WorkspacePlan(1, 96),
++        WorkspacePlan(2, 96),
++        WorkspacePlan(2, 160),
++        WorkspacePlan(1, 192),
++    )
++    # A single parameter never splits at its own slot, so two slots are skipped.
++    assert AdamWSwap._workspace_candidates(65, 4096, True, full_slot=96) == (
++        WorkspacePlan(1, 96),
++    )
++
++
++@pytest.mark.parametrize(
++    "sizes,dtypes",
++    [((33, 17, 4), (torch.float32,) * 3), ((7, 1, 30), (torch.bfloat16, torch.float32, torch.float16))],
++)
++def test_single_chunk_slot_is_the_smallest_one_chunk_slot(sizes, dtypes):
++    from torchturbo.engine.backends.fsdp2.optimizers.adamw_workspace import (
++        BoundParameter,
++        iter_chunks,
++        single_chunk_slot_bytes,
++    )
++
++    bound = []
++    for size, dtype in zip(sizes, dtypes):
++        tensor = torch.zeros(size, dtype=dtype)
++        bound.append(
++            BoundParameter(tensor, tensor, tensor, {}, tensor.clone(), tensor.clone())
++        )
++    full = single_chunk_slot_bytes(bound)
++    assert full % 32 == 0
++    assert len(list(iter_chunks(bound, full))) == 1
++    assert len(list(iter_chunks(bound, full - 32))) == 2
++
++
++def test_nonzero_calibration_releases_pinned_host_cache_once(cpu_adamw):
++    optimizer, _ = _optimizer((17, 9))
++    optimizer.autotune_workspace()
++    assert optimizer.device_runtime.host_cache_clears == 0
++    for state in optimizer.param_to_cpu_states_map.values():
++        state["exp_avg"].fill_(0.1)
++    optimizer.autotune_workspace()
++    assert optimizer.device_runtime.host_cache_clears == 1
++    optimizer.step()
++    assert optimizer.device_runtime.host_cache_clears == 1
++
++
+ def test_calibration_ignores_warmup_and_outliers_and_prefers_near_fastest(
+     monkeypatch, cpu_adamw
+ ):
+@@ -331,9 +384,7 @@ def test_calibration_uses_slowest_rank_time(monkeypatch, cpu_adamw):
+ 
+     _distributed(monkeypatch, all_reduce)
+     assert optimizer.autotune_workspace() == 128
+-    assert timings == [
+-        size for size in (32, 64, 128, 256, 512, 1024, 2048) for _ in range(4)
+-    ]
++    assert timings == [size for size in (32, 64, 128) for _ in range(4)]
+ 
+ 
+ def test_equal_capacity_serial_and_pipeline_plans_are_both_measured(
+@@ -539,6 +590,59 @@ def test_allocation_failure_terminates_before_any_update(monkeypatch, oom):
+     _assert_unchanged(optimizer, params, saved)
+ 
+ 
++def test_tuned_plan_exceeding_live_budget_falls_back_to_measured_plan(
++    monkeypatch, cpu_adamw
++):
++    optimizer, params = _optimizer((33,), WorkspaceRuntime(free=128))
++    _select_plan(optimizer, WorkspacePlan(1, 128))
++    optimizer._workspace_measurements = [
++        (WorkspacePlan(1, 128), 1.0, 128),
++        (WorkspacePlan(1, 64), 1.5, 64),
++        (WorkspacePlan(2, 32), 1.6, 64),
++    ]
++    allocations, initialize = [], DeviceWorkspace.__init__
++
++    def allocate(workspace, runtime, capacity):
++        allocations.append(capacity)
++        initialize(workspace, runtime, capacity)
++
++    monkeypatch.setattr(DeviceWorkspace, "__init__", allocate)
++    optimizer.step()
++    # Budget 64 bytes, minimum slot 32: both smaller plans fit, and the faster
++    # single slot wins; the 128-byte plan is no longer a candidate.
++    assert allocations == [64]
++    assert optimizer._tuned_workspace_plan == WorkspacePlan(1, 64)
++    assert optimizer.param_to_step_map[params[0]].item() == 1
++    optimizer.step()
++    assert allocations == [64, 64]
++
++
++def test_fallback_uses_peer_bounds_so_every_rank_selects_one_plan(
++    monkeypatch, cpu_adamw
++):
++    optimizer, _ = _optimizer((33,), WorkspaceRuntime(free=4096))
++    _select_plan(optimizer, WorkspacePlan(1, 256))
++    optimizer._workspace_measurements = [
++        (WorkspacePlan(1, 256), 1.0, 512),
++        (WorkspacePlan(1, 128), 1.2, 256),
++        (WorkspacePlan(1, 64), 1.5, 128),
++    ]
++    reductions = []
++
++    def all_reduce(value, op, group):
++        reductions.append(value.numel())
++        if value.dtype is torch.int32 and len(reductions) == 1:
++            value.fill_(min(int(value.item()), 1))  # A peer cannot use 256 bytes.
++        elif value.numel() == 2:
++            value[1] = min(int(value[1]), 160)  # The peer can hold 160 bytes.
++
++    _distributed(monkeypatch, all_reduce)
++    optimizer.step()
++    assert optimizer._tuned_workspace_plan == WorkspacePlan(1, 128)
++    # Allocation status, shared bounds, fallback allocation status, update status.
++    assert reductions == [1, 2, 1, 1]
++
++
+ def test_tuned_plan_exceeding_live_budget_is_rejected():
+     optimizer, _ = _optimizer((65,), WorkspaceRuntime(free=128))
+     _select_plan(optimizer, WorkspacePlan(1, 128))
+diff --git a/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py b/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
+index 07008e6..5f31382 100644
+--- a/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
++++ b/tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
+@@ -120,7 +120,7 @@ def _run_workspace_coordination(rank, init_file, empty_peer):
+             benchmark(bound, status, saved_params, cpu_sink)
+             # Keep selection deterministic while executing the real transfer,
+             # backup, update and restore coordination in every measured slot.
+-            return {160: 1.2, 320: 1.1, 640: 1.0}[capacity] if rank == 0 else 0.5
++            return {160: 1.2, 320: 1.1, 512: 1.0}[capacity] if rank == 0 else 0.5
+ 
+         saved = _snapshot(optimizer, params)
+         with (
+@@ -130,10 +130,14 @@ def _run_workspace_coordination(rank, init_file, empty_peer):
+             patch.object(optimizer, "_benchmark_workspace", measure),
+         ):
+             chosen = optimizer.autotune_workspace()
+-            assert chosen == ((640 if rank == 0 else 0) if empty_peer else 320)
++            assert chosen == ((512 if rank == 0 else 0) if empty_peer else 320)
++            # The sweep stops at rank 0's single-chunk slot (2 * 256 bytes).
++            assert optimizer._tuned_workspace_plan == WorkspacePlan(
++                1, 512 if empty_peer else 320
++            )
+             expected_measurements = [160] * 4 + [320] * 4
+             if empty_peer:
+-                expected_measurements += [640] * 4
++                expected_measurements += [512] * 4
+                 if rank == 1:
+                     expected_measurements = [0] * 12
+             assert measured_capacities == expected_measurements

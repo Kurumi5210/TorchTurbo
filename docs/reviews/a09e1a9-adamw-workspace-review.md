@@ -3,6 +3,9 @@
 - 被评审 commit：`a09e1a9ba68139a1d31568a9b8a68e156f5ace88`（父 commit `cccd6de`）
 - 评审日期：2026-11-26
 - 涉及范围：`optimizers/adamw.py`（重写）、新增 `optimizers/adamw_workspace.py`、`config.py`、`muon.py`、README 及 3 个新测试文件
+- 第二轮：复核 Codex 根据本评审改的版本 `54eeedb`（分支 `dev-chunk-optimizer`），见文末
+  [第二轮复核](#第二轮复核)；修复方案见 [建议修复方案](#建议修复方案)，
+  补丁文件 [`a09e1a9-adamw-workspace-fixes.patch`](a09e1a9-adamw-workspace-fixes.patch)
 
 下文的行号都以 a09e1a9 为准；没有写目录的文件都在
 `src/torchturbo/engine/backends/fsdp2/optimizers/` 下。
@@ -13,12 +16,12 @@
 建议合入前修掉。第 2 条和第 1 条可以用同一处改动修复。第 3 条是设计层面的取舍，
 需要和作者讨论。
 
-| # | 严重程度 | 问题 | 位置 |
-|---|---|---|---|
-| 1 | 高 | resume 时 pinned sink 的大小约等于 95% 空闲显存，和模型状态大小无关，校准后也不释放 | `adamw.py:389-392` |
-| 2 | 中 | 扫描范围不按 moment 总量截断，产生大量冗余候选 | `adamw.py:265-285` |
-| 3 | 中 | 默认行为改变，方案不再适用时没有自动回退 | `adamw.py:245-253`、`config.py:71` |
-| 4 | 低 | 计时噪声、起始 slot 大小、README 粒度 | 见下文 |
+| # | 严重程度 | 问题 | 位置 | `54eeedb` 状态 | 修复方案 |
+|---|---|---|---|---|---|
+| 1 | 高 | resume 时 pinned sink 的大小约等于 95% 空闲显存，和模型状态大小无关，校准后也不释放 | `adamw.py:389-392` | 部分修复：sink 大小已修，pinned 缓存仍不释放 | A、B |
+| 2 | 中 | 扫描范围不按 moment 总量截断，产生大量冗余候选 | `adamw.py:265-285` | 未修 | A |
+| 3 | 中 | 默认行为改变，方案不再适用时没有自动回退 | `adamw.py:245-253`、`config.py:71` | 未修 | C、D，默认值需作者决定 |
+| 4 | 低 | 计时噪声、起始 slot 大小、README 粒度 | 见下文 | 未修 | E，其余需作者决定 |
 
 ## 已核实没有问题的部分
 
@@ -242,3 +245,318 @@ for name, shard, budget, total_moments in cases:
 LoRA candidates= 45 trials= 180 max_capacity=57.0 GiB redundant= 21
 7B full, 8 ranks candidates= 17 trials= 68 max_capacity=38.0 GiB redundant= 7
 ```
+
+---
+
+## 第二轮复核
+
+- 被评审：`origin/dev-chunk-optimizer` 的 `54eeedb`（Codex 根据本评审修改，同样基于 `cccd6de`）
+- 相对 a09e1a9 改了 6 个文件，+30 / -13
+- 复核日期：2026-11-26
+
+### 改了什么
+
+只处理了第 1 条中"sink 太大"这一半：
+
+- **sink 大小**：从"最大候选的 capacity"（≈ 95% 空闲显存）改成 `min(最大 capacity, 2H)`，
+  其中 `H = Σ align16(每个活跃参数的 moment 字节数)`（`adamw_workspace.py` 新增的
+  `calibration_sink_bytes`）。
+- **sink 布局**：不再照搬设备 slot 的布局，改为前半放所有槽的 exp_avg，后半放所有槽的
+  exp_avg_sq（`_stage_views` 中的 `sink_offset = base // 2 + span.moment_offset`）。
+- `run_workspace` 的 sink 大小校验、README 中英文的 host 内存描述，以及两个测试也相应更新。
+
+### 正确性：没问题
+
+- **为什么不越界**：sink 取 2H 时，最可能越界的是双槽方案中槽 1 的写入。`iter_chunks`
+  按顺序填满 chunk，第 k 个 chunk 的起点在不分块的连续布局里正好是 `k × half_slot`，
+  所以槽 1 的写入终点 ≤ H，不会越界；两个槽同时在途的写入区间也不重叠。
+- **随机测试**：2948 组随机配置（参数大小、dtype 混合、单/双槽、sink 取 capacity 或取 2H）
+  全部通过：不越界，exp_avg 不越过中线，相邻两个在途 chunk 的写入区间不重叠。
+- **单测**：164 个通过（新增参数化后比 a09e1a9 多 2 个）；仍有 5 个失败，还是本机不能
+  pin memory 的老问题。新测试用的 slot 大小 64 / 256 / 1024 正好覆盖三种情况：
+  sink 取 capacity、sink 取 2H 且双槽多 chunk、单 chunk。
+
+### 效果
+
+| 场景 | a09e1a9 的 sink | 54eeedb 的 sink |
+|---|---|---|
+| LoRA | 57 GiB，实际占 64 GiB pinned | 约 64 MiB |
+| 7B 全参 8 卡 | 38 GiB，实际占 64 GiB pinned | 约 3.5 GiB，实际占 4 GiB |
+
+### 仍存在的问题
+
+1. **第 1 条的另一半**：pinned 块释放后仍留在 host 缓存，会一直占到训练结束。现在体量和
+   moments 本身同一量级（7B 8 卡是每卡 4 GiB，整机 32 GiB），问题小了很多，但仍值得释放。
+2. **第 2 条完全没动**：扫描仍然一路到 95% 空闲显存。LoRA 的 45 个候选里仍有 21 个是冗余的，
+   trial 仍会把显存分配到 57 GiB。README 里也还写着 "moment size does not cap the sweep"。
+3. **第 3、4 条没动**：默认值改为自动校准、方案放不下时没有回退、空 rank 的限制、计时噪声、
+   README 粒度。
+
+### 代码细节
+
+- **校验条件冗余**：`run_workspace` 里的
+  `numel < plan.capacity_bytes and numel < calibration_sink_bytes(bound, plan.capacity_bytes)`
+  中，后者不大于前者，整个条件等价于只判断后半句。
+- **缺少说明**：docstring 里的 "Its two halves omit unused device capacity." 没说清新布局；
+  `base // 2` 以及"槽 1 不会越过 H"这个不显然的性质都应该加注释，否则以后改分块逻辑时
+  很容易被破坏。
+- **风格**：`adamw.py:390` 一行有 111 列，`calibration_sink_bytes` 的续行缩进也不规整。
+  仓库没配 formatter，只是风格问题。
+- **README 措辞**：英文 "no larger than the smaller of …" 不准确，实际取的就是两者的较小值。
+
+---
+
+## 建议修复方案
+
+我在 `54eeedb` 上实现了一版原型，补丁见同目录的
+[`a09e1a9-adamw-workspace-fixes.patch`](a09e1a9-adamw-workspace-fixes.patch)
+（8 个文件，+260 / -46），在 `dev-chunk-optimizer` 上可以直接 `git apply`：
+
+```bash
+git fetch origin
+git checkout dev-chunk-optimizer
+git show origin/dev-workspace-opus:docs/reviews/a09e1a9-adamw-workspace-fixes.patch | git apply
+```
+
+| 修复 | 对应问题 | 涉及文件 |
+|---|---|---|
+| A. 扫描在"单 chunk 槽容量"处截断 | 第 1、2 条 | `adamw_workspace.py`、`adamw.py` |
+| B. 校准用过 sink 后释放 pinned host 缓存 | 第 1 条剩余部分 | `runtime/base.py`、`runtime/cuda.py`、`adamw.py` |
+| C. 方案放不下时，所有 rank 一起回退到已测候选 | 第 3 条 | `adamw.py` |
+| D. 校准时为空的 rank 也保存全局方案 | 第 3 条 | `adamw.py` |
+| E. 54eeedb 的代码细节和 README | 第二轮"代码细节" | `adamw_workspace.py`、README |
+
+**验证范围**：本机 CPU 版 torch 2.10 的 venv。`test_adamw_pipeline.py`、
+`test_adamw_workspace.py`、`test_adamw_workspace_distributed.py`（真实 Gloo 双进程）、
+`test_cpu_offload_optimizer.py`、`tests/engine/test_config.py`、`tests/runtime` 共 180 个通过；
+5 个失败仍是 `test_cpu_offload_optimizer.py` 里 pin memory 的环境问题，和 a09e1a9、54eeedb 相同。
+上面的 sink 随机测试在补丁后同样通过。**GPU/NPU 上的真实路径、NPU 的 host 缓存接口和真实计时
+都没有验证。**
+
+### 修复 A：扫描在单 chunk 槽容量处截断（第 1、2 条）
+
+**思路**：设 `S` 为"能把本 rank 全部活跃 moments 一次装下的最小 slot"。slot ≥ S 时只产生一个
+chunk，传输量、kernel 数和计算量都和 slot = S 时相同，只是多占显存。所以：
+
+- 单槽候选的上限取 `min(budget, S_max)`，`S_max` 是各 rank 的 S 取 MAX；
+- 双槽候选的上限取 `S_max - 32`：slot ≥ S_max 时最大的 rank 只有一个 chunk，双槽没有任何
+  overlap；
+- sink 仍用 Codex 的 `min(最大 capacity, 2H)`。截断后最大候选不超过 2·S_max，sink 自然
+  受 moment 总量约束，第 1 条的体量问题从根上解决。
+
+**S 的计算**和 `iter_chunks` 的对齐规则完全一致，正好就是 Codex 的 `2H`，所以抽成一个函数，
+`calibration_sink_bytes` 也改用它：
+
+```python
+def single_chunk_slot_bytes(bound: Sequence[BoundParameter]) -> int:
+    """Return the smallest slot that holds every active moment pair in one chunk."""
+    half = 0
+    for param in bound:
+        element_bytes = max(param.exp_avg.element_size(), param.exp_avg_sq.element_size())
+        half += DeviceWorkspace.align(param.numel * element_bytes)
+    return 2 * half
+
+
+def calibration_sink_bytes(bound: Sequence[BoundParameter], capacity: int) -> int:
+    return min(capacity, single_chunk_slot_bytes(bound))
+```
+
+**不增加 collective**：S 和原来的 `shard` 放进同一个 2 元素张量，一次 MAX 归约：
+
+```python
+shard = torch.zeros(2, dtype=torch.int64, device=runtime.device)
+...
+shard[0] = max((param.local_param.nbytes for param in bound), default=0)
+shard[1] = single_chunk_slot_bytes(bound)
+...
+self._reduce_workspace_value(shard, dist.ReduceOp.MAX)
+max_shard, full_slot = shard.tolist()
+...
+shared_candidates = self._workspace_candidates(max_shard, budget, bool(overlap), full_slot)
+```
+
+`_workspace_candidates` 增加一个可选参数 `full_slot`（默认 `None`，保持旧行为）：
+
+```python
+for slots in (1, 2) if overlap else (1,):
+    endpoint = budget // slots // alignment * alignment
+    if full_slot is not None:
+        limit = max(full_slot, start) if slots == 1 else full_slot - alignment
+        endpoint = min(endpoint, limit)
+    if endpoint < start:
+        continue
+```
+
+`full_slot ≥ 2·align16(M) ≥ align32(M) = start`，所以单槽一定至少有一个候选，
+`max(full_slot, start)` 只是防御。
+
+**效果**（附录脚本加上 `full_slot` 参数后的结果）：
+
+| 场景 | 修复前候选 / trial | 修复前最大显存 | 修复后候选 / trial | 修复后最大显存 | 修复后 sink |
+|---|---|---|---|---|---|
+| LoRA（moments 共约 64 MiB） | 45 / 180 | 57 GiB | 26 / 104 | 128 MiB | ≤ 64 MiB |
+| 7B 全参 8 卡（moments 每卡约 3.5 GiB） | 17 / 68 | 38 GiB | 12 / 48 | 7 GiB | ≤ 3.5 GiB |
+
+**测试改动**：
+
+- 新增 `test_candidates_stop_at_one_chunk_and_need_two_chunks_for_overlap`：单槽停在 S，
+  双槽停在 S 之下；单个参数时双槽候选全部跳过。
+- 新增 `test_single_chunk_slot_is_the_smallest_one_chunk_slot`：混合 dtype 下，slot = S 时
+  `iter_chunks` 恰好产生 1 个 chunk，slot = S - 32 时产生 2 个。
+- `test_calibration_uses_slowest_rank_time` 的期望候选从 32…2048 变为 32 / 64 / 128。
+- 分布式用例 `test_workspace_calibration_with_different_rank_demands[empty-peer]` 中，
+  rank 0 的最大候选从 640（预算上限）变为 512（rank 0 的 S），并断言两个 rank 保存同一方案。
+
+### 修复 B：校准后释放 pinned host 缓存（第 1 条剩余部分）
+
+`runtime.empty_cache()` 只清显存。`DeviceRuntime` 新增一个默认什么都不做的钩子，
+CUDA 实现调用 PyTorch 的 host 缓存释放接口：
+
+```python
+# runtime/base.py
+def empty_host_cache(self) -> None:
+    """Release cached pinned host blocks that are no longer in use."""
+
+# runtime/cuda.py
+def empty_host_cache(self) -> None:
+    # torch.cuda.empty_cache() leaves the pinned host allocator untouched.
+    accelerator = getattr(torch, "accelerator", None)
+    release = getattr(accelerator, "empty_host_cache", None) or getattr(
+        torch._C, "_host_emptyCache", None
+    )
+    if self.available() and release is not None:
+        release()
+```
+
+`_autotune_workspace` 的 `finally` 中，只在确实分配过 sink 时调用：
+
+```python
+saved_params.clear()
+if cpu_sink is not None:
+    # The caching host allocator would otherwise keep the pinned
+    # sink until exit. Every trial has synchronized its copies.
+    cpu_sink = None
+    runtime.empty_host_cache()
+```
+
+- **安全性**：host 缓存只释放空闲链表里、且记录的 stream 事件都已完成的块。正在使用的 CPU
+  moments 不受影响；每次 trial 结束都做过 `runtime.synchronize()`。
+- **代价**：其他已缓存的空闲 pinned 块也会被一并释放，下次分配需要重新 pin。
+  校准只发生一次，可以接受。
+- **接口**：`torch._C._host_emptyCache()` 是私有接口（2.5+，仅 CUDA）；
+  `torch.accelerator.empty_host_cache()` 是跨设备的公开接口（2.12+）。
+- **NPU 待确认**：NPU 走基类的空实现。需要确认 torch_npu 是否提供等价接口，或者 2.12+ 的
+  `torch.accelerator.empty_host_cache()` 是否覆盖 NPU。确认后在 `runtime/npu.py` 里实现即可。
+- 新增测试 `test_nonzero_calibration_releases_pinned_host_cache_once`：零态校准不释放，
+  非零态校准只释放一次，之后的正常 step 不释放。
+
+### 修复 C：方案放不下时，所有 rank 一起回退到已测候选（第 3 条）
+
+**思路**：校准时把测量结果 `(全局方案, 最慢 rank 的中位耗时, 全部 rank 的显存总量)` 保存下来，
+这份数据在各 rank 上完全相同。真实 step 中如果某个 rank 放不下调好的方案，所有 rank 用同一组
+全局约束从测量结果里重新选，规则和校准时相同（最快 3% 以内选显存最小的）。
+
+**正常路径不增加 collective**：利用 `_reserve_workspace` 已有的状态归约，把状态从 0/1 扩成三态：
+
+```python
+status.fill_(0 if error is not None else 1 if refit else 2)
+self._reduce_workspace_value(status, dist.ReduceOp.MIN)
+if status.item() == 1:
+    return None            # 有 rank 需要回退；本 rank 已分配的 workspace 直接丢弃
+if not status.item():
+    raise ...              # 和原来一样，任一 rank 出错则全部报错
+```
+
+`_acquire_workspace` 中，放不下不再直接报错，而是标记 `refit`；归约结果为 1 时，所有 rank
+一起进入回退：
+
+```python
+refit = target.slot_bytes < minimum or target.capacity_bytes > maximum
+...
+workspace = self._reserve_workspace(plan.capacity_bytes, status=status, error=error, refit=refit)
+if status.item() == 1:
+    # Rare path: some rank cannot use the tuned plan. Every rank reaches it.
+    plan, error = self._refit_workspace_plan(minimum, maximum), None
+    try:
+        self._get_pipeline(plan)
+    except Exception as pipeline_error:
+        error = pipeline_error.with_traceback(None)
+    workspace = self._reserve_workspace(plan.capacity_bytes, status=status, error=error)
+```
+
+`_refit_workspace_plan` 用一次 2 元素 MIN 归约同时得到"各 rank 最小 slot 的最大值"和
+"各 rank 显存上限的最小值"，然后在测量结果里选：
+
+```python
+bounds = torch.tensor([-minimum, maximum or inactive], dtype=torch.int64, device=...)
+self._reduce_workspace_value(bounds, dist.ReduceOp.MIN)
+shared_minimum, shared_maximum = -bounds[0].item(), bounds[1].item()
+fitting = [
+    entry for entry in self._workspace_measurements
+    if entry[0].slot_bytes >= shared_minimum and entry[0].capacity_bytes <= shared_maximum
+]
+if not fitting:
+    raise RuntimeError("... no longer fits ... and no measured candidate fits; recalibrate on all ranks")
+selected = self._select_measurement(fitting)      # 和校准共用同一个选择规则
+self._tuned_workspace_plan = selected[0]          # 粘性降级，后续 step 回到正常路径
+return selected[0] if maximum else WorkspacePlan(1, 0)
+```
+
+- **一致性**：所有输入都是全局归约值或各 rank 相同的测量结果，所以各 rank 一定选中同一方案，
+  或者一起报错。回退发生在 `_advance_steps` 之前，失败时 step 计数和参数都不变。
+- **代价**：只有回退那一步多 2 次小 collective 和一次重新分配。
+- **取舍：回退是粘性的**：降级后不会自动升回原方案。这样做的好处是之后每一步都走正常路径；
+  如果希望显存恢复后升回去，需要保留原方案并每步多判断一次。**请作者决定。**
+- **测试**：
+  - 新增 `test_tuned_plan_exceeding_live_budget_falls_back_to_measured_plan`：本地放不下时
+    选中能放下且最快的测量方案，step 正常完成，下一步直接使用降级后的方案。
+  - 新增 `test_fallback_uses_peer_bounds_so_every_rank_selects_one_plan`：模拟另一个 rank 放不下，
+    验证本 rank 按对方的上限选方案，collective 顺序为
+    "分配状态 → 共享边界 → 回退分配状态 → 更新状态"。
+  - 保留 `test_tuned_plan_exceeding_live_budget_is_rejected`：没有任何测量结果时，仍报
+    "no longer fits"。
+
+### 修复 D：校准时为空的 rank 也保存全局方案（第 3 条）
+
+空 rank 仍按 `(1, 0)` 参与每次 trial、不分配显存，但测量结果记录全局方案，保存下来的也是
+全局选中的方案。返回值和 `_tuned_workspace_bytes` 仍是本 rank 的实际容量（空 rank 为 0）：
+
+```python
+candidates = shared_candidates if minimum else (WorkspacePlan(1, 0),) * len(shared_candidates)
+for plan, shared_plan in zip(candidates, shared_candidates):
+    ...
+    measurements.append((shared_plan, elapsed, control.item()))
+...
+self._tuned_workspace_plan = selected[0]
+selected_capacity = selected[0].capacity_bytes if minimum else 0
+```
+
+这个 rank 以后有了非空参数时，直接使用全局方案；放不下就走修复 C 的回退，不再要求手动
+重新校准。`"active rank has no calibrated AdamW workspace"` 的检查保留，只作为防御。
+测试 `test_previously_empty_rank_requires_explicit_calibration` 是手动设置 `(1, 0)` 的，
+仍然通过。
+
+### 修复 E：54eeedb 的代码细节和 README
+
+- `run_workspace` 的 sink 校验简化为
+  `cpu_sink.numel() % 32 or cpu_sink.numel() < calibration_sink_bytes(bound, plan.capacity_bytes)`。
+- `_stage_views` 的 sink 分支加注释，说明布局和"槽 k 从 `k × half_slot` 开始、不越过 S/2"的性质。
+- README 中英文：删除 "moment size does not cap the sweep"，改为说明扫描在单 chunk 槽容量处
+  停止、双槽停在它之下；补充"空 rank 保存全局方案"；把"不再适用时须显式重新校准"改为
+  修复 C 的回退行为。
+
+### 需要作者决定、补丁里没有改的事项
+
+1. **默认值**：`optimizer_memory_fraction` 默认从 `0.8` 改为 `None`（自动校准）。
+   修复 A 之后，trial 数和显存峰值都明显下降。我的建议是保留自动校准作为默认，但在 PR 描述或
+   changelog 里写明：首步（以及每次 resume 后的首步）会多跑一轮校准；不希望校准时可显式设置
+   `optimizer_memory_fraction: 0.8` 恢复旧行为。
+2. **计时噪声**：每个候选 1 次预热加 3 次测量，容差 3%。LoRA 这类很快的 step，噪声可能超过 3%。
+   建议改为按时长采样：至少 3 次，且累计时长达到某个下限（例如 50 ms）为止。这会改变各 rank 的
+   trial 次数，需要先归约一个各 rank 相同的采样次数，所以没有放进补丁。
+3. **起始 slot**：起点 M 是最大参数分片的字节数，但一个 slot 要分两半放 exp_avg 和 exp_avg_sq，
+   所以最小候选一定会把最大参数切成两块。请确认是有意这样（多测一档更细的切分），还是本意是从
+   2M 起步。
+4. **README 粒度**：仍建议用户文档只保留默认行为、显式 fraction 的含义、`autotune_workspace()`
+   的用法、失败后怎么处理和额外的 host 内存，实现细节移到 docstring。补丁只改了与修复相关的句子。
+5. **回退是否粘性**：见修复 C。

@@ -1,0 +1,50 @@
+src/torchturbo/adapters/msswift/trainer.py
+  s_7b4c29d2633edb::t_03f6e14475f7ab 314
+  s_7b4c29d2633edb::t_d854064e2d53c7 1
+tests/adapters/msswift/test_inputs_bridging.py
+  s_7b4c29d2633edb::t_c81ba66f5e7ed7 98-99,193,195,398-409,412-425,428-437,440-447,450-461
+src/torchturbo/adapters/msswift/inputs_bridging.py
+  s_7b4c29d2633edb::t_d7ecc05f7a6ccd 198,207
+src/torchturbo/engine/backends/fsdp2/backend.py
+  s_7b4c29d2633edb::t_5d96421abee86f 1738,1751,1769-1770,1786,1818,1833-1839,1887-1898,1901-1903,1906,1918,1920-1922,1928,1940,1942,1944,1948,1956,1958,1969-1970,1988,1996,1998,2003-2004
+tests/models/qwen4_exp/test_model.py
+  s_7b4c29d2633edb::t_dc7e914c9cf7ef 589
+src/torchturbo/models/modules/loss/logits_loss.py
+  s_7b4c29d2633edb::t_ba65b4696aeb82 15-33
+  s_7b4c29d2633edb::t_0087ce705c197e 40,43,50,53,55,92-93,104,108-109,111-116
+  s_7b4c29d2633edb::t_5086e13aaeddcf 39,117-118
+src/torchturbo/models/qwen4_exp/model.py
+  s_7b4c29d2633edb::t_b9bc1b6ba69fa1 19,219-221
+tests/engine/backends/fsdp2/test_chunked_loss.py
+  s_7b4c29d2633edb::t_048e9344cef096 15,251-276,432,434,442,444-445,447,452-453,457-458,462
+README.md
+  s_7b4c29d2633edb::t_6c791ee157803d 152-156
+tests/models/modules/test_lm_loss.py
+  s_7b4c29d2633edb::t_8362f1cfa6e964 56,135,467-601
+  s_7b4c29d2633edb::t_27f91f5790545e 155,201,239,280,456,464
+src/torchturbo/models/modules/attention/ulysses/ulysses.py
+  s_7b4c29d2633edb::t_98405e3bd8354d 536
+README_zh.md
+  s_7b4c29d2633edb::t_9b0bdf328b558f 120-123
+src/torchturbo/models/modules/loss/chunk_loss.py
+  s_7b4c29d2633edb::t_c706e2744e2db3 13-14,26,29,32,37,71-76,89,95-96,105-106,181-182,186,209,212,237,261-262,273-274,280-281,291,294
+  s_7b4c29d2633edb::t_707f01ebca3972 1
+tests/adapters/llamafactory_v0/test_patches.py
+  s_7b4c29d2633edb::t_f45a032cb78ca9 579
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d83ca544c2c071e3418352d72064cc22254af131",
+  "prompts": {},
+  "sessions": {
+    "s_7b4c29d2633edb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20c9b-305e-7670-99d0-10721e08797d",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

@@ -56,9 +56,10 @@ engine_config:
       enabled: false
       # "optimizer" keeps parameters on device; "full" also offloads FSDP parameters
       mode: optimizer
-      # Fraction of free device memory for AdamWSwap/Muon workspaces
+      # Omit to autotune AdamWSwap up to 95% of free memory; Muon defaults to 0.8.
+      # A positive fraction fixes AdamWSwap's single-slot budget without probing.
       # Zero selects CPU updates, including CPU Newton-Schulz and exchange for Muon
-      optimizer_memory_fraction: 0.8
+      # optimizer_memory_fraction: 0.8
 
   checkpoint:
     # Training checkpoints always store exact model state. FSDP2 stores it as

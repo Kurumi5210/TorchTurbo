@@ -145,6 +145,35 @@ step 失败；如果权重必须离开设备，请使用 `full` CPU offload。
 Muon 支持 `full` 和 `optimizer` 两种 CPU offload，`optimizer_memory_fraction=0`
 选择 CPU Newton-Schulz 和 CPU 交换。这些路径在充分验证前属于实验性功能。
 
+显式设置正的 `optimizer_memory_fraction` 时，AdamWSwap 不探测，每步直接按各活跃 rank 中最小空闲显存乘系数分配单槽（向下对齐至 32 字节）。省略该配置时，AdamWSwap 在首次参数更新前，使用 backward 产生的真实梯度联合校准 chunk 大小与
+传输 overlap。连续参数及其状态可以拆到多个 chunk 中，原参数的 step 计数每次更新
+只增加一次；本地参数、梯度及两份 CPU moment 都必须连续，否则在校准或更新前报错。
+校准时，每槽从所有 rank 最大的活跃权重分片字节数 M 起步（向上对齐至 32 字节），依次翻倍。单槽、双槽分别补测总预算允许的最大对齐槽容量。总预算取各活跃 rank 的 `0.95 × 设备当前空闲显存` 的最小值，不加分配器缓存，也不按 moment 总量截断。单槽 M 超预算直接报错；空 rank 不分配但参与同步，全局无工作时推迟校准。双槽使用独立传输流做 overlap，`step()` 返回前完成 CPU 写回。
+
+所有 rank 共同试跑，每档预热 1 次、测量 3 次。计时覆盖整轮流水线的填充、计算和排空，
+每次取最慢 rank 的耗时，再计算中位数。在比最快中位数慢不超过 3% 的候选组合中，
+选择各 rank 的 HBM 分配总量最小的一组。任一活跃 rank 放不下双槽时，寻优不考虑双槽。
+后续 step 按原方案执行；方案不再适用时，须在所有 rank 上显式重新校准。
+分配或试跑失败时所有 rank 报错，不缩容重试，也不换候选。实际更新中途失败后
+禁止直接重试，需要重新加载模型 checkpoint 并重建优化器。
+
+显式校准时，先执行有代表性的 warmup backward，再在所有训练 rank 调用
+`adamw_swap.autotune_workspace()`，最后清空 warmup 梯度。校准保存一份活跃本地参数的
+CPU 快照并克隆 step 计数。实际检查确认活跃 CPU moments 全零后，试跑直接写回真实
+moments 地址，每轮结束后复用现有设备 slot 的零值，经 D2H 恢复零态，避免逐轮 CPU
+清零的高开销；执行异常时仍使用 CPU 恢复。非零状态使用独立 pinned 输出环保护
+原状态。零态路径的额外 CPU 内存约为活跃参数字节数，非零状态还需最大候选 workspace
+大小的输出环。输出环对真实写回流量的模拟存在偏差，计时可能与正式训练不同。
+备份、还原和跨 rank 同步在执行计时外，没有逐 chunk collective。参数、梯度和优化器
+状态的值保持不变，但参数版本计数增加，因此校准后不能复用保留的 autograd 图。
+
+校准保留既有 allocator 缓存。临时存储释放后，仅当 reserved 相对进入前的增长超过
+所选 workspace 加 64 MiB 余量时清理 cache。
+日志分别记录 setup、snapshot、trials 和清理耗时。每个正式 step 只绑定一次当前梯度，
+成功执行在流级排空后释放 workspace；外部释放和异常路径保留设备同步。
+正常 step 不清 cache。选出的是候选范围内的实测结果，不保证全局最优；
+`optimizer_memory_fraction=0` 的 CPU 更新路径不做校准。
+
 模型如需注册 LlamaFactory template，可在模型目录提供 `lf_template.py`。  
 Adapter 激活时会扫描已注册模型并自动调用对应 `register()`。
 

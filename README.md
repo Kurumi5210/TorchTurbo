@@ -182,6 +182,47 @@ Muon supports `full` and `optimizer` CPU offload, and
 `optimizer_memory_fraction=0` selects CPU Newton-Schulz and CPU exchange. These
 paths are experimental until they are fully validated.
 
+With optimizer-state offload, an explicit positive `optimizer_memory_fraction` skips calibration: each step uses a single slot sized to that fraction of the least free device memory across active ranks (rounded down to 32 bytes). When the setting is omitted, AdamWSwap calibrates chunk size and transfer overlap
+before its first parameter update, after backward has produced real gradients.
+Contiguous parameters and their moments can span multiple chunks; each original
+parameter's step counter advances once per update. Local parameters, gradients, and both CPU moments must be contiguous.
+Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.95 * free device memory` over active ranks at calibration time; cached memory is not added, and moment size does not cap the sweep. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
+
+All ranks run each trial together, with one warmup and three timing samples per
+candidate. Each sample times a complete pipeline, including fill and drain,
+and uses the slowest rank's time. Within 3% of the fastest median, AdamWSwap
+selects the candidate with the smallest total HBM allocation across ranks.
+Two-slot candidates are excluded if any active rank cannot fit both slots.
+Later updates use the selected plan unchanged. If it no longer fits, explicitly
+recalibrate on all ranks. Allocation or trial failures stop all ranks without
+shrinking the workspace or trying another candidate. A failed update cannot be replayed safely:
+reload the model checkpoint and recreate the optimizer before continuing.
+
+For an explicit calibration before the training loop, call
+`adamw_swap.autotune_workspace()` on every training rank after a representative
+warmup backward, then clear the warmup gradients. Calibration saves one CPU
+snapshot of all active local parameters and clones step counters. If the active
+CPU moments are verified to be zero, trials write back to their real addresses
+and reset them after every trial. Successful trials restore zeros by copying from
+the existing device slot; failed execution retains CPU recovery. Nonzero moments use an
+independent pinned output ring to preserve the original state. The zero-state
+path needs roughly the active parameter bytes of extra host memory; nonzero
+state additionally needs the largest candidate workspace. The output ring is an
+approximation of real writeback traffic, so its timings may differ from training.
+Backup, restore and rank coordination are outside timed execution; there are no
+per-chunk collectives. Parameter, gradient and optimizer-state values are
+preserved, but parameter version counters increase: do not reuse a retained
+autograd graph afterwards.
+
+Calibration preserves existing allocator cache. After releasing temporary
+storage, it clears cache only if reserved memory grew beyond the selected
+workspace plus a 64 MiB allowance. Logs report setup, snapshot, trials and cleanup separately.
+Each real step binds its current gradients once. Successful execution drains its
+streams before releasing the slab; external and error cleanup retain device
+synchronization. Ordinary steps do not clear cache. The result is the measured
+best candidate, not a guarantee of globally optimal performance. CPU updates
+(`optimizer_memory_fraction=0`) do not calibrate.
+
 To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.
 
 ## Quick Start

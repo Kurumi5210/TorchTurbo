@@ -1335,6 +1335,8 @@ class FSDPDistributedMuon(Optimizer):
         free, _ = runtime.memory_info()
         cached = runtime.memory_reserved() - runtime.memory_allocated()
         fraction = self._offload.optimizer_memory_fraction
+        if fraction is None:
+            fraction = 0.8
         budget = int((free + cached) * fraction)
         required = self._workspace.required_bytes(self._compiled_buckets)
         if required <= budget:

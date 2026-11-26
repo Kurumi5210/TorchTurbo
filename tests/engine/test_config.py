@@ -320,6 +320,7 @@ def test_cpu_offload_workspace_only_applies_to_optimizer_mode():
         mode="optimizer", optimizer_memory_fraction=0
     )
     assert no_device_staging.optimizer_memory_fraction == 0
+    assert CPUOffloadConfig(enabled=True, mode="optimizer").optimizer_memory_fraction is None
     assert CPUOffloadConfig(enabled=True).mode.value == "full"
 
 

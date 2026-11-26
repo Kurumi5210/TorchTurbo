@@ -15,14 +15,18 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.config import (
     CPUOffloadConfig,
     FSDPConfig,
 )
-from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.optimizers.adamw import (
     AdamWSwap,
     DeviceWorkspace,
+)
+from torchturbo.engine.backends.fsdp2.optimizers.adamw_workspace import (
+    bind_parameters,
+    iter_chunks,
 )
 from torchturbo.engine.optimizers import OptimizerClassPlan
 from torchturbo.runtime import TurboDevice
@@ -33,13 +37,27 @@ class SyncRuntime(CpuRuntime):
     """Plain CPU runtime for exercising host-side control flow."""
 
 
+class WorkspaceRuntime(SyncRuntime):
+    """Exercise device workspace control flow with CPU storage."""
+
+    turbo_device = TurboDevice.NPU
+    device = torch.device("cpu")
+
+    def memory_info(self):
+        return 4096, 4096
+
+    def memory_reserved(self):
+        return 0
+
+    def memory_allocated(self):
+        return 0
+
+
 # torch mis-dispatches CPU work to the MPS backend on MPS builds without
 # CUDA (Apple silicon laptops): any op on a pin_memory=True CPU tensor and
 # CPU fused AdamW both hit "missing kernel for mps" or crash the process.
 # CUDA/NPU hosts are unaffected.
-CPU_FUSED_ADAMW_BROKEN = (
-    torch.backends.mps.is_built() and not torch.cuda.is_available()
-)
+CPU_FUSED_ADAMW_BROKEN = torch.backends.mps.is_built() and not torch.cuda.is_available()
 requires_cpu_fused_adamw = pytest.mark.skipif(
     CPU_FUSED_ADAMW_BROKEN,
     reason="pin_memory/fused CPU ops mis-dispatch to the MPS backend on this torch build",
@@ -63,11 +81,7 @@ def _clone_groups(params):
 
 
 @requires_cpu_fused_adamw
-def test_cpu_offload_adamw_matches_adamw(monkeypatch):
-    def _workspace_init(self, _runtime, _fraction):
-        self._storage = torch.empty(1024, dtype=torch.uint8)
-
-    monkeypatch.setattr(DeviceWorkspace, "__init__", _workspace_init)
+def test_cpu_offload_adamw_matches_adamw():
     torch.manual_seed(7)
     reference_params = [
         torch.nn.Parameter(torch.randn(3, 4)),
@@ -79,8 +93,11 @@ def test_cpu_offload_adamw_matches_adamw(monkeypatch):
     ]
     reference = torch.optim.AdamW(_clone_groups(reference_params), fused=True)
     offload = _offload_adamw(_clone_groups(offloaded_params))
+    offload.device_runtime = WorkspaceRuntime()
     offload.load_state_dict(offload.state_dict())
-    reference_scheduler = torch.optim.lr_scheduler.StepLR(reference, step_size=1, gamma=0.8)
+    reference_scheduler = torch.optim.lr_scheduler.StepLR(
+        reference, step_size=1, gamma=0.8
+    )
     offload_scheduler = torch.optim.lr_scheduler.StepLR(offload, step_size=1, gamma=0.8)
 
     for step in range(4):
@@ -117,7 +134,10 @@ def test_cpu_offload_adamw_matches_adamw(monkeypatch):
         )
     assert set(offload.state) == set(offloaded_params)
     for offload_param in offloaded_params:
-        assert offload.state[offload_param]["step"] is offload.param_to_step_map[offload_param]
+        assert (
+            offload.state[offload_param]["step"]
+            is offload.param_to_step_map[offload_param]
+        )
         assert (
             offload.state[offload_param]["exp_avg"]
             is offload.param_to_cpu_states_map[offload_param]["exp_avg"]
@@ -139,9 +159,7 @@ def test_host_update_adamw_matches_adamw():
         torch.nn.Parameter(param.detach().clone()) for param in reference_params
     ]
     reference = torch.optim.AdamW(_clone_groups(reference_params), fused=True)
-    cpu_update = _offload_adamw(
-        _clone_groups(cpu_params), optimizer_memory_fraction=0
-    )
+    cpu_update = _offload_adamw(_clone_groups(cpu_params), optimizer_memory_fraction=0)
     assert not hasattr(cpu_update, "param_to_cpu_param_map")
 
     for _ in range(4):
@@ -187,62 +205,50 @@ def test_device_workspace_views_share_temporary_storage():
 
 
 def test_device_workspace_skips_cpu_runtime():
-    assert not DeviceWorkspace(SyncRuntime(), memory_fraction=0.5).is_available
+    assert not DeviceWorkspace(SyncRuntime(), capacity_bytes=64).is_available
 
 
 def test_device_workspace_raises_when_capacity_insufficient():
     runtime = types.SimpleNamespace(
         turbo_device=TurboDevice.NPU,
         device=torch.device("meta"),
-        memory_info=lambda: (10, 1000),
     )
     with pytest.raises(RuntimeError, match="too small"):
-        DeviceWorkspace(runtime, memory_fraction=0.5)
+        DeviceWorkspace(runtime, capacity_bytes=8)
 
 
-def test_device_workspace_synchronizes_capacity_across_ranks(monkeypatch):
-    runtime = types.SimpleNamespace(
-        turbo_device=TurboDevice.NPU,
-        device=torch.device("cpu"),
-        memory_info=lambda: (100, 1000),
-    )
-
-    def all_reduce(tensor, op, group):
-        assert op is dist.ReduceOp.MIN
-        tensor.fill_(32)
-
-    monkeypatch.setattr(dist, "is_available", lambda: True)
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "all_reduce", all_reduce)
-
-    workspace = DeviceWorkspace(runtime, memory_fraction=0.8)
+def test_device_workspace_allocates_requested_capacity():
+    workspace = DeviceWorkspace(WorkspaceRuntime(), capacity_bytes=32)
 
     assert workspace.capacity_bytes == 32
 
 
-@requires_cpu_fused_adamw
 def test_workspace_capacity_error_includes_param_name():
     params = [torch.nn.Parameter(torch.ones(8))]
     optimizer = _offload_adamw(
-        params, param_names={params[0]: "model.layers.3.mlp.up_proj"}
+        params,
+        optimizer_memory_fraction=0,
+        param_names={params[0]: "model.layers.3.mlp.up_proj"},
     )
-    workspace = DeviceWorkspace.__new__(DeviceWorkspace)
-    workspace._storage = torch.empty(16, dtype=torch.uint8)
-    optimizer.workspace = workspace
+    optimizer.device_runtime = WorkspaceRuntime()
+    optimizer.optimizer_memory_fraction = 0.001
+    params[0].grad = torch.ones_like(params[0])
 
     with pytest.raises(RuntimeError, match="model.layers.3.mlp.up_proj"):
-        optimizer._ensure_workspace_capacity([(params[0], {})])
+        optimizer._workspace_bounds(
+            bind_parameters([(params[0], {})], optimizer.param_to_cpu_states_map)
+        )
 
 
-@requires_cpu_fused_adamw
 def test_workspace_capacity_failure_is_synchronized(monkeypatch):
     params = [torch.nn.Parameter(torch.ones(4))]
     optimizer = _offload_adamw(
-        params, param_names={params[0]: "model.layers.3.mlp.up_proj"}
+        params,
+        optimizer_memory_fraction=0,
+        param_names={params[0]: "model.layers.3.mlp.up_proj"},
     )
-    workspace = DeviceWorkspace.__new__(DeviceWorkspace)
-    workspace._storage = torch.empty(128, dtype=torch.uint8)
-    optimizer.workspace = workspace
+    optimizer.device_runtime = WorkspaceRuntime()
+    optimizer.optimizer_memory_fraction = 0.8
 
     def all_reduce(tensor, op, group):
         assert op is dist.ReduceOp.MIN
@@ -252,42 +258,32 @@ def test_workspace_capacity_failure_is_synchronized(monkeypatch):
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "all_reduce", all_reduce)
 
-    with pytest.raises(RuntimeError, match="failed on another rank"):
-        optimizer._ensure_workspace_capacity([(params[0], {})])
+    with pytest.raises(RuntimeError, match="before any update"):
+        optimizer._acquire_workspace()
+    assert optimizer.workspace is None
 
 
-@requires_cpu_fused_adamw
-def test_workspace_stages_multiple_batches_when_each_state_pair_fits():
-    params = [torch.nn.Parameter(torch.ones(4)) for _ in range(5)]
-    optimizer = _offload_adamw(params)
-    workspace = DeviceWorkspace.__new__(DeviceWorkspace)
-    workspace._storage = torch.empty(128, dtype=torch.uint8)
-    optimizer.workspace = workspace
-    params_with_groups = [(param, {}) for param in params]
-
-    optimizer._ensure_workspace_capacity(params_with_groups)
-    entries, next_index = optimizer._stage_workspace_batch(params_with_groups, 0)
-    assert len(entries) == 4
-    assert next_index == 4
-
-    entries, next_index = optimizer._stage_workspace_batch(
-        params_with_groups, next_index
+def test_workspace_splits_large_parameter_and_packs_tail():
+    params = [torch.nn.Parameter(torch.ones(size)) for size in (17, 3)]
+    optimizer = _offload_adamw(params, optimizer_memory_fraction=0)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    bound = bind_parameters(
+        [(param, {}) for param in params], optimizer.param_to_cpu_states_map
     )
-    assert len(entries) == 1
-    assert next_index == 5
+    chunks = list(iter_chunks(bound, 64))
+    assert [[span.numel for span in chunk] for chunk in chunks] == [[8], [8], [1, 3]]
+    assert [span.start for chunk in chunks for span in chunk] == [0, 8, 16, 0]
 
 
 @requires_cpu_fused_adamw
-def test_workspace_adamw_matches_adamw(monkeypatch):
-    def _workspace_init(self, _runtime, _fraction):
-        self._storage = torch.empty(512, dtype=torch.uint8)
-
-    monkeypatch.setattr(DeviceWorkspace, "__init__", _workspace_init)
+def test_workspace_adamw_matches_adamw():
     torch.manual_seed(13)
     reference_param = torch.nn.Parameter(torch.randn(4, 3))
     workspace_param = torch.nn.Parameter(reference_param.detach().clone())
     reference = torch.optim.AdamW([reference_param], fused=True)
     workspace_update = _offload_adamw([workspace_param])
+    workspace_update.device_runtime = WorkspaceRuntime()
 
     assert workspace_update.workspace is None
 
@@ -296,15 +292,17 @@ def test_workspace_adamw_matches_adamw(monkeypatch):
         reference_param.grad = grad
         workspace_param.grad = grad.clone()
         reference.step()
+        if workspace_update._tuned_workspace_plan is None:
+            workspace_update.autotune_workspace()
         assert workspace_update._acquire_workspace() is not None
-        entries, next_index = workspace_update._stage_workspace_batch(
-            [(workspace_param, workspace_update.param_groups[0])], 0
+        state_view = workspace_update.workspace.view_like(
+            0, workspace_update.param_to_cpu_states_map[workspace_param]["exp_avg"]
         )
-        assert next_index == 1
         assert (
-            entries[0][2]["exp_avg"].untyped_storage().data_ptr()
+            state_view.untyped_storage().data_ptr()
             == workspace_update.workspace._storage.data_ptr()
         )
+        del state_view
         workspace_update.step()
         assert workspace_update.workspace is None
         reference.zero_grad()

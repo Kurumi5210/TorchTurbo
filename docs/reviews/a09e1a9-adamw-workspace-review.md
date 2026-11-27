@@ -9,8 +9,10 @@
 - 第三轮：按讨论结果增加"OOM 时缩小范围重试"，并说明重试时状态为什么正确，见
   [修复 F](#修复-f校准或分配-oom-时缩小范围重试)；预算系数从 0.95 改为 0.9，见
   [修复 G](#修复-g预算系数从-095-改为-09)
+- 第四轮：修复 A–G 已由 `77eeeb4` 合入 `dev-chunk-optimizer`。复核其后的 `c6fd417`，并报告合入后
+  发现的问题，见文末 [第四轮复核](#第四轮复核)
 
-下文的行号都以 a09e1a9 为准；没有写目录的文件都在
+下文的行号都以 a09e1a9 为准（第四轮以 c6fd417 为准）；没有写目录的文件都在
 `src/torchturbo/engine/backends/fsdp2/optimizers/` 下。
 
 ## 结论
@@ -740,3 +742,329 @@ if not measurements:
 5. **回退是否粘性**：见修复 C。
 6. **OOM 重试推翻了原设计**：a09e1a9 和 README 明确写了"不缩容重试，也不换候选"。修复 F 按讨论结果
    改成缩小范围重试，状态正确性的论证和测试见修复 F，合入前需要作者同意。
+
+---
+
+## 第四轮复核
+
+- 被评审：`origin/dev-chunk-optimizer` 的 `c6fd417`，范围是 `cccd6de..c6fd417` 的三个提交
+- 复核日期：2026-11-27
+- 本节行号以 `c6fd417` 为准
+
+### 分支现状
+
+| 提交 | 内容 |
+|---|---|
+| `54eeedb` | 第二轮复核的版本 |
+| `77eeeb4` | 修复 A–G 原样合入：在 `54eeedb` 上应用本目录补丁得到的 tree 与它相同（`1264b2e`） |
+| `c6fd417` | 补丁之外的新改动，3 个文件，+148 / -11 |
+
+补丁已经合入，不需要也无法再应用到 `c6fd417`。上文"需要作者决定"的事项里，第 6 项（OOM 重试）
+随 `77eeeb4` 合入；第 1、2、3、5 项对应的代码与补丁一致；第 4 项（README 粒度）这一轮没有复查。
+
+### 结论
+
+`c6fd417` 本身没有发现问题。整条分支有两处建议在合入主干前修掉：第 5 条和第 6 条。
+第 6 条是本评审的补丁引入的。
+
+| # | 严重程度 | 问题 | 位置 | 确认方式 |
+|---|---|---|---|---|
+| 5 | 中 | LlamaFactory 路径拿到的是 `0.8`，不会自动校准 | `fsdp2/config.py:85` | 用真实配置代码复现 |
+| 6 | 中 | 试跑 OOM 之后，pinned sink 在释放 host 缓存时仍被引用 | `adamw.py:539-541`、`587-591` | CPU 模拟 runtime 上用弱引用确认 |
+| 7 | 中 | NPU 没有实现 `empty_host_cache` | `runtime/npu.py` | 读代码；torch_npu 的行为未验证 |
+| 8 | 低 | 显式 fraction 没有 slot 下限，对应的报错有误导 | `adamw.py:137`、`148-156`、`226-242` | 读代码，对比 `cccd6de` |
+| 9 | 低 | 代码清理 6 处 | 见下文 | 读代码 |
+
+### `c6fd417`：没有发现问题
+
+这个提交做了两件事。
+
+- **只重试经过全体确认的 OOM。** 新增 `_CoordinatedWorkspaceOOM`（`torch.OutOfMemoryError` 的子类），
+  只在状态归约之后、所有失败的 rank 都是 OOM 时抛出（`_reserve_workspace`、
+  `_check_benchmark_phase`）。校准循环和 `_acquire_workspace` 改为只捕获它。归约或同步过程中
+  冒出来的 OOM 没有经过协调，其他 rank 并不知道，现在直接向上抛。修复 F 捕获的是
+  `torch.OutOfMemoryError`，范围过宽，这个改动是对的。
+- **计时的写入和读取也先对齐。** 新增 `_record_trial_time`：本地写入 `timing` 并同步，归约一次状态；
+  对耗时做 MAX 归约；非预热的试跑读回耗时后再归约一次状态。计时发生在试跑的状态恢复之后，
+  所以这里按 OOM 重试时状态也是对的。
+
+每次试跑的 collective 从 4 次变成预热 5 次、其余 6 次。`warmup` 只取决于试跑序号，各 rank 次数相同。
+每次试跑另外多两次整设备同步，都不计入被测耗时。
+
+### 5.【中】LlamaFactory 路径不会自动校准
+
+`CPUOffloadConfig.__post_init__` 在 `enabled` 为假时仍写入旧默认值（`fsdp2/config.py:83-86`）：
+
+```python
+if not self.enabled:
+    self.mode = CPUOffloadMode.FULL
+    self.optimizer_memory_fraction = 0.8
+    return
+```
+
+LlamaFactory 适配器的 `resolve_cpu_offload`（`adapters/llamafactory_v0/utils.py:300-302`）在
+`--fsdp` 没有 `offload` 时构造 `CPUOffloadConfig(enabled=False)`。`build_from_args` 把它转成 dict，
+作为最底下一层配置（`engine/config.py:1061-1062`）。配置文件只写 `enabled` 和 `mode` 时，
+覆盖不掉这个 `0.8`。
+
+同一份配置文件（`enabled: true`、`mode: optimizer`，不写 fraction）在两条路径上的结果：
+
+| 路径 | `optimizer_memory_fraction` | 行为 |
+|---|---|---|
+| 直接 `build_from_args` | `None` | 首步自动校准 |
+| LlamaFactory，`--fsdp` 无 `offload` | `0.8` | 固定单槽，不校准 |
+
+- **影响**：行为和这条分支之前相同，不会出错。但 README 和 `CPUOffloadConfig` 的 docstring 都写
+  "省略时自动校准"，LlamaFactory 用户按文档配置得不到这个行为，也没有任何提示。
+- **测试**：没有用例覆盖适配器这条路径。
+- **修法方向**：禁用时把 fraction 留成 `None`，不写 `0.8`。`backend.py:142` 和 `muon.py:1222` 只做
+  `== 0` 的比较，`None` 不影响它们；其他读这个字段的地方和断言 `0.8` 的测试需要一并检查。
+  这个方向没有实现，也没有测试。
+
+复现脚本见 [附录](#附录第四轮的复现脚本)。
+
+### 6.【中】试跑 OOM 之后 pinned sink 没有被释放
+
+这是修复 B 和修复 F 叠加出来的问题，出在本评审的补丁里。
+
+校准循环把捕获的异常留在局部变量里（`adamw.py:539-541`）：
+
+```python
+except _CoordinatedWorkspaceOOM as error:
+    # Only a completed status reduction can authorize a shared retry.
+    ceiling, out_of_memory = shared_plan.capacity_bytes, error
+```
+
+异常的 traceback 引用着 `_benchmark_workspace` 的栈帧，栈帧的参数里有 `cpu_sink`。所以 `finally` 里
+`cpu_sink = None` 之后 sink 仍然存活，紧接着的 `runtime.empty_host_cache()`（`adamw.py:587-591`）
+释放不到它。`_autotune_workspace` 的栈帧和这个异常互相引用，要等循环垃圾回收才断开。那时 sink
+回到 host 缓存的空闲链表，之后没有人再清，会一直占到训练结束。也就是第 1 条的"校准后不释放"
+在这个场景下又出现了。
+
+- **触发条件**：moments 非零（resume），并且某个候选在试跑中 OOM。实测的是 execute 阶段；
+  prepare 阶段的异常同样经过 `_benchmark_workspace` 的栈帧，按同样的道理也会触发，没有实测。
+  分配阶段和计时阶段的 OOM 不经过这个栈帧，不受影响。没有 OOM 时行为正常。
+- **体量**：sink 不超过单 chunk 槽容量 S。按修复 A 的例子，7B 全参 8 卡是每卡约 3.5 GiB，
+  实际占 4 GiB。
+- **修法**：只保留不带 traceback 的异常，和这个文件里其他地方的做法一致：
+
+  ```python
+  ceiling, out_of_memory = shared_plan.capacity_bytes, error.with_traceback(None)
+  ```
+
+  在 `c6fd417` 的副本上改这一行后，下面第二行输出变为 `sink alive at release=False`，
+  `test_adamw_workspace.py`、`test_adamw_workspace_distributed.py`、`test_adamw_pipeline.py`
+  共 103 个用例通过。建议同时加一个用例：非零态校准中途 OOM 时，调用 `empty_host_cache` 的那一刻
+  sink 已经不存在。
+
+脚本（见附录）在 `c6fd417` 上的输出：
+
+```
+trial_oom=False: plan=WorkspacePlan(num_slots=1, slot_bytes=448), sink alive at release=False, after return=False, after gc.collect()=False
+trial_oom=True: plan=WorkspacePlan(num_slots=1, slot_bytes=160), sink alive at release=True, after return=True, after gc.collect()=False
+```
+
+**验证的局限**：脚本用的是测试里的 CPU 模拟 runtime，观察的是 sink 张量对象是否存活。
+真实 pinned 分配器上的占用没有测。
+
+### 7.【中】NPU 没有实现 `empty_host_cache`
+
+`DeviceRuntime.empty_host_cache`（`runtime/base.py:84-85`）是非抽象的空实现，`NpuRuntime` 没有覆盖。
+NPU 上校准结束后不会释放 pinned sink，`release_host_seconds` 和日志照常输出，看不出没有释放。
+
+这是修复 B 里写的"NPU 待确认"，合入时没有处理。需要先确认两件事：torch_npu 的 pinned 分配
+有没有缓存，有没有对应的释放接口。本机没有 NPU，这两点都没有验证。
+
+### 8.【低】显式 fraction 没有 slot 下限，对应的报错有误导
+
+显式设置 `optimizer_memory_fraction` 时，`_fixed_workspace_plan`（`adamw.py:226-242`）直接用各 rank
+预算的最小值作为单槽容量。唯一的检查是 `_workspace_bounds` 里的 `minimum > budget`，而 `minimum`
+来自 `BoundParameter.minimum_slot_bytes`，对非空参数恒为 32 字节（`adamw_workspace.py:104-105`）。
+
+- `cccd6de` 要求 workspace 装得下最大参数的一对 moments，否则报错，并给出参数名和所需字节数。
+- 自动路径仍然要求预算不小于最大分片（`_workspace_candidates` 的 `cannot probe M=...`）。
+- 显式路径允许把参数切开是有意的设计，测试 `test_bounds_count_cache_active_demand_and_allow_parameter_splitting`
+  和 `test_local_bounds_require_only_one_aligned_moment_pair` 都在断言这一点。副作用是预算再小也会执行：
+  空闲显存接近耗尽时，一个 step 会切成极多的小 chunk，表现为极慢而不是报错。
+- 预算不足 32 字节时的报错（`adamw.py:148-156`）点名的是第一个活跃参数，写的是"需要 32 字节"，
+  容易让人去排查一个无关的参数。
+
+请作者确认显式路径是否需要一个下限，例如和自动路径一样用最大分片。报错信息建议改成描述预算本身，
+不点名参数。
+
+### 9.【低】代码清理
+
+- **`adamw.py:535-538`**：`except _WorkspaceRestoreError` 里靠 `_check_workspace_restore()` 恰好抛错来中断，
+  下一行的 `_record_trial_time(timing, elapsed, ...)` 写得像是会继续执行。现在不会出错，
+  建议改成显式 `raise`，免得以后改动那个方法时 `elapsed` 未赋值或沿用上一个候选的值。
+- **`adamw.py:278`**：`target.slot_bytes < minimum` 永远为假。`minimum` 恒为 32，而候选的起点
+  不小于 32。同一个常量还在 `_refit_workspace_plan` 里取负后参与跨 rank 的 MIN 归约
+  （`adamw.py:317-323`），过滤条件 `slot_bytes >= shared_minimum` 也不会筛掉任何候选。
+- **`adamw.py:107`、`570`**：`_tuned_workspace_bytes` 可以由 `_tuned_workspace_plan` 算出，
+  `_refit_workspace_plan` 回退时只更新了后者。目前它只用于 `autotune_workspace()` 的返回值和一行日志。
+- **`adamw_workspace.py:28-29`、`38-40`**：`DeviceWorkspace.is_available` 和构造函数里的 CPU 提前返回
+  在 `src/` 中没有调用方，只剩 `test_cpu_offload_optimizer.py:208` 一个用例在用。
+- **`muon.py:1337-1339`**：`fraction is None` 时就地写 `0.8`。默认值现在分散在 docstring 和这一处，
+  下一个读这个字段的地方容易漏掉 `None`。
+- **`runtime/cuda.py:106-113`**：用两层 `getattr` 探测接口，不符合仓库 `CLAUDE.md` 代码风格第 7 条；
+  两个接口都不存在时静默跳过。这段出自本评审的补丁。v2.10.0 的 CUDA 版已经有
+  `torch._C._host_emptyCache`（见下一节），可以直接调用，或者按版本号显式选择接口。
+
+评审中还有几条没有列为问题：`_autotune_workspace` 约 200 行、五层嵌套；`_workspace_calibration_stats`
+有二十多个键，汇总日志只用到其中 8 个；`empty_host_cache` 清的是进程级缓存（修复 B 已写明这个代价）。
+另有一个值得实测的方向：校准的参数快照放在 pageable 内存里，每次试跑后的恢复都是一次同步的 H2D。
+换成 pinned 是否明显缩短校准时间，需要在 GPU 上测，这里没有结论。
+
+### 核对后排除的两种说法
+
+记在这里，避免之后重复提出。
+
+- **"零态检查的 `count_nonzero` 换成 `any()` 可以提前返回"**（`adamw.py:494-498`）。
+  torch 2.10 CPU 版、单线程、1 GiB 的 float32 张量上实测：`count_nonzero` 约 95 ms，`any()` 为
+  264–319 ms，首元素非零时也一样。`any()` 不提前返回，不要换。
+- **"torch 2.10 没有 host 缓存释放接口"**。CPU 版确实没有 `torch._C._host_emptyCache`，但 v2.10.0 的
+  `torch/csrc/cuda/Module.cpp:2082` 注册了它，CUDA 版可用。`torch.accelerator` 在 2.10 里没有
+  `empty_host_cache`，上游主干上有。
+
+### 测试情况
+
+本机 CPU 版 torch 2.10 的 venv，`c6fd417`：
+
+| 文件 | 通过 | 失败 | 跳过 |
+|---|---|---|---|
+| `tests/engine/backends/fsdp2/test_adamw_pipeline.py` | 17 | 0 | 0 |
+| `tests/engine/backends/fsdp2/test_adamw_workspace.py` | 73 | 0 | 0 |
+| `tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py` | 13 | 0 | 0 |
+| `tests/engine/backends/fsdp2/test_cpu_offload_optimizer.py` | 10 | 5 | 0 |
+| `tests/engine/backends/fsdp2/test_adamw_swap_checkpoint.py` | 10 | 3 | 0 |
+| `tests/engine/backends/fsdp2/test_cpu_offload_grad_scaling.py` | 0 | 0 | 5 |
+| `tests/engine/test_config.py` | 74 | 0 | 0 |
+| `tests/runtime` | 10 | 0 | 0 |
+| 合计 | 207 | 8 | 5 |
+
+- 8 个失败报的都是 `pin_memory=True requires a CUDA or other accelerator backend`，属于环境问题。
+- 5 个跳过的用例要求 CUDA 或 NPU。
+- `test_adamw_swap_checkpoint.py` 和 `test_cpu_offload_grad_scaling.py` 是这一轮新加进范围的。
+  按前三轮的范围算是 197 个通过、5 个失败，比补丁验证时多 5 个通过，对应 `c6fd417` 新增的 5 个用例
+  （`test_timing_collective_oom_aborts_after_smaller_candidate_succeeded` 2 个、
+  `test_rank_local_timing_failure_is_coordinated` 3 个）。
+
+**GPU/NPU 上的真实路径仍然没有验证**：异步拷贝、真实计时、真实 pinned 分配器下的第 6 条，
+以及第 7 条的 NPU 行为。
+
+### 附录：第四轮的复现脚本
+
+第 5 条：
+
+```python
+# PYTHONPATH=<repo>/src python lf_fraction.py
+import tempfile
+
+from torchturbo.adapters.llamafactory_v0.utils import resolve_cpu_offload
+from torchturbo.engine.args import TorchTurboArgs
+from torchturbo.engine.config import build_from_args
+
+YAML = """\
+engine_config:
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: optimizer
+"""
+
+with tempfile.NamedTemporaryFile("w", suffix=".yaml") as config:
+    config.write(YAML)
+    config.flush()
+
+    plain = build_from_args(TorchTurboArgs(config_path=config.name))
+    print("plain:", plain.backend_config.cpu_offload.optimizer_memory_fraction)
+
+    # Same order as _build_config_from_args: resolve first (utils.py:114),
+    # then build from the same args (utils.py:130).
+    args = TorchTurboArgs(config_path=config.name)
+    args.cpu_offload = resolve_cpu_offload([], args, strict=True)
+    adapter = build_from_args(args)
+    print("LlamaFactory:", adapter.backend_config.cpu_offload.optimizer_memory_fraction)
+```
+
+输出：
+
+```
+plain: None
+LlamaFactory: 0.8
+```
+
+第 6 条（输出见上文）：
+
+```python
+# PYTHONPATH=<repo>/src:<repo> python sink_lifetime.py
+import gc
+import weakref
+
+import torch
+
+import tests.engine.backends.fsdp2.test_adamw_workspace as helpers
+from torchturbo.engine.backends.fsdp2.optimizers.adamw import AdamWSwap
+
+# The cpu_adamw fixture's substitutions, plus a weak reference to the sink.
+empty, empty_like = torch.empty, torch.empty_like
+sinks = []
+
+
+def unpinned_empty(*args, **kwargs):
+    pinned = kwargs.pop("pin_memory", None)
+    tensor = empty(*args, **kwargs)
+    if pinned and tensor.dtype == torch.uint8:
+        sinks.append(weakref.ref(tensor))
+    return tensor
+
+
+def unpinned_empty_like(*args, **kwargs):
+    kwargs.pop("pin_memory", None)
+    return empty_like(*args, **kwargs)
+
+
+torch.empty, torch.empty_like = unpinned_empty, unpinned_empty_like
+AdamWSwap._run_adamw = helpers._run_cpu_adamw
+
+
+class Runtime(helpers.WorkspaceRuntime):
+    def empty_host_cache(self):
+        super().empty_host_cache()
+        self.sink_alive_at_release = sinks[-1]() is not None
+
+
+def calibrate(trial_oom):
+    gc.collect()
+    gc.disable()
+    optimizer, _ = helpers._optimizer((33, 17), runtime=Runtime())
+    for state in optimizer.param_to_cpu_states_map.values():
+        state["exp_avg"].fill_(0.25)
+        state["exp_avg_sq"].fill_(0.5)
+    run, large_calls = optimizer._run_adamw, 0
+
+    def fail_second_large_chunk(*args):
+        nonlocal large_calls
+        run(*args)
+        if optimizer.workspace.capacity_bytes >= 320:
+            large_calls += 1
+            if large_calls == 2:
+                raise torch.OutOfMemoryError("injected kernel workspace failure")
+
+    if trial_oom:
+        optimizer._run_adamw = fail_second_large_chunk
+    optimizer.autotune_workspace()
+    at_release = optimizer.device_runtime.sink_alive_at_release
+    after_return = sinks[-1]() is not None
+    gc.enable()
+    gc.collect()
+    print(
+        f"trial_oom={trial_oom}: plan={optimizer._tuned_workspace_plan}, "
+        f"sink alive at release={at_release}, after return={after_return}, "
+        f"after gc.collect()={sinks[-1]() is not None}"
+    )
+
+
+calibrate(trial_oom=False)
+calibrate(trial_oom=True)
+```

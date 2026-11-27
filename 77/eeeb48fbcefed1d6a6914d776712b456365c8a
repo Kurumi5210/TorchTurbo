@@ -1,0 +1,39 @@
+src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
+  s_840e098f9607de::t_0f909f2ce1405c 31,88,105-106,163,165-173,175-176,181-185,187-190,193,196-199,262-263,274-276,280-304,308-351,354,356-360,370-372,392-393,427-428,441-442,451,453,458-471,513-518,520-549,553,562-568,570-571,588-592
+src/torchturbo/runtime/base.py
+  s_840e098f9607de::t_0f909f2ce1405c 84-86
+src/torchturbo/runtime/cuda.py
+  s_840e098f9607de::t_0f909f2ce1405c 106-114
+tests/engine/backends/fsdp2/test_adamw_workspace.py
+  s_840e098f9607de::t_0f909f2ce1405c 40,54-56,93,97-98,304-352,388,594-646,771-984
+  s_840e098f9607de::t_8490d31dd51ff4 985-986
+src/torchturbo/engine/backends/fsdp2/config.py
+  s_840e098f9607de::t_0f909f2ce1405c 59
+README.md
+  s_840e098f9607de::t_0f909f2ce1405c 189,196-206
+README_zh.md
+  s_840e098f9607de::t_0f909f2ce1405c 151,156-159
+scripts/runs/config_example.yaml
+  s_840e098f9607de::t_0f909f2ce1405c 59
+tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
+  s_840e098f9607de::t_0f909f2ce1405c 123,133-137,140,478-564,567
+  s_840e098f9607de::t_a0444b6b2b5697 565-566
+src/torchturbo/engine/backends/fsdp2/optimizers/adamw_workspace.py
+  s_840e098f9607de::t_0f909f2ce1405c 230-242,245,278-281,377
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "77eeeb48fbcefed1d6a6914d776712b456365c8a",
+  "prompts": {},
+  "sessions": {
+    "s_840e098f9607de": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21703-5fbb-7a80-8d21-0295b9d75b6a",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}

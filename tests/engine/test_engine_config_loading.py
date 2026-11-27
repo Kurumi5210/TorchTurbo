@@ -646,7 +646,7 @@ def test_yaml_cpu_offload_parses_string_enabled(tmp_path, enabled):
     offload = cfg.backend_config.cpu_offload
     assert offload.enabled is (enabled == "true")
     assert offload.mode.value == ("optimizer" if enabled == "true" else "full")
-    assert offload.optimizer_memory_fraction == (0.5 if enabled == "true" else 0.8)
+    assert offload.optimizer_memory_fraction == (0.5 if enabled == "true" else None)
 
 
 @pytest.mark.parametrize("enabled", [None, "true", "false"])

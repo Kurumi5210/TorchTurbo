@@ -54,10 +54,12 @@ class CPUOffloadConfig:
 
     ``enabled`` controls CPU offload. When enabled, ``mode`` selects either
     full offload or optimizer-state-only offload. ``optimizer_memory_fraction``
-    bounds optimizer workspaces: AdamWSwap sizes its staging slab from that
-    fraction of free device memory, while Muon checks its complete-matrix
-    compute and exchange buffers against that fraction of free device memory
-    plus blocks cached by the device allocator. Muon stages offloaded tensors
+    bounds each rank's optimizer workspaces using that fraction of free device
+    memory. When omitted, AdamWSwap calibrates chunk size and transfer overlap
+    up to 90% of free memory. An explicit positive fraction selects a fixed
+    single-slot budget without calibration. Muon defaults to 0.8, includes
+    reusable allocator cache, and checks its complete-matrix
+    compute and exchange buffers against this budget. Muon stages offloaded tensors
     with blocking copies, so ``overlap_comm_compute`` gives little overlap
     there. Zero selects synchronous CPU updates, which for Muon includes CPU
     collectives in either mode. Full-mode native AdamW retains its existing
@@ -66,7 +68,12 @@ class CPUOffloadConfig:
 
     enabled: Optional[bool] = None
     mode: CPUOffloadMode = CPUOffloadMode.FULL
-    optimizer_memory_fraction: float = 0.8
+    optimizer_memory_fraction: Optional[float] = None
+
+    @property
+    def muon_workspace_fraction(self) -> float:
+        """Return the fixed fraction used by Muon when offload is enabled."""
+        return 0.8 if self.optimizer_memory_fraction is None else self.optimizer_memory_fraction
 
     def __post_init__(self) -> None:
         if self.enabled is None:
@@ -80,9 +87,11 @@ class CPUOffloadConfig:
             self.enabled = bool(self.enabled)
         if not self.enabled:
             self.mode = CPUOffloadMode.FULL
-            self.optimizer_memory_fraction = 0.8
+            self.optimizer_memory_fraction = None
             return
         self.mode = CPUOffloadMode(self.mode)
+        if self.optimizer_memory_fraction is None:
+            return
         self.optimizer_memory_fraction = float(self.optimizer_memory_fraction)
         if not 0 <= self.optimizer_memory_fraction <= 1:
             raise ValueError(

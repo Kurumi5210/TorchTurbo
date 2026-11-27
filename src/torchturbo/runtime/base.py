@@ -81,6 +81,9 @@ class DeviceRuntime(ABC):
     def empty_cache(self) -> None:
         ...
 
+    def empty_host_cache(self) -> None:
+        """Release cached pinned host blocks that are no longer in use."""
+
     @abstractmethod
     def memory_info(self) -> tuple[int, int]:
         ...

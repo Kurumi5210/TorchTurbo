@@ -182,6 +182,60 @@ Muon supports `full` and `optimizer` CPU offload, and
 `optimizer_memory_fraction=0` selects CPU Newton-Schulz and CPU exchange. These
 paths are experimental until they are fully validated.
 
+With optimizer-state offload, an explicit positive `optimizer_memory_fraction` skips calibration.
+Each step uses a single slot sized to that fraction of the least free device memory across active ranks,
+rounded down to a multiple of 32 bytes. A slot as small as 32 bytes works by splitting parameters
+into smaller chunks, which can substantially slow the update. When the setting is omitted, AdamWSwap calibrates chunk size and transfer overlap
+before its first parameter update, after backward has produced real gradients.
+Contiguous parameters and their moments can span multiple chunks; each original
+parameter's step counter advances once per update. Local parameters, gradients, and both CPU moments must be contiguous.
+Unsupported layouts fail before calibration or update. Calibration starts each slot at M, the largest active local weight shard in bytes across all ranks (rounded up to 32 bytes). Slot sizes double from M. For each supported slot count (one or two), the search also measures the largest aligned slot fitting the total budget. The shared budget is the minimum of `0.9 * free device memory` over active ranks at calibration time; cached memory is not added. The sweep stops at the slot that holds the largest rank's active moments in one chunk, and two slots stop below it, since larger slots only add HBM. If even a single M-sized slot cannot fit, calibration fails before updating. Empty ranks participate without allocating and keep the shared plan; a globally empty step leaves calibration pending. Two slots use separate transfer streams for overlap; CPU writes finish before `step()` returns.
+
+All ranks run each trial together, with one warmup and three timing samples per
+candidate. Each sample times a complete pipeline, including fill and drain,
+and uses the slowest rank's time. Within 3% of the fastest median, AdamWSwap
+selects the candidate with the smallest total HBM allocation across ranks.
+Two-slot candidates are excluded if any active rank cannot fit both slots.
+Later updates use the selected plan unchanged. If it no longer fits, all ranks
+switch to the measured candidate that fits now, chosen by the same rule; only if
+none fits must you recalibrate on all ranks.
+If a calibration candidate runs out of device memory on any rank, every rank
+first restores its parameters and moments, then skips that capacity and every
+larger one and continues with the smaller candidates. Calibration fails only if
+the smallest candidate runs out of memory. If a real update cannot allocate its
+workspace, all ranks retry the measured plans below that capacity before any
+value changes. Other allocation or trial failures, and any restore failure, stop
+all ranks. A failed update cannot be replayed safely: reload the model checkpoint
+and recreate the optimizer before continuing.
+
+For an explicit calibration before the training loop, call
+`adamw_swap.autotune_workspace()` on every training rank after a representative
+warmup backward, then clear the warmup gradients. Calibration saves one CPU
+snapshot of all active local parameters and clones step counters. If the active
+CPU moments are verified to be zero, trials write back to their real addresses
+and reset them after every trial. Successful trials restore zeros by copying from
+the existing device slot; failed execution retains CPU recovery. Nonzero moments use an
+independent pinned output ring to preserve the original state. The zero-state
+path needs roughly the active parameter bytes of extra host memory; nonzero
+state additionally needs an output ring no larger than the smaller of the largest
+candidate workspace and the aligned size of the active moment pairs. The output ring is an
+approximation of real writeback traffic, so its timings may differ from training.
+Backup, restore and rank coordination are outside timed execution; there are no
+per-chunk collectives. Parameter, gradient and optimizer-state values are
+preserved, but parameter version counters increase: do not reuse a retained
+autograd graph afterwards.
+
+After calibration with nonzero moments, AdamWSwap releases its pinned output
+ring and clears unused blocks from the process's host allocator cache. On NPU
+it synchronizes the current device before clearing that cache. It clears the
+device allocator cache only if reserved memory grew beyond the selected
+workspace plus a 64 MiB allowance. Logs report setup, snapshot, trials and cleanup separately.
+Each real step binds its current gradients once. Successful execution drains its
+streams before releasing the slab; external and error cleanup retain device
+synchronization. Ordinary steps do not clear cache. The result is the measured
+best candidate, not a guarantee of globally optimal performance. CPU updates
+(`optimizer_memory_fraction=0`) do not calibrate.
+
 To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.
 
 ## Quick Start

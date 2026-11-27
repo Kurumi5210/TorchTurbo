@@ -5,6 +5,7 @@ from contextlib import nullcontext
 
 import torch
 
+from ..utils.torch_utils import torch_version
 from .base import BaseProfiler, DeviceRuntime, TurboDevice
 
 
@@ -102,6 +103,15 @@ class CudaRuntime(DeviceRuntime):
     def empty_cache(self) -> None:
         if self.available():
             torch.cuda.empty_cache()
+
+    def empty_host_cache(self) -> None:
+        if not self.available():
+            return
+        if torch_version() >= (2, 12, 0):
+            torch.accelerator.empty_host_cache()
+        else:
+            # PyTorch 2.10 and 2.11 expose the CUDA host allocator through this binding.
+            torch._C._host_emptyCache()
 
     def memory_info(self) -> tuple[int, int]:
         return torch.cuda.mem_get_info()

@@ -159,6 +159,12 @@ class NpuRuntime(DeviceRuntime):
         if self.available():
             self._npu.empty_cache()
 
+    def empty_host_cache(self) -> None:
+        if self.available():
+            # The host allocator can reclaim the sink once its copy events complete.
+            self._npu.synchronize()
+            self._npu.memory.host_empty_cache()
+
     def memory_info(self) -> tuple[int, int]:
         if not hasattr(self._npu, "mem_get_info"):
             raise NotImplementedError(

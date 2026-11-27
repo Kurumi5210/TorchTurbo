@@ -1219,7 +1219,7 @@ class FSDPDistributedMuon(Optimizer):
                 f"the configured offload policy, got {parameter_device.type!r}"
             )
         cpu_execution = (
-            self._offload.enabled and self._offload.optimizer_memory_fraction == 0
+            self._offload.enabled and self._offload.muon_workspace_fraction == 0
         )
         execution_runtime = CpuRuntime() if cpu_execution else device_runtime
         # Muon runs on the shards' own device when its type matches; full
@@ -1334,7 +1334,7 @@ class FSDPDistributedMuon(Optimizer):
         runtime = self._device_runtime
         free, _ = runtime.memory_info()
         cached = runtime.memory_reserved() - runtime.memory_allocated()
-        fraction = self._offload.optimizer_memory_fraction
+        fraction = self._offload.muon_workspace_fraction
         budget = int((free + cached) * fraction)
         required = self._workspace.required_bytes(self._compiled_buckets)
         if required <= budget:

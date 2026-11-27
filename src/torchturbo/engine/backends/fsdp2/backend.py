@@ -139,7 +139,7 @@ class FSDP2Backend(BaseBackend):
             offload.mode is CPUOffloadMode.FULL
             or (
                 config.optimizer.name == MuonPlan.name
-                and offload.optimizer_memory_fraction == 0
+                and offload.muon_workspace_fraction == 0
             )
         ):
             init_process_group_if_needed(enable_cpu_backend=True)

@@ -4064,7 +4064,8 @@ def test_muon_workspace_required_bytes_counts_buffers_and_temporaries():
     assert required == allocated + newton_schulz_bytes + staging_bytes
 
 
-def test_muon_offloaded_workspace_budget_counts_allocator_cache(monkeypatch):
+@pytest.mark.parametrize(("fraction", "effective"), [(None, 0.8), (0.5, 0.5)])
+def test_muon_offloaded_workspace_budget_counts_allocator_cache(monkeypatch, fraction, effective):
     from torchturbo.engine.backends.fsdp2.optimizers.muon import (
         FSDPDistributedMuon,
         _MuonWorkspace,
@@ -4096,7 +4097,7 @@ def test_muon_offloaded_workspace_budget_counts_allocator_cache(monkeypatch):
     buckets = _workspace_test_buckets()
     optimizer = object.__new__(FSDPDistributedMuon)
     optimizer._offload = CPUOffloadConfig(
-        enabled=True, mode="optimizer", optimizer_memory_fraction=0.5
+        enabled=True, mode="optimizer", optimizer_memory_fraction=fraction
     )
     optimizer._device_runtime = runtime
     optimizer._workspace = _MuonWorkspace(CpuRuntime(), overlap_comm_compute=False)
@@ -4118,7 +4119,7 @@ def test_muon_offloaded_workspace_budget_counts_allocator_cache(monkeypatch):
     runtime.free, runtime.cached = required, 0
     with pytest.raises(RuntimeError, match="before any update") as failure:
         optimizer._acquire_workspace()
-    assert "optimizer_memory_fraction=0.5" in str(failure.value.__cause__)
+    assert f"optimizer_memory_fraction={effective}" in str(failure.value.__cause__)
     assert not optimizer._workspace.configured
     assert not optimizer._workspace.slots
 

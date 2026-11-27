@@ -262,6 +262,37 @@ def test_build_config_maps_lf_fsdp_without_offload_to_disabled_cpu_offload():
     assert cfg.backend_config.cpu_offload.enabled is False
 
 
+@pytest.mark.parametrize(
+    ("yaml_value", "expected"),
+    [(None, None), ("null", None), ("0.8", 0.8), ("0", 0.0)],
+    ids=["omitted", "null", "fixed", "cpu"],
+)
+def test_yaml_optimizer_offload_fraction_after_lf_defaults(tmp_path, yaml_value, expected):
+    from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
+    from torchturbo.engine.args import TorchTurboArgs
+
+    config_file = tmp_path / "optimizer.yaml"
+    config = """\
+engine_config:
+  backend_config:
+    cpu_offload:
+      enabled: true
+      mode: optimizer
+"""
+    if yaml_value is not None:
+        config += f"      optimizer_memory_fraction: {yaml_value}\n"
+    config_file.write_text(config, encoding="utf-8")
+
+    cfg, _ = build_config_from_lf_args(
+        training_args=_training_args(fsdp=["full_shard"]),
+        torchturbo_args=TorchTurboArgs(config_path=str(config_file)),
+    )
+    policy = cfg.backend_config.cpu_offload
+    assert policy.enabled is True
+    assert policy.mode.value == "optimizer"
+    assert policy.optimizer_memory_fraction == expected
+
+
 def test_build_config_maps_lf_fsdp_offload_to_enabled_cpu_offload():
     from torchturbo.adapters.llamafactory_v0.utils import build_config_from_lf_args
     from torchturbo.engine.args import TorchTurboArgs

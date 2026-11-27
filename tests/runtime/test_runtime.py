@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 import os
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from torchturbo.runtime import (
     is_npu_available,
 )
 from torchturbo.runtime.cpu import CpuRuntime
+from torchturbo.runtime.cuda import CudaRuntime
 from torchturbo.runtime.npu import _NPU_DETERMINISTIC_ENV, NpuRuntime
 import torchturbo.runtime.runtime as runtime_impl
 
@@ -156,6 +158,35 @@ def test_device_runtime_synchronize_stream():
     runtime.synchronize_stream(stream)
 
     assert stream.synchronized == 1
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_npu_host_cache_waits_for_copies_before_release(monkeypatch, available):
+    runtime = NpuRuntime()
+    npu = Mock()
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    monkeypatch.setattr(runtime, "available", lambda: available)
+
+    runtime.empty_host_cache()
+
+    expected = [call.synchronize(), call.memory.host_empty_cache()] if available else []
+    assert npu.mock_calls == expected
+
+
+@pytest.mark.parametrize("version", [(2, 10, 0), (2, 12, 0)])
+def test_cuda_host_cache_release_uses_supported_api(monkeypatch, version):
+    runtime = CudaRuntime()
+    public, legacy = Mock(), Mock()
+    monkeypatch.setattr(runtime, "available", lambda: True)
+    monkeypatch.setattr("torchturbo.runtime.cuda.torch_version", lambda: version)
+    monkeypatch.setattr(torch.accelerator, "empty_host_cache", public, raising=False)
+    monkeypatch.setattr(torch._C, "_host_emptyCache", legacy, raising=False)
+
+    runtime.empty_host_cache()
+
+    selected, other = (public, legacy) if version >= (2, 12, 0) else (legacy, public)
+    selected.assert_called_once_with()
+    other.assert_not_called()
 
 
 def test_runtime_availability_helpers_cache_and_probe(monkeypatch):

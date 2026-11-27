@@ -1,0 +1,24 @@
+tests/engine/backends/fsdp2/test_adamw_workspace.py
+  s_840e098f9607de::t_610e85dc4b1cfd 391-426
+src/torchturbo/engine/backends/fsdp2/optimizers/adamw.py
+  s_840e098f9607de::t_610e85dc4b1cfd 47-50,202,291,538-540,770,773-800
+  s_840e098f9607de::t_27449c1b190463 801
+tests/engine/backends/fsdp2/test_adamw_workspace_distributed.py
+  s_840e098f9607de::t_610e85dc4b1cfd 19,22,570-640
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c6fd417c8c215c41f0ec5fcfd8f69994b9786ebe",
+  "prompts": {},
+  "sessions": {
+    "s_840e098f9607de": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a21703-5fbb-7a80-8d21-0295b9d75b6a",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "chenxiao <Jaychou1620@Gmail.com>"
+    }
+  }
+}
